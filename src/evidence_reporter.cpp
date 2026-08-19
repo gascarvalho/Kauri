@@ -42,9 +42,9 @@ bool valid_fact(
         fact.attempt_start_monotonic_ns != 0;
     const bool has_local_commit =
         fact.reporter_local_commit_monotonic_ns != 0;
-    if (has_attempt_start != has_local_commit)
+    if (has_local_commit && !has_attempt_start)
         return false;
-    if (has_attempt_start)
+    if (has_attempt_start && has_local_commit)
     {
         if (fact.outcome != ResponseOutcome::timeout ||
             fact.response_duration_us != 0 ||
@@ -145,6 +145,15 @@ EvidenceReporter::EvidenceReporter(EvidenceReporterConfig config)
 
 EvidenceReporter::~EvidenceReporter() = default;
 
+bool EvidenceReporter::enable_exact_timeout_attempt_evidence_v3() noexcept
+{
+    if (!state_->diagnostics.healthy || state_->diagnostics.stopped ||
+        !state_->pending.empty())
+        return false;
+    state_->config.exact_timeout_attempt_evidence_v3 = true;
+    return true;
+}
+
 bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
 {
     if (state_->diagnostics.stopped || !state_->configured_limits)
@@ -180,13 +189,27 @@ bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
         state_->diagnostics.healthy = false;
         return false;
     }
+    if (state_->config.exact_timeout_attempt_evidence_v3 &&
+        (fact.attempt_start_monotonic_ns == 0 ||
+         fact.fact_monotonic_ns < fact.attempt_start_monotonic_ns ||
+         fact.deadline_duration_us == 0))
+    {
+        increment(state_->diagnostics.rejected_facts);
+        state_->diagnostics.healthy = false;
+        return false;
+    }
 
     const auto next_sequence =
         state_->diagnostics.last_reporter_sequence + 1;
     try
     {
         ResponseObservation observation;
-        if (fact.attempt_start_monotonic_ns != 0)
+        if (state_->config.exact_timeout_attempt_evidence_v3)
+        {
+            observation.schema_version =
+                kResponseObservationSchemaVersionV3;
+        }
+        else if (fact.attempt_start_monotonic_ns != 0)
         {
             observation.schema_version =
                 kResponseObservationSchemaVersionV2;
@@ -213,12 +236,7 @@ bool EvidenceReporter::enqueue(const ResponseAttemptFact &fact)
             fact.reporter_local_commit_monotonic_ns;
         observation.signer_set = fact.signer_set;
         observation.observation_id =
-            compute_response_observation_id(
-                ResponseAttemptIdentity{
-                    state_->config.trusted_reporter_id,
-                    fact.key.observed_replica_id,
-                    fact.key.proposal,
-                    fact.key.expected_message_type});
+            compute_response_observation_id(observation);
 
         ResponseObservationBatch batch;
         batch.observations.push_back(observation);

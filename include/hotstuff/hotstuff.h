@@ -1138,6 +1138,7 @@ namespace hotstuff
         std::unique_ptr<AdaptiveV2ResponseEvidenceBridge>
             adaptive_v2_response_evidence;
         bool experiment_responsive_cross_commit_retention_v2{false};
+        bool experiment_exact_timeout_attempt_evidence_v3{false};
         std::unique_ptr<ExperimentByzantineAdapter>
             experiment_byzantine_adapter;
         std::unique_ptr<ExperimentPostQcAudit>
@@ -1934,6 +1935,7 @@ namespace hotstuff
         void configure_experiment_byzantine_faults(
             ExperimentByzantineOptions options);
         void enable_experiment_responsive_cross_commit_retention_v2();
+        void enable_experiment_exact_timeout_attempt_evidence_v3();
         void configure_experiment_post_qc_audit(
             ExperimentPostQcAuditOptions options);
         /**

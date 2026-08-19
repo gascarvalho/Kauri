@@ -4555,7 +4555,7 @@ def _native_snapshot_id_reference(
         result += validation._u(record.deadline_duration_us, 8)
         result += validation._u(record.reporter_monotonic_ns, 8)
         result += validation._u(record.reporter_sequence, 8)
-        if record.schema_version == 2:
+        if record.schema_version in {2, 3}:
             assert record.attempt_start_monotonic_ns is not None
             assert record.reporter_local_commit_monotonic_ns is not None
             result += validation._u(record.attempt_start_monotonic_ns, 8)
@@ -4835,6 +4835,7 @@ def _replay_snapshot(
     predecessor_digest: str = _NATIVE_REPLAY_EPOCH_DIGEST,
     baseline_cutoff: int = 4,
     current_cutoff: int = 14,
+    allowed_schema_versions: Collection[int] = frozenset({1, 2}),
 ) -> dict[str, object]:
     return _replay_document(
         validation.replay_native_adaptation_snapshot(
@@ -4847,8 +4848,213 @@ def _replay_snapshot(
             policy=policy,
             seed=seed,
             suffix_only=suffix_only,
+            allowed_schema_versions=allowed_schema_versions,
         )
     )
+
+
+def _mixed_schema_v1_v3_native_replay() -> (
+    tuple[list[dict[str, object]], tuple[validation._EvidenceRecord, ...]]
+):
+    """Convert native-shaped accepted rows to v3 without changing audit rules."""
+
+    events, records = _native_replay_evidence()
+    events = copy.deepcopy(events)
+    updated = {record.ingestion_sequence: record for record in records}
+    starts = {
+        block_hash: 1_000_000 + index * 1_000_000
+        for index, block_hash in enumerate(
+            dict.fromkeys(record.block_hash for record in records), start=1
+        )
+    }
+    for event in events:
+        event["source_monotonic_ns"] = 20_000_000 + int(event["source_sequence"])
+        if event["event_type"] != "evidence.observation_accepted":
+            continue
+        payload = event["payload"]
+        assert isinstance(payload, dict)
+        ingestion = payload["ingestion_sequence"]
+        assert isinstance(ingestion, int)
+        if ingestion == 1:
+            continue  # Preserve one archived v1 row in the otherwise v3 stream.
+        observation = payload["observation"]
+        assert isinstance(observation, dict)
+        record = updated[ingestion]
+        start = starts[record.block_hash]
+        deadline = record.deadline_duration_us
+        reporter_ns = (
+            start + deadline * 1_000
+            if record.outcome == "timeout"
+            else start + record.response_duration_us * 1_000
+        )
+        observation.update(
+            schema_version=3,
+            attempt_start_monotonic_ns=start,
+            reporter_local_commit_monotonic_ns=0,
+            reporter_monotonic_ns=reporter_ns,
+        )
+        observation["observation_id"] = hashlib.sha256(
+            b"kauri-response-observation-v3"
+            + record.reporter_id.to_bytes(2, "big")
+            + record.target_id.to_bytes(2, "big")
+            + record.epoch_number.to_bytes(4, "big")
+            + record.tree_id.to_bytes(4, "big")
+            + bytes.fromhex(record.epoch_digest)
+            + bytes.fromhex(record.block_hash)
+            + (1).to_bytes(1, "big")
+            + start.to_bytes(8, "big")
+            + deadline.to_bytes(8, "big")
+        ).hexdigest()
+        updated[ingestion] = replace(
+            record,
+            acceptance_monotonic_ns=int(event["source_monotonic_ns"]),
+            observation_id=str(observation["observation_id"]),
+            schema_version=3,
+            attempt_start_monotonic_ns=start,
+            reporter_local_commit_monotonic_ns=0,
+            reporter_monotonic_ns=reporter_ns,
+        )
+    ordered = tuple(updated[record.ingestion_sequence] for record in records)
+    _rebind_native_replay_audit(
+        events,
+        ordered,
+        baseline_cutoff=4,
+        current_cutoff=14,
+        suffix_only=False,
+    )
+    return events, ordered
+
+
+def test_native_replay_v3_is_opt_in_and_recomputes_exact_attempt_identity() -> None:
+    events, records = _mixed_schema_v1_v3_native_replay()
+    replay = _replay_snapshot(
+        events,
+        suffix_only=False,
+        allowed_schema_versions=frozenset({1, 3}),
+    )
+    assert replay["snapshot_id"] == _native_snapshot_id_reference(
+        records,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+    with pytest.raises(validation.FactorialValidationError):
+        _replay_snapshot(events, suffix_only=False)
+
+
+def test_native_replay_v3_accepts_delayed_on_time_callback() -> None:
+    events, records = _mixed_schema_v1_v3_native_replay()
+    accepted = next(
+        event
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["schema_version"] == 3
+        and event["payload"]["observation"]["outcome"] == "on_time"
+    )
+    observation = accepted["payload"]["observation"]
+    assert isinstance(observation, dict)
+    delayed_us = 200
+    observation["response_duration_us"] = delayed_us
+    observation["reporter_monotonic_ns"] = (
+        int(observation["attempt_start_monotonic_ns"]) + delayed_us * 1_000
+    )
+    ingestion = accepted["payload"]["ingestion_sequence"]
+    assert isinstance(ingestion, int)
+    record = next(
+        record for record in records if record.ingestion_sequence == ingestion
+    )
+    observation["observation_id"] = hashlib.sha256(
+        b"kauri-response-observation-v3"
+        + record.reporter_id.to_bytes(2, "big")
+        + record.target_id.to_bytes(2, "big")
+        + record.epoch_number.to_bytes(4, "big")
+        + record.tree_id.to_bytes(4, "big")
+        + bytes.fromhex(record.epoch_digest)
+        + bytes.fromhex(record.block_hash)
+        + (1).to_bytes(1, "big")
+        + int(observation["attempt_start_monotonic_ns"]).to_bytes(8, "big")
+        + int(observation["deadline_duration_us"]).to_bytes(8, "big")
+    ).hexdigest()
+    updated = tuple(
+        (
+            replace(
+                row,
+                observation_id=str(observation["observation_id"]),
+                response_duration_us=delayed_us,
+                reporter_monotonic_ns=int(observation["reporter_monotonic_ns"]),
+            )
+            if row.ingestion_sequence == ingestion
+            else row
+        )
+        for row in records
+    )
+    _rebind_native_replay_audit(
+        events, updated, baseline_cutoff=4, current_cutoff=14, suffix_only=False
+    )
+    assert _replay_snapshot(
+        events, suffix_only=False, allowed_schema_versions=frozenset({1, 3})
+    )["snapshot_id"] == _native_snapshot_id_reference(
+        updated,
+        replica_count=3,
+        epoch_number=1,
+        epoch_digest=_NATIVE_REPLAY_EPOCH_DIGEST,
+        cutoff=14,
+        policy=_NATIVE_REPLAY_POLICY,
+    )
+
+
+def test_native_replay_v3_rejects_early_late_and_archived_on_time_deadline() -> None:
+    events, _records = _mixed_schema_v1_v3_native_replay()
+    late = next(
+        event["payload"]["observation"]
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["schema_version"] == 3
+        and event["payload"]["observation"]["outcome"] == "late"
+    )
+    late["reporter_monotonic_ns"] = int(late["attempt_start_monotonic_ns"]) + 1_000
+    late["response_duration_us"] = 1
+    with pytest.raises(validation.FactorialValidationError):
+        _replay_snapshot(
+            events, suffix_only=False, allowed_schema_versions=frozenset({1, 3})
+        )
+
+    archived_events, _records = _native_replay_evidence()
+    archived = next(
+        event["payload"]["observation"]
+        for event in archived_events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["outcome"] == "on_time"
+    )
+    archived["response_duration_us"] = int(archived["deadline_duration_us"])
+    with pytest.raises(validation.FactorialValidationError):
+        _replay_snapshot(archived_events, suffix_only=False)
+
+
+@pytest.mark.parametrize("mutation", ("observation_id", "reporter_monotonic_ns"))
+def test_native_replay_v3_rejects_identity_and_timing_drift(mutation: str) -> None:
+    events, _records = _mixed_schema_v1_v3_native_replay()
+    observation = next(
+        event["payload"]["observation"]
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["schema_version"] == 3
+    )
+    assert isinstance(observation, dict)
+    if mutation == "observation_id":
+        observation["observation_id"] = "00" * 32
+    else:
+        observation["reporter_monotonic_ns"] = (
+            int(observation["attempt_start_monotonic_ns"]) - 1
+        )
+    with pytest.raises(validation.FactorialValidationError):
+        _replay_snapshot(
+            events,
+            suffix_only=False,
+            allowed_schema_versions=frozenset({1, 3}),
+        )
 
 
 def _rebind_native_replay_audit(

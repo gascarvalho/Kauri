@@ -33,6 +33,217 @@ N31_PROFILE_V3 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v3.json"
 N31_PROFILE_V4 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json"
 N7_PROFILE_V5 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v5.json"
 N31_PROFILE_V5 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v5.json"
+N7_PROFILE_V6 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v6.json"
+N31_PROFILE_V6 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v6.json"
+
+
+def test_v6_replica_configs_enable_exact_timeout_attempt_evidence(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    config = tmp_path / "config"
+    config.mkdir()
+    for replica in (0, 1):
+        (config / f"replica-{replica}.conf").write_text("idx = 0\n", encoding="ascii")
+
+    runtime._enable_v6_timeout_attempt_evidence(tmp_path, (0, 1))
+
+    for replica in (0, 1):
+        assert (config / f"replica-{replica}.conf").read_text(encoding="ascii") == (
+            "idx = 0\nexperiment-exact-timeout-attempt-evidence-v3 = true\n"
+        )
+
+
+@pytest.mark.parametrize("profile_path", (N31_PROFILE_V4, N31_PROFILE_V5))
+def test_archived_focused_ranking_rejects_schema2_replay(
+    profile_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Focused archive replay is schema-1 only even though generic replay has v2."""
+
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(profile_path)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    epoch1 = SimpleNamespace(epoch_digest="11" * 32, generation_seed=1)
+    source._bundle = lambda _epoch: (b"", epoch1)
+    audit = {
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+        "baseline_cutoff": 0,
+        "current_cutoff": 1,
+    }
+    poisoned_observation = {"schema_version": 2}
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "payload": audit,
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "event_type": "evidence.observation_accepted",
+            "payload": {"observation": poisoned_observation},
+        },
+    ]
+
+    def reject_schema2(_events: object, **kwargs: object) -> object:
+        assert kwargs["allowed_schema_versions"] == frozenset({1})
+        assert poisoned_observation["schema_version"] == 2
+        raise runtime.factorial_validation.FactorialValidationError("schema2 poison")
+
+    monkeypatch.setattr(
+        runtime.factorial_validation,
+        "replay_native_adaptation_snapshot",
+        reject_schema2,
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="ranking replay"):
+        source._ranking(events, predecessor_epoch=0)
+
+
+def _v6_runtime_timeout_events(profile: Any) -> list[dict[str, object]]:
+    runtime = _runtime()
+    coverage = runtime.derive_reporter_coverage_plan(profile)
+    digest = str(profile.raw["topology"]["epoch_zero_digest"])
+    events: list[dict[str, object]] = []
+
+    def append(
+        *,
+        target: int,
+        reporter: int,
+        tree: int,
+        message_type: str,
+        outcome: str,
+        start: int,
+        ordinal: int,
+    ) -> None:
+        deadline = 1
+        block_hash = hashlib.sha256(
+            f"v6-runtime-{target}-{reporter}-{tree}-{ordinal}".encode()
+        ).hexdigest()
+        reporter_ns = start + 1_000 if outcome != "on_time" else start
+        response_us = 0
+        observation = {
+            "schema_version": 3,
+            "reporter_id": reporter,
+            "observed_replica_id": target,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": tree,
+                "epoch_digest": digest,
+            },
+            "block_hash": block_hash,
+            "expected_message_type": message_type,
+            "outcome": outcome,
+            "response_duration_us": response_us,
+            "deadline_duration_us": deadline,
+            "reporter_monotonic_ns": reporter_ns,
+            "reporter_sequence": ordinal + 1,
+            "attempt_start_monotonic_ns": start,
+            "reporter_local_commit_monotonic_ns": 0,
+            "signer_set": [] if outcome == "timeout" else [reporter],
+        }
+        observation["observation_id"] = runtime._v6_timeout_observation_id(
+            reporter_id=reporter,
+            observed_replica_id=target,
+            epoch_number=0,
+            tree_id=tree,
+            epoch_digest=digest,
+            block_hash=block_hash,
+            expected_message_type=message_type,
+            attempt_start_monotonic_ns=start,
+            deadline_duration_us=deadline,
+        )
+        sequence = len(events) + 1
+        events.append(
+            {
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_sequence": sequence,
+                "source_monotonic_ns": 50_000 + sequence,
+                "event_type": "evidence.observation_accepted",
+                "payload": {"ingestion_sequence": sequence, "observation": observation},
+            }
+        )
+
+    # A valid pre-R timeout and on-time fact compensate in the raw suffix but
+    # cannot enter the exact post-arm reporter guard.
+    first = coverage["targets"][0]["first_qualifying_reporters"][0]
+    append(
+        target=int(coverage["targets"][0]["target_replica_id"]),
+        reporter=int(first["reporter_id"]),
+        tree=int(first["tree_id"]),
+        message_type=(
+            "aggregate_relay" if int(first["reporter_id"]) == 6 else "direct_vote"
+        ),
+        outcome="timeout",
+        start=9_000,
+        ordinal=99,
+    )
+    append(
+        target=int(coverage["targets"][0]["target_replica_id"]),
+        reporter=int(first["reporter_id"]),
+        tree=int(first["tree_id"]),
+        message_type=(
+            "aggregate_relay" if int(first["reporter_id"]) == 6 else "direct_vote"
+        ),
+        outcome="on_time",
+        start=9_100,
+        ordinal=100,
+    )
+    ordinal = 0
+    for row in coverage["targets"]:
+        for reporter_row in row["first_qualifying_reporters"]:
+            for _ in range(2):
+                ordinal += 1
+                reporter = int(reporter_row["reporter_id"])
+                append(
+                    target=int(row["target_replica_id"]),
+                    reporter=reporter,
+                    tree=int(reporter_row["tree_id"]),
+                    message_type=(
+                        "aggregate_relay" if reporter == 6 else "direct_vote"
+                    ),
+                    outcome="timeout",
+                    start=10_000 + ordinal,
+                    ordinal=ordinal,
+                )
+    return events
+
+
+def test_v6_runtime_exact_timeout_guard_replays_mixed_native_attempts() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V6)
+    backend = object.__new__(runtime.FocusedRawEvidenceSource)
+    backend._profile = profile
+    events = _v6_runtime_timeout_events(profile)
+    result = backend._qualifying_timeout_counts(
+        events, fault_ns=10_000, baseline_cutoff=0, current_cutoff=len(events)
+    )
+    assert result is not None
+    counts, raw_drawdowns, _timestamp = result
+    assert counts == {
+        "0": {"4": 2, "5": 2, "6": 2},
+        "1": {"4": 2, "5": 2, "6": 2},
+    }
+    assert raw_drawdowns == {"0": -6, "1": -6}
+
+
+def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V6)
+    backend = object.__new__(runtime.FocusedRawEvidenceSource)
+    backend._profile = profile
+    events = _v6_runtime_timeout_events(profile)
+    observation = events[-1]["payload"]["observation"]
+    assert isinstance(observation, dict)
+    observation["outcome"] = "late"
+    observation["reporter_id"] = 4 if observation["reporter_id"] != 4 else 5
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="identity"):
+        backend._qualifying_timeout_counts(
+            events, fault_ns=10_000, baseline_cutoff=0, current_cutoff=len(events)
+        )
 
 
 _CONTROLLER_FAILURE_MUTATIONS = (

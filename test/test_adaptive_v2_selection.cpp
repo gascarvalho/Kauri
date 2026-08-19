@@ -101,6 +101,18 @@ std::vector<EpochTreeDefinition> all_reporter_target_trees()
     return trees;
 }
 
+std::vector<EpochTreeDefinition> production_n7_trees()
+{
+    return {
+        {0, 2, 2, {0, 1, 2, 3, 4, 5, 6}, {}},
+        {1, 2, 2, {1, 2, 3, 4, 5, 6, 0}, {}},
+        {2, 2, 2, {2, 3, 4, 5, 6, 0, 1}, {}},
+        {3, 2, 2, {3, 4, 5, 6, 0, 1, 2}, {}},
+        {4, 2, 2, {4, 5, 6, 0, 1, 2, 3}, {}},
+        {5, 2, 2, {5, 6, 0, 1, 2, 3, 4}, {}},
+        {6, 2, 2, {6, 0, 1, 2, 3, 4, 5}, {}}};
+}
+
 EpochDefinitionInput epoch_input(
     std::uint32_t epoch_number,
     const uint256_t &previous_epoch_digest,
@@ -120,6 +132,17 @@ EpochDefinitionInput epoch_input(
         "adaptive-v2-selection-fixture-" +
         std::to_string(epoch_number);
     input.evidence_cutoff = 0;
+    return input;
+}
+
+EpochDefinitionInput production_epoch_input(
+    std::uint32_t epoch_number,
+    const uint256_t &previous_epoch_digest,
+    std::uint64_t activation_height)
+{
+    auto input = epoch_input(
+        epoch_number, previous_epoch_digest, activation_height);
+    input.trees = production_n7_trees();
     return input;
 }
 
@@ -188,10 +211,14 @@ struct Fixture
     std::uint64_t monotonic_clock{0};
     std::uint64_t attempt_number{0};
 
-    explicit Fixture(std::size_t accepted_capacity = 256)
+    explicit Fixture(
+        std::size_t accepted_capacity = 256,
+        bool production_n7_topology = false)
     {
         const auto &definition = epochs.stage(
-            epoch_input(0, uint256_t{}, 15),
+            production_n7_topology
+                ? production_epoch_input(0, uint256_t{}, 15)
+                : epoch_input(0, uint256_t{}, 15),
             validation_context(10));
         epoch = {definition.epoch_number(), definition.epoch_digest()};
         ledger = std::make_unique<EvidenceLedger>(
@@ -302,6 +329,66 @@ struct Fixture
         return value;
     }
 
+    ResponseObservation timeout_v3_in_tree(
+        ReplicaID target, std::uint32_t tree_id,
+        std::uint64_t attempt_start_monotonic_ns)
+    {
+        const auto &definition = tree(tree_id);
+        const auto position = static_cast<std::size_t>(
+            std::find(definition.members_breadth_first.begin(),
+                      definition.members_breadth_first.end(), target) -
+            definition.members_breadth_first.begin());
+        REQUIRE(position != 0);
+        REQUIRE(position < definition.members_breadth_first.size());
+        const auto reporter = definition.members_breadth_first[
+            (position - 1) / definition.fanout];
+        ResponseObservation value;
+        value.schema_version = hotstuff::kResponseObservationSchemaVersionV3;
+        value.reporter_id = reporter; value.observed_replica_id = target;
+        value.configuration = {epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest("adaptive-v2-v3-timeout-" + std::to_string(++attempt_number));
+        value.expected_message_type = ExpectedMessageType::direct_vote;
+        value.outcome = ResponseOutcome::timeout; value.deadline_duration_us = 100;
+        value.attempt_start_monotonic_ns = attempt_start_monotonic_ns;
+        value.reporter_monotonic_ns = attempt_start_monotonic_ns + 100'000;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.observation_id = hotstuff::compute_response_observation_id(value);
+        window.admit(value.proposal_key()); ingest(value); return value;
+    }
+
+    void on_time_in_tree(ReplicaID target, std::uint32_t tree_id)
+    {
+        const auto &definition = tree(tree_id);
+        const auto target_position = std::find(
+            definition.members_breadth_first.begin(),
+            definition.members_breadth_first.end(), target);
+        REQUIRE(target_position != definition.members_breadth_first.end());
+        const auto position = static_cast<std::size_t>(
+            target_position - definition.members_breadth_first.begin());
+        REQUIRE(position != 0);
+        const auto reporter = definition.members_breadth_first[
+            (position - 1) / definition.fanout];
+        ResponseObservation value;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = {
+            epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest(
+            "adaptive-v2-tree-on-time-" +
+            std::to_string(++attempt_number));
+        value.expected_message_type = ExpectedMessageType::direct_vote;
+        value.outcome = ResponseOutcome::on_time;
+        value.response_duration_us = 50;
+        value.deadline_duration_us = 100;
+        value.reporter_monotonic_ns = ++monotonic_clock * 1'000;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.signer_set = {target};
+        value.observation_id = hotstuff::compute_response_observation_id(
+            value.attempt_identity());
+        window.admit(value.proposal_key());
+        ingest(value);
+    }
+
     ResponseObservation timeout_v2(
         ReplicaID reporter, ReplicaID target)
     {
@@ -315,6 +402,37 @@ struct Fixture
             value.reporter_monotonic_ns - 1'000;
         value.reporter_local_commit_monotonic_ns =
             value.attempt_start_monotonic_ns + 500;
+        ingest(value);
+        return value;
+    }
+
+    ResponseObservation aggregate_timeout_in_tree(
+        ReplicaID reporter,
+        ReplicaID target,
+        std::uint32_t tree_id,
+        std::uint64_t reporter_monotonic_ns,
+        std::uint64_t deadline_duration_us)
+    {
+        ResponseObservation value;
+        value.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV3;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = {
+            epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest(
+            "adaptive-v2-aggregate-timeout-" +
+            std::to_string(++attempt_number));
+        value.expected_message_type = ExpectedMessageType::aggregate_relay;
+        value.outcome = ResponseOutcome::timeout;
+        value.deadline_duration_us = deadline_duration_us;
+        value.reporter_monotonic_ns = reporter_monotonic_ns;
+        value.attempt_start_monotonic_ns =
+            reporter_monotonic_ns - deadline_duration_us * 1'000U;
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.observation_id =
+            hotstuff::compute_response_observation_id(value);
+        window.admit(value.proposal_key());
         ingest(value);
         return value;
     }
@@ -878,7 +996,6 @@ TEST_CASE(
     arm.evidence_start_monotonic_ns = kEvidenceStartNs;
     arm.prefault_tree_id = 6;
     arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
-
     SECTION("reject malformed or noncanonical arms")
     {
         auto malformed = arm;
@@ -976,6 +1093,262 @@ TEST_CASE(
     CHECK(selected.metadata.timeout_audit_basis ==
           AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered);
     (void)unanchored;
+}
+
+TEST_CASE(
+    "v6 arm admits only exact post-boundary prefix aggregate timeout guards",
+    "[adaptive-v2][selection][fault-window-arm][v6][n7][aggregate][intentional-red]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, true);
+    // Use the frozen N7 production tree order.  Baseline direct-votes must
+    // originate at leaves; the two crashed roots are internal children of
+    // reporter 6 in tree 6 and are exercised below as aggregate relays.
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {0, 2}, {1, 3}, {2, 6}, {3, 6}, {4, 6}, {5, 6}, {6, 0}})
+        fixture.on_time_in_tree(target, tree);
+
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 2;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 6;
+    arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    fixture.advance_monotonic_clock(kEvidenceStartNs / 1'000U + 1'000U);
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {0, 2}, {0, 4}, {1, 2}, {1, 3}})
+    {
+        fixture.timeout_v3_in_tree(
+            target, tree, kEvidenceStartNs + 1'000'000U);
+    }
+
+    // Both poisons are authenticated and accepted, but cannot supply the
+    // third guard: the first can conservatively start before R; the second
+    // is outside the immutable wrapped prefix.
+    fixture.aggregate_timeout_in_tree(
+        6, 0, 6, kEvidenceStartNs + 50'000U, 100);
+    fixture.aggregate_timeout_in_tree(
+        6, 1, 6, kEvidenceStartNs + 60'000U, 100);
+    fixture.aggregate_timeout_in_tree(
+        5, 0, 5, kEvidenceStartNs + 3'000'000U, 100);
+    const auto poisoned = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(poisoned.selected_replicas.empty());
+    CHECK(poisoned.eligible_candidates.empty());
+
+    // These source-bound aggregate-relay timeout attempts begin
+    // conservatively after R and occupy the prefault tree 6. Together with
+    // the two direct-vote reporters they provide exactly f+1 guards for each
+    // crashed target.
+    fixture.aggregate_timeout_in_tree(
+        6, 0, 6, kEvidenceStartNs + 2'000'000U, 100);
+    fixture.aggregate_timeout_in_tree(
+        6, 1, 6, kEvidenceStartNs + 2'100'000U, 100);
+    const auto selected = selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selected.selected_replicas == std::vector<ReplicaID>{0, 1});
+    REQUIRE(selected.eligible_candidates.size() == 2);
+    for (const auto &candidate : selected.eligible_candidates)
+    {
+        CHECK(candidate.qualifying_reporters ==
+              std::vector<ReplicaID>{4, 5, 6});
+        CHECK(candidate.total_uncompensated_timeouts == 3);
+    }
+}
+
+TEST_CASE(
+    "v6 exact timeout attempts cannot bleed across one proposal key",
+    "[adaptive-v2][selection][fault-window-arm][v6][attempt-id][late]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, true);
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {0, 2}, {1, 3}, {2, 6}, {3, 6}, {4, 6}, {5, 6}, {6, 0}})
+    {
+        fixture.on_time_in_tree(target, tree);
+    }
+
+    auto config = selection_config(1, 1, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    config.responsiveness_policy.minimum_response_rate_ppm = 700'000;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 6;
+    arm.required_tree_ids = {6, 0, 1, 2, 3, 4};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    const auto timeout = [&fixture](
+                             ReplicaID reporter,
+                             ReplicaID target,
+                             const ProposalKey &proposal,
+                             ExpectedMessageType message_type,
+                             std::uint64_t attempt_start_ns,
+                             std::uint64_t deadline_us) {
+        ResponseObservation value;
+        value.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV3;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = proposal.configuration;
+        value.block_hash = proposal.block_hash;
+        value.expected_message_type = message_type;
+        value.outcome = ResponseOutcome::timeout;
+        value.deadline_duration_us = deadline_us;
+        value.attempt_start_monotonic_ns = attempt_start_ns;
+        value.reporter_monotonic_ns =
+            attempt_start_ns + deadline_us * 1'000U;
+        value.reporter_sequence =
+            ++fixture.reporter_sequences[reporter];
+        value.observation_id =
+            hotstuff::compute_response_observation_id(value);
+        fixture.window.admit(proposal);
+        fixture.ingest(value);
+        return value;
+    };
+    const auto late = [&fixture](
+                          const ResponseObservation &timed_out,
+                          std::uint64_t reporter_monotonic_ns) {
+        auto value = timed_out;
+        value.outcome = ResponseOutcome::late;
+        value.reporter_monotonic_ns = reporter_monotonic_ns;
+        value.response_duration_us =
+            (reporter_monotonic_ns -
+             value.attempt_start_monotonic_ns) /
+            1'000U;
+        value.reporter_sequence =
+            ++fixture.reporter_sequences[value.reporter_id];
+        value.signer_set = {value.observed_replica_id};
+        REQUIRE(
+            hotstuff::compute_response_observation_id(value) ==
+            timed_out.observation_id);
+        fixture.ingest(value);
+    };
+
+    const ProposalKey shared_proposal{
+        {fixture.epoch.epoch_number, 6, fixture.epoch.epoch_digest},
+        digest("v6-shared-proposal-key")};
+    const auto pre_fault_attempt = timeout(
+        6,
+        0,
+        shared_proposal,
+        ExpectedMessageType::aggregate_relay,
+        kEvidenceStartNs - 2'000U,
+        1);
+    const auto post_fault_attempt = timeout(
+        6,
+        1,
+        shared_proposal,
+        ExpectedMessageType::aggregate_relay,
+        kEvidenceStartNs + 1'000U,
+        1);
+    REQUIRE(pre_fault_attempt.proposal_key() ==
+            post_fault_attempt.proposal_key());
+    REQUIRE(pre_fault_attempt.attempt_identity() !=
+            post_fault_attempt.attempt_identity());
+    REQUIRE(pre_fault_attempt.observation_id !=
+            post_fault_attempt.observation_id);
+
+    timeout(
+        4,
+        0,
+        ProposalKey{
+            {fixture.epoch.epoch_number, 2, fixture.epoch.epoch_digest},
+            digest("v6-reporter-4-timeout")},
+        ExpectedMessageType::direct_vote,
+        kEvidenceStartNs + 2'000U,
+        1);
+    timeout(
+        5,
+        0,
+        ProposalKey{
+            {fixture.epoch.epoch_number, 4, fixture.epoch.epoch_digest},
+            digest("v6-reporter-5-timeout")},
+        ExpectedMessageType::direct_vote,
+        kEvidenceStartNs + 3'000U,
+        1);
+
+    // Keep target 0 exactly below the response-rate threshold while its
+    // pre-R timeout remains open. Once its own late arrives, target 0 becomes
+    // a valid survivor without changing target 1's independent guard.
+    fixture.advance_monotonic_clock(
+        (kEvidenceStartNs + 10'000U) / 1'000U);
+    for (std::size_t attempt = 0; attempt < 4; ++attempt)
+        fixture.on_time_in_tree(0, 2);
+
+    timeout(
+        4,
+        1,
+        ProposalKey{
+            {fixture.epoch.epoch_number, 2, fixture.epoch.epoch_digest},
+            digest("v6-reporter-4-target-1-timeout")},
+        ExpectedMessageType::direct_vote,
+        kEvidenceStartNs + 20'000U,
+        1);
+    timeout(
+        5,
+        1,
+        ProposalKey{
+            {fixture.epoch.epoch_number, 3, fixture.epoch.epoch_digest},
+            digest("v6-reporter-5-target-1-timeout")},
+        ExpectedMessageType::direct_vote,
+        kEvidenceStartNs + 21'000U,
+        1);
+
+    const auto selected =
+        selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status ==
+            AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    REQUIRE(selected.selected_replicas.empty());
+    REQUIRE(selected.eligible_candidates.size() == 1);
+    CHECK(candidate(selected.eligible_candidates, 0) == nullptr);
+    CHECK(selected.eligible_candidates.front().qualifying_reporters ==
+          std::vector<ReplicaID>{4, 5, 6});
+    CHECK(selected.eligible_candidates.front().total_uncompensated_timeouts ==
+          3);
+
+    late(pre_fault_attempt, kEvidenceStartNs + 7'000U);
+    const auto unrelated_late =
+        selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(unrelated_late.status == AdaptiveV2SelectionStatus::selected);
+    REQUIRE(unrelated_late.selected_replicas ==
+            std::vector<ReplicaID>{1});
+    REQUIRE(unrelated_late.eligible_candidates.size() == 1);
+    CHECK(unrelated_late.eligible_candidates.front()
+              .total_uncompensated_timeouts == 3);
+
+    late(post_fault_attempt, kEvidenceStartNs + 8'000U);
+    const auto matching_late =
+        selector.select_through(fixture.ledger->high_watermark());
+    CHECK(matching_late.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(matching_late.selected_replicas.empty());
+    CHECK(matching_late.eligible_candidates.empty());
 }
 
 TEST_CASE(
@@ -1818,7 +2191,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "unsupported schema-v3 evidence is rejected before selection",
+    "unsupported schema-v4 evidence is rejected before selection",
     "[adaptive-v2][selection][schema][unsupported][fail-closed]"
     "[v40][intentional-red]")
 {
@@ -1833,7 +2206,7 @@ TEST_CASE(
             AdaptiveV2SelectionStatus::baseline_frozen);
     auto unsupported = fixture.observation(
         2, 0, ResponseOutcome::timeout);
-    unsupported.schema_version = 3;
+    unsupported.schema_version = 4;
     const auto accepted_before = fixture.ledger->accepted().size();
     fixture.ledger->ingest(
         AuthenticatedReporter{2}, unsupported);

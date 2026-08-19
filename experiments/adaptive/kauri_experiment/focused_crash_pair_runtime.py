@@ -108,8 +108,10 @@ _RUNTIME_EVENT_KEYS = {
     "event_type",
     "payload",
 }
-_FAULT_WINDOW_ARM_DOMAIN = "kauri-focused-fault-window-arm-v1"
+_FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
+_FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
+_V6_TIMEOUT_OBSERVATION_DOMAIN = b"kauri-response-observation-v3"
 
 
 class FocusedCrashPairRuntimeError(RuntimeError):
@@ -164,12 +166,55 @@ def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _v6_timeout_observation_id(
+    *,
+    reporter_id: int,
+    observed_replica_id: int,
+    epoch_number: int,
+    tree_id: int,
+    epoch_digest: str,
+    block_hash: str,
+    expected_message_type: str,
+    attempt_start_monotonic_ns: int,
+    deadline_duration_us: int,
+) -> str:
+    """Recompute the native schema-v3 exact-attempt observation identity."""
+
+    message_types = {"direct_vote": 1, "aggregate_relay": 2}
+    if expected_message_type not in message_types:
+        _error("v6 observation expected message type is invalid")
+    try:
+        encoded = b"".join(
+            (
+                _V6_TIMEOUT_OBSERVATION_DOMAIN,
+                reporter_id.to_bytes(2, "big"),
+                observed_replica_id.to_bytes(2, "big"),
+                epoch_number.to_bytes(4, "big"),
+                tree_id.to_bytes(4, "big"),
+                bytes.fromhex(epoch_digest),
+                bytes.fromhex(block_hash),
+                message_types[expected_message_type].to_bytes(1, "big"),
+                attempt_start_monotonic_ns.to_bytes(8, "big"),
+                deadline_duration_us.to_bytes(8, "big"),
+            )
+        )
+    except (OverflowError, ValueError) as exc:
+        raise FocusedCrashPairRuntimeError(
+            "v6 observation identity fields are out of range"
+        ) from exc
+    return _sha256(encoded)
+
+
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith(("-v4", "-v5"))
+    return str(getattr(profile, "profile_id", "")).endswith(("-v4", "-v5", "-v6"))
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith("-v5")
+    return str(getattr(profile, "profile_id", "")).endswith(("-v5", "-v6"))
+
+
+def _is_v6_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v6")
 
 
 def _fault_window_arm_path(run_directory: Path) -> Path:
@@ -707,18 +752,25 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             1,
         )
         prefix = arm.get("ordered_tree_prefix")
-        if (
-            set(arm)
-            != {
-                "schema_version",
-                "domain",
-                "manager_visibility",
-                "ordered_tree_prefix",
-                "required_for_new_executions",
-                "required_postfault_tree_positions",
+        expected_arm_keys = {
+            "schema_version",
+            "domain",
+            "manager_visibility",
+            "ordered_tree_prefix",
+            "required_for_new_executions",
+            "required_postfault_tree_positions",
+        }
+        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)):
+            expected_arm_keys |= {
+                "clock_domain",
+                "required_observation_schema",
+                "timeout_evidence_basis",
             }
+        if (
+            set(arm) != expected_arm_keys
             or type(arm.get("schema_version")) is not int
-            or arm.get("schema_version") != 1
+            or arm.get("schema_version")
+            != (2 if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) else 1)
             or arm.get("domain") != "epoch_zero_native_cyclic_tree_positions"
             or arm.get("manager_visibility")
             != "target-identity/process-state blind; intervention-boundary aware"
@@ -736,6 +788,12 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             ]
         ):
             _error("fault-window arm metadata drifted")
+        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) and (
+            arm.get("clock_domain") != "same_host_clock_monotonic_raw"
+            or arm.get("required_observation_schema") != 3
+            or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
+        ):
+            _error("v6 fault-window timeout evidence metadata drifted")
     protocol = _document(profile.get("protocol"), "profile protocol")
     topology = _document(profile.get("topology"), "profile topology")
     replica_count = _integer(protocol.get("N"), "replica count", 1)
@@ -1071,9 +1129,13 @@ def _fault_window_arm_document(
     ]
     if len(set(required_ids)) != len(required_ids):
         _error("fault-window required tree prefix is not unique")
-    return {
-        "schema_version": 1,
-        "kind": _FAULT_WINDOW_ARM_DOMAIN,
+    arm = {
+        "schema_version": 2 if _is_v6_profile(profile) else 1,
+        "kind": (
+            _FAULT_WINDOW_ARM_DOMAIN_V2
+            if _is_v6_profile(profile)
+            else _FAULT_WINDOW_ARM_DOMAIN_V1
+        ),
         "run_id": str(configuration["run_id"]),
         "profile_id": profile.profile_id,
         "profile_sha256": profile.profile_sha256,
@@ -1089,6 +1151,29 @@ def _fault_window_arm_document(
         "required_tree_positions": positions,
         "required_tree_ids": required_ids,
     }
+    if _is_v6_profile(profile):
+        arm.update(
+            {
+                "clock_domain": "same_host_clock_monotonic_raw",
+                "required_observation_schema": 3,
+                "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+            }
+        )
+    return arm
+
+
+def _enable_v6_timeout_attempt_evidence(
+    run_directory: Path, replica_ids: Sequence[int]
+) -> None:
+    """Append the one native v3 evidence switch to every replica config."""
+
+    suffix = b"experiment-exact-timeout-attempt-evidence-v3 = true\n"
+    for replica in replica_ids:
+        path = run_directory / "config" / f"replica-{replica}.conf"
+        payload = path.read_bytes()
+        if not payload.endswith(b"\n") or suffix in payload:
+            _error("v6 replica timeout-attempt evidence configuration drifted")
+        path.write_bytes(payload + suffix)
 
 
 def has_exact_active_configuration_barrier(
@@ -2786,6 +2871,9 @@ class FocusedRawEvidenceSource:
                 policy=_NATIVE_RESPONSIVENESS_POLICY,
                 seed=_integer(epoch1.generation_seed, "ranking seed"),
                 suffix_only=predecessor == 1,
+                allowed_schema_versions=(
+                    frozenset({3}) if _is_v6_profile(self._profile) else frozenset({1})
+                ),
             )
         except factorial_validation.FactorialValidationError as exc:
             raise FocusedCrashPairRuntimeError(
@@ -2858,6 +2946,13 @@ class FocusedRawEvidenceSource:
         baseline_cutoff: int,
         current_cutoff: int,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
+        if _is_v6_profile(self._profile):
+            return self._qualifying_v6_timeout_counts(
+                events,
+                fault_ns=fault_ns,
+                baseline_cutoff=baseline_cutoff,
+                current_cutoff=current_cutoff,
+            )
         coverage = derive_reporter_coverage_plan(self._profile)
         topology = _document(self._profile.raw.get("topology"), "profile topology")
         expected_digest = topology.get("epoch_zero_digest")
@@ -2996,6 +3091,225 @@ class FocusedRawEvidenceSource:
         return (
             clipped,
             {str(target): drawdown for target, drawdown in sorted(drawdowns.items())},
+            max(timestamps),
+        )
+
+    def _qualifying_v6_timeout_counts(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        *,
+        fault_ns: int,
+        baseline_cutoff: int,
+        current_cutoff: int,
+    ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
+        """Replay only post-arm native v3 timeout attempts for the live guard."""
+
+        coverage = derive_reporter_coverage_plan(self._profile)
+        topology = _document(self._profile.raw.get("topology"), "profile topology")
+        expected_digest = _digest(
+            topology.get("epoch_zero_digest"), "profile epoch-zero digest"
+        )
+        arm = _document(
+            self._profile.raw.get("fault_window_arm"), "v6 fault-window metadata"
+        )
+        prefix = {
+            _integer(tree_id, "v6 fault-window tree")
+            for tree_id in _sequence(arm.get("ordered_tree_prefix"), "v6 tree prefix")
+        }
+        expected = {
+            int(row["target_replica_id"]): {
+                int(reporter) for reporter in row["authenticated_reporter_ids"]
+            }
+            for row in coverage["targets"]
+        }
+        expected_trees = {
+            (int(row["target_replica_id"]), int(first["reporter_id"])): int(
+                first["tree_id"]
+            )
+            for row in coverage["targets"]
+            for first in row["first_qualifying_reporters"]
+        }
+        outstanding: dict[str, tuple[int, int]] = {}
+        latest: dict[str, tuple[Mapping[str, Any], int, int]] = {}
+        eligible_drawdowns = {target: 0 for target in expected}
+        raw_drawdowns = {target: 0 for target in expected}
+        raw_outstanding: dict[str, tuple[int, int]] = {}
+        for event in events:
+            if (
+                event.get("source_kind") != "adaptation_manager"
+                or event.get("source_id") != "adaptive-manager"
+                or event.get("event_type") != "evidence.observation_accepted"
+            ):
+                continue
+            payload = _document(event.get("payload"), "accepted evidence")
+            sequence = _integer(
+                payload.get("ingestion_sequence"), "evidence ingestion sequence", 1
+            )
+            if sequence <= baseline_cutoff or sequence > current_cutoff:
+                continue
+            observation = _document(payload.get("observation"), "accepted observation")
+            configuration = _document(
+                observation.get("configuration"), "observation configuration"
+            )
+            if (
+                configuration.get("epoch_number") != 0
+                or configuration.get("epoch_digest") != expected_digest
+            ):
+                continue
+            reporter = _integer(observation.get("reporter_id"), "v6 reporter", 0)
+            target = _integer(observation.get("observed_replica_id"), "v6 target", 0)
+            tree_id = _integer(configuration.get("tree_id"), "v6 tree", 0)
+            schema = _integer(
+                observation.get("schema_version"), "v6 observation schema"
+            )
+            message_type = observation.get("expected_message_type")
+            outcome = observation.get("outcome")
+            attempt_start = _integer(
+                observation.get("attempt_start_monotonic_ns"), "v6 attempt start", 1
+            )
+            deadline_us = _integer(
+                observation.get("deadline_duration_us"), "v6 deadline", 1
+            )
+            reporter_ns = _integer(
+                observation.get("reporter_monotonic_ns"), "v6 reporter timestamp", 1
+            )
+            response_us = _integer(
+                observation.get("response_duration_us"), "v6 response duration"
+            )
+            local_commit_ns = _integer(
+                observation.get("reporter_local_commit_monotonic_ns"),
+                "v6 reporter local commit",
+                0,
+            )
+            observation_id = observation.get("observation_id")
+            signers = _sequence(observation.get("signer_set"), "v6 signer set")
+            if (
+                schema != 3
+                or message_type not in {"direct_vote", "aggregate_relay"}
+                or outcome not in {"on_time", "timeout", "late"}
+                or not isinstance(observation_id, str)
+                or deadline_us > ((1 << 64) - 1) // 1_000
+                or attempt_start > (1 << 64) - 1 - deadline_us * 1_000
+                or attempt_start > reporter_ns
+                or observation_id
+                != _v6_timeout_observation_id(
+                    reporter_id=reporter,
+                    observed_replica_id=target,
+                    epoch_number=0,
+                    tree_id=tree_id,
+                    epoch_digest=expected_digest,
+                    block_hash=str(observation.get("block_hash")),
+                    expected_message_type=str(message_type),
+                    attempt_start_monotonic_ns=attempt_start,
+                    deadline_duration_us=deadline_us,
+                )
+            ):
+                _error("v6 accepted observation identity or schema drifted")
+            absolute_deadline = attempt_start + deadline_us * 1_000
+            if (
+                (
+                    outcome == "timeout"
+                    and (response_us != 0 or signers or absolute_deadline > reporter_ns)
+                )
+                or (
+                    outcome != "timeout"
+                    and (
+                        response_us != (reporter_ns - attempt_start) // 1_000
+                        or not signers
+                        or (outcome == "late" and reporter_ns < absolute_deadline)
+                    )
+                )
+                or (
+                    local_commit_ns != 0
+                    and (
+                        outcome != "timeout"
+                        or not (attempt_start <= local_commit_ns < absolute_deadline)
+                    )
+                )
+            ):
+                _error("v6 accepted observation timing or signer drifted")
+            if outcome == "timeout":
+                if observation_id in raw_outstanding:
+                    _error("v6 raw timeout attempt is duplicated")
+                raw_outstanding[observation_id] = (reporter, target)
+                if target in raw_drawdowns:
+                    raw_drawdowns[target] -= 1
+            elif outcome == "on_time":
+                if target in raw_drawdowns and raw_drawdowns[target] < 0:
+                    raw_drawdowns[target] += 1
+            else:
+                raw_previous = raw_outstanding.pop(observation_id, None)
+                if raw_previous is not None:
+                    if raw_previous != (reporter, target):
+                        _error(
+                            "v6 raw late evidence changed its exact attempt identity"
+                        )
+                    if target in raw_drawdowns and raw_drawdowns[target] < 0:
+                        raw_drawdowns[target] += 1
+            if (
+                attempt_start < fault_ns
+                or tree_id not in prefix
+                or target not in expected
+                or reporter not in expected[target]
+                or expected_trees.get((target, reporter)) != tree_id
+            ):
+                continue
+            if outcome == "timeout":
+                if observation_id in outstanding:
+                    _error("v6 accepted timeout attempt is duplicated")
+                outstanding[observation_id] = (reporter, target)
+                eligible_drawdowns[target] -= 1
+            elif outcome == "late":
+                previous = outstanding.pop(observation_id, None)
+                if previous is not None:
+                    if previous != (reporter, target):
+                        _error("v6 late evidence changed its exact attempt identity")
+                    eligible_drawdowns[target] += 1
+            latest[observation_id] = (
+                observation,
+                int(event["source_monotonic_ns"]),
+                reporter_ns,
+            )
+        counts = {
+            target: {reporter: 0 for reporter in reporters}
+            for target, reporters in expected.items()
+        }
+        timestamps: list[int] = []
+        for observation, accepted_ns, reporter_ns in latest.values():
+            if observation.get("outcome") != "timeout":
+                continue
+            target = int(observation["observed_replica_id"])
+            reporter = int(observation["reporter_id"])
+            counts[target][reporter] += 1
+            timestamps.extend((accepted_ns, reporter_ns))
+        minimum = _integer(
+            coverage.get("minimum_timeouts_per_reporter"),
+            "minimum timeouts per reporter",
+            1,
+        )
+        minimum_drop = _integer(
+            coverage.get("minimum_score_drop"), "minimum score drop", 1
+        )
+        if (
+            not timestamps
+            or any(
+                count < minimum
+                for reporters in counts.values()
+                for count in reporters.values()
+            )
+            or any(drawdown > -minimum_drop for drawdown in raw_drawdowns.values())
+            or any(drawdown > -minimum_drop for drawdown in eligible_drawdowns.values())
+        ):
+            return None
+        return (
+            {
+                str(target): {str(reporter): minimum for reporter in sorted(reporters)}
+                for target, reporters in counts.items()
+            },
+            {
+                str(target): drawdown
+                for target, drawdown in sorted(raw_drawdowns.items())
+            },
             max(timestamps),
         )
 
@@ -5323,6 +5637,9 @@ def _validate_manager_launch_boundary(
         "--fault-window-arm-prefault-tree-id",
         "--fault-window-arm-required-tree-positions",
         "--fault-window-arm-deadline-seconds",
+        "--fault-window-arm-clock-domain",
+        "--fault-window-arm-required-observation-schema",
+        "--fault-window-arm-timeout-evidence-basis",
         "--replica",
     }
     if len(requested) % 2 == 0:
@@ -5675,9 +5992,13 @@ def _focused_manager_command(
                 "--fault-window-arm-path",
                 str(fault_window_arm_path),
                 "--fault-window-arm-schema-version",
-                "1",
+                "2" if _is_v6_profile(profile) else "1",
                 "--fault-window-arm-domain",
-                _FAULT_WINDOW_ARM_DOMAIN,
+                (
+                    _FAULT_WINDOW_ARM_DOMAIN_V2
+                    if _is_v6_profile(profile)
+                    else _FAULT_WINDOW_ARM_DOMAIN_V1
+                ),
                 "--fault-window-arm-run-id",
                 run_id,
                 "--fault-window-arm-profile-id",
@@ -5704,6 +6025,17 @@ def _focused_manager_command(
                 ),
             )
         )
+        if _is_v6_profile(profile):
+            command.extend(
+                (
+                    "--fault-window-arm-clock-domain",
+                    "same_host_clock_monotonic_raw",
+                    "--fault-window-arm-required-observation-schema",
+                    "3",
+                    "--fault-window-arm-timeout-evidence-basis",
+                    "exact_timeout_attempt_id_v1",
+                )
+            )
     for request, output in _focused_transition_requests(run_directory, arm):
         command.extend(
             (
@@ -5971,6 +6303,21 @@ class FocusedLaunchBackend:
                 include_issuer_identity_artifact=False,
             )
         )
+        if _is_v6_profile(profile):
+            _enable_v6_timeout_attempt_evidence(run_directory, profile.replica_ids)
+            artifacts = [
+                (
+                    {
+                        **artifact,
+                        "sha256": profiled_fault_runtime.sha256_file(
+                            run_directory / str(artifact["path"])
+                        ),
+                    }
+                    if artifact["kind"] == "replica_config"
+                    else artifact
+                )
+                for artifact in artifacts
+            ]
         profiled_fault_runtime.write_exclusive(
             run_directory / "treegen.conf",
             _focused_client_default_epoch(profile, adapter),

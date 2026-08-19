@@ -32,6 +32,7 @@ struct AdaptiveV2ResponseEvidenceLimits
     // A late response can therefore be retained even while both ordinary
     // outbox queues are saturated.
     std::size_t maximum_late_compensations{4096};
+    bool exact_timeout_attempt_evidence_v3{false};
 };
 
 struct AdaptiveV2ResponseEvidenceDiagnostics
@@ -170,6 +171,7 @@ public:
 
     /** Enable schema-v2 retained-commit observations before any arm. */
     bool enable_cross_commit_retention_v2() noexcept;
+    bool enable_exact_timeout_attempt_evidence_v3() noexcept;
 
     bool arm(
         const ProposalKey &proposal,

@@ -53,6 +53,26 @@ std::string canonical_arm()
         "\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
 }
 
+FaultWindowArmBindings v2_bindings()
+{
+    auto result = bindings();
+    result.schema_version = 2;
+    result.domain = "kauri-focused-fault-window-arm-v2";
+    result.timeout_evidence_basis = "exact_timeout_attempt_id_v1";
+    result.required_observation_schema = 3;
+    result.clock_domain = "same_host_clock_monotonic_raw";
+    return result;
+}
+
+std::string canonical_v2_arm()
+{
+    return std::string{"{\"clock_domain\":\"same_host_clock_monotonic_raw\",\"epoch_digest\":\""} + kDigestD +
+        "\",\"epoch_number\":0,\"evidence_start_monotonic_ns\":42,\"fault_receipt_sha256\":\"" + kDigestE +
+        "\",\"kind\":\"kauri-focused-fault-window-arm-v2\",\"prefault_tree_id\":6,\"profile_id\":\"n7-f2-q5-two-crash-pair-smoke-v4\",\"profile_sha256\":\"" + kDigestA +
+        "\",\"request_sha256\":\"" + kDigestC +
+        "\",\"required_observation_schema\":3,\"required_tree_ids\":[6,0,1,2,3,4],\"required_tree_positions\":6,\"run_id\":\"run-v4\",\"schema_version\":2,\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
+}
+
 FaultWindowArmBindings n31_bindings()
 {
     auto result = bindings();
@@ -94,6 +114,25 @@ TEST_CASE("fault-window parser accepts exact canonical publisher bytes",
     CHECK(document.arm.required_tree_ids ==
           std::vector<std::uint32_t>{6, 0, 1, 2, 3, 4});
     CHECK(document.event.fault_window_arm_sha256 == fault_window_sha256(text));
+}
+
+TEST_CASE("fault-window v2 parser binds exact evidence fields",
+          "[adaptive-v2][fault-window-arm][v6][parser]")
+{
+    const auto text = canonical_v2_arm();
+    const auto document = FaultWindowArmJsonParser(text, v2_bindings()).parse();
+    CHECK(document.arm.evidence_basis ==
+          hotstuff::AdaptiveV2FaultWindowEvidenceBasis::exact_timeout_attempt_id_v1);
+    CHECK(document.event.clock_domain == "same_host_clock_monotonic_raw");
+    CHECK(document.event.required_observation_schema == 3);
+    CHECK(document.event.timeout_evidence_basis == "exact_timeout_attempt_id_v1");
+    for (const auto &bad : {replace_once(text, "same_host_clock_monotonic_raw", "unknown"),
+                            replace_once(text, "\"required_observation_schema\":3", "\"required_observation_schema\":2"),
+                            replace_once(text, "exact_timeout_attempt_id_v1", "unknown")})
+    {
+        CHECK_THROWS_AS(FaultWindowArmJsonParser(bad, v2_bindings()).parse(),
+                        std::invalid_argument);
+    }
 }
 
 TEST_CASE("fault-window parser rejects noncanonical JSON syntax",

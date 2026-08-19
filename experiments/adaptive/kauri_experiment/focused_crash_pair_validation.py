@@ -66,8 +66,40 @@ _FCRASH_H_V5_IDENTITIES = {
         "197650f1d4b4c2e0db950ad8dc191a830a36c3d412971036b03a283b245b381e",
     ),
 }
-_FAULT_WINDOW_PROFILE_IDS = _FCRASH_H_V4_PROFILE_IDS | _FCRASH_H_V5_PROFILE_IDS
-_FAULT_WINDOW_ARM_DOMAIN = "kauri-focused-fault-window-arm-v1"
+_FCRASH_H_V6_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v6",
+        "n31-f5-q21-three-crash-pair-v6",
+    }
+)
+_FCRASH_H_V6_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v6": (
+        "13194cb75a0fe6cb40623be3d53fc1fe1db41f75f9c284e1d1267e409a447c00",
+        "d59be85eac2b6828368f92f7c927bbf1eb4990c1ecb0eaee5b0f563b7de35a3c",
+    ),
+    "n31-f5-q21-three-crash-pair-v6": (
+        "780d98fc0122c56fddf4ad2aa5eb3fc9c2f8a85386ada565257855b6dd6c527c",
+        "a2d0435df187dd66c50daf59dedf24c4ffbcc4dcbb1a93191601c913bc959f0d",
+    ),
+}
+_REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v1",
+        "n31-f5-q21-three-crash-pair-v1",
+        "n7-f2-q5-two-crash-pair-smoke-v2",
+        "n31-f5-q21-three-crash-pair-v2",
+    }
+) | (
+    _FCRASH_H_V3_PROFILE_IDS
+    | _FCRASH_H_V4_PROFILE_IDS
+    | _FCRASH_H_V5_PROFILE_IDS
+    | _FCRASH_H_V6_PROFILE_IDS
+)
+_FAULT_WINDOW_PROFILE_IDS = (
+    _FCRASH_H_V4_PROFILE_IDS | _FCRASH_H_V5_PROFILE_IDS | _FCRASH_H_V6_PROFILE_IDS
+)
+_FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
+_FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _EVENT_KEYS = {
     "event_schema_version",
@@ -371,12 +403,58 @@ def _sha_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _v6_timeout_observation_id(
+    *,
+    reporter_id: int,
+    observed_replica_id: int,
+    epoch_number: int,
+    tree_id: int,
+    epoch_digest: str,
+    block_hash: str,
+    expected_message_type: str,
+    attempt_start_monotonic_ns: int,
+    deadline_duration_us: int,
+) -> str:
+    """Recompute the native schema-v3 exact-attempt observation identity."""
+
+    message_types = {"direct_vote": 1, "aggregate_relay": 2}
+    if expected_message_type not in message_types:
+        _error("v6 observation expected message type is invalid")
+    try:
+        payload = b"".join(
+            (
+                b"kauri-response-observation-v3",
+                reporter_id.to_bytes(2, "big"),
+                observed_replica_id.to_bytes(2, "big"),
+                epoch_number.to_bytes(4, "big"),
+                tree_id.to_bytes(4, "big"),
+                bytes.fromhex(epoch_digest),
+                bytes.fromhex(block_hash),
+                message_types[expected_message_type].to_bytes(1, "big"),
+                attempt_start_monotonic_ns.to_bytes(8, "big"),
+                deadline_duration_us.to_bytes(8, "big"),
+            )
+        )
+    except (OverflowError, ValueError) as exc:
+        raise FocusedCrashPairValidationError(
+            "v6 observation identity fields are out of range"
+        ) from exc
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _is_v4_contract(contract: Mapping[str, object]) -> bool:
     return contract.get("profile_id") in _FAULT_WINDOW_PROFILE_IDS
 
 
 def _is_v5_contract(contract: Mapping[str, object]) -> bool:
-    return contract.get("profile_id") in _FCRASH_H_V5_PROFILE_IDS
+    return (
+        contract.get("profile_id")
+        in _FCRASH_H_V5_PROFILE_IDS | _FCRASH_H_V6_PROFILE_IDS
+    )
+
+
+def _is_v6_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V6_PROFILE_IDS
 
 
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
@@ -604,6 +682,7 @@ def validate_fcrash_h_evidence(
     coverage = _mapping(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
     )
+    is_v6 = _is_v6_contract(contract)
     expected_keys = {
         "fault_monotonic_ns",
         "nonresponse_monotonic_ns",
@@ -616,6 +695,8 @@ def validate_fcrash_h_evidence(
     required_progress = coverage.get("required_postfault_tree_positions")
     if required_progress is not None:
         expected_keys.add("postfault_progress")
+    if is_v6:
+        expected_keys.add("eligible_guard_drawdowns")
     if set(witness) != expected_keys:
         _error("FCRASH-H witness schema drifted")
     fault_ns = _integer(witness.get("fault_monotonic_ns"), "fault timestamp")
@@ -738,6 +819,18 @@ def validate_fcrash_h_evidence(
         for target in expected
     ):
         _error("FCRASH-H score drawdown is incomplete")
+    if is_v6:
+        eligible = _mapping(
+            witness.get("eligible_guard_drawdowns"), "eligible guard drawdowns"
+        )
+        expected_eligible = {
+            str(target): -sum(reporters.values())
+            for target, reporters in counts.items()
+        }
+        if dict(eligible) != expected_eligible or any(
+            value > -minimum_drop for value in expected_eligible.values()
+        ):
+            _error("v6 exact eligible timeout drawdown is incomplete")
     if required_progress is not None:
         progress = _mapping(witness.get("postfault_progress"), "post-fault progress")
         required_count = _integer(
@@ -994,6 +1087,7 @@ def _v4_replay_fault_window_anchors(
     intentionally does not use the manager's selected ranking.
     """
 
+    is_v6 = _is_v6_contract(contract)
     armed = [
         event
         for event in events
@@ -1059,7 +1153,8 @@ def _v4_replay_fault_window_anchors(
         block_hash = _digest(observation.get("block_hash"), "observation block hash")
         key = (0, tree_id, expected_digest, block_hash)
         if (
-            observation.get("outcome") == "on_time"
+            not is_v6
+            and observation.get("outcome") == "on_time"
             and observation.get("expected_message_type") == "direct_vote"
             and tree_id in anchors
             and factorial_validation._conservative_attempt_started_at_or_after(
@@ -1087,7 +1182,7 @@ def _v4_replay_fault_window_anchors(
             "first qualifying reporters",
         )
     }
-    if (
+    if not is_v6 and (
         not frozen_anchor_trees
         or not frozen_anchor_trees.issubset(anchors)
         or any(not anchors[tree] for tree in frozen_anchor_trees)
@@ -1156,7 +1251,107 @@ def _v4_replay_fault_window_anchors(
                 _error("v4 late observation changed its attempt identity")
             if previous is not None and target in drawdowns and drawdowns[target] < 0:
                 drawdowns[target] += 1
-        if key not in anchored_keys or outcome == "on_time":
+        if is_v6 and outcome == "on_time":
+            attempt_start_ns = _uint64(
+                observation.get("attempt_start_monotonic_ns"),
+                "v6 on-time observation attempt start",
+                1,
+            )
+            deadline_us = _uint64(
+                observation.get("deadline_duration_us"),
+                "v6 on-time observation deadline",
+                1,
+            )
+            reporter_ns = _uint64(
+                observation.get("reporter_monotonic_ns"),
+                "v6 on-time observation reporter time",
+                1,
+            )
+            message_type = observation.get("expected_message_type")
+            if (
+                _integer(observation.get("schema_version"), "v6 observation schema")
+                != 3
+                or message_type not in {"direct_vote", "aggregate_relay"}
+                or observation_id
+                != _v6_timeout_observation_id(
+                    reporter_id=reporter,
+                    observed_replica_id=target,
+                    epoch_number=0,
+                    tree_id=key[1],
+                    epoch_digest=expected_digest,
+                    block_hash=key[3],
+                    expected_message_type=str(message_type),
+                    attempt_start_monotonic_ns=attempt_start_ns,
+                    deadline_duration_us=deadline_us,
+                )
+                or reporter_ns < attempt_start_ns
+                or observation.get("response_duration_us")
+                != (reporter_ns - attempt_start_ns) // 1_000
+                or not _sequence(observation.get("signer_set"), "v6 on-time signers")
+            ):
+                _error("v6 on-time observation identity or timing drifted")
+        if outcome == "on_time":
+            continue
+        if is_v6:
+            message_type = observation.get("expected_message_type")
+            if message_type not in {"direct_vote", "aggregate_relay"}:
+                continue
+            if (
+                _integer(observation.get("schema_version"), "v6 observation schema")
+                != 3
+            ):
+                continue
+            attempt_start_ns = _uint64(
+                observation.get("attempt_start_monotonic_ns"),
+                "v6 observation attempt start",
+                1,
+            )
+            deadline_us = _uint64(
+                observation.get("deadline_duration_us"),
+                "v6 observation deadline",
+                1,
+            )
+            reporter_ns = _uint64(
+                observation.get("reporter_monotonic_ns"),
+                "v6 observation reporter time",
+                1,
+            )
+            if attempt_start_ns < start_ns or key[1] not in prefix:
+                continue
+            if deadline_us > ((1 << 64) - 1) // 1_000:
+                _error("v6 observation deadline overflows nanoseconds")
+            deadline_ns = deadline_us * 1_000
+            if (
+                attempt_start_ns > (1 << 64) - 1 - deadline_ns
+                or attempt_start_ns + deadline_ns > reporter_ns
+                or observation_id
+                != _v6_timeout_observation_id(
+                    reporter_id=reporter,
+                    observed_replica_id=target,
+                    epoch_number=0,
+                    tree_id=key[1],
+                    epoch_digest=expected_digest,
+                    block_hash=key[3],
+                    expected_message_type=str(message_type),
+                    attempt_start_monotonic_ns=attempt_start_ns,
+                    deadline_duration_us=deadline_us,
+                )
+            ):
+                _error("v6 exact timeout observation identity or timing drifted")
+            signer_set = _sequence(
+                observation.get("signer_set"), "v6 observation signers"
+            )
+            if outcome == "timeout" and (
+                observation.get("response_duration_us") != 0 or signer_set
+            ):
+                _error("v6 timeout observation outcome timing drifted")
+            if outcome == "late" and (
+                observation.get("response_duration_us")
+                != (reporter_ns - attempt_start_ns) // 1_000
+                or not signer_set
+            ):
+                _error("v6 late observation outcome timing drifted")
+        elif key not in anchored_keys:
             continue
         if outcome == "timeout":
             if (
@@ -1288,6 +1483,11 @@ def _fcrash_h_witness_from_events(
             "timeout_observations": rows,
             "guard_drawdowns": guard_drawdowns,
         }
+        if _is_v6_contract(contract):
+            witness["eligible_guard_drawdowns"] = {
+                str(target): -sum(row["observed_replica_id"] == target for row in rows)
+                for target in tuple(contract["target_replica_ids"])
+            }
         if coverage.get("required_postfault_tree_positions") is not None:
             witness["postfault_progress"] = _fcrash_h_postfault_progress(
                 contract,
@@ -1513,18 +1713,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     ):
         _error("focused profile schema or identity drifted")
     profile_id = profile.get("profile_id")
-    if profile_id not in {
-        "n7-f2-q5-two-crash-pair-smoke-v1",
-        "n31-f5-q21-three-crash-pair-v1",
-        "n7-f2-q5-two-crash-pair-smoke-v2",
-        "n31-f5-q21-three-crash-pair-v2",
-        "n7-f2-q5-two-crash-pair-smoke-v3",
-        "n31-f5-q21-three-crash-pair-v3",
-        "n7-f2-q5-two-crash-pair-smoke-v4",
-        "n31-f5-q21-three-crash-pair-v4",
-        "n7-f2-q5-two-crash-pair-smoke-v5",
-        "n31-f5-q21-three-crash-pair-v5",
-    }:
+    if profile_id not in _REVIEWED_FOCUSED_PROFILE_IDS:
         _error("focused profile identity is not reviewed")
     if profile_id in _FAULT_WINDOW_PROFILE_IDS:
         arm_metadata = _mapping(
@@ -1543,18 +1732,25 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             1,
         )
         prefix_metadata = arm_metadata.get("ordered_tree_prefix")
-        if (
-            set(arm_metadata)
-            != {
-                "schema_version",
-                "domain",
-                "manager_visibility",
-                "ordered_tree_prefix",
-                "required_for_new_executions",
-                "required_postfault_tree_positions",
+        expected_arm_keys = {
+            "schema_version",
+            "domain",
+            "manager_visibility",
+            "ordered_tree_prefix",
+            "required_for_new_executions",
+            "required_postfault_tree_positions",
+        }
+        if profile_id in _FCRASH_H_V6_PROFILE_IDS:
+            expected_arm_keys |= {
+                "clock_domain",
+                "required_observation_schema",
+                "timeout_evidence_basis",
             }
+        if (
+            set(arm_metadata) != expected_arm_keys
             or type(arm_metadata.get("schema_version")) is not int
-            or arm_metadata.get("schema_version") != 1
+            or arm_metadata.get("schema_version")
+            != (2 if profile_id in _FCRASH_H_V6_PROFILE_IDS else 1)
             or arm_metadata.get("domain") != "epoch_zero_native_cyclic_tree_positions"
             or arm_metadata.get("manager_visibility")
             != "target-identity/process-state blind; intervention-boundary aware"
@@ -1572,6 +1768,13 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             ]
         ):
             _error("fault-window arm metadata drifted")
+        if profile_id in _FCRASH_H_V6_PROFILE_IDS and (
+            arm_metadata.get("clock_domain") != "same_host_clock_monotonic_raw"
+            or arm_metadata.get("required_observation_schema") != 3
+            or arm_metadata.get("timeout_evidence_basis")
+            != "exact_timeout_attempt_id_v1"
+        ):
+            _error("v6 fault-window timeout evidence metadata drifted")
     protocol = _mapping(profile.get("protocol"), "profile protocol")
     count = _integer(protocol.get("N"), "profile replica count", 1)
     threshold = _integer(protocol.get("f"), "profile fault threshold")
@@ -1607,12 +1810,12 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "commit_event_type",
         "phase_names",
     }
-    if profile_id in _FCRASH_H_V5_PROFILE_IDS:
+    if profile_id in _FCRASH_H_V5_PROFILE_IDS | _FCRASH_H_V6_PROFILE_IDS:
         expected_measurement_keys.add("phase_window_contract")
     if set(measurement) != expected_measurement_keys:
         _error("profile measurement schema drifted")
     phase_window_contract: dict[str, object] | None = None
-    if profile_id in _FCRASH_H_V5_PROFILE_IDS:
+    if profile_id in _FCRASH_H_V5_PROFILE_IDS | _FCRASH_H_V6_PROFILE_IDS:
         raw_phase_contract = _mapping(
             measurement.get("phase_window_contract"), "phase-window contract"
         )
@@ -1704,15 +1907,14 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         != list(targets)
     ):
         _error("topology proof is not bound to the native focused tree")
-    if (
-        profile_id in _FCRASH_H_V5_PROFILE_IDS
-        and (
-            profile_sha,
-            proof_sha,
-        )
-        != _FCRASH_H_V5_IDENTITIES[str(profile_id)]
+    if profile_id in _FCRASH_H_V5_PROFILE_IDS | _FCRASH_H_V6_PROFILE_IDS and (
+        profile_sha,
+        proof_sha,
+    ) != (
+        _FCRASH_H_V6_IDENTITIES.get(str(profile_id))
+        or _FCRASH_H_V5_IDENTITIES[str(profile_id)]
     ):
-        _error("v5 profile or topology proof is not the frozen reviewed identity")
+        _error("v5/v6 profile or topology proof is not the frozen reviewed identity")
     children = {
         index: tuple(
             child
@@ -1900,6 +2102,28 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         _error("main runtime overrides the sealed client tree configuration")
     if len(options.get("replica", ())) != len(tuple(contract["members"])):
         _error("main runtime replica membership cardinality drifted")
+    if _is_v6_contract(contract):
+        for replica in tuple(contract["members"]):
+            replica_path = root / "config" / f"replica-{replica}.conf"
+            if replica_path.is_symlink() or not replica_path.is_file():
+                _error("v6 replica timeout-attempt evidence configuration is absent")
+            try:
+                replica_payload = replica_path.read_bytes().decode("ascii")
+            except UnicodeDecodeError as exc:
+                raise FocusedCrashPairValidationError(
+                    "v6 replica timeout-attempt evidence configuration is not ASCII"
+                ) from exc
+            if (
+                not replica_payload.endswith("\n")
+                or replica_payload.count(
+                    "experiment-exact-timeout-attempt-evidence-v3 = true\n"
+                )
+                != 1
+                or not replica_payload.endswith(
+                    "experiment-exact-timeout-attempt-evidence-v3 = true\n"
+                )
+            ):
+                _error("v6 replica timeout-attempt evidence configuration drifted")
 
 
 def _validated_profile(root: Path) -> tuple[Mapping[str, Any], str, str]:
@@ -2217,6 +2441,7 @@ def reconstruct_focused_ranking(
     policy: Mapping[str, Any],
     seed: int,
     suffix_only: bool,
+    allowed_schema_versions: Collection[int] = frozenset({1}),
 ) -> dict[str, object]:
     """Replay the native scorer and expose its exact eligible ordering."""
 
@@ -2231,6 +2456,7 @@ def reconstruct_focused_ranking(
             policy=policy,
             seed=seed,
             suffix_only=suffix_only,
+            allowed_schema_versions=allowed_schema_versions,
         )
     except factorial_validation.FactorialValidationError as exc:
         raise FocusedCrashPairValidationError(
@@ -2371,6 +2597,9 @@ def _ranking(
             policy=_NATIVE_RESPONSIVENESS_POLICY,
             seed=_integer(epoch1.generation_seed, "Epoch 1 generation seed"),
             suffix_only=suffix_only,
+            allowed_schema_versions=(
+                frozenset({3}) if _is_v6_contract(contract) else frozenset({1})
+            ),
         )
         replay_snapshot_id = _digest(
             replay.get("snapshot_id"), "ranking replay snapshot ID"
@@ -2411,6 +2640,9 @@ def _ranking(
                 policy=_NATIVE_RESPONSIVENESS_POLICY,
                 seed=_integer(epoch1.generation_seed, "Epoch 1 generation seed"),
                 suffix_only=other_epoch == 1,
+                allowed_schema_versions=(
+                    frozenset({3}) if _is_v6_contract(contract) else frozenset({1})
+                ),
             )
         ranked = list(replay["ranked_ids"])
     else:
@@ -3176,6 +3408,9 @@ _MANAGER_SINGLETON_OPTIONS = {
     "--fault-window-arm-prefault-tree-id",
     "--fault-window-arm-required-tree-positions",
     "--fault-window-arm-deadline-seconds",
+    "--fault-window-arm-clock-domain",
+    "--fault-window-arm-required-observation-schema",
+    "--fault-window-arm-timeout-evidence-basis",
 }
 _MANAGER_REPEATABLE_OPTIONS = {"--transition-request", "--bundle-output", "--replica"}
 
@@ -3230,8 +3465,24 @@ def _validate_manager_boundary(
         for option in _MANAGER_SINGLETON_OPTIONS
         if option.startswith("--fault-window-arm-")
     }
+    v6_arm_options = {
+        "--fault-window-arm-clock-domain",
+        "--fault-window-arm-required-observation-schema",
+        "--fault-window-arm-timeout-evidence-basis",
+    }
+    common_arm_options = arm_options - v6_arm_options
     if _is_v4_contract(contract):
-        if any(counts.get(option) != 1 for option in arm_options):
+        if (
+            any(counts.get(option) != 1 for option in common_arm_options)
+            or (
+                _is_v6_contract(contract)
+                and any(counts.get(option) != 1 for option in v6_arm_options)
+            )
+            or (
+                not _is_v6_contract(contract)
+                and any(counts.get(option, 0) for option in v6_arm_options)
+            )
+        ):
             _error("v4 manager launch lacks exact fault-window arm bindings")
     elif any(counts.get(option, 0) for option in arm_options):
         _error("legacy manager launch contains a prospective fault-window arm")
@@ -3255,6 +3506,7 @@ def _validate_fault_window_arm(
 
     if not _is_v4_contract(contract):
         return
+    is_v6 = _is_v6_contract(contract)
     path = (root / "runtime" / _FAULT_WINDOW_ARM_FILENAME).resolve()
     if (
         path.parent != (root / "runtime").resolve()
@@ -3282,13 +3534,26 @@ def _validate_fault_window_arm(
         "required_tree_positions",
         "required_tree_ids",
     }
+    if is_v6:
+        expected_keys |= {
+            "clock_domain",
+            "required_observation_schema",
+            "timeout_evidence_basis",
+        }
     if (
         set(arm) != expected_keys
-        or arm.get("schema_version") != 1
-        or arm.get("kind") != _FAULT_WINDOW_ARM_DOMAIN
+        or arm.get("schema_version") != (2 if is_v6 else 1)
+        or arm.get("kind")
+        != (_FAULT_WINDOW_ARM_DOMAIN_V2 if is_v6 else _FAULT_WINDOW_ARM_DOMAIN_V1)
     ):
         _error("v4 fault-window arm schema drifted")
     _integer(arm.get("schema_version"), "fault-window schema version", 1)
+    if is_v6 and (
+        arm.get("clock_domain") != "same_host_clock_monotonic_raw"
+        or arm.get("required_observation_schema") != 3
+        or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
+    ):
+        _error("v6 fault-window arm timeout evidence binding drifted")
     _integer(arm.get("epoch_number"), "fault-window epoch number")
     _integer(arm.get("evidence_start_monotonic_ns"), "fault-window evidence start", 1)
     for key in (
@@ -3448,8 +3713,10 @@ def _validate_fault_window_arm(
     pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
     expected_argv = {
         "--fault-window-arm-path": str(historical_arm_path),
-        "--fault-window-arm-schema-version": "1",
-        "--fault-window-arm-domain": _FAULT_WINDOW_ARM_DOMAIN,
+        "--fault-window-arm-schema-version": "2" if is_v6 else "1",
+        "--fault-window-arm-domain": (
+            _FAULT_WINDOW_ARM_DOMAIN_V2 if is_v6 else _FAULT_WINDOW_ARM_DOMAIN_V1
+        ),
         "--fault-window-arm-run-id": str(arm["run_id"]),
         "--fault-window-arm-profile-id": str(arm["profile_id"]),
         "--fault-window-arm-profile-sha256": str(arm["profile_sha256"]),
@@ -3467,6 +3734,14 @@ def _validate_fault_window_arm(
             ]
         ),
     }
+    if is_v6:
+        expected_argv.update(
+            {
+                "--fault-window-arm-clock-domain": "same_host_clock_monotonic_raw",
+                "--fault-window-arm-required-observation-schema": "3",
+                "--fault-window-arm-timeout-evidence-basis": "exact_timeout_attempt_id_v1",
+            }
+        )
     if any(pairs.get(key) != value for key, value in expected_argv.items()):
         _error("v4 manager arm bindings differ from the persisted arm")
     arm_sha = _sha_bytes(arm_bytes)

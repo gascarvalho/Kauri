@@ -917,8 +917,7 @@ bool valid_observation_accepted_payload(
     try
     {
         return observation.observation_id ==
-            compute_response_observation_id(
-                observation.attempt_identity());
+            compute_response_observation_id(observation);
     }
     catch (...)
     {
@@ -1342,9 +1341,15 @@ bool valid_fault_window_armed_payload(
                     (character >= 'a' && character <= 'f');
             });
     };
+    const bool v1 = event.schema_version == 1 &&
+        event.kind == "kauri-focused-fault-window-arm-v1";
+    const bool v2 = event.schema_version == 2 &&
+        event.kind == "kauri-focused-fault-window-arm-v2" &&
+        event.clock_domain == "same_host_clock_monotonic_raw" &&
+        event.required_observation_schema == 3 &&
+        event.timeout_evidence_basis == "exact_timeout_attempt_id_v1";
     return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
-        event.schema_version == 1 &&
-        event.kind == "kauri-focused-fault-window-arm-v1" &&
+        (v1 || v2) &&
         !event.run_id.empty() && !event.profile_id.empty() &&
         event.epoch_digest != uint256_t{} &&
         event.evidence_start_monotonic_ns != 0 &&
@@ -1894,7 +1899,9 @@ void append_observation_accepted_payload(
     builder.append(",\"reporter_sequence\":");
     builder.append_integer(observation.reporter_sequence);
     if (observation.schema_version ==
-        kResponseObservationSchemaVersionV2)
+            kResponseObservationSchemaVersionV2 ||
+        observation.schema_version ==
+            kResponseObservationSchemaVersionV3)
     {
         builder.append(",\"attempt_start_monotonic_ns\":");
         builder.append_integer(
@@ -2007,6 +2014,12 @@ void append_fault_window_armed_payload(
     builder.append(",\"prefault_tree_id\":"); builder.append_integer(event.prefault_tree_id);
     builder.append(",\"required_tree_positions\":"); builder.append_integer(event.required_tree_positions);
     builder.append(",\"required_tree_ids\":"); append_u32_ids(builder, event.required_tree_ids);
+    if (event.schema_version == 2)
+    {
+        builder.append(",\"clock_domain\":"); builder.append_escaped(event.clock_domain);
+        builder.append(",\"required_observation_schema\":"); builder.append_integer(event.required_observation_schema);
+        builder.append(",\"timeout_evidence_basis\":"); builder.append_escaped(event.timeout_evidence_basis);
+    }
     builder.append(",\"fault_window_arm_sha256\":"); builder.append_escaped(event.fault_window_arm_sha256);
     builder.append('}');
 }

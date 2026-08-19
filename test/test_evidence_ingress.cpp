@@ -736,7 +736,7 @@ TEST_CASE("each malformed wire input records exactly one healthy rejection",
         overwrite_u32(
             unsupported,
             8,
-            hotstuff::kResponseObservationSchemaVersionV2 + 1);
+            hotstuff::kResponseObservationSchemaVersionV3 + 1);
         run(
             unsupported,
             wire_limits(),

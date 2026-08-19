@@ -2362,6 +2362,43 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         CHECK(rendered(output) == expected);
     }
 
+    SECTION("schema v3 accepted observation validates exact identity")
+    {
+        auto event = retention_observation_accepted_event();
+        auto &observation = event.record.observation;
+        observation.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV3;
+        observation.reporter_local_commit_monotonic_ns = 0;
+        observation.observation_id =
+            compute_response_observation_id(observation);
+        FakeClock clock({7005});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+
+        ++observation.attempt_start_monotonic_ns;
+        FakeClock bad_clock({7006});
+        MemoryOutput bad_output;
+        StructuredEventSink bad_sink(
+            manager_event_config(), bad_clock, bad_output);
+        bad_sink.emit_audit(AuditStructuredEventPayload{event});
+        bad_sink.shutdown();
+        CHECK_FALSE(bad_sink.health().healthy);
+
+        observation.attempt_start_monotonic_ns = 100'000;
+        ++observation.deadline_duration_us;
+        FakeClock deadline_clock({7007});
+        MemoryOutput deadline_output;
+        StructuredEventSink deadline_sink(
+            manager_event_config(), deadline_clock, deadline_output);
+        deadline_sink.emit_audit(AuditStructuredEventPayload{event});
+        deadline_sink.shutdown();
+        CHECK_FALSE(deadline_sink.health().healthy);
+    }
+
     SECTION("fault containment coverage readiness has exact source-bound JSON")
     {
         const auto event = fault_containment_coverage_ready_event();

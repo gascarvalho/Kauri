@@ -508,6 +508,27 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "public v3 enablement stamps exact timeout attempt identity",
+    "[adaptive-v2][response-evidence][v3][enablement]")
+{
+    AdaptiveV2ResponseEvidenceBridge bridge(0, limits());
+    REQUIRE(bridge.enable_exact_timeout_attempt_evidence_v3());
+    REQUIRE(bridge.enable_exact_timeout_attempt_evidence_v3());
+    const auto key = proposal("v3-public-enable");
+    REQUIRE(bridge.arm(key, response_tree(), kStartNs, kDeadlineUs));
+    CHECK(bridge.record_timeouts(key, {1}, after_us(kDeadlineUs)) == 1);
+    REQUIRE(bridge.front() != nullptr);
+    const auto &observation = bridge.front()->envelope.observation;
+    CHECK(observation.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV3);
+    CHECK(observation.attempt_start_monotonic_ns == kStartNs);
+    CHECK(observation.observation_id ==
+          hotstuff::compute_response_observation_id(observation));
+    CHECK(hotstuff::valid_response_observation_retention_witness(
+        observation));
+}
+
+TEST_CASE(
     "conflicting reporter-local commit timestamp fails retention closed",
     "[adaptive-v2][response-evidence][v2][retention][conflict]"
     "[intentional-red]")

@@ -927,6 +927,38 @@ TEST_CASE(
         std::invalid_argument);
 }
 
+TEST_CASE("response observation v3 binds exact start and deadline",
+          "[adaptive-v2][evidence][wire][v3]")
+{
+    EvidenceFixture fixture;
+    auto timeout = observation(fixture.configuration, fixture.block_a, 0, 1,
+        ExpectedMessageType::aggregate_relay, ResponseOutcome::timeout, {},
+        10, 1'100'000);
+    timeout.schema_version = hotstuff::kResponseObservationSchemaVersionV3;
+    timeout.attempt_start_monotonic_ns = 1'000'000;
+    timeout.reporter_local_commit_monotonic_ns = 0;
+    timeout.observation_id = hotstuff::compute_response_observation_id(timeout);
+    auto changed = timeout;
+    ++changed.attempt_start_monotonic_ns;
+    CHECK(changed.observation_id != hotstuff::compute_response_observation_id(changed));
+    changed = timeout;
+    ++changed.deadline_duration_us;
+    CHECK(changed.observation_id != hotstuff::compute_response_observation_id(changed));
+    const auto encoded = hotstuff::encode_evidence_batch(
+        ResponseObservationBatch{hotstuff::kEvidenceBatchSchemaVersion, {timeout}},
+        EvidenceWireLimits{4096, 4, 7});
+    const auto decoded = hotstuff::decode_evidence_batch(encoded, EvidenceWireLimits{4096, 4, 7});
+    REQUIRE(decoded);
+    CHECK(decoded.batch->observations.front().attempt_start_monotonic_ns == 1'000'000);
+    CHECK(decoded.batch->observations.front().reporter_local_commit_monotonic_ns == 0);
+    auto late = timeout;
+    late.outcome = ResponseOutcome::late;
+    late.reporter_monotonic_ns = 1'200'000;
+    late.response_duration_us = 200;
+    late.signer_set = {1};
+    CHECK(late.observation_id == hotstuff::compute_response_observation_id(late));
+}
+
 TEST_CASE("evidence wire accepts every version-one message and outcome enum",
           "[e08][evidence][wire][enum][intentional-red]")
 {
@@ -1000,7 +1032,7 @@ TEST_CASE("evidence decoder rejects unsupported schemas and enum values",
         overwrite_u32(
             wire,
             8,
-            hotstuff::kResponseObservationSchemaVersionV2 + 1);
+            hotstuff::kResponseObservationSchemaVersionV3 + 1);
         CHECK(hotstuff::decode_evidence_batch(wire, limits).error ==
               EvidenceWireError::unsupported_observation_schema);
     }
@@ -1249,7 +1281,7 @@ TEST_CASE("ledger applies deterministic trust and correlation rejection order",
             fixture.epochs, fixture.window, generous_store_limits());
         auto value = aggregate_on_time(fixture, fixture.block_a);
         value.schema_version =
-            hotstuff::kResponseObservationSchemaVersionV2 + 1;
+            hotstuff::kResponseObservationSchemaVersionV3 + 1;
         value.observation_id = fixture_digest("forged-id");
         value.reporter_id = 6;
         ++value.configuration.epoch_number;

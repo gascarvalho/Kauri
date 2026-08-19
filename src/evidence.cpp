@@ -17,6 +17,8 @@ namespace
 
 constexpr char kObservationDomain[] =
     "kauri-response-observation-v1";
+constexpr char kObservationV3Domain[] =
+    "kauri-response-observation-v3";
 constexpr std::size_t kDigestSize = 32;
 constexpr std::size_t kBatchFixedSize = 8;
 constexpr std::size_t kObservationV1FixedSize = 150;
@@ -87,6 +89,52 @@ bool valid_retention_witness_impl(
     {
         return observation.attempt_start_monotonic_ns == 0 &&
                observation.reporter_local_commit_monotonic_ns == 0;
+    }
+    if (observation.schema_version ==
+        kResponseObservationSchemaVersionV3)
+    {
+        if (observation.attempt_start_monotonic_ns == 0 ||
+            observation.deadline_duration_us == 0 ||
+            observation.deadline_duration_us >
+                std::numeric_limits<std::uint64_t>::max() / 1'000 ||
+            observation.attempt_start_monotonic_ns >
+                observation.reporter_monotonic_ns)
+        {
+            return false;
+        }
+        const auto deadline_ns = observation.deadline_duration_us * 1'000;
+        if (observation.attempt_start_monotonic_ns >
+            std::numeric_limits<std::uint64_t>::max() - deadline_ns)
+        {
+            return false;
+        }
+        const auto absolute_deadline =
+            observation.attempt_start_monotonic_ns + deadline_ns;
+        if (observation.outcome == ResponseOutcome::timeout)
+        {
+            if (observation.response_duration_us != 0 ||
+                !observation.signer_set.empty() ||
+                absolute_deadline > observation.reporter_monotonic_ns)
+            {
+                return false;
+            }
+        }
+        else if (observation.response_duration_us !=
+                     (observation.reporter_monotonic_ns -
+                      observation.attempt_start_monotonic_ns) / 1'000 ||
+                 observation.signer_set.empty() ||
+                 (observation.outcome == ResponseOutcome::late &&
+                  observation.reporter_monotonic_ns < absolute_deadline))
+        {
+            return false;
+        }
+        if (observation.reporter_local_commit_monotonic_ns == 0)
+            return true;
+        return observation.outcome == ResponseOutcome::timeout &&
+               observation.attempt_start_monotonic_ns <=
+                   observation.reporter_local_commit_monotonic_ns &&
+               observation.reporter_local_commit_monotonic_ns <
+                   absolute_deadline;
     }
     if (observation.schema_version !=
         kResponseObservationSchemaVersionV2)
@@ -263,7 +311,9 @@ EvidenceDecodeResult decode_evidence_batch_impl(
         }
 
         if (observation.schema_version ==
-            kResponseObservationSchemaVersionV2)
+                kResponseObservationSchemaVersionV2 ||
+            observation.schema_version ==
+                kResponseObservationSchemaVersionV3)
         {
             if (!reader.read(
                     observation.attempt_start_monotonic_ns) ||
@@ -556,8 +606,7 @@ struct EvidenceLedger::State
             return EvidenceRejectionReason::unsupported_schema;
         }
         if (observation.observation_id !=
-            compute_response_observation_id(
-                observation.attempt_identity()))
+            compute_response_observation_id(observation))
         {
             return EvidenceRejectionReason::observation_id_mismatch;
         }
@@ -758,6 +807,33 @@ uint256_t compute_response_observation_id(
     return DataStream(bytes).get_hash();
 }
 
+uint256_t compute_response_observation_id(
+    const ResponseObservation &observation)
+{
+    if (observation.schema_version !=
+        kResponseObservationSchemaVersionV3)
+    {
+        return compute_response_observation_id(
+            observation.attempt_identity());
+    }
+    bytearray_t bytes(
+        kObservationV3Domain,
+        kObservationV3Domain + sizeof(kObservationV3Domain) - 1);
+    const auto identity = observation.attempt_identity();
+    append_big_endian(bytes, identity.reporter_id);
+    append_big_endian(bytes, identity.observed_replica_id);
+    append_big_endian(bytes, identity.proposal.configuration.epoch_number);
+    append_big_endian(bytes, identity.proposal.configuration.tree_id);
+    append_digest(bytes, identity.proposal.configuration.epoch_digest);
+    append_digest(bytes, identity.proposal.block_hash);
+    append_big_endian(bytes,
+        static_cast<std::underlying_type_t<ExpectedMessageType>>(
+            identity.expected_message_type));
+    append_big_endian(bytes, observation.attempt_start_monotonic_ns);
+    append_big_endian(bytes, observation.deadline_duration_us);
+    return DataStream(bytes).get_hash();
+}
+
 bytearray_t encode_evidence_batch(
     const ResponseObservationBatch &batch,
     const EvidenceWireLimits &limits)
@@ -808,8 +884,10 @@ bytearray_t encode_evidence_batch(
         }
         add_encoded_size(
             encoded_size,
-            observation.schema_version ==
-                    kResponseObservationSchemaVersionV2
+            (observation.schema_version ==
+                    kResponseObservationSchemaVersionV2 ||
+             observation.schema_version ==
+                    kResponseObservationSchemaVersionV3)
                 ? kObservationV2FixedSize
                 : kObservationV1FixedSize,
             limits.maximum_payload_bytes);
@@ -849,7 +927,9 @@ bytearray_t encode_evidence_batch(
         append_big_endian(payload, observation.reporter_monotonic_ns);
         append_big_endian(payload, observation.reporter_sequence);
         if (observation.schema_version ==
-            kResponseObservationSchemaVersionV2)
+                kResponseObservationSchemaVersionV2 ||
+            observation.schema_version ==
+                kResponseObservationSchemaVersionV3)
         {
             append_big_endian(
                 payload, observation.attempt_start_monotonic_ns);
@@ -920,8 +1000,7 @@ void EvidenceLedger::ingest(
             return;
         }
         if (observation.observation_id !=
-            compute_response_observation_id(
-                observation.attempt_identity()))
+            compute_response_observation_id(observation))
         {
             reject(EvidenceRejectionReason::observation_id_mismatch);
             return;

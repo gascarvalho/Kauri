@@ -225,8 +225,7 @@ void validate_observation(const ResponseObservation &observation)
             "invalid adaptation retention witness");
     }
     if (observation.observation_id !=
-        compute_response_observation_id(
-            observation.attempt_identity()))
+        compute_response_observation_id(observation))
     {
         throw std::invalid_argument(
             "adaptation evidence identity does not match");
@@ -548,7 +547,9 @@ std::string compute_snapshot_id(
         append_big_endian(bytes, observation.reporter_monotonic_ns);
         append_big_endian(bytes, observation.reporter_sequence);
         if (observation.schema_version ==
-            kResponseObservationSchemaVersionV2)
+                kResponseObservationSchemaVersionV2 ||
+            observation.schema_version ==
+                kResponseObservationSchemaVersionV3)
         {
             append_big_endian(
                 bytes, observation.attempt_start_monotonic_ns);

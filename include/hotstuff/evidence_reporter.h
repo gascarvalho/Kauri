@@ -54,6 +54,7 @@ struct EvidenceReporterConfig
     std::uint64_t initial_reporter_monotonic_ns{0};
     EvidenceReporterLimits limits;
     EvidenceWireLimits wire_limits;
+    bool exact_timeout_attempt_evidence_v3{false};
 };
 
 struct EvidenceReporterDiagnostics
@@ -104,6 +105,7 @@ public:
     EvidenceReporter &operator=(EvidenceReporter &&) = delete;
 
     bool enqueue(const ResponseAttemptFact &fact);
+    bool enable_exact_timeout_attempt_evidence_v3() noexcept;
 
     std::optional<EvidenceTransportResult> dispatch_one(
         const EvidenceTransportCallback &transport);

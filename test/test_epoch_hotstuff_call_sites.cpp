@@ -2847,6 +2847,86 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "exact timeout attempt evidence v3 is explicit and evidence-only",
+    "[adaptive-v2][evidence][schema-v3][cli][wiring]")
+{
+    const auto app = source("examples/hotstuff_app.cpp");
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto bridge_implementation =
+        source("src/adaptive_v2_response_evidence.cpp");
+    const auto main = function_body(app, "int main(");
+    const auto enable = function_body(
+        implementation,
+        "void HotStuffBase::enable_experiment_exact_timeout_attempt_evidence_v3(");
+    const auto bridge_enable = function_body(
+        bridge_implementation,
+        "AdaptiveV2ResponseEvidenceBridge::\n"
+        "enable_exact_timeout_attempt_evidence_v3(");
+
+    const auto binding = option_binding(
+        app, "experiment-exact-timeout-attempt-evidence-v3");
+    REQUIRE(binding.has_value());
+    CHECK(*binding ==
+          "opt_experiment_exact_timeout_attempt_evidence_v3");
+    const auto option = app.find(
+        "\"experiment-exact-timeout-attempt-evidence-v3\"");
+    REQUIRE(option != std::string::npos);
+    const auto option_end = app.find(';', option);
+    REQUIRE(option_end != std::string::npos);
+    CHECK(app.substr(option, option_end - option).find("Config::SWITCH_ON") !=
+          std::string::npos);
+
+    REQUIRE_FALSE(main.empty());
+    CHECK(contains_in_order(
+        main,
+        {"opt_experiment_exact_timeout_attempt_evidence_v3->get()",
+         "papp->enable_experiment_exact_timeout_attempt_evidence_v3()",
+         "papp->start(reps)"}));
+    CHECK(count_occurrences(
+              main,
+              "papp->enable_experiment_exact_timeout_attempt_evidence_v3()") ==
+          1);
+
+    REQUIRE_FALSE(enable.empty());
+    CHECK(contains_in_order(
+        enable,
+        {"epoch_protocol_mode != EpochProtocolMode::adaptive_v2",
+         "proposal_contexts->active_configuration().has_value()",
+         "adaptive_v2_response_evidence == nullptr",
+         "enable_exact_timeout_attempt_evidence_v3()",
+         "experiment_exact_timeout_attempt_evidence_v3 = true"}));
+    REQUIRE_FALSE(bridge_enable.empty());
+    CHECK(contains_in_order(
+        bridge_enable,
+        {"auto &state = *state_",
+         "!state.healthy",
+         "!state.handles.empty()",
+         "state.reporter.enable_exact_timeout_attempt_evidence_v3()"}));
+
+    CHECK(header.find(
+              "bool experiment_exact_timeout_attempt_evidence_v3{false};") !=
+          std::string::npos);
+    CHECK(count_occurrences(
+              implementation,
+              "experiment_exact_timeout_attempt_evidence_v3") == 2);
+    for (const auto *forbidden : {
+             "do_consensus",
+             "do_vote",
+             "do_broadcast_proposal",
+             "send_exact_relay",
+             "epoch_live_binding",
+             "fixed_quorum_size",
+             "on_receive_proposal",
+             "on_receive_vote"})
+    {
+        CAPTURE(forbidden);
+        CHECK(enable.find(forbidden) == std::string::npos);
+        CHECK(bridge_enable.find(forbidden) == std::string::npos);
+    }
+}
+
+TEST_CASE(
     "retention v2 shares one reporter-local commit sample with rich audit",
     "[adaptive-v2][evidence][retention-v2][commit][wiring][v40]")
 {

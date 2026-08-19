@@ -320,6 +320,9 @@ struct FaultWindowArmedStructuredEvent
     std::uint32_t prefault_tree_id{0};
     std::uint32_t required_tree_positions{0};
     std::vector<std::uint32_t> required_tree_ids;
+    std::string clock_domain;
+    std::uint32_t required_observation_schema{0};
+    std::string timeout_evidence_basis;
     std::string fault_window_arm_sha256;
 };
 

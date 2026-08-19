@@ -18,6 +18,9 @@ namespace hotstuff
 
 constexpr std::uint32_t kResponseObservationSchemaVersionV1 = 1;
 constexpr std::uint32_t kResponseObservationSchemaVersionV2 = 2;
+// Schema v3 binds every fact to the exact locally armed attempt start.  Its
+// wire layout deliberately remains the v2 two-u64 extension.
+constexpr std::uint32_t kResponseObservationSchemaVersionV3 = 3;
 // The default remains v1. Schema v2 is an explicitly enabled experiment
 // extension and must never leak into ordinary reporters.
 constexpr std::uint32_t kResponseObservationSchemaVersion =
@@ -28,7 +31,8 @@ constexpr bool is_supported_response_observation_schema(
     std::uint32_t schema_version) noexcept
 {
     return schema_version == kResponseObservationSchemaVersionV1 ||
-           schema_version == kResponseObservationSchemaVersionV2;
+           schema_version == kResponseObservationSchemaVersionV2 ||
+           schema_version == kResponseObservationSchemaVersionV3;
 }
 
 enum class ExpectedMessageType : std::uint8_t
@@ -107,6 +111,8 @@ bool valid_response_observation_retention_witness(
 
 uint256_t compute_response_observation_id(
     const ResponseAttemptIdentity &identity);
+uint256_t compute_response_observation_id(
+    const ResponseObservation &observation);
 
 struct ResponseObservationBatch
 {

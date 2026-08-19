@@ -144,6 +144,7 @@ struct PostFaultProposalCoverage
 {
     AdaptiveV2FaultContainmentCoverage audit;
     std::set<ProposalKey> proposal_keys;
+    std::set<uint256_t> observation_ids;
 };
 
 PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
@@ -153,7 +154,8 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
     std::uint64_t fault_evidence_start_monotonic_ns,
     const std::vector<std::uint32_t> &required_tree_ids,
     bool restrict_proposal_keys_to_required_trees,
-    bool require_all_required_tree_anchors)
+    bool require_all_required_tree_anchors,
+    bool exact_timeout_attempts = false)
 {
     PostFaultProposalCoverage result;
     result.audit.fault_evidence_start_monotonic_ns =
@@ -194,9 +196,15 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
                 current_epoch.epoch_number ||
             observation.configuration.epoch_digest !=
                 current_epoch.epoch_digest ||
-            !post_fault_direct_vote_proposal_anchor(
-                observation,
-                fault_evidence_start_monotonic_ns))
+            (exact_timeout_attempts
+                 ? (observation.schema_version !=
+                        kResponseObservationSchemaVersionV3 ||
+                    observation.outcome != ResponseOutcome::timeout ||
+                    observation.attempt_start_monotonic_ns <
+                        fault_evidence_start_monotonic_ns)
+                 : !post_fault_direct_vote_proposal_anchor(
+                       observation,
+                       fault_evidence_start_monotonic_ns)))
         {
             continue;
         }
@@ -205,7 +213,11 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
                       observation.configuration.tree_id) !=
             required_tree_ids.end();
         if (!restrict_proposal_keys_to_required_trees || required_tree)
+        {
             result.proposal_keys.insert(observation.proposal_key());
+            if (exact_timeout_attempts)
+                result.observation_ids.insert(observation.observation_id);
+        }
         if (required_tree)
         {
             observed_tree_ids.insert(
@@ -467,6 +479,7 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
     std::uint64_t evidence_cutoff,
     std::size_t capacity,
     const std::set<ProposalKey> *eligible_proposals,
+    const std::set<uint256_t> *eligible_observation_ids,
     TargetTimeoutCounts &counts) noexcept
 {
     try
@@ -484,7 +497,11 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
             const auto &observation = record.observation;
             if (observation.outcome == ResponseOutcome::on_time)
                 continue;
-            if (eligible_proposals != nullptr &&
+            if (eligible_observation_ids != nullptr &&
+                eligible_observation_ids->find(observation.observation_id) ==
+                    eligible_observation_ids->end())
+                continue;
+            if (eligible_observation_ids == nullptr && eligible_proposals != nullptr &&
                 eligible_proposals->find(observation.proposal_key()) ==
                     eligible_proposals->end())
             {
@@ -945,6 +962,16 @@ struct AdaptiveV2ByzantineSelection::State
                     audit.guard_drawdown <=
                     -static_cast<std::int64_t>(
                         config.minimum_score_drop);
+                // In v6 arm mode the guarded drawdown must be supported by
+                // the same outstanding, arm-eligible timeout attempts; raw
+                // reputation changes from unrelated evidence cannot qualify.
+                const bool eligible_drawdown_satisfied =
+                    !config.fault_window_arm.has_value() ||
+                    config.fault_window_arm->evidence_basis !=
+                        AdaptiveV2FaultWindowEvidenceBasis::
+                            exact_timeout_attempt_id_v1 ||
+                    audit.total_uncompensated_timeouts >=
+                        config.minimum_score_drop;
                 audit.reporter_guard_satisfied =
                     audit.qualifying_reporters.size() >=
                     static_cast<std::size_t>(
@@ -952,6 +979,7 @@ struct AdaptiveV2ByzantineSelection::State
                 audit.guarded_eligible =
                     audit.snapshot_nonresponsive &&
                     audit.score_drop_satisfied &&
+                    eligible_drawdown_satisfied &&
                     audit.reporter_guard_satisfied;
                 if (audit.guarded_eligible)
                 {
@@ -1293,6 +1321,11 @@ AdaptiveV2ByzantineSelection::select_through(
     }
 
     PostFaultProposalCoverage fault_coverage;
+    const bool exact_timeout_attempt_basis =
+        state.config.fault_window_arm.has_value() &&
+        state.config.fault_window_arm->evidence_basis ==
+            AdaptiveV2FaultWindowEvidenceBasis::
+                exact_timeout_attempt_id_v1;
     try
     {
         std::vector<std::uint32_t> required_tree_ids;
@@ -1321,7 +1354,8 @@ AdaptiveV2ByzantineSelection::select_through(
                 state.config.fault_containment_evidence_start_monotonic_ns,
             required_tree_ids,
             arm != nullptr,
-            arm == nullptr);
+            arm == nullptr,
+            exact_timeout_attempt_basis);
     }
     catch (...)
     {
@@ -1356,6 +1390,8 @@ AdaptiveV2ByzantineSelection::select_through(
                 AdaptiveV2FaultContainmentCoverageStatus::ready
             ? &fault_coverage.proposal_keys
             : nullptr,
+        exact_timeout_attempt_basis
+            ? &fault_coverage.observation_ids : nullptr,
         timeout_counts);
     if (replay != TimeoutReplayStatus::replayed)
     {

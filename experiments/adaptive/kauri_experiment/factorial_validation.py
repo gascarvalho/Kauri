@@ -874,6 +874,7 @@ _EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
 _EPOCH_DEFINITION_DOMAIN = b"kauri-epoch-definition-v2"
 _MEMBERSHIP_DOMAIN = b"kauri-membership-v1"
 _OBSERVATION_DOMAIN = b"kauri-response-observation-v1"
+_OBSERVATION_V3_DOMAIN = b"kauri-response-observation-v3"
 _SNAPSHOT_DOMAIN = b"kauri-adaptation-snapshot-v1"
 _SHAPE_TOPOLOGY_DOMAIN = b"kauri-shape-v1-topology"
 _SHAPE_EVIDENCE_DOMAIN = b"kauri-shape-v1-evidence"
@@ -6791,7 +6792,7 @@ def _evidence_record(
     allowed_versions = frozenset(allowed_schema_versions)
     if (
         not allowed_versions
-        or not allowed_versions.issubset({1, 2})
+        or not allowed_versions.issubset({1, 2, 3})
         or schema_version not in allowed_versions
     ):
         _fail(f"{label} observation schema version is not authorized")
@@ -6800,7 +6801,7 @@ def _evidence_record(
             "attempt_start_monotonic_ns",
             "reporter_local_commit_monotonic_ns",
         }
-        if schema_version == 2
+        if schema_version in {2, 3}
         else set()
     )
     _fields(
@@ -6875,13 +6876,17 @@ def _evidence_record(
     elif (
         not signers
         or (outcome == "late" and response_duration < deadline)
-        or (outcome == "on_time" and response_duration >= deadline)
+        or (
+            schema_version != 3
+            and outcome == "on_time"
+            and response_duration >= deadline
+        )
     ):
         _fail(f"{label} response timing/signer set is invalid")
 
     attempt_start: int | None = None
     reporter_local_commit: int | None = None
-    if schema_version == 2:
+    if schema_version in {2, 3}:
         attempt_start = _integer(
             observation["attempt_start_monotonic_ns"],
             f"{label}.attempt_start_monotonic_ns",
@@ -6890,7 +6895,7 @@ def _evidence_record(
         reporter_local_commit = _integer(
             observation["reporter_local_commit_monotonic_ns"],
             f"{label}.reporter_local_commit_monotonic_ns",
-            1,
+            1 if schema_version == 2 else 0,
         )
         bounded_u64 = {
             "ingestion_sequence": _integer(
@@ -6913,23 +6918,43 @@ def _evidence_record(
             or epoch > (1 << 32) - 1
             or tree_id > (1 << 32) - 1
         ):
-            _fail(f"{label} schema-v2 timeout exceeds an unsigned 32-bit bound")
+            _fail(
+                f"{label} schema-v{schema_version} observation exceeds an unsigned 32-bit bound"
+            )
         if (
             deadline > _UINT64_MAX // 1_000
             or attempt_start > _UINT64_MAX - deadline * 1_000
         ):
-            _fail(f"{label} schema-v2 retention deadline overflows u64")
+            _fail(f"{label} schema-v{schema_version} retention deadline overflows u64")
         absolute_deadline = attempt_start + deadline * 1_000
-        if not (
-            attempt_start
-            <= reporter_local_commit
-            < absolute_deadline
-            <= reporter_monotonic
+        if schema_version == 2:
+            if not (
+                attempt_start
+                <= reporter_local_commit
+                < absolute_deadline
+                <= reporter_monotonic
+            ):
+                _fail(f"{label} schema-v2 timeout violates strict retention chronology")
+        elif (
+            attempt_start > reporter_monotonic
+            or (outcome == "timeout" and absolute_deadline > reporter_monotonic)
+            or (
+                outcome != "timeout"
+                and response_duration != (reporter_monotonic - attempt_start) // 1_000
+            )
+            or (outcome == "late" and reporter_monotonic < absolute_deadline)
+            or (
+                reporter_local_commit != 0
+                and (
+                    outcome != "timeout"
+                    or not (attempt_start <= reporter_local_commit < absolute_deadline)
+                )
+            )
         ):
-            _fail(f"{label} schema-v2 timeout violates strict retention chronology")
+            _fail(f"{label} schema-v3 observation violates exact attempt chronology")
 
     expected_id = _sha256(
-        _OBSERVATION_DOMAIN
+        (_OBSERVATION_V3_DOMAIN if schema_version == 3 else _OBSERVATION_DOMAIN)
         + _u(reporter, 2)
         + _u(target, 2)
         + _u(epoch, 4)
@@ -6937,6 +6962,7 @@ def _evidence_record(
         + bytes.fromhex(epoch_digest)
         + bytes.fromhex(block_hash)
         + _u(_MESSAGE_TYPE_CODE[message_type], 1)
+        + (_u(attempt_start, 8) + _u(deadline, 8) if schema_version == 3 else b"")
     )
     observation_id = _digest(observation["observation_id"], f"{label}.observation_id")
     if observation_id != expected_id:
@@ -8572,12 +8598,12 @@ def _snapshot_id(
         result += _u(record.deadline_duration_us, 8)
         result += _u(record.reporter_monotonic_ns, 8)
         result += _u(record.reporter_sequence, 8)
-        if record.schema_version == 2:
+        if record.schema_version in {2, 3}:
             if (
                 record.attempt_start_monotonic_ns is None
                 or record.reporter_local_commit_monotonic_ns is None
             ):
-                _fail("snapshot schema-v2 record lacks retention chronology")
+                _fail("snapshot retention record lacks chronology")
             result += _u(record.attempt_start_monotonic_ns, 8)
             result += _u(record.reporter_local_commit_monotonic_ns, 8)
         elif record.schema_version != 1:
@@ -8758,6 +8784,7 @@ def replay_native_adaptation_snapshot(
     policy: Mapping[str, Any],
     seed: int,
     suffix_only: bool,
+    allowed_schema_versions: Collection[int] = frozenset({1, 2}),
 ) -> dict[str, Any]:
     """Replay one native adaptation snapshot from authenticated envelopes.
 
@@ -8951,7 +8978,7 @@ def replay_native_adaptation_snapshot(
         accepted_events,
         len(membership),
         allow_ingestion_sequence_gaps=True,
-        allowed_schema_versions=frozenset({1, 2}),
+        allowed_schema_versions=allowed_schema_versions,
     )
     expected_epoch = (epoch_number, epoch_digest)
     if expected_epoch not in grouped:

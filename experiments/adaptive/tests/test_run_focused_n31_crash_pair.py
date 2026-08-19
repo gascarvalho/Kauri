@@ -25,8 +25,8 @@ from experiments.adaptive.tests import (
 
 RUNNER = "experiments.adaptive.run_focused_n31_crash_pair"
 PROFILE_ROOT = Path(__file__).parents[1] / "profiles"
-N7_PROFILE_V5 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v5.json"
-N31_PROFILE_V5 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v5.json"
+N7_PROFILE_V6 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v6.json"
+N31_PROFILE_V6 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v6.json"
 
 
 def _runner() -> Any:
@@ -53,7 +53,7 @@ def _inputs(
         "authorization": tmp_path / "authorization.json",
         "trusted": tmp_path / "trusted.json",
     }
-    source_profile = N7_PROFILE_V5 if mode == "smoke" else N31_PROFILE_V5
+    source_profile = N7_PROFILE_V6 if mode == "smoke" else N31_PROFILE_V6
     profile = json.loads(source_profile.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(source_profile, profile)
     values["proof"] = tmp_path / profile["topology"]["proof_path"]
@@ -1169,7 +1169,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
-    profile = runtime.load_focused_profile(N7_PROFILE_V5)
+    profile = runtime.load_focused_profile(N7_PROFILE_V6)
     assert profile.issuer_public_key is None
     checks = _CliPreflightChecks()
     captured: list[dict[str, object]] = []
@@ -1185,7 +1185,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
                 "--mode",
                 "smoke",
                 "--profile",
-                str(N7_PROFILE_V5),
+                str(N7_PROFILE_V6),
                 "--pairs",
                 "1",
                 "--output",
@@ -1208,11 +1208,11 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     assert context["issuer_public_key"] == native_fixture.ISSUER_PUBLIC_KEY
     assert (
         preflight["profile_sha256"]
-        == "a358c93d9cc418f06630108f30653ffb6bca3fa51fd05c7a62089b2a2814d6dc"
+        == "13194cb75a0fe6cb40623be3d53fc1fe1db41f75f9c284e1d1267e409a447c00"
     )
     assert (
         preflight["topology_proof_sha256"]
-        == "6127a7a6d11391c237eea8c9f8bc392666a61686083569b6cdd715127beda4c6"
+        == "d59be85eac2b6828368f92f7c927bbf1eb4990c1ecb0eaee5b0f563b7de35a3c"
     )
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
@@ -1249,27 +1249,27 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
         (
             "smoke",
             1,
-            "n7-f2-q5-two-crash-pair-smoke-v5",
-            "a358c93d9cc418f06630108f30653ffb6bca3fa51fd05c7a62089b2a2814d6dc",
-            "6127a7a6d11391c237eea8c9f8bc392666a61686083569b6cdd715127beda4c6",
+            "n7-f2-q5-two-crash-pair-smoke-v6",
+            "13194cb75a0fe6cb40623be3d53fc1fe1db41f75f9c284e1d1267e409a447c00",
+            "d59be85eac2b6828368f92f7c927bbf1eb4990c1ecb0eaee5b0f563b7de35a3c",
         ),
         (
             "pair",
             1,
-            "n31-f5-q21-three-crash-pair-v5",
-            "5c080f6632b99f3be25b0253283e0da2f13fd5a892f77494342e1b6c248cafa2",
-            "197650f1d4b4c2e0db950ad8dc191a830a36c3d412971036b03a283b245b381e",
+            "n31-f5-q21-three-crash-pair-v6",
+            "780d98fc0122c56fddf4ad2aa5eb3fc9c2f8a85386ada565257855b6dd6c527c",
+            "a2d0435df187dd66c50daf59dedf24c4ffbcc4dcbb1a93191601c913bc959f0d",
         ),
         (
             "campaign",
             5,
-            "n31-f5-q21-three-crash-pair-v5",
-            "5c080f6632b99f3be25b0253283e0da2f13fd5a892f77494342e1b6c248cafa2",
-            "197650f1d4b4c2e0db950ad8dc191a830a36c3d412971036b03a283b245b381e",
+            "n31-f5-q21-three-crash-pair-v6",
+            "780d98fc0122c56fddf4ad2aa5eb3fc9c2f8a85386ada565257855b6dd6c527c",
+            "a2d0435df187dd66c50daf59dedf24c4ffbcc4dcbb1a93191601c913bc959f0d",
         ),
     ),
 )
-def test_cli_preflight_defaults_to_the_exact_v5_profile_and_proof(
+def test_cli_preflight_defaults_to_the_exact_v6_profile_and_proof(
     mode: str,
     pairs: int,
     profile_id: str,
@@ -1316,24 +1316,27 @@ def test_cli_preflight_defaults_to_the_exact_v5_profile_and_proof(
         ("smoke", runtime_fixture.N7_PROFILE_V2, 1),
         ("smoke", runtime_fixture.N7_PROFILE_V3, 1),
         ("smoke", PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v4.json", 1),
+        ("smoke", runtime_fixture.N7_PROFILE_V5, 1),
         ("pair", runtime_fixture.N31_PROFILE, 1),
         ("pair", runtime_fixture.N31_PROFILE_V2, 1),
         ("pair", runtime_fixture.N31_PROFILE_V3, 1),
         ("pair", PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json", 1),
+        ("pair", runtime_fixture.N31_PROFILE_V5, 1),
         ("campaign", runtime_fixture.N31_PROFILE, 5),
         ("campaign", runtime_fixture.N31_PROFILE_V2, 5),
         ("campaign", runtime_fixture.N31_PROFILE_V3, 5),
         ("campaign", PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json", 5),
+        ("campaign", runtime_fixture.N31_PROFILE_V5, 5),
     ),
 )
-def test_cli_rejects_archived_v1_to_v4_profiles_for_new_execution(
+def test_cli_rejects_archived_v1_to_v5_profiles_for_new_execution(
     mode: str,
     profile_path: Path,
     pairs: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Archived v1-v4 evidence remains readable but cannot authorize a new run."""
+    """Archived v1-v5 evidence remains readable but cannot authorize a new run."""
 
     runner = _runner()
     _execution_sentinels(runner, monkeypatch)
@@ -1353,12 +1356,12 @@ def test_cli_rejects_archived_v1_to_v4_profiles_for_new_execution(
         )
 
 
-def test_cli_rejects_rebound_noncanonical_v5_profile_for_preflight_and_execution(
+def test_cli_rejects_rebound_noncanonical_v6_profile_for_preflight_and_execution(
     tmp_path: Path,
 ) -> None:
     runner = _runner()
-    profile = json.loads(N31_PROFILE_V5.read_text(encoding="utf-8"))
-    proof_path = runtime_fixture._topology_proof_path(N31_PROFILE_V5, profile)
+    profile = json.loads(N31_PROFILE_V6.read_text(encoding="utf-8"))
+    proof_path = runtime_fixture._topology_proof_path(N31_PROFILE_V6, profile)
     proof = json.loads(proof_path.read_text(encoding="utf-8"))
     profile["timers"]["arm_hard_deadline_seconds"] = 481
     rebound_proof = tmp_path / "topology-proof.json"
@@ -1580,7 +1583,7 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
                 "--mode",
                 "campaign",
                 "--profile",
-                str(N31_PROFILE_V5),
+                str(N31_PROFILE_V6),
                 "--pairs",
                 "5",
                 "--output",

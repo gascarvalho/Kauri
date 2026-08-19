@@ -11233,6 +11233,17 @@ namespace hotstuff
         experiment_responsive_cross_commit_retention_v2 = true;
     }
 
+    void HotStuffBase::enable_experiment_exact_timeout_attempt_evidence_v3()
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            proposal_contexts->active_configuration().has_value() ||
+            adaptive_v2_response_evidence == nullptr ||
+            !adaptive_v2_response_evidence
+                 ->enable_exact_timeout_attempt_evidence_v3())
+            throw std::logic_error("exact timeout evidence v3 unavailable");
+        experiment_exact_timeout_attempt_evidence_v3 = true;
+    }
+
     void HotStuffBase::configure_experiment_post_qc_audit(
         ExperimentPostQcAuditOptions options)
     {

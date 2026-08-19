@@ -19,6 +19,12 @@ namespace hotstuff
 
 constexpr std::uint32_t kAdaptiveV2SelectionSchemaVersion = 1;
 
+enum class AdaptiveV2FaultWindowEvidenceBasis : std::uint8_t
+{
+    legacy_proposal_key_v1 = 1,
+    exact_timeout_attempt_id_v1,
+};
+
 /** Immutable local manager gate; it is not consensus or fault-target input. */
 struct AdaptiveV2FaultWindowArm
 {
@@ -27,6 +33,8 @@ struct AdaptiveV2FaultWindowArm
     std::uint64_t evidence_start_monotonic_ns{0};
     std::uint32_t prefault_tree_id{0};
     std::vector<std::uint32_t> required_tree_ids;
+    AdaptiveV2FaultWindowEvidenceBasis evidence_basis{
+        AdaptiveV2FaultWindowEvidenceBasis::legacy_proposal_key_v1};
 };
 
 struct AdaptiveV2SelectionConfig

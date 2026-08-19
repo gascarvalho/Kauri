@@ -637,6 +637,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N7_PROFILE_V6,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N31_PROFILE_V6,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (22, 23, 24),
+                "survivors": tuple((*range(22), *range(25, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -666,11 +692,21 @@ def test_validator_contract_is_derived_from_each_focused_profile(
     )
 
 
-def test_validator_rejects_rebound_noncanonical_v5_profile(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "profile_path",
+    (
+        runtime_fixture.N31_PROFILE_V5,
+        runtime_fixture.N7_PROFILE_V6,
+        runtime_fixture.N31_PROFILE_V6,
+    ),
+)
+def test_validator_rejects_rebound_noncanonical_v5_v6_profile(
+    tmp_path: Path, profile_path: Path
+) -> None:
     validation = _validation()
-    profile = json.loads(runtime_fixture.N31_PROFILE_V5.read_text(encoding="utf-8"))
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(
-        runtime_fixture.N31_PROFILE_V5, profile
+        profile_path, profile
     )
     proof = json.loads(source_proof.read_text(encoding="utf-8"))
     profile["timers"]["arm_hard_deadline_seconds"] = 481
@@ -687,6 +723,14 @@ def test_validator_rejects_rebound_noncanonical_v5_profile(tmp_path: Path) -> No
         match="not the frozen reviewed identity",
     ):
         validation.validation_contract_from_profile(tmp_path)
+
+
+def test_focused_profile_version_sets_are_disjoint() -> None:
+    validation = _validation()
+    assert validation._FCRASH_H_V5_PROFILE_IDS.isdisjoint(
+        validation._FCRASH_H_V6_PROFILE_IDS
+    )
+    assert validation._FCRASH_H_V6_PROFILE_IDS <= validation._REVIEWED_FOCUSED_PROFILE_IDS
 
 
 @pytest.mark.parametrize(
@@ -879,6 +923,366 @@ def _v3_progress_events(contract: Mapping[str, object]) -> list[dict[str, object
         for index in range(12)
     ]
     return [*lifecycle, *configurations, *commits]
+
+
+def _source_blind_postfault_attempt_fixture(
+    profile_version: str,
+    *,
+    compensate: bool = False,
+) -> tuple[dict[str, object], list[dict[str, object]], dict[str, int]]:
+    """Build the smallest post-fault reporter-guard replay input.
+
+    The direct-vote row is deliberately a different ProposalKey: it proves the
+    arm prefix itself is valid without lending an aggregate-relay timeout an
+    unrelated ProposalKey anchor.
+    """
+
+    assert profile_version == "v6"
+    validation = _validation()
+    digest = "ab" * 32
+    start_ns = 10_000
+    contract: dict[str, object] = {
+        "profile_version": profile_version,
+        "profile_id": "n7-f2-q5-two-crash-pair-smoke-v6",
+        "epoch_zero_digest": digest,
+        "reporter_coverage_plan": {
+            "targets": [
+                {
+                    "target_replica_id": 2,
+                    "first_qualifying_reporters": [{"reporter_id": 1, "tree_id": 7}],
+                }
+            ]
+        },
+    }
+
+    def observation(
+        *,
+        observation_id: str,
+        reporter: int,
+        target: int,
+        tree: int,
+        block: str,
+        outcome: str,
+        reporter_ns: int,
+    ) -> dict[str, object]:
+        message_type = (
+            "aggregate_relay" if observation_id != "anchor" else "direct_vote"
+        )
+        attempt_start_ns = (
+            9_000 if observation_id == "pre-fault-aggregate" else start_ns
+        )
+        value: dict[str, object] = {
+            "schema_version": 3,
+            "observation_id": observation_id,
+            "reporter_id": reporter,
+            "observed_replica_id": target,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": tree,
+                "epoch_digest": digest,
+            },
+            "block_hash": block,
+            "expected_message_type": message_type,
+            "outcome": outcome,
+            "response_duration_us": (
+                0 if outcome == "timeout" else (reporter_ns - attempt_start_ns) // 1_000
+            ),
+            "deadline_duration_us": 1,
+            "reporter_monotonic_ns": reporter_ns,
+            "attempt_start_monotonic_ns": attempt_start_ns,
+            "signer_set": [target] if outcome != "timeout" else [],
+        }
+        value["observation_id"] = validation._v6_timeout_observation_id(
+            reporter_id=reporter,
+            observed_replica_id=target,
+            epoch_number=0,
+            tree_id=tree,
+            epoch_digest=digest,
+            block_hash=block,
+            expected_message_type=message_type,
+            attempt_start_monotonic_ns=attempt_start_ns,
+            deadline_duration_us=1,
+        )
+        return value
+
+    def accepted(sequence: int, payload: Mapping[str, object]) -> dict[str, object]:
+        return {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": sequence,
+            "source_monotonic_ns": 20_000 + sequence,
+            "event_type": "evidence.observation_accepted",
+            "payload": {
+                "ingestion_sequence": sequence - 1,
+                "observation": dict(payload),
+            },
+        }
+
+    events: list[dict[str, object]] = [
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": 1,
+            "source_monotonic_ns": start_ns,
+            "event_type": "fault_window_armed",
+            "payload": {
+                "evidence_start_monotonic_ns": start_ns,
+                "required_tree_ids": [7],
+            },
+        },
+        accepted(
+            2,
+            observation(
+                observation_id="anchor",
+                reporter=9,
+                target=9,
+                tree=7,
+                block="01" * 32,
+                outcome="on_time",
+                reporter_ns=12_000,
+            ),
+        ),
+        # This is the exact required reporter/tree, but intentionally has no
+        # on-time direct-vote row for its ProposalKey.
+        accepted(
+            3,
+            observation(
+                observation_id="post-fault-aggregate",
+                reporter=1,
+                target=2,
+                tree=7,
+                block="02" * 32,
+                outcome="timeout",
+                reporter_ns=12_000,
+            ),
+        ),
+        # The same physical reporter/tree before R cannot enter the guard.
+        accepted(
+            4,
+            observation(
+                observation_id="pre-fault-aggregate",
+                reporter=1,
+                target=2,
+                tree=7,
+                block="03" * 32,
+                outcome="timeout",
+                reporter_ns=11_000,
+            ),
+        ),
+        # A post-R timeout outside the armed tree prefix cannot enter either.
+        accepted(
+            5,
+            observation(
+                observation_id="nonprefix-aggregate",
+                reporter=1,
+                target=2,
+                tree=8,
+                block="04" * 32,
+                outcome="timeout",
+                reporter_ns=12_000,
+            ),
+        ),
+    ]
+    if compensate:
+        events.append(
+            accepted(
+                6,
+                observation(
+                    observation_id="post-fault-aggregate",
+                    reporter=1,
+                    target=2,
+                    tree=7,
+                    block="02" * 32,
+                    outcome="late",
+                    reporter_ns=12_100,
+                ),
+            )
+        )
+    return (
+        contract,
+        events,
+        {
+            "source_monotonic_ns": 30_000,
+            "source_sequence": 100,
+        },
+    )
+
+
+def test_source_blind_postfault_aggregate_timeout_counts_without_direct_vote_anchor() -> (
+    None
+):
+    validation = _validation()
+    contract, events, audit = _source_blind_postfault_attempt_fixture("v6")
+
+    rows, _drawdowns, latest = validation._v4_replay_fault_window_anchors(
+        contract,
+        events,
+        baseline_cutoff=0,
+        current_cutoff=4,
+        audit=audit,
+    )
+
+    assert rows == [
+        {
+            "epoch_number": 0,
+            "tree_id": 7,
+            "observed_replica_id": 2,
+            "reporter_id": 1,
+            "outcome": "timeout",
+            "compensated": False,
+            "source_monotonic_ns": 20_003,
+        }
+    ]
+    assert latest == 20_003
+
+
+def test_source_blind_postfault_aggregate_late_observation_compensates_same_attempt() -> (
+    None
+):
+    validation = _validation()
+    contract, events, audit = _source_blind_postfault_attempt_fixture(
+        "v6",
+        compensate=True,
+    )
+
+    rows, _drawdowns, latest = validation._v4_replay_fault_window_anchors(
+        contract,
+        events,
+        baseline_cutoff=0,
+        current_cutoff=5,
+        audit=audit,
+    )
+
+    assert rows == []
+    assert latest == 0
+
+
+def _n7_v6_mixed_timeout_guard_fixture() -> (
+    tuple[dict[str, object], list[dict[str, object]], dict[str, int]]
+):
+    """Use the frozen N7 reporter plan: r6 aggregate, r4/r5 direct votes."""
+
+    validation = _validation()
+    runtime = runtime_fixture._runtime()
+    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V6)
+    coverage = runtime.derive_reporter_coverage_plan(profile)
+    digest = str(profile.raw["topology"]["epoch_zero_digest"])
+    contract: dict[str, object] = {
+        "profile_id": profile.profile_id,
+        "epoch_zero_digest": digest,
+        "reporter_coverage_plan": coverage,
+    }
+    events: list[dict[str, object]] = [
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": 1,
+            "source_monotonic_ns": 10_000,
+            "event_type": "fault_window_armed",
+            "payload": {
+                "evidence_start_monotonic_ns": 10_000,
+                "required_tree_ids": [6, 0, 1, 2, 3, 4],
+            },
+        }
+    ]
+    sequence = 1
+    for target, reporter, tree, message_type in (
+        (0, 6, 6, "aggregate_relay"),
+        (0, 4, 2, "direct_vote"),
+        (0, 5, 4, "direct_vote"),
+        (1, 6, 6, "aggregate_relay"),
+        (1, 4, 2, "direct_vote"),
+        (1, 5, 3, "direct_vote"),
+    ):
+        for ordinal in range(2):
+            sequence += 1
+            block_hash = hashlib.sha256(
+                f"n7-v6-{target}-{reporter}-{tree}-{ordinal}".encode("ascii")
+            ).hexdigest()
+            attempt_start_ns = 10_000 + sequence
+            observation: dict[str, object] = {
+                "schema_version": 3,
+                "reporter_id": reporter,
+                "observed_replica_id": target,
+                "configuration": {
+                    "epoch_number": 0,
+                    "tree_id": tree,
+                    "epoch_digest": digest,
+                },
+                "block_hash": block_hash,
+                "expected_message_type": message_type,
+                "outcome": "timeout",
+                "response_duration_us": 0,
+                "deadline_duration_us": 1,
+                "reporter_monotonic_ns": attempt_start_ns + 1_000,
+                "reporter_sequence": ordinal + 1,
+                "attempt_start_monotonic_ns": attempt_start_ns,
+                "reporter_local_commit_monotonic_ns": 0,
+                "signer_set": [],
+            }
+            observation["observation_id"] = validation._v6_timeout_observation_id(
+                reporter_id=reporter,
+                observed_replica_id=target,
+                epoch_number=0,
+                tree_id=tree,
+                epoch_digest=digest,
+                block_hash=block_hash,
+                expected_message_type=message_type,
+                attempt_start_monotonic_ns=attempt_start_ns,
+                deadline_duration_us=1,
+            )
+            events.append(
+                {
+                    "source_kind": "adaptation_manager",
+                    "source_id": "adaptive-manager",
+                    "source_sequence": sequence,
+                    "source_monotonic_ns": 20_000 + sequence,
+                    "event_type": "evidence.observation_accepted",
+                    "payload": {
+                        "ingestion_sequence": sequence - 1,
+                        "observation": observation,
+                    },
+                }
+            )
+    return contract, events, {"source_monotonic_ns": 40_000, "source_sequence": 100}
+
+
+def test_v6_source_blind_replay_accepts_native_n7_mixed_timeout_guard() -> None:
+    validation = _validation()
+    contract, events, audit = _n7_v6_mixed_timeout_guard_fixture()
+    rows, drawdowns, _latest = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=12, audit=audit
+    )
+    assert len(rows) == 12
+    assert {(row["reporter_id"], row["tree_id"]) for row in rows} == {
+        (6, 6),
+        (4, 2),
+        (5, 4),
+        (5, 3),
+    }
+    assert drawdowns == {"0": -6, "1": -6}
+
+
+@pytest.mark.parametrize("mutation", ("message-type", "observation-id"))
+def test_v6_source_blind_replay_rejects_mixed_timeout_identity_mutation(
+    mutation: str,
+) -> None:
+    validation = _validation()
+    contract, events, audit = _n7_v6_mixed_timeout_guard_fixture()
+    direct = next(
+        event["payload"]["observation"]
+        for event in events
+        if event["event_type"] == "evidence.observation_accepted"
+        and event["payload"]["observation"]["expected_message_type"] == "direct_vote"
+    )
+    if mutation == "message-type":
+        direct["expected_message_type"] = "aggregate_relay"
+    else:
+        direct["observation_id"] = "00" * 32
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="identity"):
+        validation._v4_replay_fault_window_anchors(
+            contract, events, baseline_cutoff=0, current_cutoff=12, audit=audit
+        )
 
 
 def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(

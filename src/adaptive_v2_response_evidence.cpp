@@ -425,7 +425,8 @@ struct AdaptiveV2ResponseEvidenceBridge::State
               0,
               0,
               limits.reporter,
-              limits.wire}),
+              limits.wire,
+              limits.exact_timeout_attempt_evidence_v3}),
           retained_facts(limits.maximum_retained_facts),
           late_compensations(limits.maximum_late_compensations)
     {
@@ -509,6 +510,20 @@ enable_cross_commit_retention_v2() noexcept
         return false;
     }
     state_->cross_commit_retention_v2_enabled = true;
+    return true;
+}
+
+bool AdaptiveV2ResponseEvidenceBridge::
+enable_exact_timeout_attempt_evidence_v3() noexcept
+{
+    auto &state = *state_;
+    if (!state.healthy || !state.handles.empty())
+        return false;
+    if (state.limits.exact_timeout_attempt_evidence_v3)
+        return true;
+    if (!state.reporter.enable_exact_timeout_attempt_evidence_v3())
+        return false;
+    state.limits.exact_timeout_attempt_evidence_v3 = true;
     return true;
 }
 
@@ -1078,6 +1093,12 @@ bool AdaptiveV2ResponseEvidenceBridge::record_verified_response(
             finalize_ready_deadlines();
             return false;
         }
+        if (state_->limits.exact_timeout_attempt_evidence_v3)
+        {
+            fact->attempt_start_monotonic_ns =
+                found->second.attempt_start_monotonic_ns;
+            fact->reporter_local_commit_monotonic_ns = 0;
+        }
         if ((expects_late && fact->outcome != ResponseOutcome::late) ||
             (!expects_late &&
              fact->outcome != ResponseOutcome::on_time))
@@ -1248,6 +1269,12 @@ std::size_t AdaptiveV2ResponseEvidenceBridge::record_timeouts_impl(
                 mark_deadline_delivery_failed(proposal);
                 finalize_ready_deadlines();
                 continue;
+            }
+            if (state_->limits.exact_timeout_attempt_evidence_v3)
+            {
+                fact->attempt_start_monotonic_ns =
+                    found->second.attempt_start_monotonic_ns;
+                fact->reporter_local_commit_monotonic_ns = 0;
             }
             const auto retained_deadline =
                 state_->deadlines.find(proposal);

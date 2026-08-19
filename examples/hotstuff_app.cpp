@@ -981,6 +981,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_responsive_cross_commit_retention_v2 =
         Config::OptValFlag::create(false);
+    auto opt_experiment_exact_timeout_attempt_evidence_v3 =
+        Config::OptValFlag::create(false);
     auto opt_experiment_post_qc_audit_configuration =
         Config::OptValStr::create("");
     auto opt_experiment_post_qc_audit_window =
@@ -1234,6 +1236,9 @@ int main(int argc, char **argv)
         Config::SWITCH_ON,
         -1,
         "emit schema-v2 reporter-local cross-commit retention evidence");
+    config.add_opt("experiment-exact-timeout-attempt-evidence-v3",
+        opt_experiment_exact_timeout_attempt_evidence_v3, Config::SWITCH_ON,
+        -1, "emit exact schema-v3 response-attempt evidence");
     config.add_opt(
         "experiment-post-qc-audit-configuration",
         opt_experiment_post_qc_audit_configuration,
@@ -1547,6 +1552,8 @@ int main(int argc, char **argv)
     {
         papp->enable_experiment_responsive_cross_commit_retention_v2();
     }
+    if (opt_experiment_exact_timeout_attempt_evidence_v3->get())
+        papp->enable_experiment_exact_timeout_attempt_evidence_v3();
     if (experiment_byzantine_options.has_value())
         papp->configure_experiment_byzantine_faults(
             *experiment_byzantine_options);
