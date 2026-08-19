@@ -10039,14 +10039,33 @@ namespace hotstuff
             }
             if (adaptive_v2_committed_convergence_identity.has_value())
             {
-                pending_adaptive_v2_commit->identity_disposition =
-                    CommittedProposalIdentityDisposition::conflicting;
-                pending_adaptive_v2_commit->event_identity_disposition =
-                    CommittedProposalIdentityDisposition::conflicting;
-                mark_adaptive_v2_convergence_evidence_unhealthy(
-                    "authoritative_commit_identity_unavailable_while_"
-                    "convergence_pending");
+                const auto &convergence =
+                    *adaptive_v2_committed_convergence_identity;
+                const bool distinct_from_convergence_command =
+                    cached.block_hash != convergence.command_block_hash;
+                const bool distinct_from_pending_epoch_change =
+                    !pending_committed_epoch_change.has_value() ||
+                    pending_committed_epoch_change->block_hash !=
+                        cached.block_hash;
+                if (!distinct_from_convergence_command ||
+                    !distinct_from_pending_epoch_change)
+                {
+                    pending_adaptive_v2_commit->identity_disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                    pending_adaptive_v2_commit->event_identity_disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                    mark_adaptive_v2_convergence_evidence_unhealthy(
+                        "authoritative_commit_identity_mismatched_or_"
+                        "conflicted");
+                    return;
+                }
             }
+            // A later legal QC-skipped commit does not change the exact
+            // epoch-change identity that was already committed and queued
+            // for convergence reporting. Keep that identity available for
+            // the matching activation observation; the unavailable commit
+            // remains explicit in the structured evidence stream and is
+            // never promoted into a protocol ProposalKey.
             return;
         }
         const bool exact_authoritative_identity =

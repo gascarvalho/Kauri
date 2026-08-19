@@ -267,10 +267,63 @@ public:
                 HotStuffBase::CommittedProposalIdentityDisposition::exact};
     }
 
-    static void seed_convergence_identity(HotStuffBase &runtime)
+    static AdaptiveV2EpochChangeIdentity seed_convergence_identity(
+        HotStuffBase &runtime,
+        const ConfigurationId &predecessor,
+        std::uint32_t successor_epoch_number = 1,
+        std::uint64_t command_block_height = 41,
+        std::uint64_t activation_delay_blocks = 5,
+        std::optional<uint256_t> command_block_hash = std::nullopt)
     {
-        runtime.adaptive_v2_committed_convergence_identity =
-            AdaptiveV2EpochChangeIdentity{};
+        const AdaptiveV2EpochChangeIdentity identity{
+            predecessor.epoch_number,
+            predecessor.epoch_digest,
+            successor_epoch_number,
+            DataStream("pending-convergence-successor").get_hash(),
+            DataStream("pending-convergence-payload").get_hash(),
+            command_block_height,
+            command_block_hash.value_or(
+                DataStream("pending-convergence-command").get_hash()),
+            activation_delay_blocks,
+            command_block_height + activation_delay_blocks};
+        runtime.adaptive_v2_committed_convergence_identity = identity;
+        return identity;
+    }
+
+    static bool has_convergence_identity(
+        const HotStuffBase &runtime,
+        const AdaptiveV2EpochChangeIdentity &identity)
+    {
+        return runtime.adaptive_v2_committed_convergence_identity == identity;
+    }
+
+    static bool has_any_convergence_identity(const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v2_committed_convergence_identity.has_value();
+    }
+
+    static void seed_pending_epoch_command(
+        HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        runtime.pending_committed_epoch_change.emplace(
+            HotStuffBase::PendingCommittedEpochChange{
+                block_hash, AuthorizedEpochChange{}, uint256_t{}});
+    }
+
+    static void poison_convergence_evidence(HotStuffBase &runtime)
+    {
+        runtime.mark_adaptive_v2_convergence_evidence_unhealthy(
+            "test_pre_poisoned_convergence");
+    }
+
+    static void enqueue_matching_activation(
+        HotStuffBase &runtime,
+        const AdaptiveV2EpochChangeIdentity &identity)
+    {
+        REQUIRE(runtime.adaptive_v2_committed_convergence_identity == identity);
+        runtime.adaptive_v2_activation_observation_pending = true;
+        runtime.enqueue_pending_adaptive_v2_activation_observation();
     }
 
     static void report_committed(
@@ -984,6 +1037,37 @@ void deliver_and_release(
             AdaptiveV2ReportingTransitionStatus::delivered);
     REQUIRE(outbox.release_terminal(report_id) ==
             AdaptiveV2ReportingReleaseStatus::released);
+}
+
+void acknowledge_and_release_convergence(
+    AdaptiveV2ReportingOutbox &outbox,
+    std::uint64_t now)
+{
+    const auto attempt = outbox.begin_delivery(now);
+    REQUIRE(attempt.status == AdaptiveV2ReportingAttemptStatus::started);
+    REQUIRE(attempt.token.has_value());
+    REQUIRE(attempt.report != nullptr);
+    const auto report_id = attempt.report->report_id;
+    CHECK(outbox.acknowledge_delivery(
+              *attempt.token,
+              AdaptiveV2ReportingDeliveryResult::delivered,
+              now) ==
+          AdaptiveV2ReportingTransitionStatus::retry_scheduled);
+    REQUIRE(outbox.front() != nullptr);
+    REQUIRE(outbox.front()->convergence_observation_kind.has_value());
+    REQUIRE(outbox.front()->convergence_identity.has_value());
+    AdaptiveV2ConvergenceObservationAck acknowledgement;
+    acknowledgement.target_replica_id = 1;
+    acknowledgement.observation_kind =
+        *outbox.front()->convergence_observation_kind;
+    acknowledgement.identity = *outbox.front()->convergence_identity;
+    acknowledgement.observation_digest =
+        outbox.front()->convergence_observation_digest;
+    acknowledgement.disposition = AdaptiveV2ConvergenceAckDisposition::positive;
+    CHECK(outbox.acknowledge_convergence_observation(acknowledgement) ==
+          AdaptiveV2ReportingTransitionStatus::delivered);
+    CHECK(outbox.release_terminal(report_id) ==
+          AdaptiveV2ReportingReleaseStatus::released);
 }
 
 struct DelayedProposalBlocks
@@ -2146,22 +2230,57 @@ TEST_CASE(
     RecordingProtocolEmitter emitter;
     runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
 
-    SECTION("missing identity while convergence is pending remains fatal")
+    SECTION(
+        "a legal unavailable QC-skipped commit preserves a pending exact "
+        "identity for the matching activation")
     {
-        Access::reset_reporting_outbox(runtime);
+        auto &outbox = Access::reset_reporting_outbox(runtime, 1);
         const auto block =
             indirect_commit_block(runtime, "pending-convergence-gap");
         const auto cached = Access::resolve_and_cache_commit(
             runtime, block, {}, nullptr, true);
         REQUIRE(cached.unavailable);
-        Access::seed_convergence_identity(runtime);
+        const auto identity = Access::seed_convergence_identity(
+            runtime, configuration);
 
         Access::report_and_post_commit(runtime, block);
 
-        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
-        REQUIRE(emitter.events.size() == 1);
+        CHECK(Access::convergence_evidence_healthy(runtime));
+        CHECK(Access::has_convergence_identity(runtime, identity));
+        REQUIRE(emitter.events.size() == 2);
         CHECK(std::get_if<CommitObservedStructuredEvent>(
                   &emitter.events.front()) != nullptr);
+        CHECK(std::get_if<CommitIdentityUnavailableStructuredEvent>(
+                  &emitter.events.back()) != nullptr);
+
+        // The outbox has capacity for one record only.  The matching live
+        // activation first retains its exact identity behind the commit
+        // report, then succeeds when the durable queue is retried.
+        Access::enqueue_matching_activation(runtime, identity);
+        REQUIRE(outbox.front() != nullptr);
+        CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::convergence);
+        const auto committed =
+            decode_adaptive_v2_epoch_change_committed_observation(
+                outbox.front()->canonical_payload,
+                AdaptiveV2ConvergenceWireLimits{});
+        REQUIRE(committed);
+        CHECK(committed.observation->identity == identity);
+        acknowledge_and_release_convergence(outbox, 1);
+
+        Access::enqueue_matching_activation(runtime, identity);
+        REQUIRE(outbox.front() != nullptr);
+        CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::convergence);
+        const auto activated =
+            decode_adaptive_v2_epoch_activated_observation(
+                outbox.front()->canonical_payload,
+                AdaptiveV2ConvergenceWireLimits{});
+        REQUIRE(activated);
+        CHECK(activated.observation->identity == identity);
+        CHECK(activated.observation->activated_epoch_number ==
+              identity.successor_epoch_number);
+        CHECK(activated.observation->activated_epoch_digest ==
+              identity.successor_epoch_digest);
+        CHECK(Access::convergence_evidence_healthy(runtime));
     }
 
     SECTION("an exact key without authenticated generation remains fatal")
@@ -2180,6 +2299,82 @@ TEST_CASE(
         REQUIRE(emitter.events.size() == 1);
         CHECK(std::get_if<CommitObservedStructuredEvent>(
                   &emitter.events[0]) != nullptr);
+    }
+
+    SECTION("an unavailable commit at the exact epoch-command hash is fatal")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "convergence-command-hash-gap");
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        REQUIRE(cached.unavailable);
+        const auto identity = Access::seed_convergence_identity(
+            runtime, configuration, 1, 41, 5, block->get_hash());
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        CHECK_FALSE(Access::has_convergence_identity(runtime, identity));
+    }
+
+    SECTION("an unavailable second pending epoch command is fatal")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "second-pending-command-gap");
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        REQUIRE(cached.unavailable);
+        const auto identity = Access::seed_convergence_identity(
+            runtime, configuration);
+        Access::seed_pending_epoch_command(runtime, block->get_hash());
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        CHECK_FALSE(Access::has_convergence_identity(runtime, identity));
+    }
+
+    SECTION("a legal unavailable commit cannot heal pre-poisoned evidence")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto block =
+            indirect_commit_block(runtime, "pre-poisoned-unavailable-gap");
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        REQUIRE(cached.unavailable);
+        const auto identity = Access::seed_convergence_identity(
+            runtime, configuration);
+        Access::poison_convergence_evidence(runtime);
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+        CHECK_FALSE(Access::has_any_convergence_identity(runtime));
+        CHECK_FALSE(Access::has_convergence_identity(runtime, identity));
+    }
+
+    SECTION("repeat distinct legal unavailable commits preserve the identity")
+    {
+        Access::reset_reporting_outbox(runtime);
+        const auto identity = Access::seed_convergence_identity(
+            runtime, configuration);
+        const auto first =
+            indirect_commit_block(runtime, "first-distinct-unavailable-gap");
+        const auto second =
+            indirect_commit_block(runtime, "second-distinct-unavailable-gap");
+        REQUIRE(first->get_hash() != second->get_hash());
+
+        for (const auto &block : {first, second})
+        {
+            const auto cached = Access::resolve_and_cache_commit(
+                runtime, block, {}, nullptr, true);
+            REQUIRE(cached.unavailable);
+            Access::report_and_post_commit(runtime, block);
+            CHECK(Access::convergence_evidence_healthy(runtime));
+            CHECK(Access::has_convergence_identity(runtime, identity));
+        }
     }
 
     SECTION("the one-argument compatibility path cannot claim a legal QC skip")

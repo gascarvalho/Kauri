@@ -3280,11 +3280,26 @@ TEST_CASE(
          "mark_adaptive_v2_convergence_evidence_unhealthy(",
          "authoritative_commit_identity_mismatched_or_conflicted",
          "CommittedProposalIdentityDisposition::unavailable",
+         "const bool exact_unavailable",
+         "!key.has_value()",
+         "!cached.committed_key.has_value()",
+         "!cached.view_generation.has_value()",
          "adaptive_v2_committed_convergence_identity.has_value()",
+         "cached.block_hash != convergence.command_block_hash",
+         "!pending_committed_epoch_change.has_value()",
+         "pending_committed_epoch_change->block_hash !=",
+         "cached.block_hash",
+         "!distinct_from_convergence_command",
+         "!distinct_from_pending_epoch_change",
          "CommittedProposalIdentityDisposition::conflicting",
-         "authoritative_commit_identity_unavailable_while_",
-         "convergence_pending",
+         "event_identity_disposition =",
+         "CommittedProposalIdentityDisposition::conflicting",
+         "authoritative_commit_identity_mismatched_or_",
+         "conflicted",
          "CommittedProposalIdentityDisposition::exact"}));
+    CHECK(committed.find(
+              "authoritative_commit_identity_unavailable_while_") ==
+          std::string::npos);
     CHECK(count_occurrences(
               committed,
               "authoritative_commit_identity_mismatched_or_conflicted") ==
