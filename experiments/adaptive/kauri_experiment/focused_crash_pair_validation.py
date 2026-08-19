@@ -50,6 +50,23 @@ _FCRASH_H_V4_PROFILE_IDS = frozenset(
         "n31-f5-q21-three-crash-pair-v4",
     }
 )
+_FCRASH_H_V5_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v5",
+        "n31-f5-q21-three-crash-pair-v5",
+    }
+)
+_FCRASH_H_V5_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v5": (
+        "a358c93d9cc418f06630108f30653ffb6bca3fa51fd05c7a62089b2a2814d6dc",
+        "6127a7a6d11391c237eea8c9f8bc392666a61686083569b6cdd715127beda4c6",
+    ),
+    "n31-f5-q21-three-crash-pair-v5": (
+        "5c080f6632b99f3be25b0253283e0da2f13fd5a892f77494342e1b6c248cafa2",
+        "197650f1d4b4c2e0db950ad8dc191a830a36c3d412971036b03a283b245b381e",
+    ),
+}
+_FAULT_WINDOW_PROFILE_IDS = _FCRASH_H_V4_PROFILE_IDS | _FCRASH_H_V5_PROFILE_IDS
 _FAULT_WINDOW_ARM_DOMAIN = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _EVENT_KEYS = {
@@ -355,7 +372,11 @@ def _sha_bytes(value: bytes) -> str:
 
 
 def _is_v4_contract(contract: Mapping[str, object]) -> bool:
-    return contract.get("profile_id") in _FCRASH_H_V4_PROFILE_IDS
+    return contract.get("profile_id") in _FAULT_WINDOW_PROFILE_IDS
+
+
+def _is_v5_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V5_PROFILE_IDS
 
 
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
@@ -439,7 +460,7 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter",
         "minimum_score_drop",
     }
-    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
     expected_timer_keys = {
         "adaptation_interval_seconds",
@@ -497,7 +518,7 @@ def _derive_reporter_coverage_plan(
         row["authenticated_reporter_ids"] = common_ids
     expected_period = (
         2
-        if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
         else count
     )
     expected_guard = {
@@ -508,7 +529,7 @@ def _derive_reporter_coverage_plan(
         "minimum_timeouts_per_reporter": 2,
         "minimum_score_drop": 2 * required,
     }
-    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS:
         expected_guard["required_postfault_tree_positions"] = horizon
     if dict(guard) != expected_guard:
         _error("FCRASH-H frozen evidence guard differs from topology derivation")
@@ -552,7 +573,7 @@ def _derive_reporter_coverage_plan(
                 "nominal_commit_horizon": horizon * expected_period,
             }
             if profile["profile_id"]
-            in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+            in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
             else {}
         ),
         "deadlines_seconds": deadlines,
@@ -1482,7 +1503,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     schema_version = profile.get("schema_version")
     expected_keys = (
         _PROFILE_KEYS_V4
-        if profile.get("profile_id") in _FCRASH_H_V4_PROFILE_IDS
+        if profile.get("profile_id") in _FAULT_WINDOW_PROFILE_IDS
         else _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
     )
     if (
@@ -1501,9 +1522,11 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "n31-f5-q21-three-crash-pair-v3",
         "n7-f2-q5-two-crash-pair-smoke-v4",
         "n31-f5-q21-three-crash-pair-v4",
+        "n7-f2-q5-two-crash-pair-smoke-v5",
+        "n31-f5-q21-three-crash-pair-v5",
     }:
         _error("focused profile identity is not reviewed")
-    if profile_id in _FCRASH_H_V4_PROFILE_IDS:
+    if profile_id in _FAULT_WINDOW_PROFILE_IDS:
         arm_metadata = _mapping(
             profile.get("fault_window_arm"), "fault-window arm metadata"
         )
@@ -1578,6 +1601,47 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     if active_tree not in members:
         _error("active tree is outside membership")
     measurement = _mapping(profile.get("measurement"), "profile measurement")
+    expected_measurement_keys = {
+        "authoritative_replica_id",
+        "bucket_width_seconds",
+        "commit_event_type",
+        "phase_names",
+    }
+    if profile_id in _FCRASH_H_V5_PROFILE_IDS:
+        expected_measurement_keys.add("phase_window_contract")
+    if set(measurement) != expected_measurement_keys:
+        _error("profile measurement schema drifted")
+    phase_window_contract: dict[str, object] | None = None
+    if profile_id in _FCRASH_H_V5_PROFILE_IDS:
+        raw_phase_contract = _mapping(
+            measurement.get("phase_window_contract"), "phase-window contract"
+        )
+        if (
+            set(raw_phase_contract)
+            != {
+                "schema_version",
+                "domain",
+                "stabilization_offset_seconds",
+                "control_optimization_hold_seconds",
+            }
+            or raw_phase_contract.get("schema_version") != 1
+            or raw_phase_contract.get("domain")
+            != "kauri-focused-causal-phase-windows-v1"
+            or _integer(
+                raw_phase_contract.get("stabilization_offset_seconds"),
+                "phase stabilization offset",
+                1,
+            )
+            != 30
+            or _integer(
+                raw_phase_contract.get("control_optimization_hold_seconds"),
+                "control optimization hold",
+                1,
+            )
+            != 30
+        ):
+            _error("phase-window contract drifted")
+        phase_window_contract = dict(raw_phase_contract)
     observer = _integer(
         measurement.get("authoritative_replica_id"), "authoritative observer"
     )
@@ -1640,6 +1704,15 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         != list(targets)
     ):
         _error("topology proof is not bound to the native focused tree")
+    if (
+        profile_id in _FCRASH_H_V5_PROFILE_IDS
+        and (
+            profile_sha,
+            proof_sha,
+        )
+        != _FCRASH_H_V5_IDENTITIES[str(profile_id)]
+    ):
+        _error("v5 profile or topology proof is not the frozen reviewed identity")
     children = {
         index: tuple(
             child
@@ -1735,6 +1808,8 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         ),
         "figure_eligible": profile.get("figure_eligible") is True,
     }
+    if phase_window_contract is not None:
+        result["phase_window_contract"] = phase_window_contract
     if schema_version == 2:
         result["reporter_coverage_plan"] = _derive_reporter_coverage_plan(
             profile,
@@ -1812,7 +1887,7 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         "tree-switch-period": str(
             2
             if _mapping(contract.get("profile"), "focused profile").get("profile_id")
-            in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+            in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
             else len(tuple(contract["members"]))
         ),
         "epoch-protocol-mode": "adaptive_v2",
@@ -1971,7 +2046,7 @@ def _validate_trees(
         _error(f"{label} roots drifted")
     is_v3 = (
         _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
     )
     members = tuple(_integer(member, "tree member") for member in contract["members"])
     first_leaf = (len(members) - 2) // int(contract["fanout"]) + 1
@@ -2384,7 +2459,7 @@ def _ranking(
     if (
         audited_eligible_ranking is not None
         and _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
     ):
         expected_audit_roots = (
             _containment_roots(ranked, contract)
@@ -2466,6 +2541,289 @@ def _select_latest_common_commit(
     return latest[0]
 
 
+def _event_epoch(event: Mapping[str, Any], label: str) -> int:
+    payload = _mapping(event.get("payload"), label)
+    proof = _mapping(payload.get("decision_proof"), f"{label} proof")
+    return _integer(proof.get("epoch_number"), f"{label} epoch")
+
+
+def _first_common_commit_anchor(
+    commits: Sequence[Mapping[str, Any]],
+    observations: Sequence[Mapping[str, Any]],
+    *,
+    epoch_number: int,
+    after_ns: int,
+    contract: Mapping[str, object],
+) -> int:
+    survivor_sources = {f"replica-{replica}" for replica in contract["survivors"]}
+    candidates = sorted(
+        (
+            event
+            for event in commits
+            if _event_epoch(event, "phase commit") == epoch_number
+            and _integer(event.get("source_monotonic_ns"), "phase commit timestamp")
+            > after_ns
+        ),
+        key=lambda event: (
+            _integer(event.get("source_monotonic_ns"), "phase commit timestamp"),
+            _integer(
+                _mapping(event.get("payload"), "phase commit").get("block_height"),
+                "phase commit height",
+                1,
+            ),
+        ),
+    )
+    for commit in candidates:
+        payload = _mapping(commit.get("payload"), "phase commit")
+        identity = {
+            key: payload.get(key)
+            for key in (
+                "block_height",
+                "block_hash",
+                "parent_hash",
+                "transaction_count",
+                "commit_batch_index",
+            )
+        }
+        earliest_by_source: dict[str, int] = {}
+        for observation in observations:
+            source = str(observation.get("source_id"))
+            if (
+                observation.get("source_kind") != "replica"
+                or source not in survivor_sources
+                or dict(
+                    _mapping(observation.get("payload"), "phase commit observation")
+                )
+                != identity
+            ):
+                continue
+            timestamp = _integer(
+                observation.get("source_monotonic_ns"),
+                "phase commit observation timestamp",
+            )
+            if timestamp <= after_ns:
+                continue
+            previous = earliest_by_source.get(source)
+            if previous is None or timestamp < previous:
+                earliest_by_source[source] = timestamp
+        if len(earliest_by_source) < int(contract["quorum"]):
+            continue
+        quorum_times = sorted(earliest_by_source.values())[: int(contract["quorum"])]
+        return max(
+            _integer(commit.get("source_monotonic_ns"), "phase commit timestamp"),
+            max(quorum_times),
+        )
+    _error("causal phase lacks a post-activation common commit")
+
+
+def _v5_causal_phase_windows(
+    root: Path,
+    events: Sequence[Mapping[str, Any]],
+    authoritative_commits: Sequence[Mapping[str, Any]],
+    epoch2: Any | None,
+    contract: Mapping[str, object],
+) -> list[tuple[str, int, int, int]]:
+    raw_contract = _mapping(
+        contract.get("phase_window_contract"), "phase-window contract"
+    )
+    if (
+        set(raw_contract)
+        != {
+            "schema_version",
+            "domain",
+            "stabilization_offset_seconds",
+            "control_optimization_hold_seconds",
+        }
+        or raw_contract.get("schema_version") != 1
+        or raw_contract.get("domain") != "kauri-focused-causal-phase-windows-v1"
+    ):
+        _error("causal phase-window contract drifted")
+    width_ns = _integer(contract.get("bucket_width_seconds"), "bucket width", 1)
+    width_ns *= 1_000_000_000
+    stabilization_ns = (
+        _integer(
+            raw_contract.get("stabilization_offset_seconds"),
+            "phase stabilization offset",
+            1,
+        )
+        * 1_000_000_000
+    )
+    control_hold_ns = (
+        _integer(
+            raw_contract.get("control_optimization_hold_seconds"),
+            "control optimization hold",
+            1,
+        )
+        * 1_000_000_000
+    )
+
+    fault_receipt = _read_json(root / "raw" / "fault-receipt.json", "fault receipt")
+    outcomes = _sequence(fault_receipt.get("sigkill_outcomes"), "SIGKILL outcomes")
+    if not outcomes:
+        _error("causal phase windows lack fault outcomes")
+    prefault_ns = min(
+        _integer(
+            _mapping(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),
+            "fault request timestamp",
+            1,
+        )
+        for outcome in outcomes
+    )
+    fault_ns = max(
+        _integer(
+            _mapping(outcome, "SIGKILL outcome").get("confirmed_monotonic_ns"),
+            "fault confirmation timestamp",
+            1,
+        )
+        for outcome in outcomes
+    )
+    baseline_start = prefault_ns - width_ns
+    if baseline_start < 0:
+        _error("causal baseline window precedes the event clock")
+    epoch0_commits = [
+        event
+        for event in authoritative_commits
+        if _event_epoch(event, "phase commit") == 0
+    ]
+    if not epoch0_commits:
+        _error("causal phase windows lack Epoch-0 commits")
+    stable_seconds = _integer(
+        _mapping(
+            _mapping(contract.get("profile"), "focused profile").get("timers"),
+            "profile timers",
+        ).get("stable_phase_seconds"),
+        "stable phase",
+        1,
+    )
+    if (
+        min(
+            _integer(event.get("source_monotonic_ns"), "Epoch-0 commit timestamp")
+            for event in epoch0_commits
+        )
+        > prefault_ns - stable_seconds * 1_000_000_000
+    ):
+        _error("causal baseline is not inside the proven stable interval")
+
+    command1_times = [
+        _integer(event.get("source_monotonic_ns"), "Epoch-1 command timestamp")
+        for event in events
+        if event.get("event_type") == "epoch.command_committed"
+        and _mapping(event.get("payload"), "Epoch-1 command").get(
+            "successor_epoch_number"
+        )
+        == 1
+    ]
+    if not command1_times or fault_ns + width_ns >= min(command1_times):
+        _error("causal fault window overlaps the Epoch-1 transition")
+    activations1 = [
+        event
+        for event in events
+        if event.get("event_type") == "epoch.activated"
+        and _mapping(event.get("payload"), "Epoch-1 activation").get("epoch_number")
+        == 1
+    ]
+    expected_sources = {f"replica-{replica}" for replica in contract["survivors"]}
+    if {str(event.get("source_id")) for event in activations1} != expected_sources:
+        _error("causal Epoch-1 phase lacks every survivor activation")
+    activation1_ns = max(
+        _integer(event.get("source_monotonic_ns"), "Epoch-1 activation timestamp")
+        for event in activations1
+    )
+    observations = [
+        event for event in events if event.get("event_type") == "block.commit_observed"
+    ]
+    common1_ns = _first_common_commit_anchor(
+        authoritative_commits,
+        observations,
+        epoch_number=1,
+        after_ns=activation1_ns,
+        contract=contract,
+    )
+    epoch1_start = max(activation1_ns, common1_ns) + stabilization_ns
+    epoch1_end = epoch1_start + width_ns
+
+    windows: list[tuple[str, int, int, int]] = [
+        ("baseline", baseline_start, prefault_ns, 0),
+        ("fault", fault_ns, fault_ns + width_ns, 0),
+        ("epoch1", epoch1_start, epoch1_end, 1),
+    ]
+    if epoch2 is not None:
+        command2_times = [
+            _integer(event.get("source_monotonic_ns"), "Epoch-2 command timestamp")
+            for event in events
+            if event.get("event_type") == "epoch.command_committed"
+            and _mapping(event.get("payload"), "Epoch-2 command").get(
+                "successor_epoch_number"
+            )
+            == 2
+        ]
+        if not command2_times or epoch1_end >= min(command2_times):
+            _error("causal Epoch-1 window overlaps the Epoch-2 transition")
+        activations2 = [
+            event
+            for event in events
+            if event.get("event_type") == "epoch.activated"
+            and _mapping(event.get("payload"), "Epoch-2 activation").get("epoch_number")
+            == 2
+        ]
+        if {str(event.get("source_id")) for event in activations2} != expected_sources:
+            _error("causal late phase lacks every survivor Epoch-2 activation")
+        activation2_ns = max(
+            _integer(event.get("source_monotonic_ns"), "Epoch-2 activation timestamp")
+            for event in activations2
+        )
+        common2_ns = _first_common_commit_anchor(
+            authoritative_commits,
+            observations,
+            epoch_number=2,
+            after_ns=activation2_ns,
+            contract=contract,
+        )
+        late_start = max(activation2_ns, common2_ns) + stabilization_ns
+        late_epoch = 2
+    else:
+        late_start = epoch1_end + control_hold_ns
+        late_epoch = 1
+    windows.append(("late", late_start, late_start + width_ns, late_epoch))
+
+    if tuple(name for name, _start, _end, _epoch in windows) != tuple(
+        contract["phase_names"]
+    ):
+        _error("causal phase identities drifted")
+    if any(right[1] < left[2] for left, right in zip(windows, windows[1:])):
+        _error("causal phase windows overlap")
+    for phase, start, end, expected_epoch in windows:
+        phase_commits = [
+            event
+            for event in authoritative_commits
+            if start
+            <= _integer(event.get("source_monotonic_ns"), "phase commit timestamp")
+            < end
+        ]
+        if (
+            (phase != "fault" and not phase_commits)
+            or any(
+                _event_epoch(event, f"{phase} commit") != expected_epoch
+                for event in phase_commits
+            )
+            or (
+                phase != "fault"
+                and sum(
+                    _integer(
+                        _mapping(event.get("payload"), f"{phase} commit").get(
+                            "transaction_count"
+                        ),
+                        f"{phase} transactions",
+                    )
+                    for event in phase_commits
+                )
+                <= 0
+            )
+        ):
+            _error("causal phase transactions or exact epoch drifted")
+    return windows
+
+
 def _commit_reconstruction(
     root: Path,
     events: Sequence[Mapping[str, Any]],
@@ -2488,7 +2846,8 @@ def _commit_reconstruction(
         _error("raw evidence lacks the minimum authoritative commit chain")
     profile = _mapping(contract.get("profile"), "focused profile")
     is_v3 = (
-        profile.get("profile_id") in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        profile.get("profile_id")
+        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
     )
     configurations_by_source_epoch: dict[
         tuple[str, int], list[tuple[tuple[int, int], int]]
@@ -2703,7 +3062,36 @@ def _commit_reconstruction(
     recorded = _sequence(phase_document.get("phases"), "phase windows")
     phase_names = tuple(str(name) for name in contract["phase_names"])
     width_ns = int(contract["bucket_width_seconds"]) * 1_000_000_000
-    if recorded:
+    if contract.get("profile_id") in _FCRASH_H_V4_PROFILE_IDS:
+        _error("v4 evidence lacks the frozen causal phase-window contract")
+    if _is_v5_contract(contract):
+        if (
+            set(phase_document) != {"schema_version", "domain", "phases"}
+            or phase_document.get("schema_version") != 1
+            or phase_document.get("domain") != "kauri-focused-causal-phase-windows-v1"
+            or not recorded
+        ):
+            _error("v5 causal phase-window document drifted")
+        derived = _v5_causal_phase_windows(
+            root,
+            events,
+            authoritative_commits,
+            epoch2,
+            contract,
+        )
+        expected_rows = [
+            {
+                "phase": phase,
+                "start_ns": start,
+                "end_ns": end,
+                "epoch_number": epoch,
+            }
+            for phase, start, end, epoch in derived
+        ]
+        if list(recorded) != expected_rows:
+            _error("recorded causal phase windows differ from independent replay")
+        windows = [(phase, start, end) for phase, start, end, _epoch in derived]
+    elif recorded:
         if len(recorded) != len(phase_names):
             _error("phase window count drifted")
         windows: list[tuple[str, int, int]] = []
@@ -2732,7 +3120,8 @@ def _commit_reconstruction(
             for event in authoritative_commits
             if start <= int(event["source_monotonic_ns"]) < end
         )
-        if transaction_count <= 0:
+        allow_zero_fault = _is_v5_contract(contract) and phase == "fault"
+        if not allow_zero_fault and transaction_count <= 0:
             _error("throughput phase has no authoritative committed transactions")
         phase_rows.append(
             {
@@ -2829,7 +3218,7 @@ def _validate_manager_boundary(
     expected_transition_count = (
         transition_count
         if _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
         else int(contract["adaptive_transition_count"])
     )
     if counts.get("--transition-request") != expected_transition_count:
@@ -3513,9 +3902,7 @@ def validate_sealed_arm(
     _validate_runtime_configuration(root, contract)
     events, source_inventory = _validate_sources(
         root,
-        require_controller_failure=str(
-            _mapping(contract["profile"], "focused profile").get("profile_id")
-        ).endswith("-v4"),
+        require_controller_failure=_is_v4_contract(contract),
     )
 
     issuer_path = root / "raw" / "issuer-public-key.txt"
@@ -3560,7 +3947,7 @@ def validate_sealed_arm(
     epoch1_roots = (
         _containment_roots(containment_ranked_ids, contract)
         if _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS | _FCRASH_H_V4_PROFILE_IDS
+        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
         else tuple(range(int(contract["quorum"])))
     )
     _validate_trees(epoch1, epoch1_roots, "Epoch 1", contract)
@@ -3660,9 +4047,7 @@ def validate_sealed_arm(
             <= epoch2_audit_ns
         ):
             _error("Epoch 2 command precedes the fresh common-commit window")
-    if str(_mapping(contract["profile"], "focused profile").get("profile_id")).endswith(
-        "-v4"
-    ):
+    if _is_v4_contract(contract):
         _validate_v4_pass_terminals(
             events,
             contract=contract,

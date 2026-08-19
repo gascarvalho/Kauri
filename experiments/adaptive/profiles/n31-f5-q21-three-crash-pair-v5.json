@@ -1,0 +1,149 @@
+{
+  "blinding": {
+    "forbidden": [
+      "crash_ids",
+      "target_pids",
+      "target_pgids",
+      "process_state",
+      "performance_labels"
+    ],
+    "manager_input_source": "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+  },
+  "campaign": {
+    "automatic_retries": 0,
+    "claim_slot_count": 10,
+    "outcome_dependent_order": false,
+    "pair_count": 5,
+    "replacement_policy": "none"
+  },
+  "campaign_member": true,
+  "evidence_guard": {
+    "horizon_tree_positions": 16,
+    "minimum_score_drop": 22,
+    "minimum_timeouts_per_reporter": 2,
+    "required_postfault_tree_positions": 16,
+    "required_qualifying_reporters": 11,
+    "schedule": "native_cyclic_epoch_zero",
+    "tree_switch_period_blocks": 2
+  },
+  "execution_class": "n31_focused",
+  "fault": {
+    "automatic_retries": 0,
+    "kind": "atomic_process_group_sigkill",
+    "replacement_policy": "none",
+    "signal_number": 9,
+    "target_count": 3
+  },
+  "fault_window_arm": {
+    "domain": "epoch_zero_native_cyclic_tree_positions",
+    "manager_visibility": "target-identity/process-state blind; intervention-boundary aware",
+    "ordered_tree_prefix": [
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "required_for_new_executions": true,
+    "required_postfault_tree_positions": 16,
+    "schema_version": 1
+  },
+  "figure_eligible": true,
+  "frozen": true,
+  "matched_inputs": {
+    "shared_build": true,
+    "shared_epoch1_structure": true,
+    "shared_pair_seed": true,
+    "shared_revision": true,
+    "shared_workload": true
+  },
+  "measurement": {
+    "authoritative_replica_id": 0,
+    "bucket_width_seconds": 5,
+    "commit_event_type": "block.committed",
+    "phase_window_contract": {
+      "control_optimization_hold_seconds": 30,
+      "domain": "kauri-focused-causal-phase-windows-v1",
+      "schema_version": 1,
+      "stabilization_offset_seconds": 30
+    },
+    "phase_names": [
+      "baseline",
+      "fault",
+      "epoch1",
+      "late"
+    ]
+  },
+  "performance": {
+    "initial_root_top_ranked": false,
+    "labels_or_fault_truth_manager_visible": false,
+    "responsive_tiers": [
+      "fast",
+      "medium",
+      "slow"
+    ]
+  },
+  "ports": {
+    "base": 20000,
+    "require_available": true,
+    "stride": 1
+  },
+  "profile_id": "n31-f5-q21-three-crash-pair-v5",
+  "protocol": {
+    "N": 31,
+    "Q": 21,
+    "f": 10,
+    "fanout": 5,
+    "pipeline_stretch": 2,
+    "transactions_per_block": 1000
+  },
+  "schema_version": 2,
+  "thresholds": {
+    "adaptive_ratio_min_ppm": 1100000,
+    "containment_over_baseline_min_ppm": 800000,
+    "paired_ratio_min_ppm": 1100000
+  },
+  "timers": {
+    "adaptation_interval_seconds": 30,
+    "arm_hard_deadline_seconds": 480,
+    "containment_activation_deadline_seconds": 270,
+    "manager_convergence_timeout_seconds": 60,
+    "nonresponse_evidence_deadline_seconds": 180,
+    "optimization_activation_deadline_seconds": 90,
+    "readiness_timeout_seconds": 60,
+    "stable_phase_seconds": 30
+  },
+  "topology": {
+    "active_tree_id": 20,
+    "epoch_zero_digest": "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a",
+    "proof_path": "topology-proofs/n31-f5-q21-three-crash-pair-v5-topology-proof.json",
+    "proof_sha256": "197650f1d4b4c2e0db950ad8dc191a830a36c3d412971036b03a283b245b381e",
+    "reviewed_target_replica_ids": [
+      22,
+      23,
+      24
+    ]
+  },
+  "transitions": {
+    "adaptive": [
+      "epoch1",
+      "epoch2"
+    ],
+    "common_commit_quorum": 21,
+    "control": [
+      "epoch1"
+    ],
+    "survivor_barrier_count": 28
+  }
+}

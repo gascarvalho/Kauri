@@ -666,6 +666,29 @@ def test_validator_contract_is_derived_from_each_focused_profile(
     )
 
 
+def test_validator_rejects_rebound_noncanonical_v5_profile(tmp_path: Path) -> None:
+    validation = _validation()
+    profile = json.loads(runtime_fixture.N31_PROFILE_V5.read_text(encoding="utf-8"))
+    source_proof = runtime_fixture._topology_proof_path(
+        runtime_fixture.N31_PROFILE_V5, profile
+    )
+    proof = json.loads(source_proof.read_text(encoding="utf-8"))
+    profile["timers"]["arm_hard_deadline_seconds"] = 481
+    proof["profile_sha256"] = runtime_fixture._canonical_profile_sha256(profile)
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True)
+    _write_json(proof_path, proof)
+    profile["topology"]["proof_sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    _write_json(tmp_path / "profile.json", profile)
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="not the frozen reviewed identity",
+    ):
+        validation.validation_contract_from_profile(tmp_path)
+
+
 @pytest.mark.parametrize(
     "profile_path", (runtime_fixture.N7_PROFILE_V2, runtime_fixture.N31_PROFILE_V2)
 )
@@ -4520,6 +4543,323 @@ def test_v3_commit_reconstruction_rejects_epoch_packed_generation_drift(
         epoch1_commit["payload"]["decision_proof"]["extra"] = True
     else:
         commits[2]["payload"]["view_generation"] = (1 << 32) + 1
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._commit_reconstruction(root, events, epoch1, epoch2, contract)
+
+
+def _v5_causal_phase_window_fixture(
+    tmp_path: Path,
+    *,
+    arm: str = "adaptive",
+) -> tuple[Path, list[dict[str, object]], object, object, dict[str, object]]:
+    """Minimal v5 causal anchors with deliberately gapped 5-second windows."""
+
+    root = tmp_path / "v5-causal-windows"
+    root.mkdir()
+    second = 1_000_000_000
+    e0_digest, e1_digest, e2_digest = ("0" * 64, "1" * 64, "2" * 64)
+    e1 = SimpleNamespace(epoch_digest=e1_digest, trees=(SimpleNamespace(tree_id=0),))
+    e2 = (
+        SimpleNamespace(epoch_digest=e2_digest, trees=(SimpleNamespace(tree_id=0),))
+        if arm == "adaptive"
+        else None
+    )
+    instance = "v5-run-replica-0"
+
+    def commit(epoch: int, height: int, timestamp: int) -> dict[str, object]:
+        digest = (e0_digest, e1_digest, e2_digest)[epoch]
+        block_hash = f"{height:064x}"
+        return {
+            "source_kind": "replica",
+            "source_id": "replica-0",
+            "source_instance": instance,
+            "source_sequence": height,
+            "source_monotonic_ns": timestamp,
+            "event_type": "block.committed",
+            "payload": {
+                "block_height": height,
+                "block_hash": block_hash,
+                "parent_hash": "0" * 64 if height == 1 else f"{height - 1:064x}",
+                "transaction_count": 1000,
+                "commit_batch_index": 0,
+                "designated_observer": True,
+                "view_generation": 1,
+                "decision_proof": {
+                    "epoch_number": epoch,
+                    "tree_id": 0,
+                    "epoch_digest": digest,
+                    "block_hash": block_hash,
+                },
+            },
+        }
+
+    commits = [
+        commit(0, 1, 5 * second),
+        commit(0, 2, 36 * second),
+        commit(0, 3, 49 * second),
+        commit(1, 4, 60 * second),
+        commit(1, 5, 91 * second),
+        *(
+            [commit(2, 6, 110 * second), commit(2, 7, 141 * second)]
+            if arm == "adaptive"
+            else [commit(1, 6, 126 * second)]
+        ),
+    ]
+    events: list[dict[str, object]] = [*commits]
+    for item in commits:
+        payload = item["payload"]
+        assert isinstance(payload, dict)
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": instance,
+                "source_sequence": int(item["source_sequence"]) + 10,
+                "source_monotonic_ns": int(item["source_monotonic_ns"]),
+                "event_type": "block.commit_observed",
+                "payload": {
+                    key: payload[key]
+                    for key in (
+                        "block_height",
+                        "block_hash",
+                        "parent_hash",
+                        "transaction_count",
+                        "commit_batch_index",
+                    )
+                },
+            }
+        )
+    events.extend(
+        {
+            "source_kind": "replica",
+            "source_id": "replica-0",
+            "source_instance": instance,
+            "source_sequence": 30 + epoch,
+            "source_monotonic_ns": timestamp * second,
+            "event_type": "epoch.activated",
+            "payload": {"epoch_number": epoch, "epoch_digest": digest},
+        }
+        for epoch, digest, timestamp in (
+            ((1, e1_digest, 55), (2, e2_digest, 105))
+            if arm == "adaptive"
+            else ((1, e1_digest, 55),)
+        )
+    )
+    events.extend(
+        {
+            "source_kind": "replica",
+            "source_id": "replica-0",
+            "source_instance": instance,
+            "source_sequence": 40 + epoch,
+            "source_monotonic_ns": timestamp * second,
+            "event_type": "epoch.command_committed",
+            "payload": {"successor_epoch_number": epoch},
+        }
+        for epoch, timestamp in (
+            ((1, 50), (2, 100)) if arm == "adaptive" else ((1, 50),)
+        )
+    )
+    _write_json(
+        root / "raw" / "fault-receipt.json",
+        {
+            "sigkill_outcomes": [
+                {
+                    "requested_monotonic_ns": 40 * second,
+                    "confirmed_monotonic_ns": 40 * second,
+                },
+            ]
+        },
+    )
+    phases = [
+        {
+            "phase": "baseline",
+            "start_ns": 35 * second,
+            "end_ns": 40 * second,
+            "epoch_number": 0,
+        },
+        {
+            "phase": "fault",
+            "start_ns": 40 * second,
+            "end_ns": 45 * second,
+            "epoch_number": 0,
+        },
+        {
+            "phase": "epoch1",
+            "start_ns": 90 * second,
+            "end_ns": 95 * second,
+            "epoch_number": 1,
+        },
+        {
+            "phase": "late",
+            "start_ns": (140 if arm == "adaptive" else 125) * second,
+            "end_ns": (145 if arm == "adaptive" else 130) * second,
+            "epoch_number": 2 if arm == "adaptive" else 1,
+        },
+    ]
+    _write_json(
+        root / "derived" / "phase-windows.json",
+        {
+            "schema_version": 1,
+            "domain": "kauri-focused-causal-phase-windows-v1",
+            "phases": phases,
+        },
+    )
+    contract = {
+        "profile_id": "n31-f5-q21-three-crash-pair-v5",
+        "authoritative_source_id": "replica-0",
+        "profile": {
+            "profile_id": "synthetic-causal-phase-fixture",
+            "timers": {"stable_phase_seconds": 30},
+            "measurement": {
+                "bucket_width_seconds": 5,
+                "phase_names": ("baseline", "fault", "epoch1", "late"),
+                "phase_window_contract": {
+                    "schema_version": 1,
+                    "domain": "kauri-focused-causal-phase-windows-v1",
+                    "stabilization_offset_seconds": 30,
+                    "control_optimization_hold_seconds": 30,
+                },
+            },
+        },
+        "arm": arm,
+        "members": (0,),
+        "survivors": (0,),
+        "quorum": 1,
+        "epoch_zero_digest": e0_digest,
+        "transactions_per_block": 1000,
+        "phase_names": ("baseline", "fault", "epoch1", "late"),
+        "bucket_width_seconds": 5,
+        "phase_window_contract": {
+            "schema_version": 1,
+            "domain": "kauri-focused-causal-phase-windows-v1",
+            "stabilization_offset_seconds": 30,
+            "control_optimization_hold_seconds": 30,
+        },
+    }
+    return root, events, e1, e2, contract
+
+
+def test_v5_causal_phase_reconstruction_accepts_gapped_windows(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    root, events, epoch1, epoch2, contract = _v5_causal_phase_window_fixture(tmp_path)
+    _commits, measurements = validation._commit_reconstruction(
+        root, events, epoch1, epoch2, contract
+    )
+    assert [phase["phase"] for phase in measurements["phases"]] == [
+        "baseline",
+        "fault",
+        "epoch1",
+        "late",
+    ]
+    assert measurements["phases"][1]["transactions"] == 0
+
+
+def test_v4_phase_fallback_is_not_figure_acceptable(tmp_path: Path) -> None:
+    validation = _validation()
+    root, events, epoch1, epoch2, contract = _v5_causal_phase_window_fixture(tmp_path)
+    contract["profile_id"] = "n31-f5-q21-three-crash-pair-v4"
+    contract.pop("phase_window_contract")
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="lacks the frozen causal phase-window contract",
+    ):
+        validation._commit_reconstruction(root, events, epoch1, epoch2, contract)
+
+
+@pytest.mark.parametrize("profile_id", ("synthetic-v1", "synthetic-v2", "synthetic-v3"))
+def test_archived_phase_fault_still_requires_positive_transactions(
+    profile_id: str, tmp_path: Path
+) -> None:
+    validation = _validation()
+    root, events, epoch1, epoch2, contract = _v5_causal_phase_window_fixture(tmp_path)
+    contract["profile_id"] = profile_id
+    contract.pop("phase_window_contract")
+    phase_path = root / "derived" / "phase-windows.json"
+    phase_document = json.loads(phase_path.read_text())
+    for index, phase in enumerate(phase_document["phases"]):
+        phase["start_ns"] = (35 + index * 5) * 1_000_000_000
+        phase["end_ns"] = (40 + index * 5) * 1_000_000_000
+    _write_json(phase_path, phase_document)
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="throughput phase has no authoritative committed transactions",
+    ):
+        validation._commit_reconstruction(root, events, epoch1, epoch2, contract)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "empty",
+        "run-start-fallback",
+        "boundary-crossing",
+        "wrong-proof-epoch",
+        "missing-e2-late",
+        "control-before-hold",
+        "overlap",
+        "zero-transactions",
+        "wrong-epoch-fault",
+        "command-at-fault-end",
+    ),
+)
+def test_v5_causal_phase_reconstruction_rejects_unanchored_or_invalid_windows(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    arm = "control" if mutation == "control-before-hold" else "adaptive"
+    root, events, epoch1, epoch2, contract = _v5_causal_phase_window_fixture(
+        tmp_path, arm=arm
+    )
+    path = root / "derived" / "phase-windows.json"
+    document = json.loads(path.read_text())
+    phases = document["phases"]
+    if mutation in {"empty", "run-start-fallback"}:
+        document["phases"] = []
+    elif mutation == "boundary-crossing":
+        phases[0]["end_ns"] += 1_000_000_000
+    elif mutation == "wrong-proof-epoch":
+        phases[-1]["epoch_number"] = 1
+    elif mutation == "missing-e2-late":
+        events = [
+            event
+            for event in events
+            if not (
+                event["event_type"] == "block.committed"
+                and event["payload"]["decision_proof"]["epoch_number"] == 2
+            )
+        ]
+    elif mutation == "control-before-hold":
+        phases[-1].update(
+            {"start_ns": 59_000_000_000, "end_ns": 64_000_000_000, "epoch_number": 1}
+        )
+        epoch2 = None
+    elif mutation == "overlap":
+        phases[2]["start_ns"] = phases[1]["end_ns"] - 1
+        phases[2]["end_ns"] = phases[2]["start_ns"] + 5_000_000_000
+    elif mutation == "wrong-epoch-fault":
+        wrong = deepcopy(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "block.committed"
+                and event["payload"]["decision_proof"]["epoch_number"] == 1
+            )
+        )
+        wrong["source_monotonic_ns"] = 12_000_000_000
+        events.append(wrong)
+    elif mutation == "command-at-fault-end":
+        for event in events:
+            if (
+                event["event_type"] == "epoch.command_committed"
+                and event["payload"]["successor_epoch_number"] == 1
+            ):
+                event["source_monotonic_ns"] = 15_000_000_000
+    else:
+        phases[-1].update({"start_ns": 104_000_000_000, "end_ns": 109_000_000_000})
+    _write_json(path, document)
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation._commit_reconstruction(root, events, epoch1, epoch2, contract)
 

@@ -44,10 +44,10 @@ class FocusedCrashPairCliError(RuntimeError):
 FOCUSED_LAUNCH_BACKEND = FocusedLaunchBackend()
 FOCUSED_PREFLIGHT_CHECKS: object = FocusedLivePreflightChecks
 _PROFILE_DIRECTORY = Path(__file__).resolve().parent / "profiles"
-_V4_PROFILES = {
-    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v4.json",
-    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v4.json",
-    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v4.json",
+_V5_PROFILES = {
+    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v5.json",
+    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v5.json",
+    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v5.json",
 }
 
 
@@ -645,23 +645,30 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
-    expected = (
-        "n7-f2-q5-two-crash-pair-smoke-v4"
-        if mode == "smoke"
-        else "n31-f5-q21-three-crash-pair-v4"
-    )
-    if profile.profile_id != expected:
+    canonical_path = _V5_PROFILES.get(mode)
+    if canonical_path is None:
+        raise FocusedCrashPairCliError("execution mode has no frozen v5 profile")
+    canonical = load_focused_profile(canonical_path)
+    if (
+        profile.profile_id,
+        profile.profile_sha256,
+        profile.topology_proof_sha256,
+    ) != (
+        canonical.profile_id,
+        canonical.profile_sha256,
+        canonical.topology_proof_sha256,
+    ):
         raise FocusedCrashPairCliError(
             "execution mode is not bound to the required frozen profile"
         )
 
 
 def _profile_path(profile: Path | None, mode: str) -> Path:
-    """Use the immutable v4 profile unless an explicit path is supplied."""
+    """Use the immutable v5 profile unless an explicit path is supplied."""
 
-    if mode not in _V4_PROFILES:
-        raise FocusedCrashPairCliError("execution mode has no frozen v4 profile")
-    return _V4_PROFILES[mode] if profile is None else profile
+    if mode not in _V5_PROFILES:
+        raise FocusedCrashPairCliError("execution mode has no frozen v5 profile")
+    return _V5_PROFILES[mode] if profile is None else profile
 
 
 def _authorized_execution(

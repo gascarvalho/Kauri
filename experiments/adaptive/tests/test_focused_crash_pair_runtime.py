@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from contextlib import nullcontext
 from dataclasses import asdict, fields, is_dataclass, replace
 import hashlib
 import importlib
@@ -30,6 +31,8 @@ N31_PROFILE_V2 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v2.json"
 N7_PROFILE_V3 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v3.json"
 N31_PROFILE_V3 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v3.json"
 N31_PROFILE_V4 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v4.json"
+N7_PROFILE_V5 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v5.json"
+N31_PROFILE_V5 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v5.json"
 
 
 _CONTROLLER_FAILURE_MUTATIONS = (
@@ -1262,6 +1265,439 @@ def test_v3_raw_common_commit_accepts_zero_transaction_workload(
     snapshot = source._common_commit(events, 1)
     assert snapshot is not None
     assert snapshot["transaction_count"] == 0
+
+
+def _v5_runtime_phase_fixture(
+    *, arm: str = "adaptive"
+) -> tuple[object, list[dict[str, object]], dict[str, object], object]:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V5)
+    second = 1_000_000_000
+    digests = ("0" * 64, "1" * 64, "2" * 64)
+    observer = int(profile.raw["measurement"]["authoritative_replica_id"])
+
+    def commit(epoch: int, height: int, timestamp: int) -> dict[str, object]:
+        block_hash = f"{height:064x}"
+        return {
+            "source_kind": "replica",
+            "source_id": f"replica-{observer}",
+            "source_monotonic_ns": timestamp * second,
+            "event_type": "block.committed",
+            "payload": {
+                "block_height": height,
+                "block_hash": block_hash,
+                "parent_hash": "0" * 64 if height == 1 else f"{height - 1:064x}",
+                "transaction_count": 1000,
+                "commit_batch_index": 0,
+                "decision_proof": {
+                    "epoch_number": epoch,
+                    "epoch_digest": digests[epoch],
+                    "tree_id": 0,
+                    "block_hash": block_hash,
+                },
+            },
+        }
+
+    commits = [
+        commit(0, 1, 5),
+        commit(0, 2, 36),
+        commit(0, 3, 49),
+        commit(1, 4, 60),
+        commit(1, 5, 91),
+        *(
+            [commit(2, 6, 110), commit(2, 7, 141)]
+            if arm == "adaptive"
+            else [commit(1, 6, 126)]
+        ),
+    ]
+    events = list(commits)
+    survivors = [
+        replica
+        for replica in profile.replica_ids
+        if replica not in profile.target_replica_ids
+    ]
+    for item in commits:
+        payload = item["payload"]
+        assert isinstance(payload, dict)
+        identity = {
+            key: payload[key]
+            for key in (
+                "block_height",
+                "block_hash",
+                "parent_hash",
+                "transaction_count",
+                "commit_batch_index",
+            )
+        }
+        events.extend(
+            {
+                "source_kind": "replica",
+                "source_id": f"replica-{replica}",
+                "source_monotonic_ns": item["source_monotonic_ns"],
+                "event_type": "block.commit_observed",
+                "payload": dict(identity),
+            }
+            for replica in survivors
+        )
+    events.extend(
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{replica}",
+            "source_monotonic_ns": timestamp * second,
+            "event_type": "epoch.activated",
+            "payload": {"epoch_number": epoch},
+        }
+        for epoch, timestamp in (
+            ((1, 55), (2, 105)) if arm == "adaptive" else ((1, 55),)
+        )
+        for replica in survivors
+    )
+    events.extend(
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{replica}",
+            "source_monotonic_ns": timestamp * second,
+            "event_type": "epoch.command_committed",
+            "payload": {"successor_epoch_number": epoch},
+        }
+        for epoch, timestamp in (
+            ((1, 50), (2, 100)) if arm == "adaptive" else ((1, 50),)
+        )
+        for replica in survivors
+    )
+    receipt = {
+        "sigkill_outcomes": [
+            {
+                "requested_monotonic_ns": 40 * second,
+                "confirmed_monotonic_ns": 40 * second,
+            }
+        ]
+    }
+
+    class PhaseSource:
+        def _common_commit(self, _events: object, _epoch: int) -> dict[str, object]:
+            return {"source_monotonic_ns": 1}
+
+        def _transition(
+            self, _events: object, epoch: int, *, activation: bool
+        ) -> dict[str, object]:
+            assert activation
+            return {"source_monotonic_ns": (55 if epoch == 1 else 105) * second}
+
+    return profile, events, receipt, PhaseSource()
+
+
+@pytest.mark.parametrize(
+    ("arm", "late_epoch", "late_start"),
+    (("adaptive", 2, 140), ("control", 1, 125)),
+)
+def test_v5_runtime_materializes_exact_causal_phase_windows(
+    arm: str, late_epoch: int, late_start: int
+) -> None:
+    runtime = _runtime()
+    profile, events, receipt, source = _v5_runtime_phase_fixture(arm=arm)
+    document = runtime._v5_phase_window_document(profile, arm, events, receipt, source)
+    assert document["domain"] == "kauri-focused-causal-phase-windows-v1"
+    assert document["phases"] == [
+        {
+            "phase": "baseline",
+            "start_ns": 35_000_000_000,
+            "end_ns": 40_000_000_000,
+            "epoch_number": 0,
+        },
+        {
+            "phase": "fault",
+            "start_ns": 40_000_000_000,
+            "end_ns": 45_000_000_000,
+            "epoch_number": 0,
+        },
+        {
+            "phase": "epoch1",
+            "start_ns": 90_000_000_000,
+            "end_ns": 95_000_000_000,
+            "epoch_number": 1,
+        },
+        {
+            "phase": "late",
+            "start_ns": late_start * 1_000_000_000,
+            "end_ns": (late_start + 5) * 1_000_000_000,
+            "epoch_number": late_epoch,
+        },
+    ]
+
+
+def test_v5_runtime_accepts_a_truly_empty_fault_interval() -> None:
+    runtime = _runtime()
+    profile, events, receipt, source = _v5_runtime_phase_fixture()
+    document = runtime._v5_phase_window_document(
+        profile, "adaptive", events, receipt, source
+    )
+    fault = next(row for row in document["phases"] if row["phase"] == "fault")
+    assert not [
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and fault["start_ns"] <= event["source_monotonic_ns"] < fault["end_ns"]
+    ]
+
+
+@pytest.mark.parametrize("mutation", ("wrong-epoch-fault", "command-at-fault-end"))
+def test_v5_runtime_rejects_fault_bucket_epoch_or_transition_drift(
+    mutation: str,
+) -> None:
+    runtime = _runtime()
+    profile, events, receipt, source = _v5_runtime_phase_fixture()
+    if mutation == "wrong-epoch-fault":
+        wrong = deepcopy(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "block.committed"
+                and event["payload"]["decision_proof"]["epoch_number"] == 1
+            )
+        )
+        wrong["source_monotonic_ns"] = 42_000_000_000
+        events.append(wrong)
+    else:
+        for event in events:
+            if (
+                event["event_type"] == "epoch.command_committed"
+                and event["payload"]["successor_epoch_number"] == 1
+            ):
+                event["source_monotonic_ns"] = 45_000_000_000
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._v5_phase_window_document(profile, "adaptive", events, receipt, source)
+
+
+def test_v5_runtime_rejects_phase_without_quorum_common_commit() -> None:
+    runtime = _runtime()
+    profile, events, receipt, source = _v5_runtime_phase_fixture()
+    last_survivor = max(
+        replica
+        for replica in profile.replica_ids
+        if replica not in profile.target_replica_ids
+    )
+    events = [
+        event
+        for event in events
+        if not (
+            event["event_type"] == "block.commit_observed"
+            and event["source_id"] == f"replica-{last_survivor}"
+            and event["payload"]["block_height"] in {6, 7}
+        )
+    ]
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="common commit"):
+        runtime._v5_phase_window_document(profile, "adaptive", events, receipt, source)
+
+
+@pytest.mark.parametrize(("after_fault", "raises"), ((479.0, False), (480.0, True)))
+def test_v5_run_arm_hard_cap_is_anchored_at_fault(
+    after_fault: float,
+    raises: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N31_PROFILE_V5)
+    clock = [100.0]
+    deadlines: list[float | None] = []
+
+    def wait(
+        _name: str, _poll: object, *, deadline_monotonic: float | None
+    ) -> dict[str, object]:
+        deadlines.append(deadline_monotonic)
+        if _name == "fault":
+            return {"receipt": True}
+        if _name == "commit1":
+            clock[0] = 200.0 + after_fault
+        if deadline_monotonic is not None and clock[0] >= deadline_monotonic:
+            raise runtime.FocusedCrashPairRuntimeError("deadline")
+        return {}
+
+    root = tmp_path / "run"
+    root.mkdir()
+    backend = runtime.FocusedLaunchBackend(
+        execute_fault=lambda _c, _p: {"receipt": True}
+    )
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(backend, "_wait_for_snapshot", wait)
+    monkeypatch.setattr(
+        backend, "_wait_for_prefault_configuration", lambda *_a, **_k: []
+    )
+    monkeypatch.setattr(
+        backend, "_wait_for_v4_fault_window_coverage", lambda *_a, **_k: None
+    )
+    monkeypatch.setattr(runtime, "_fault_window_arm_document", lambda *_a: {})
+    monkeypatch.setattr(runtime, "_publish_fault_window_arm", lambda *_a: "a" * 64)
+
+    class Source:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def poll(self, _name: str) -> dict[str, object]:
+            return {"receipt": True} if _name == "fault" else {}
+
+        def unexpected_exit_ids(self) -> tuple[int, ...]:
+            return ()
+
+    monkeypatch.setattr(runtime, "FocusedRawEvidenceSource", Source)
+    monkeypatch.setattr(
+        runtime,
+        "_drive_arm_state_machine",
+        lambda _profile, _arm, _pair, hooks: (
+            hooks.wait_for_stable_phase("baseline"),
+            hooks.inject_atomic_fault_batch(),
+            hooks.wait_for_common_commit(1),
+            {},
+        )[-1],
+    )
+
+    def fault(
+        configuration: Mapping[str, object], processes: object
+    ) -> dict[str, object]:
+        clock[0] = 200.0
+        backend._fault_receipts[str(root.resolve())] = {"receipt": True}
+        return {"receipt": True}
+
+    backend._execute_fault = fault
+    configuration = {
+        "profile": profile,
+        "pair_id": "pair-01",
+        "arm": "control",
+        "run_directory": root,
+        "run_id": "hard-cap",
+        "source_instances": {},
+        "fault_window_arm_path": root / "fault-window-arm.json",
+    }
+    expected = (
+        pytest.raises(runtime.FocusedCrashPairRuntimeError, match="deadline")
+        if raises
+        else nullcontext()
+    )
+    with expected:
+        backend.run_arm(configuration, SimpleNamespace(records=()))
+    assert deadlines == [160.0, 580.0, 680.0, 680.0]
+
+
+def test_v5_runtime_phase_document_matches_validator_reconstruction(
+    tmp_path: Path,
+) -> None:
+    """The producer and source-blind replay derive the same causal windows."""
+
+    runtime = _runtime()
+    validation = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    profile, events, receipt, source = _v5_runtime_phase_fixture(arm="adaptive")
+    document = runtime._v5_phase_window_document(
+        profile, "adaptive", events, receipt, source
+    )
+    root = tmp_path / "same-synthetic-fixture"
+    receipt_path = root / "raw" / "fault-receipt.json"
+    receipt_path.parent.mkdir(parents=True)
+    receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+    measurement = profile.raw["measurement"]
+    assert isinstance(measurement, Mapping)
+    contract = {
+        "profile": profile.raw,
+        "phase_window_contract": measurement["phase_window_contract"],
+        "bucket_width_seconds": measurement["bucket_width_seconds"],
+        "phase_names": measurement["phase_names"],
+        "members": profile.replica_ids,
+        "survivors": tuple(
+            replica
+            for replica in profile.replica_ids
+            if replica not in profile.target_replica_ids
+        ),
+        "quorum": profile.quorum,
+        "authoritative_source_id": "replica-0",
+    }
+    commits = [event for event in events if event["event_type"] == "block.committed"]
+    derived = validation._v5_causal_phase_windows(
+        root, events, commits, object(), contract
+    )
+    assert document["phases"] == [
+        {
+            "phase": phase,
+            "start_ns": start,
+            "end_ns": end,
+            "epoch_number": epoch,
+        }
+        for phase, start, end, epoch in derived
+    ]
+
+
+def test_v5_default_materializer_writes_phase_document_from_finalized_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V5)
+    root = tmp_path / "arm"
+    for relative in (
+        "raw",
+        "runtime",
+        "derived",
+        "transitions/e0-to-e1-containment",
+    ):
+        (root / relative).mkdir(parents=True, exist_ok=True)
+    (root / "raw" / "replica-0.jsonl").write_bytes(
+        _canonical_json({"source_kind": "replica", "source_id": "replica-0"})
+    )
+    (root / "raw" / "adaptive-manager.jsonl").write_bytes(
+        _canonical_json(
+            {"source_kind": "adaptation_manager", "source_id": "adaptive-manager"}
+        )
+    )
+    (root / "raw" / "client-events.jsonl").write_bytes(b"")
+    (root / "transitions" / "e0-to-e1-containment" / "successor.bundle").write_bytes(
+        b"signed-bundle"
+    )
+    receipt = {"schema_version": 1, "sigkill_outcomes": []}
+    (root / "raw" / "fault-receipt.json").write_bytes(_canonical_json(receipt))
+    expected_document = {
+        "schema_version": 1,
+        "domain": "kauri-focused-causal-phase-windows-v1",
+        "phases": [{"phase": "sentinel"}],
+    }
+    captured: list[Mapping[str, object]] = []
+
+    class Source:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def _events(self) -> list[dict[str, object]]:
+            return [{"validated": True}]
+
+    def phase_document(
+        _profile: object,
+        _arm: str,
+        events: Sequence[Mapping[str, object]],
+        finalized_receipt: Mapping[str, object],
+        _source: object,
+    ) -> dict[str, object]:
+        assert events == [{"validated": True}]
+        captured.append(finalized_receipt)
+        return expected_document
+
+    monkeypatch.setattr(runtime, "FocusedRawEvidenceSource", Source)
+    monkeypatch.setattr(runtime, "_v5_phase_window_document", phase_document)
+    backend = runtime.FocusedLaunchBackend()
+    backend._fault_receipts[str(root.resolve())] = receipt
+    backend.materialize_artifacts(
+        {
+            "run_directory": root,
+            "run_id": "v5-materializer-run",
+            "source_instances": {},
+            "profile": profile,
+            "arm": "control",
+        },
+        {"runtime_graph": "complete"},
+        {"complete": True, "outcomes": []},
+    )
+    assert captured == [receipt]
+    assert json.loads((root / "derived" / "phase-windows.json").read_bytes()) == (
+        expected_document
+    )
 
 
 def test_v3_raw_common_commit_caches_lifecycle_identity_per_source(

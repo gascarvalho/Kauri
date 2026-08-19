@@ -165,7 +165,11 @@ def _sha256(value: bytes) -> str:
 
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith("-v4")
+    return str(getattr(profile, "profile_id", "")).endswith(("-v4", "-v5"))
+
+
+def _is_v5_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v5")
 
 
 def _fault_window_arm_path(run_directory: Path) -> Path:
@@ -676,7 +680,9 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     schema_version = profile.get("schema_version")
     expected_keys = (
         _PROFILE_KEYS_V4
-        if str(profile.get("profile_id", "")).endswith("-v4")
+        if _is_v4_profile(
+            SimpleNamespace(profile_id=str(profile.get("profile_id", "")))
+        )
         else _PROFILE_KEYS_V2 if schema_version == 2 else _PROFILE_KEYS
     )
     if set(profile) != expected_keys or schema_version not in {1, 2}:
@@ -751,6 +757,45 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     if fault.get("target_count") != len(targets):
         _error("profile fault cardinality differs from the proven targets")
     measurement = _document(profile.get("measurement"), "profile measurement")
+    expected_measurement_keys = {
+        "authoritative_replica_id",
+        "bucket_width_seconds",
+        "commit_event_type",
+        "phase_names",
+    }
+    if _is_v5_profile(SimpleNamespace(profile_id=profile_id)):
+        expected_measurement_keys.add("phase_window_contract")
+    if set(measurement) != expected_measurement_keys:
+        _error("profile measurement schema drifted")
+    if _is_v5_profile(SimpleNamespace(profile_id=profile_id)):
+        phase_contract = _document(
+            measurement.get("phase_window_contract"),
+            "phase-window contract",
+        )
+        if (
+            set(phase_contract)
+            != {
+                "schema_version",
+                "domain",
+                "stabilization_offset_seconds",
+                "control_optimization_hold_seconds",
+            }
+            or phase_contract.get("schema_version") != 1
+            or phase_contract.get("domain") != "kauri-focused-causal-phase-windows-v1"
+            or _integer(
+                phase_contract.get("stabilization_offset_seconds"),
+                "phase stabilization offset",
+                1,
+            )
+            != 30
+            or _integer(
+                phase_contract.get("control_optimization_hold_seconds"),
+                "control optimization hold",
+                1,
+            )
+            != 30
+        ):
+            _error("phase-window contract drifted")
     observer = _integer(
         measurement.get("authoritative_replica_id"),
         "authoritative replica",
@@ -2577,7 +2622,7 @@ class FocusedRawEvidenceSource:
             "baseline_evidence_cutoff",
             "current_evidence_cutoff",
         }
-        requires_controller_failure = self._profile.profile_id.endswith("-v4")
+        requires_controller_failure = _is_v4_profile(self._profile)
         for event in events:
             if event["event_type"] != "adaptive_v2_session_terminal":
                 continue
@@ -4560,6 +4605,49 @@ class FocusedRawEvidenceSource:
             commit = self._common_commit(events, 1)
             if commit is None:
                 return None
+            if _is_v5_profile(self._profile):
+                activation = self._transition(events, 1, activation=True)
+                if activation is None:
+                    return None
+                width_ns, stabilization_ns, _control_hold_ns = _v5_phase_parameters(
+                    self._profile
+                )
+                activation_ns = _integer(
+                    activation.get("source_monotonic_ns"),
+                    "Epoch-1 activation timestamp",
+                )
+                common_ns = _runtime_first_common_commit_anchor(
+                    events,
+                    self._profile,
+                    epoch_number=1,
+                    after_ns=activation_ns,
+                )
+                start_ns = max(activation_ns, common_ns) + stabilization_ns
+                end_ns = start_ns + width_ns
+                authoritative = _runtime_authoritative_commits(events, self._profile)
+                if (
+                    not authoritative
+                    or max(
+                        _integer(
+                            event.get("source_monotonic_ns"),
+                            "authoritative commit timestamp",
+                        )
+                        for event in authoritative
+                    )
+                    < end_ns
+                    or not _runtime_phase_has_transactions(
+                        authoritative,
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        epoch_number=1,
+                    )
+                ):
+                    return None
+                return {
+                    "stable": True,
+                    "epoch_number": 1,
+                    "source_monotonic_ns": end_ns,
+                }
             stable_duration_ns = (
                 _integer(
                     _document(self._profile.raw["timers"], "profile timers").get(
@@ -4625,6 +4713,53 @@ class FocusedRawEvidenceSource:
             final = self._common_commit(events, 2 if self._arm == "A" else 1)
             if final is None:
                 return None
+            if _is_v5_profile(self._profile):
+                final_epoch = 2 if self._arm == "A" else 1
+                activation = self._transition(events, final_epoch, activation=True)
+                if activation is None:
+                    return None
+                width_ns, stabilization_ns, control_hold_ns = _v5_phase_parameters(
+                    self._profile
+                )
+                activation_ns = _integer(
+                    activation.get("source_monotonic_ns"),
+                    "final activation timestamp",
+                )
+                common_ns = _runtime_first_common_commit_anchor(
+                    events,
+                    self._profile,
+                    epoch_number=final_epoch,
+                    after_ns=activation_ns,
+                )
+                start_ns = max(activation_ns, common_ns) + stabilization_ns
+                if self._arm == "C":
+                    start_ns += width_ns + control_hold_ns
+                end_ns = start_ns + width_ns
+                authoritative = _runtime_authoritative_commits(events, self._profile)
+                if (
+                    not authoritative
+                    or max(
+                        _integer(
+                            event.get("source_monotonic_ns"),
+                            "authoritative commit timestamp",
+                        )
+                        for event in authoritative
+                    )
+                    < end_ns
+                    or not _runtime_phase_has_transactions(
+                        authoritative,
+                        start_ns=start_ns,
+                        end_ns=end_ns,
+                        epoch_number=final_epoch,
+                    )
+                ):
+                    return None
+                return {
+                    "stable": True,
+                    "held_epoch_number": final_epoch,
+                    "epoch2_present": self._arm == "A",
+                    "source_monotonic_ns": end_ns,
+                }
             stable_duration_ns = (
                 _integer(
                     _document(self._profile.raw["timers"], "profile timers").get(
@@ -4689,6 +4824,307 @@ class FocusedRawEvidenceSource:
             rebuild_ranking=lambda: self._wait("ranking"),
             unexpected_exit_ids=self.unexpected_exit_ids,
         )
+
+
+def _v5_phase_parameters(profile: FocusedProfile) -> tuple[int, int, int]:
+    if not _is_v5_profile(profile):
+        _error("causal phase parameters require a v5 profile")
+    measurement = _document(profile.raw.get("measurement"), "profile measurement")
+    phase_contract = _document(
+        measurement.get("phase_window_contract"), "phase-window contract"
+    )
+    return (
+        _integer(measurement.get("bucket_width_seconds"), "bucket width", 1)
+        * 1_000_000_000,
+        _integer(
+            phase_contract.get("stabilization_offset_seconds"),
+            "phase stabilization offset",
+            1,
+        )
+        * 1_000_000_000,
+        _integer(
+            phase_contract.get("control_optimization_hold_seconds"),
+            "control optimization hold",
+            1,
+        )
+        * 1_000_000_000,
+    )
+
+
+def _runtime_commit_epoch(event: Mapping[str, Any], label: str) -> int:
+    payload = _document(event.get("payload"), label)
+    proof = _document(payload.get("decision_proof"), f"{label} proof")
+    return _integer(proof.get("epoch_number"), f"{label} epoch")
+
+
+def _runtime_authoritative_commits(
+    events: Sequence[Mapping[str, Any]], profile: FocusedProfile
+) -> list[Mapping[str, Any]]:
+    observer = _integer(
+        _document(profile.raw.get("measurement"), "profile measurement").get(
+            "authoritative_replica_id"
+        ),
+        "authoritative replica",
+    )
+    return [
+        event
+        for event in events
+        if event.get("event_type") == "block.committed"
+        and event.get("source_kind") == "replica"
+        and event.get("source_id") == f"replica-{observer}"
+    ]
+
+
+def _runtime_first_common_commit_anchor(
+    events: Sequence[Mapping[str, Any]],
+    profile: FocusedProfile,
+    *,
+    epoch_number: int,
+    after_ns: int,
+) -> int:
+    commits = _runtime_authoritative_commits(events, profile)
+    survivors = {
+        f"replica-{replica}"
+        for replica in profile.replica_ids
+        if replica not in profile.target_replica_ids
+    }
+    observations = [
+        event
+        for event in events
+        if event.get("event_type") == "block.commit_observed"
+        and event.get("source_kind") == "replica"
+    ]
+    candidates = sorted(
+        (
+            event
+            for event in commits
+            if _runtime_commit_epoch(event, "phase commit") == epoch_number
+            and _integer(event.get("source_monotonic_ns"), "phase commit timestamp")
+            > after_ns
+        ),
+        key=lambda event: (
+            _integer(event.get("source_monotonic_ns"), "phase commit timestamp"),
+            _integer(
+                _document(event.get("payload"), "phase commit").get("block_height"),
+                "phase commit height",
+                1,
+            ),
+        ),
+    )
+    for commit in candidates:
+        payload = _document(commit.get("payload"), "phase commit")
+        identity = {
+            key: payload.get(key)
+            for key in (
+                "block_height",
+                "block_hash",
+                "parent_hash",
+                "transaction_count",
+                "commit_batch_index",
+            )
+        }
+        earliest_by_source: dict[str, int] = {}
+        for observation in observations:
+            source = str(observation.get("source_id"))
+            if (
+                source not in survivors
+                or dict(
+                    _document(observation.get("payload"), "phase commit observation")
+                )
+                != identity
+            ):
+                continue
+            timestamp = _integer(
+                observation.get("source_monotonic_ns"),
+                "phase commit observation timestamp",
+            )
+            if timestamp <= after_ns:
+                continue
+            previous = earliest_by_source.get(source)
+            if previous is None or timestamp < previous:
+                earliest_by_source[source] = timestamp
+        if len(earliest_by_source) < profile.quorum:
+            continue
+        quorum_times = sorted(earliest_by_source.values())[: profile.quorum]
+        return max(
+            _integer(commit.get("source_monotonic_ns"), "phase commit timestamp"),
+            max(quorum_times),
+        )
+    _error("causal phase lacks a post-activation common commit")
+
+
+def _runtime_phase_has_transactions(
+    commits: Sequence[Mapping[str, Any]],
+    *,
+    start_ns: int,
+    end_ns: int,
+    epoch_number: int,
+    require_positive: bool = True,
+) -> bool:
+    selected = [
+        event
+        for event in commits
+        if start_ns
+        <= _integer(event.get("source_monotonic_ns"), "phase commit timestamp")
+        < end_ns
+    ]
+    if any(
+        _runtime_commit_epoch(event, "phase commit") != epoch_number
+        for event in selected
+    ):
+        return False
+    if not require_positive:
+        return True
+    return (
+        bool(selected)
+        and sum(
+            _integer(
+                _document(event.get("payload"), "phase commit").get(
+                    "transaction_count"
+                ),
+                "phase transactions",
+            )
+            for event in selected
+        )
+        > 0
+    )
+
+
+def _v5_phase_window_document(
+    profile: FocusedProfile,
+    arm: str,
+    events: Sequence[Mapping[str, Any]],
+    fault_receipt: Mapping[str, object],
+    source: FocusedRawEvidenceSource,
+) -> dict[str, object]:
+    width_ns, stabilization_ns, control_hold_ns = _v5_phase_parameters(profile)
+    source._common_commit(events, 1)
+    if arm == "adaptive":
+        source._common_commit(events, 2)
+    outcomes = _sequence(fault_receipt.get("sigkill_outcomes"), "SIGKILL outcomes")
+    if not outcomes:
+        _error("causal phase windows lack fault outcomes")
+    prefault_ns = min(
+        _integer(
+            _document(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),
+            "fault request timestamp",
+            1,
+        )
+        for outcome in outcomes
+    )
+    fault_ns = max(
+        _integer(
+            _document(outcome, "SIGKILL outcome").get("confirmed_monotonic_ns"),
+            "fault confirmation timestamp",
+            1,
+        )
+        for outcome in outcomes
+    )
+    commits = _runtime_authoritative_commits(events, profile)
+    epoch0 = [
+        event for event in commits if _runtime_commit_epoch(event, "phase commit") == 0
+    ]
+    stable_ns = (
+        _integer(
+            _document(profile.raw.get("timers"), "profile timers").get(
+                "stable_phase_seconds"
+            ),
+            "stable phase",
+            1,
+        )
+        * 1_000_000_000
+    )
+    if (
+        not epoch0
+        or min(
+            _integer(event.get("source_monotonic_ns"), "Epoch-0 commit timestamp")
+            for event in epoch0
+        )
+        > prefault_ns - stable_ns
+    ):
+        _error("causal baseline is not inside the proven stable interval")
+    command1_times = [
+        _integer(event.get("source_monotonic_ns"), "Epoch-1 command timestamp")
+        for event in events
+        if event.get("event_type") == "epoch.command_committed"
+        and _document(event.get("payload"), "Epoch-1 command").get(
+            "successor_epoch_number"
+        )
+        == 1
+    ]
+    if not command1_times or fault_ns + width_ns >= min(command1_times):
+        _error("causal fault window overlaps the Epoch-1 transition")
+    activation1 = source._transition(events, 1, activation=True)
+    if activation1 is None:
+        _error("causal Epoch-1 phase lacks every survivor activation")
+    activation1_ns = _integer(
+        activation1.get("source_monotonic_ns"), "Epoch-1 activation timestamp"
+    )
+    common1_ns = _runtime_first_common_commit_anchor(
+        events, profile, epoch_number=1, after_ns=activation1_ns
+    )
+    epoch1_start = max(activation1_ns, common1_ns) + stabilization_ns
+    epoch1_end = epoch1_start + width_ns
+    windows: list[tuple[str, int, int, int]] = [
+        ("baseline", prefault_ns - width_ns, prefault_ns, 0),
+        ("fault", fault_ns, fault_ns + width_ns, 0),
+        ("epoch1", epoch1_start, epoch1_end, 1),
+    ]
+    if arm == "adaptive":
+        command2_times = [
+            _integer(event.get("source_monotonic_ns"), "Epoch-2 command timestamp")
+            for event in events
+            if event.get("event_type") == "epoch.command_committed"
+            and _document(event.get("payload"), "Epoch-2 command").get(
+                "successor_epoch_number"
+            )
+            == 2
+        ]
+        if not command2_times or epoch1_end >= min(command2_times):
+            _error("causal Epoch-1 window overlaps the Epoch-2 transition")
+        activation2 = source._transition(events, 2, activation=True)
+        if activation2 is None:
+            _error("causal late phase lacks every survivor Epoch-2 activation")
+        activation2_ns = _integer(
+            activation2.get("source_monotonic_ns"), "Epoch-2 activation timestamp"
+        )
+        common2_ns = _runtime_first_common_commit_anchor(
+            events, profile, epoch_number=2, after_ns=activation2_ns
+        )
+        late_start = max(activation2_ns, common2_ns) + stabilization_ns
+        late_epoch = 2
+    elif arm == "control":
+        late_start = epoch1_end + control_hold_ns
+        late_epoch = 1
+    else:
+        _error("causal phase window arm is invalid")
+    windows.append(("late", late_start, late_start + width_ns, late_epoch))
+    if any(right[1] < left[2] for left, right in zip(windows, windows[1:])):
+        _error("causal phase windows overlap")
+    if any(
+        not _runtime_phase_has_transactions(
+            commits,
+            start_ns=start,
+            end_ns=end,
+            epoch_number=epoch,
+            require_positive=phase != "fault",
+        )
+        for phase, start, end, epoch in windows
+    ):
+        _error("causal phase transactions or exact epoch drifted")
+    return {
+        "schema_version": 1,
+        "domain": "kauri-focused-causal-phase-windows-v1",
+        "phases": [
+            {
+                "phase": phase,
+                "start_ns": start,
+                "end_ns": end,
+                "epoch_number": epoch,
+            }
+            for phase, start, end, epoch in windows
+        ],
+    }
 
 
 def _valid_pid(pid: object) -> int:
@@ -5961,17 +6397,19 @@ class FocusedLaunchBackend:
             else None
         )
         started_wall = time.monotonic()
-        hard_deadline = (
+        arm_hard_seconds = (
             None
             if coverage is None
-            else started_wall
-            + _integer(
+            else _integer(
                 _document(coverage["deadlines_seconds"], "coverage deadlines").get(
                     "arm_hard_seconds"
                 ),
                 "arm hard deadline",
                 1,
             )
+        )
+        prefault_hard_deadline = (
+            None if arm_hard_seconds is None else started_wall + arm_hard_seconds
         )
         readiness_deadline = (
             None
@@ -5984,6 +6422,7 @@ class FocusedLaunchBackend:
             )
         )
         fault_wall: float | None = None
+        postfault_hard_deadline: float | None = None
         epoch1_activation_wall: float | None = None
         try:
             self._wait_for_snapshot(
@@ -5995,12 +6434,18 @@ class FocusedLaunchBackend:
 
         def wait(name: str) -> Mapping[str, object]:
             nonlocal epoch1_activation_wall
-            deadline = hard_deadline
+            deadline = (
+                postfault_hard_deadline
+                if fault_wall is not None
+                else prefault_hard_deadline
+            )
             if coverage is not None and fault_wall is not None:
+                if postfault_hard_deadline is None:
+                    _error("post-fault hard deadline is not anchored")
                 limits = _document(coverage["deadlines_seconds"], "coverage deadlines")
                 if name in {"nonresponse", "epoch1"}:
                     deadline = min(
-                        float(hard_deadline),
+                        postfault_hard_deadline,
                         fault_wall
                         + _integer(
                             limits.get("evidence_seconds"),
@@ -6010,7 +6455,7 @@ class FocusedLaunchBackend:
                     )
                 elif name in {"commands1", "activations1"}:
                     deadline = min(
-                        float(hard_deadline),
+                        postfault_hard_deadline,
                         fault_wall
                         + _integer(
                             limits.get("epoch1_activation_seconds"),
@@ -6022,7 +6467,7 @@ class FocusedLaunchBackend:
                     if epoch1_activation_wall is None:
                         _error("optimization wait lacks its Epoch 1 activation anchor")
                     deadline = min(
-                        float(hard_deadline),
+                        postfault_hard_deadline,
                         epoch1_activation_wall
                         + _integer(
                             limits.get("optimization_activation_seconds"),
@@ -6036,7 +6481,7 @@ class FocusedLaunchBackend:
             return snapshot
 
         def inject() -> Mapping[str, object]:
-            nonlocal fault_wall
+            nonlocal fault_wall, postfault_hard_deadline
             latched_barrier: list[dict[str, object]] | None = None
             if (
                 self._poll_snapshot is None
@@ -6047,7 +6492,7 @@ class FocusedLaunchBackend:
                 )
             ):
                 latch_deadline = min(
-                    float(hard_deadline),
+                    float(prefault_hard_deadline),
                     time.monotonic() + self._readiness_timeout_s,
                 )
                 latched_barrier = self._wait_for_prefault_configuration(
@@ -6065,6 +6510,8 @@ class FocusedLaunchBackend:
                     )
                 )
             fault_wall = time.monotonic()
+            if arm_hard_seconds is not None:
+                postfault_hard_deadline = fault_wall + arm_hard_seconds
             observed = wait("fault")
             if dict(observed) != outcome:
                 _error("observed fault receipt differs from the atomic outcome")
@@ -6086,8 +6533,8 @@ class FocusedLaunchBackend:
                     processes,
                     arm_document,
                     deadline_monotonic=(
-                        float(hard_deadline)
-                        if hard_deadline is not None
+                        postfault_hard_deadline
+                        if postfault_hard_deadline is not None
                         else time.monotonic() + self._readiness_timeout_s
                     ),
                 )
@@ -6254,6 +6701,29 @@ class FocusedLaunchBackend:
         (root / "runtime" / "source-inventory.json").write_bytes(
             _canonical_json({"sources": [list(source) for source in inventory]})
         )
+        profile = configuration.get("profile")
+        if isinstance(profile, FocusedProfile) and _is_v5_profile(profile):
+            source = FocusedRawEvidenceSource(
+                root,
+                poll_interval_s=0.0,
+                timeout_s=1.0,
+                expected_run_id=str(configuration["run_id"]),
+                expected_source_instances=_document(
+                    configuration.get("source_instances"),
+                    "focused source instances",
+                ),
+            )
+            validated_events = source._events()
+            phase_document = _v5_phase_window_document(
+                profile,
+                str(configuration["arm"]),
+                validated_events,
+                _document(receipt, "fault receipt"),
+                source,
+            )
+            (root / "derived" / "phase-windows.json").write_bytes(
+                _canonical_json(phase_document)
+            )
 
     def seal(
         self,
