@@ -7,6 +7,7 @@ contains no live runner, retry mechanism, or execution authorization.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from fractions import Fraction
 import hashlib
 import json
 from pathlib import Path
@@ -33,6 +34,19 @@ _ARMS = ("control", "adaptive")
 _SCHEDULE_ALGORITHM = "factorial_manifest.derive_execution_schedule"
 _LEDGER_GENESIS_DOMAIN = "kauri-n31-crash-pair-ledger-genesis-v1"
 _SOURCE_BLIND_ORDER_DOMAIN = "kauri-n31-crash-pair-source-blind-order-v1"
+_SCIENTIFIC_SUPPORT_DOMAIN = "kauri-focused-campaign-scientific-support-v1"
+_SCIENTIFIC_SUPPORT_CONTRACT = {
+    "schema_version": 1,
+    "domain": _SCIENTIFIC_SUPPORT_DOMAIN,
+}
+_SCIENTIFIC_THRESHOLD_KEYS = frozenset(
+    {
+        "adaptive_ratio_min_ppm",
+        "containment_over_baseline_min_ppm",
+        "paired_ratio_min_ppm",
+    }
+)
+_PPM_SCALE = 1_000_000
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _REVISION = re.compile(r"^[0-9a-f]{40}$")
 _PLAN_KEYS = frozenset(
@@ -346,19 +360,24 @@ def _validated_measurements(value: object) -> dict[str, object]:
         _error("source-blind measurements do not contain four phases")
     expected_names = ("baseline", "fault", "epoch1", "late")
     normalized: list[dict[str, object]] = []
+    extended_schema: bool | None = None
     for name, raw_phase in zip(expected_names, phases, strict=True):
         phase = _mapping(raw_phase, "source-blind phase row")
-        if (
-            set(phase)
-            != {
-                "phase",
-                "start_ns",
-                "end_ns",
-                "transactions",
-                "mean_milli_tps",
-            }
-            or phase.get("phase") != name
-        ):
+        extended = "buckets" in phase or "median_milli_tps" in phase
+        if extended_schema is None:
+            extended_schema = extended
+        elif extended_schema is not extended:
+            _error("source-blind phase aggregation schema is mixed")
+        expected_keys = {
+            "phase",
+            "start_ns",
+            "end_ns",
+            "transactions",
+            "mean_milli_tps",
+        }
+        if extended:
+            expected_keys |= {"buckets", "median_milli_tps"}
+        if set(phase) != expected_keys or phase.get("phase") != name:
             _error("source-blind phase schema or order drifted")
         start = _integer(phase.get("start_ns"), "phase start")
         end = _integer(phase.get("end_ns"), "phase end", minimum=1)
@@ -368,14 +387,257 @@ def _validated_measurements(value: object) -> dict[str, object]:
             end - start
         ):
             _error("source-blind throughput row does not recompute")
+        if extended:
+            buckets = [
+                _mapping(bucket, "source-blind phase bucket")
+                for bucket in _sequence(phase.get("buckets"), "phase buckets")
+            ]
+            if len(buckets) != 6:
+                _error("scientific phase does not contain six complete buckets")
+            throughputs: list[int] = []
+            bucket_transactions = 0
+            prior_end = start
+            bucket_width: int | None = None
+            for index, bucket in enumerate(buckets):
+                if set(bucket) != {
+                    "bucket_index",
+                    "start_ns",
+                    "end_ns",
+                    "transactions",
+                    "mean_milli_tps",
+                }:
+                    _error("scientific bucket schema drifted")
+                bucket_start = _integer(bucket.get("start_ns"), "bucket start")
+                bucket_end = _integer(bucket.get("end_ns"), "bucket end", minimum=1)
+                count = _integer(bucket.get("transactions"), "bucket transactions")
+                throughput = _integer(bucket.get("mean_milli_tps"), "bucket throughput")
+                duration = bucket_end - bucket_start
+                if (
+                    bucket.get("bucket_index") != index
+                    or bucket_start != prior_end
+                    or duration <= 0
+                    or (bucket_width is not None and duration != bucket_width)
+                    or throughput != count * 1_000_000_000_000 // duration
+                ):
+                    _error("scientific bucket identity or throughput drifted")
+                bucket_width = duration
+                prior_end = bucket_end
+                bucket_transactions += count
+                throughputs.append(throughput)
+            ordered = sorted(throughputs)
+            median_sum = ordered[2] + ordered[3]
+            if (
+                prior_end != end
+                or bucket_transactions != transactions
+                or median_sum % 2
+                or phase.get("median_milli_tps") != median_sum // 2
+            ):
+                _error("scientific phase bucket aggregation drifted")
         normalized.append(dict(phase))
     late = _integer(
         measurements.get("late_window_throughput_milli_tps"),
         "late-window throughput",
     )
-    if late != normalized[-1]["mean_milli_tps"]:
+    expected_late = normalized[-1][
+        "median_milli_tps" if extended_schema else "mean_milli_tps"
+    ]
+    if late != expected_late:
         _error("late-window throughput differs from its raw phase")
     return {"phases": normalized, "late_window_throughput_milli_tps": late}
+
+
+def _scientific_support_contract(
+    sealed_child_directory: Path,
+) -> dict[str, object] | None:
+    """Read the explicit opt-in and thresholds from one verified child profile."""
+
+    profile_path = sealed_child_directory / "profile.json"
+    if not profile_path.exists():
+        return None
+    if profile_path.is_symlink() or not profile_path.is_file():
+        _error("scientific-support child profile is not a regular file")
+    try:
+        profile = _mapping(
+            json.loads(profile_path.read_text(encoding="utf-8")),
+            "scientific-support child profile",
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise N31CrashPairCampaignError(
+            "scientific-support child profile is unreadable"
+        ) from error
+    campaign = profile.get("campaign")
+    if not isinstance(campaign, Mapping):
+        return None
+    raw_contract = campaign.get("scientific_support_contract")
+    if raw_contract is None:
+        return None
+    contract = _mapping(raw_contract, "scientific-support contract")
+    if dict(contract) != _SCIENTIFIC_SUPPORT_CONTRACT:
+        _error("scientific-support contract is not the reviewed exact opt-in")
+    thresholds = _mapping(profile.get("thresholds"), "scientific-support thresholds")
+    if set(thresholds) != _SCIENTIFIC_THRESHOLD_KEYS:
+        _error("scientific-support threshold schema drifted")
+    normalized_thresholds = {
+        key: _integer(thresholds.get(key), f"scientific-support {key}", minimum=1)
+        for key in sorted(_SCIENTIFIC_THRESHOLD_KEYS)
+    }
+    return {
+        **_SCIENTIFIC_SUPPORT_CONTRACT,
+        "thresholds_ppm": normalized_thresholds,
+    }
+
+
+def _ratio_ppm(numerator: int, denominator: int) -> int | None:
+    if denominator == 0:
+        return None
+    return numerator * _PPM_SCALE // denominator
+
+
+def _phase_tps(validation: Mapping[str, Any]) -> dict[str, int]:
+    measurements = _mapping(
+        validation.get("scientific_measurements"), "scientific measurements"
+    )
+    phases = _sequence(measurements.get("phases"), "scientific phase rows")
+    return {
+        str(_mapping(phase, "scientific phase row")["phase"]): _integer(
+            _mapping(phase, "scientific phase row").get(
+                "median_milli_tps"
+                if "median_milli_tps" in _mapping(phase, "scientific phase row")
+                else "mean_milli_tps"
+            ),
+            "scientific phase throughput",
+        )
+        for phase in phases
+    }
+
+
+def _median_ratio_ppm(ratios: Sequence[tuple[int, int]]) -> int | None:
+    if len(ratios) != _PAIR_COUNT or any(denominator == 0 for _, denominator in ratios):
+        return None
+    ordered = sorted(
+        (Fraction(numerator, denominator), numerator, denominator)
+        for numerator, denominator in ratios
+    )
+    _fraction, numerator, denominator = ordered[_PAIR_COUNT // 2]
+    return _ratio_ppm(numerator, denominator)
+
+
+def _median_meets_threshold(
+    ratios: Sequence[tuple[int, int]], threshold_ppm: int
+) -> bool:
+    if len(ratios) != _PAIR_COUNT or any(denominator == 0 for _, denominator in ratios):
+        return False
+    ordered = sorted(
+        Fraction(numerator, denominator) for numerator, denominator in ratios
+    )
+    median = ordered[_PAIR_COUNT // 2]
+    return median.numerator * _PPM_SCALE >= threshold_ppm * median.denominator
+
+
+def _evaluate_scientific_support(
+    by_pair: Mapping[str, Mapping[str, Mapping[str, Any]]],
+    pair_verdicts: list[dict[str, object]],
+    thresholds: Mapping[str, Any],
+) -> dict[str, object]:
+    """Evaluate the opt-in v9 recovery and paired-improvement claim gate."""
+
+    containment_threshold = _integer(
+        thresholds.get("containment_over_baseline_min_ppm"),
+        "containment-over-baseline threshold",
+        minimum=1,
+    )
+    adaptive_threshold = _integer(
+        thresholds.get("adaptive_ratio_min_ppm"),
+        "adaptive-ratio threshold",
+        minimum=1,
+    )
+    paired_threshold = _integer(
+        thresholds.get("paired_ratio_min_ppm"),
+        "paired-ratio threshold",
+        minimum=1,
+    )
+    adaptive_ratios: list[tuple[int, int]] = []
+    paired_ratios: list[tuple[int, int]] = []
+    containment_pass_count = 0
+    adaptive_positive_count = 0
+    paired_positive_count = 0
+    verdict_by_pair = {str(verdict["pair_id"]): verdict for verdict in pair_verdicts}
+    for pair_ordinal in range(1, _PAIR_COUNT + 1):
+        pair_id = f"pair-{pair_ordinal:02d}"
+        arms = by_pair[pair_id]
+        control = _phase_tps(arms["control"])
+        adaptive = _phase_tps(arms["adaptive"])
+        control_containment = (control["epoch1"], control["baseline"])
+        adaptive_containment = (adaptive["epoch1"], adaptive["baseline"])
+        adaptive_ratio = (adaptive["late"], adaptive["epoch1"])
+        paired_ratio = (
+            adaptive["late"] * control["epoch1"],
+            adaptive["epoch1"] * control["late"],
+        )
+        adaptive_ratios.append(adaptive_ratio)
+        paired_ratios.append(paired_ratio)
+        control_containment_pass = (
+            control_containment[1] > 0
+            and control_containment[0] * _PPM_SCALE
+            >= containment_threshold * control_containment[1]
+        )
+        adaptive_containment_pass = (
+            adaptive_containment[1] > 0
+            and adaptive_containment[0] * _PPM_SCALE
+            >= containment_threshold * adaptive_containment[1]
+        )
+        containment_pass_count += int(control_containment_pass)
+        containment_pass_count += int(adaptive_containment_pass)
+        adaptive_positive = (
+            adaptive_ratio[1] > 0 and adaptive_ratio[0] > adaptive_ratio[1]
+        )
+        paired_positive = paired_ratio[1] > 0 and paired_ratio[0] > paired_ratio[1]
+        adaptive_positive_count += int(adaptive_positive)
+        paired_positive_count += int(paired_positive)
+        verdict_by_pair[pair_id].update(
+            {
+                "control_containment_over_baseline_ppm": _ratio_ppm(
+                    *control_containment
+                ),
+                "adaptive_containment_over_baseline_ppm": _ratio_ppm(
+                    *adaptive_containment
+                ),
+                "adaptive_ratio_ppm": _ratio_ppm(*adaptive_ratio),
+                "paired_ratio_ppm": _ratio_ppm(*paired_ratio),
+                "control_containment_support": control_containment_pass,
+                "adaptive_containment_support": adaptive_containment_pass,
+                "adaptive_ratio_positive": adaptive_positive,
+                "paired_ratio_positive": paired_positive,
+            }
+        )
+    median_adaptive = _median_ratio_ppm(adaptive_ratios)
+    median_paired = _median_ratio_ppm(paired_ratios)
+    requirements = {
+        "all_arms_containment_over_baseline": containment_pass_count
+        == _CLAIM_SLOT_COUNT,
+        "adaptive_positive_at_least_four_of_five": adaptive_positive_count >= 4,
+        "adaptive_median_meets_threshold": _median_meets_threshold(
+            adaptive_ratios, adaptive_threshold
+        ),
+        "paired_positive_at_least_four_of_five": paired_positive_count >= 4,
+        "paired_median_meets_threshold": _median_meets_threshold(
+            paired_ratios, paired_threshold
+        ),
+    }
+    return {
+        "schema_version": 1,
+        "domain": _SCIENTIFIC_SUPPORT_DOMAIN,
+        "thresholds_ppm": {
+            key: int(thresholds[key]) for key in sorted(_SCIENTIFIC_THRESHOLD_KEYS)
+        },
+        "containment_pass_count": containment_pass_count,
+        "adaptive_positive_pair_count": adaptive_positive_count,
+        "paired_positive_pair_count": paired_positive_count,
+        "median_adaptive_ratio_ppm": median_adaptive,
+        "median_paired_ratio_ppm": median_paired,
+        "requirements": requirements,
+        "supported": all(requirements.values()),
+    }
 
 
 def validate_campaign_source_blind(
@@ -473,7 +735,12 @@ def validate_campaign_source_blind(
         )
 
     observations: list[
-        tuple[Mapping[str, Any], Mapping[str, Any], Mapping[str, Any]]
+        tuple[
+            Mapping[str, Any],
+            Mapping[str, Any],
+            Mapping[str, Any],
+            dict[str, object] | None,
+        ]
     ] = []
     for _, _, child, slot, source in sorted(
         prepared, key=lambda item: (item[0], item[1])
@@ -531,17 +798,61 @@ def validate_campaign_source_blind(
             measurements = _validated_measurements(
                 validation.get("scientific_measurements")
             )
+            try:
+                post_validation_seal = verify_evidence_seal(isolated)
+            except (EvidenceSealError, OSError) as error:
+                raise N31CrashPairCampaignError(
+                    "source-blind child mutated during validation"
+                ) from error
+            if (
+                post_validation_seal.tree_sha256 != child["child_tree_sha256"]
+                or post_validation_seal.seal_sha256 != child["child_seal_sha256"]
+            ):
+                _error("source-blind child mutated during validation")
+            scientific_support_contract = _scientific_support_contract(isolated)
             observations.append(
                 (
                     child,
                     slot,
                     {**dict(validation), "scientific_measurements": measurements},
+                    scientific_support_contract,
                 )
             )
 
+    support_contracts = [observation[3] for observation in observations]
+    support_enabled = any(contract is not None for contract in support_contracts)
+    support_thresholds: Mapping[str, Any] | None = None
+    if support_enabled:
+        if any(contract is None for contract in support_contracts):
+            _error("scientific-support opt-in is missing from one or more children")
+        first_contract = support_contracts[0]
+        if first_contract is None:
+            _error("scientific-support contract collection is inconsistent")
+        if any(contract != first_contract for contract in support_contracts[1:]):
+            _error("scientific-support contracts or thresholds differ across children")
+        support_thresholds = _mapping(
+            first_contract.get("thresholds_ppm"),
+            "scientific-support campaign thresholds",
+        )
+        if any(
+            any(
+                "median_milli_tps"
+                not in _mapping(phase, "scientific-support phase row")
+                for phase in _sequence(
+                    _mapping(
+                        observation[2].get("scientific_measurements"),
+                        "scientific-support measurements",
+                    ).get("phases"),
+                    "scientific-support phases",
+                )
+            )
+            for observation in observations
+        ):
+            _error("scientific-support measurements lack stable-phase medians")
+
     child_verdicts: list[dict[str, object]] = []
     by_pair: dict[str, dict[str, dict[str, object]]] = {}
-    for child, slot, validation in observations:
+    for child, slot, validation, _support_contract in observations:
         epoch2_present = validation.get("epoch2_present")
         if type(epoch2_present) is not bool or epoch2_present is not (
             slot["arm"] == "adaptive"
@@ -595,9 +906,18 @@ def validate_campaign_source_blind(
                 ),
             }
         )
+    scientific_support = (
+        None
+        if support_thresholds is None
+        else _evaluate_scientific_support(
+            by_pair,
+            pair_verdicts,
+            support_thresholds,
+        )
+    )
     child_verdicts.sort(key=lambda row: int(str(row["slot_id"]).removeprefix("slot-")))
     all_pass = all(verdict.get("outcome") == "PASS" for verdict in child_verdicts)
-    return {
+    result: dict[str, object] = {
         "schema_version": 1,
         "source_blind": True,
         "expected_claim_slot_count": _CLAIM_SLOT_COUNT,
@@ -610,6 +930,12 @@ def validate_campaign_source_blind(
             None if ledger_summary is None else ledger_summary["ledger_head_sha256"]
         ),
     }
+    if scientific_support is not None:
+        result["scientific_support"] = scientific_support
+        result["claim_eligible"] = bool(
+            all_pass and scientific_support["supported"] is True
+        )
+    return result
 
 
 __all__ = [

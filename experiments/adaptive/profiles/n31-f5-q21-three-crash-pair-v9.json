@@ -1,0 +1,733 @@
+{
+  "blinding": {
+    "forbidden": [
+      "crash_ids",
+      "target_pids",
+      "target_pgids",
+      "process_state",
+      "performance_labels"
+    ],
+    "manager_input_source": "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+  },
+  "campaign": {
+    "automatic_retries": 0,
+    "claim_slot_count": 10,
+    "outcome_dependent_order": false,
+    "pair_count": 5,
+    "replacement_policy": "none",
+    "scientific_support_contract": {
+      "domain": "kauri-focused-campaign-scientific-support-v1",
+      "schema_version": 1
+    }
+  },
+  "campaign_member": true,
+  "evidence_guard": {
+    "horizon_tree_positions": 17,
+    "minimum_score_drop": 22,
+    "minimum_timeouts_per_reporter": 2,
+    "minimum_topology_eligible_reporter_capacity": 12,
+    "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+    "required_postfault_tree_positions": 17,
+    "required_qualifying_reporters": 11,
+    "schedule": "native_cyclic_epoch_zero",
+    "tree_switch_period_blocks": 2
+  },
+  "execution_class": "n31_focused",
+  "fault": {
+    "automatic_retries": 0,
+    "kind": "atomic_process_group_sigkill",
+    "replacement_policy": "none",
+    "signal_number": 9,
+    "target_count": 3
+  },
+  "fault_window_arm": {
+    "clock_domain": "same_host_clock_monotonic_raw",
+    "domain": "epoch_zero_native_cyclic_tree_positions",
+    "manager_visibility": "target-identity/process-state blind; intervention-boundary aware",
+    "ordered_tree_prefix": [
+      20,
+      21,
+      22,
+      23,
+      24,
+      25,
+      26,
+      27,
+      28,
+      29,
+      30,
+      0,
+      1,
+      2,
+      3,
+      4,
+      5
+    ],
+    "required_for_new_executions": true,
+    "required_observation_schema": 3,
+    "required_postfault_tree_positions": 17,
+    "schema_version": 4,
+    "selection_cardinality_policy": "all_guarded_up_to_fault_bound_v1",
+    "snapshot_evidence_basis": "exact_post_fault_attempt_start_v1",
+    "timeout_evidence_basis": "exact_timeout_attempt_id_v1"
+  },
+  "figure_eligible": true,
+  "frozen": true,
+  "matched_inputs": {
+    "shared_build": true,
+    "shared_epoch1_structure": true,
+    "shared_pair_seed": true,
+    "shared_revision": true,
+    "shared_workload": true
+  },
+  "measurement": {
+    "authoritative_replica_id": 0,
+    "bucket_width_seconds": 5,
+    "commit_event_type": "block.committed",
+    "phase_names": [
+      "baseline",
+      "fault",
+      "epoch1",
+      "late"
+    ],
+    "phase_window_contract": {
+      "control_optimization_hold_seconds": 30,
+      "domain": "kauri-focused-causal-phase-windows-v1",
+      "schema_version": 1,
+      "stabilization_offset_seconds": 30
+    }
+  },
+  "performance": {
+    "initial_root_top_ranked": false,
+    "labels_or_fault_truth_manager_visible": false,
+    "responsive_tiers": [
+      "fast",
+      "medium",
+      "slow"
+    ]
+  },
+  "ports": {
+    "base": 20000,
+    "require_available": true,
+    "stride": 1
+  },
+  "profile_id": "n31-f5-q21-three-crash-pair-v9",
+  "protocol": {
+    "N": 31,
+    "Q": 21,
+    "f": 10,
+    "fanout": 5,
+    "pipeline_stretch": 2,
+    "transactions_per_block": 1000
+  },
+  "schema_version": 2,
+  "thresholds": {
+    "adaptive_ratio_min_ppm": 1100000,
+    "containment_over_baseline_min_ppm": 800000,
+    "paired_ratio_min_ppm": 1100000
+  },
+  "timers": {
+    "adaptation_interval_seconds": 30,
+    "arm_hard_deadline_seconds": 480,
+    "containment_activation_deadline_seconds": 270,
+    "manager_convergence_timeout_seconds": 60,
+    "nonresponse_evidence_deadline_seconds": 180,
+    "optimization_activation_deadline_seconds": 90,
+    "readiness_timeout_seconds": 60,
+    "stable_phase_seconds": 30
+  },
+  "topology": {
+    "active_tree_id": 20,
+    "epoch_zero_digest": "145fac093343fa9cff20fcf49d85ad5443e93db14146f7854b17e28cf44f6d7a",
+    "proof_path": "topology-proofs/n31-f5-q21-three-crash-pair-v9-topology-proof.json",
+    "proof_sha256": "a50bd106887e5e3baf550875217db37c96fb9b07d40c39a98e80cef20e435ced",
+    "reporter_coverage_capacity": {
+      "domain": "kauri-topology-fault-window-reporter-capacity-v1",
+      "minimum_topology_eligible_reporter_capacity": 12,
+      "prefix_tree_ids": [
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+      "schema_version": 1,
+      "targets": [
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 0,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 26
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 27
+                }
+              ]
+            },
+            {
+              "reporter_id": 1,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 28
+                }
+              ]
+            },
+            {
+              "reporter_id": 2,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 29
+                }
+              ]
+            },
+            {
+              "reporter_id": 3,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 30
+                }
+              ]
+            },
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 0
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 1
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                }
+              ]
+            },
+            {
+              "reporter_id": 7,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 8,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 5
+                }
+              ]
+            },
+            {
+              "reporter_id": 20,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 20
+                }
+              ]
+            },
+            {
+              "reporter_id": 29,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 24
+                }
+              ]
+            },
+            {
+              "reporter_id": 30,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 25
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 21
+        },
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 0,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 26
+                }
+              ]
+            },
+            {
+              "reporter_id": 1,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 27
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 28
+                }
+              ]
+            },
+            {
+              "reporter_id": 2,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 29
+                }
+              ]
+            },
+            {
+              "reporter_id": 3,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 30
+                }
+              ]
+            },
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 0
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 1
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                }
+              ]
+            },
+            {
+              "reporter_id": 7,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 8,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 5
+                }
+              ]
+            },
+            {
+              "reporter_id": 20,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 20
+                }
+              ]
+            },
+            {
+              "reporter_id": 29,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 24
+                }
+              ]
+            },
+            {
+              "reporter_id": 30,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 25
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 22
+        },
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 0,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 26
+                }
+              ]
+            },
+            {
+              "reporter_id": 1,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 27
+                }
+              ]
+            },
+            {
+              "reporter_id": 2,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 28
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 29
+                }
+              ]
+            },
+            {
+              "reporter_id": 3,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 30
+                }
+              ]
+            },
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 0
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 1
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                }
+              ]
+            },
+            {
+              "reporter_id": 7,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 8,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 5
+                }
+              ]
+            },
+            {
+              "reporter_id": 20,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 20
+                }
+              ]
+            },
+            {
+              "reporter_id": 29,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 24
+                }
+              ]
+            },
+            {
+              "reporter_id": 30,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 25
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 23
+        }
+      ]
+    },
+    "reviewed_target_replica_ids": [
+      21,
+      22,
+      23
+    ],
+    "target_selection_metric": {
+      "bfs_member_order": [
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18,
+        19
+      ],
+      "candidate_internal_replica_ids": [
+        21,
+        22,
+        23,
+        24,
+        25
+      ],
+      "domain": "kauri-topology-survivor-path-shadow-v1",
+      "fanout": 5,
+      "prefix_tree_ids": [
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27,
+        28,
+        29,
+        30,
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "schema_version": 1,
+      "selected_target_replica_ids": [
+        21,
+        22,
+        23
+      ],
+      "tie_break": "lexicographic_replica_id",
+      "triple_scores": [
+        {
+          "collateral_survivor_path_shadow": 15,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            22,
+            23
+          ],
+          "total_survivor_path_shadow": 99
+        },
+        {
+          "collateral_survivor_path_shadow": 20,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            22,
+            24
+          ],
+          "total_survivor_path_shadow": 104
+        },
+        {
+          "collateral_survivor_path_shadow": 25,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            22,
+            25
+          ],
+          "total_survivor_path_shadow": 109
+        },
+        {
+          "collateral_survivor_path_shadow": 25,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            23,
+            24
+          ],
+          "total_survivor_path_shadow": 109
+        },
+        {
+          "collateral_survivor_path_shadow": 30,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            23,
+            25
+          ],
+          "total_survivor_path_shadow": 114
+        },
+        {
+          "collateral_survivor_path_shadow": 35,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            21,
+            24,
+            25
+          ],
+          "total_survivor_path_shadow": 119
+        },
+        {
+          "collateral_survivor_path_shadow": 30,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            22,
+            23,
+            24
+          ],
+          "total_survivor_path_shadow": 114
+        },
+        {
+          "collateral_survivor_path_shadow": 35,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            22,
+            23,
+            25
+          ],
+          "total_survivor_path_shadow": 119
+        },
+        {
+          "collateral_survivor_path_shadow": 40,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            22,
+            24,
+            25
+          ],
+          "total_survivor_path_shadow": 124
+        },
+        {
+          "collateral_survivor_path_shadow": 45,
+          "fixed_root_shadow": 84,
+          "maximum_per_tree_survivor_path_shadow": 28,
+          "target_replica_ids": [
+            23,
+            24,
+            25
+          ],
+          "total_survivor_path_shadow": 129
+        }
+      ]
+    }
+  },
+  "transitions": {
+    "adaptive": [
+      "epoch1",
+      "epoch2"
+    ],
+    "common_commit_quorum": 21,
+    "control": [
+      "epoch1"
+    ],
+    "survivor_barrier_count": 28
+  }
+}

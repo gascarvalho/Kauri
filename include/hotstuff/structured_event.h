@@ -324,6 +324,7 @@ struct FaultWindowArmedStructuredEvent
     std::uint32_t required_observation_schema{0};
     std::string timeout_evidence_basis;
     std::string snapshot_evidence_basis;
+    std::string selection_cardinality_policy;
     std::string fault_window_arm_sha256;
 };
 

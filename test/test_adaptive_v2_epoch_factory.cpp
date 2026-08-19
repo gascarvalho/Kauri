@@ -202,7 +202,10 @@ EpochDefinitionInput campaign_contained_epoch_input(
                 ordered.push_back(member);
         }
         for (const auto member : profile.hard)
-            ordered.push_back(member);
+        {
+            if (member != tree_id)
+                ordered.push_back(member);
+        }
         input.trees.push_back(
             EpochTreeDefinition{
                 tree_id,
@@ -1097,6 +1100,138 @@ TEST_CASE(
                   leaf_start);
         }
     }
+}
+
+TEST_CASE(
+    "N31 v9 containment places the entire seven-replica guarded cohort as leaves",
+    "[adaptive-v2][epoch-factory][n31][v9][all-guarded]")
+{
+    const CampaignScaleCase profile{
+        2,
+        41'739,
+        {11, 12, 15, 16, 21, 22, 23},
+        {},
+        {}};
+    const auto members = campaign_membership();
+    EpochStore store{members};
+    auto predecessor_profile = profile;
+    predecessor_profile.hard.clear();
+    const auto &current = store.stage(
+        campaign_contained_epoch_input(predecessor_profile),
+        EpochValidationContext{});
+    auto selection = campaign_inherited_selection(current, profile);
+    selection.constraint_basis =
+        AdaptiveV2SelectionConstraintBasis::guarded_evidence;
+    selection.metadata.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    selection.eligible_candidates.clear();
+    for (const auto target : profile.hard)
+    {
+        AdaptiveV2CandidateAudit audit;
+        audit.replica_id = target;
+        audit.snapshot_classification =
+            ResponsivenessClass::nonresponsive;
+        audit.baseline_score = 0;
+        audit.current_score = -11;
+        audit.baseline_score_delta = -11;
+        audit.guard_drawdown = -11;
+        audit.total_uncompensated_timeouts = 11;
+        audit.qualifying_reporters = {
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        audit.snapshot_nonresponsive = true;
+        audit.score_drop_satisfied = true;
+        audit.reporter_guard_satisfied = true;
+        audit.guarded_eligible = true;
+        selection.eligible_candidates.push_back(std::move(audit));
+    }
+
+    hotstuff::AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    for (const auto &tree : current.trees())
+        policy.containment_baseline_roots.push_back(
+            BaselineRoot{
+                tree.tree_id,
+                tree.members_breadth_first.front()});
+    const TreePlacementInput placement{
+        members,
+        TreeShape{2, 2, 21},
+        profile.scientific_seed,
+        "v9-all-guarded-fault-containment-v1"};
+    const auto result = hotstuff::build_adaptive_v2_successor_bundle(
+        current,
+        selection,
+        policy,
+        placement,
+        5,
+        kIssuerId,
+        private_key(),
+        EpochChangeBundleLimits{});
+
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    REQUIRE(result.bundle->definition().trees.size() == 21);
+    for (const auto &tree : result.bundle->definition().trees)
+    {
+        CHECK(tree.wait_exempt_leaves == profile.hard);
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto selected : profile.hard)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(),
+                selected);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
+    }
+
+    const auto &epoch_one = store.stage(
+        result.bundle->definition(), EpochValidationContext{});
+    auto inherited = campaign_inherited_selection(epoch_one, profile);
+    inherited.metadata.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    hotstuff::AdaptiveV2TransitionPolicy optimization;
+    optimization.intent = TreePolicyKind::performance_optimization;
+    const auto epoch_two = hotstuff::build_adaptive_v2_successor_bundle(
+        epoch_one,
+        inherited,
+        optimization,
+        placement,
+        5,
+        kIssuerId,
+        private_key(),
+        EpochChangeBundleLimits{});
+
+    REQUIRE(epoch_two);
+    REQUIRE(epoch_two.bundle != nullptr);
+    CHECK(epoch_two.bundle->definition().epoch_number == 2);
+    for (const auto &tree : epoch_two.bundle->definition().trees)
+        CHECK(tree.wait_exempt_leaves == profile.hard);
+
+    auto cardinality_mutation = campaign_inherited_selection(
+        epoch_one, profile);
+    cardinality_mutation.metadata.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    cardinality_mutation.selected_replicas.pop_back();
+    const auto rejected_mutation =
+        hotstuff::build_adaptive_v2_successor_bundle(
+            epoch_one,
+            cardinality_mutation,
+            optimization,
+            placement,
+            5,
+            kIssuerId,
+            private_key(),
+            EpochChangeBundleLimits{});
+    CHECK_FALSE(rejected_mutation);
+    CHECK(rejected_mutation.status ==
+          AdaptiveV2EpochFactoryStatus::invalid_selection);
 }
 
 TEST_CASE(

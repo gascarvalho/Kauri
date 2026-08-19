@@ -32,6 +32,15 @@ enum class AdaptiveV2FaultWindowSnapshotEvidenceBasis : std::uint8_t
     exact_post_fault_attempt_start_v1,
 };
 
+/** Arm-bound meaning of required_nonresponsive. */
+enum class AdaptiveV2FaultWindowCardinalityPolicy : std::uint8_t
+{
+    /** v1-v8 behavior: select exactly required_nonresponsive candidates. */
+    exact_required_v1 = 1,
+    /** Select the entire guarded cohort, bounded by N-Q (consensus f). */
+    all_guarded_up_to_fault_bound_v1,
+};
+
 /** Immutable local manager gate; it is not consensus or fault-target input. */
 struct AdaptiveV2FaultWindowArm
 {
@@ -44,6 +53,8 @@ struct AdaptiveV2FaultWindowArm
         AdaptiveV2FaultWindowEvidenceBasis::legacy_proposal_key_v1};
     AdaptiveV2FaultWindowSnapshotEvidenceBasis snapshot_evidence_basis{
         AdaptiveV2FaultWindowSnapshotEvidenceBasis::legacy_all_accepted_v1};
+    AdaptiveV2FaultWindowCardinalityPolicy cardinality_policy{
+        AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1};
 };
 
 struct AdaptiveV2SelectionConfig
@@ -66,6 +77,9 @@ struct AdaptiveV2SelectionConfig
     bool fault_window_arm_required{false};
     /** v4 one-shot arm supersedes the legacy count/timestamp pair. */
     std::optional<AdaptiveV2FaultWindowArm> fault_window_arm;
+    /** Session policy persists after the one-shot cycle-zero arm is consumed. */
+    AdaptiveV2FaultWindowCardinalityPolicy cardinality_policy{
+        AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1};
 };
 
 enum class AdaptiveV2FaultContainmentCoverageStatus : std::uint8_t
@@ -123,6 +137,7 @@ enum class AdaptiveV2SelectionStatus : std::uint8_t
     capacity_exceeded,
     snapshot_failed,
     internal_failure,
+    guarded_candidate_bound_exceeded,
 };
 
 /** Authority for the exact constrained replica set in a selection result. */
@@ -156,6 +171,8 @@ struct AdaptiveV2SelectionMetadata
     /** Domain of candidate timeout totals/reporters, not guard_drawdown. */
     AdaptiveV2TimeoutAuditBasis timeout_audit_basis{
         AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline};
+    AdaptiveV2FaultWindowCardinalityPolicy cardinality_policy{
+        AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1};
 };
 
 struct AdaptiveV2ReplicaScore

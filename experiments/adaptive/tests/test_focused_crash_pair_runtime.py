@@ -39,6 +39,8 @@ N7_PROFILE_V7 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v7.json"
 N31_PROFILE_V7 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v7.json"
 N7_PROFILE_V8 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v8.json"
 N31_PROFILE_V8 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v8.json"
+N7_PROFILE_V9 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v9.json"
+N31_PROFILE_V9 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v9.json"
 
 
 def test_v7_profiles_bind_arm_v3_and_independently_recomputed_n31_metric() -> None:
@@ -470,6 +472,18 @@ def test_v7_runtime_preserves_first_tree_requirement() -> None:
     )
 
 
+def test_v9_uses_six_complete_buckets_while_v8_keeps_archived_window_width() -> None:
+    runtime = _runtime()
+    bucket_width_ns = 5_000_000_000
+    v8 = runtime.load_focused_profile(N7_PROFILE_V8)
+    v9 = runtime.load_focused_profile(N7_PROFILE_V9)
+
+    assert (
+        runtime._phase_measurement_duration_ns(v8, bucket_width_ns) == bucket_width_ns
+    )
+    assert runtime._phase_measurement_duration_ns(v9, bucket_width_ns) == 30_000_000_000
+
+
 def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:
     runtime = _runtime()
     profile = runtime.load_focused_profile(N7_PROFILE_V6)
@@ -541,6 +555,19 @@ _CONTROLLER_FAILURE_MUTATIONS = (
             "controller_failure": {
                 "stage": "guarded_selection",
                 "selection_status": "internal_failure",
+                "epoch_factory_status": None,
+            },
+        },
+        True,
+        True,
+    ),
+    (
+        "guarded cohort bound exceeded",
+        {
+            "reason": "controller_unhealthy",
+            "controller_failure": {
+                "stage": "guarded_selection",
+                "selection_status": "guarded_candidate_bound_exceeded",
                 "epoch_factory_status": None,
             },
         },
@@ -3273,13 +3300,186 @@ def test_v8_state_machine_accepts_exactly_any_eleven_eligible_reporters(
     with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="reporter coverage"):
         runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
+
+def test_v9_state_machine_accepts_full_guarded_cohort_and_recovered_dependents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """V9 contains every guarded member while crash truth remains a strict subset."""
+
+    runtime = _runtime()
+    original_profile = runtime.load_focused_profile(N31_PROFILE_V9)
+    coverage = deepcopy(runtime.derive_reporter_coverage_plan(original_profile))
+    profile = replace(
+        original_profile,
+        target_replica_ids=(22, 23, 24),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    for row, target in zip(coverage["targets"], profile.target_replica_ids):
+        row["target_replica_id"] = target
+    monkeypatch.setattr(
+        runtime, "derive_reporter_coverage_plan", lambda _profile: coverage
+    )
+    snapshots = _fcrash_h_snapshots(profile, "A")
+    cohort = (11, 12, 13, 14, 22, 23, 24)
+    snapshots["nonresponse"]["detected_target_ids"] = list(cohort)
+    for target in cohort:
+        reporters = sorted(runtime._v9_eligible_guard_reporters(profile, target))
+        assert len(reporters) >= 11
+        snapshots["nonresponse"]["qualifying_timeout_counts"][str(target)] = {
+            str(reporter): 2 for reporter in reporters[:11]
+        }
+        snapshots["nonresponse"]["guard_drawdowns"][str(target)] = -22
+    snapshots["ranking"]["detected_target_ids"] = list(profile.target_replica_ids)
+    ranked_ids = list(snapshots["ranking"]["ranked_ids"])
+    containment_eligible = [
+        replica for replica in profile.replica_ids if replica not in cohort
+    ]
+    baseline_roots = list(range(profile.quorum))
+    preserved = {root for root in baseline_roots if root in containment_eligible}
+    replacements = iter(
+        sorted(replica for replica in containment_eligible if replica not in preserved)
+    )
+    epoch1_roots = [
+        root if root in preserved else next(replacements) for root in baseline_roots
+    ]
+    epoch1_trees = _native_trees(
+        replica_count=len(profile.replica_ids),
+        quorum=profile.quorum,
+        fanout=int(profile.raw["protocol"]["fanout"]),
+        targets=cohort,
+        roots=epoch1_roots,
+    )
+    prior_epoch1 = snapshots["epoch1"]["decoded"]
+    epoch1_wire, epoch1 = _encode_signed_bundle(
+        replica_count=len(profile.replica_ids),
+        epoch_number=1,
+        previous_digest=str(prior_epoch1["previous_epoch_digest"]),
+        trees=epoch1_trees,
+        evidence_snapshot_id=str(prior_epoch1["evidence_snapshot_id"]),
+        evidence_cutoff=int(prior_epoch1["evidence_cutoff"]),
+        nonce=16,
+    )
+    commands1, activations1 = _transition_snapshot(
+        epoch1,
+        epoch1_wire,
+        tuple(
+            replica
+            for replica in profile.replica_ids
+            if replica not in profile.target_replica_ids
+        ),
+        timestamp_ns=2_000_000_004,
+        command_height=4,
+    )
+    snapshots["epoch1"] = {
+        "native_bundle": epoch1_wire,
+        "decoded": asdict(epoch1),
+        "source_monotonic_ns": 2_000_000_003,
+    }
+    snapshots["commands1"] = {
+        **commands1,
+        "source_monotonic_ns": 2_000_000_004,
+    }
+    snapshots["activations1"] = {
+        **activations1,
+        "source_monotonic_ns": 2_000_000_005,
+    }
+    snapshots["commit1"] = {
+        **snapshots["commit1"],
+        "epoch_digest": epoch1.epoch_digest,
+    }
+    snapshots["ranking"]["predecessor_epoch_digest"] = epoch1.epoch_digest
+    epoch2_roots = [
+        replica for replica in ranked_ids if replica not in cohort
+    ][: profile.quorum]
+    epoch2_trees = _native_trees(
+        replica_count=len(profile.replica_ids),
+        quorum=profile.quorum,
+        fanout=int(profile.raw["protocol"]["fanout"]),
+        targets=cohort,
+        roots=epoch2_roots,
+    )
+    epoch2_wire, epoch2 = _encode_signed_bundle(
+        replica_count=len(profile.replica_ids),
+        epoch_number=2,
+        previous_digest=epoch1.epoch_digest,
+        trees=epoch2_trees,
+        evidence_snapshot_id="47" * 32,
+        evidence_cutoff=29,
+        nonce=17,
+    )
+    commands2, activations2 = _transition_snapshot(
+        epoch2,
+        epoch2_wire,
+        tuple(
+            replica
+            for replica in profile.replica_ids
+            if replica not in profile.target_replica_ids
+        ),
+        timestamp_ns=2_000_000_010,
+        command_height=11,
+    )
+    snapshots["ranking"]["selected_root_ids"] = epoch2_roots
+    snapshots["epoch2"] = {
+        "native_bundle": epoch2_wire,
+        "decoded": asdict(epoch2),
+        "source_monotonic_ns": 2_000_000_009,
+    }
+    snapshots["commands2"] = {
+        **commands2,
+        "source_monotonic_ns": 2_000_000_010,
+    }
+    snapshots["activations2"] = {
+        **activations2,
+        "source_monotonic_ns": 2_000_000_011,
+    }
+    snapshots["commit2"] = {
+        **snapshots["commit2"],
+        "epoch_digest": epoch2.epoch_digest,
+    }
+    hooks, _ = _arm_hooks(runtime, snapshots)
+    runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    promoted_dependent = deepcopy(snapshots)
+    promoted_dependent["ranking"]["selected_root_ids"] = ranked_ids[
+        : profile.quorum
+    ]
+    hooks, _ = _arm_hooks(runtime, promoted_dependent)
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError, match="membership-incomplete"
+    ):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    missing = deepcopy(snapshots)
+    del missing["nonresponse"]["qualifying_timeout_counts"]["14"]
+    hooks, _ = _arm_hooks(runtime, missing)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="guarded-cohort"):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    new_epoch1_nonresponse = deepcopy(snapshots)
+    new_epoch1_nonresponse["ranking"]["detected_target_ids"] = [
+        11,
+        12,
+        13,
+        14,
+        16,
+        22,
+        23,
+        24,
+    ]
+    new_epoch1_nonresponse["ranking"]["ranked_ids"].remove(16)
+    hooks, _ = _arm_hooks(runtime, new_epoch1_nonresponse)
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError, match="membership-incomplete"
+    ):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
     outsider = _fcrash_h_snapshots(profile, "A")
-    counts = outsider["nonresponse"]["qualifying_timeout_counts"][target]
+    counts = outsider["nonresponse"]["qualifying_timeout_counts"][str(target)]
     reporter, value = counts.popitem()
     assert reporter != "999"
     counts["999"] = value
     hooks, _ = _arm_hooks(runtime, outsider)
-    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="reporter coverage"):
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="guarded-cohort"):
         runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
 
@@ -4184,6 +4384,86 @@ def test_v7_manager_launch_boundary_accepts_snapshot_basis(tmp_path: Path) -> No
         "exact_post_fault_attempt_start_v1"
     )
     assert proof["blinded"] is True
+
+
+def test_v9_arm_publication_and_manager_launch_bind_schema_four(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V9)
+    topology = profile.raw["topology"]
+    barrier = [
+        {
+            "replica_id": replica,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": topology["active_tree_id"],
+                "epoch_digest": topology["epoch_zero_digest"],
+            },
+        }
+        for replica in profile.replica_ids
+    ]
+    receipt = {
+        "schema_version": 1,
+        "sigkill_outcomes": [
+            {"confirmed_monotonic_ns": 100},
+            {"confirmed_monotonic_ns": 101},
+        ],
+    }
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "runtime").mkdir()
+    (tmp_path / "raw" / "fault-receipt.json").write_bytes(
+        runtime._canonical_json(receipt)
+    )
+    arm = runtime._fault_window_arm_document(
+        {
+            "profile": profile,
+            "run_directory": tmp_path,
+            "run_id": "run-v9",
+            "parent_request_sha256": "a" * 64,
+        },
+        receipt,
+        barrier,
+    )
+    published_path = (tmp_path / "runtime" / "fault-window-arm.json").resolve()
+    runtime._publish_fault_window_arm(published_path, arm)
+    assert arm["schema_version"] == 4
+    assert arm["kind"] == "kauri-focused-fault-window-arm-v4"
+    assert arm["selection_cardinality_policy"] == ("all_guarded_up_to_fault_bound_v1")
+
+    launch_root = tmp_path / "launch"
+    launch_arm = (launch_root / "runtime" / "fault-window-arm.json").resolve()
+    launch_arm.parent.mkdir(parents=True)
+    adapter = runtime._profiled_adapter(profile, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
+    argv = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm="control",
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=launch_root,
+        run_id="run-v9",
+        source_instance="manager-v9",
+        fault_window_arm_path=launch_arm,
+        request_sha256="a" * 64,
+    )
+    pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
+    assert pairs["--fault-window-arm-schema-version"] == "4"
+    assert pairs["--fault-window-arm-domain"] == "kauri-focused-fault-window-arm-v4"
+    assert pairs["--fault-window-arm-selection-cardinality-policy"] == (
+        "all_guarded_up_to_fault_bound_v1"
+    )
+    runtime._validate_manager_launch_boundary(
+        argv,
+        argv,
+        manager_input={
+            "input_source": "normalized_manager_launch_boundary_v1",
+            "requested_argv": list(argv),
+            "observed_argv": list(argv),
+            "stdin": "closed",
+        },
+        forbidden_values=(),
+    )
 
 
 def _membership_digest(replica_count: int) -> str:

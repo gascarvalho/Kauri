@@ -21,6 +21,9 @@ constexpr char kDigestD[] =
 constexpr char kDigestE[] =
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 
+std::string replace_once(std::string value, const std::string &from,
+                         const std::string &to);
+
 FaultWindowArmBindings bindings()
 {
     FaultWindowArmBindings result;
@@ -89,6 +92,29 @@ std::string canonical_v3_arm()
         "\",\"kind\":\"kauri-focused-fault-window-arm-v3\",\"prefault_tree_id\":6,\"profile_id\":\"n7-f2-q5-two-crash-pair-smoke-v4\",\"profile_sha256\":\"" + kDigestA +
         "\",\"request_sha256\":\"" + kDigestC +
         "\",\"required_observation_schema\":3,\"required_tree_ids\":[6,0,1,2,3,4],\"required_tree_positions\":6,\"run_id\":\"run-v4\",\"schema_version\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"topology_proof_sha256\":\"" + kDigestB + "\"}\n";
+}
+
+FaultWindowArmBindings v4_bindings()
+{
+    auto result = v3_bindings();
+    result.schema_version = 4;
+    result.domain = "kauri-focused-fault-window-arm-v4";
+    result.selection_cardinality_policy =
+        "all_guarded_up_to_fault_bound_v1";
+    return result;
+}
+
+std::string canonical_v4_arm()
+{
+    auto result = canonical_v3_arm();
+    result = replace_once(result,
+                          "kauri-focused-fault-window-arm-v3",
+                          "kauri-focused-fault-window-arm-v4");
+    result = replace_once(
+        result, "\"schema_version\":3,",
+        "\"schema_version\":4,\"selection_cardinality_policy\":"
+        "\"all_guarded_up_to_fault_bound_v1\",");
+    return result;
 }
 
 FaultWindowArmBindings n31_bindings()
@@ -190,6 +216,34 @@ TEST_CASE("fault-window v3 parser binds the causal snapshot basis",
                     v3_bindings());
 }
 
+TEST_CASE("fault-window v4 parser binds full guarded cohort selection",
+          "[adaptive-v2][fault-window-arm][v9][parser]")
+{
+    const auto text = canonical_v4_arm();
+    const auto document = FaultWindowArmJsonParser(
+        text, v4_bindings()).parse();
+    CHECK(document.arm.cardinality_policy ==
+          hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+              all_guarded_up_to_fault_bound_v1);
+    CHECK(document.event.selection_cardinality_policy ==
+          "all_guarded_up_to_fault_bound_v1");
+    require_invalid(replace_once(
+                        text, "all_guarded_up_to_fault_bound_v1",
+                        "exact_required_v1"),
+                    v4_bindings());
+    require_invalid(replace_once(
+                        text,
+                        ",\"selection_cardinality_policy\":"
+                        "\"all_guarded_up_to_fault_bound_v1\"",
+                        ""),
+                    v4_bindings());
+
+    auto contaminated = v3_bindings();
+    contaminated.selection_cardinality_policy =
+        "all_guarded_up_to_fault_bound_v1";
+    require_invalid(canonical_v3_arm(), contaminated);
+}
+
 TEST_CASE("fault-window v1 parser rejects newer binding contamination",
           "[adaptive-v2][fault-window-arm][v4][parser][partition]")
 {
@@ -205,6 +259,10 @@ TEST_CASE("fault-window v1 parser rejects newer binding contamination",
     contaminated = bindings();
     contaminated.snapshot_evidence_basis =
         "exact_post_fault_attempt_start_v1";
+    require_invalid(canonical_arm(), contaminated);
+    contaminated = bindings();
+    contaminated.selection_cardinality_policy =
+        "all_guarded_up_to_fault_bound_v1";
     require_invalid(canonical_arm(), contaminated);
 }
 

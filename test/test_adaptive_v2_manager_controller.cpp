@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 #include <vector>
 
 #include "catch.hpp"
+#include "hotstuff/adaptation_manager_profile.h"
 #include "hotstuff/adaptive_v2_manager_controller.h"
 
 namespace
@@ -602,10 +604,263 @@ struct Fixture
     }
 };
 
+std::vector<ReplicaID> n31_membership()
+{
+    std::vector<ReplicaID> members;
+    members.reserve(31);
+    for (ReplicaID replica = 0; replica < 31; ++replica)
+        members.push_back(replica);
+    return members;
+}
+
+struct N31ControllerFixture
+{
+    std::vector<ReplicaID> members{n31_membership()};
+    hotstuff::AdaptiveV2ManagerRuntimeShape shape;
+    AdaptiveV2ManagerIngress ingress;
+    PrivKeySecp256k1 key{private_key()};
+    AdaptiveV2ManagerControllerConfig config;
+    std::unique_ptr<AdaptiveV2ManagerController> controller;
+    std::vector<std::uint64_t> readiness_sequences;
+    std::vector<std::uint64_t> lifecycle_sequences;
+    std::vector<std::uint64_t> evidence_sequences;
+    std::map<std::pair<std::string, std::uint32_t>, uint256_t>
+        admitted_proposals;
+    std::uint64_t next_attempt_start_ns{1'000};
+
+    N31ControllerFixture()
+        : shape(*hotstuff::derive_adaptive_v2_manager_runtime_shape(
+              members, 5, 2)),
+          ingress(
+              members,
+              *hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
+                  members, 5, 2),
+              0,
+              kActivationGeneration,
+              shape.ingress_limits),
+          readiness_sequences(members.size()),
+          lifecycle_sequences(members.size()),
+          evidence_sequences(members.size())
+    {
+        config.selection.required_nonresponsive = 3;
+        config.selection.minimum_score_drop = 1;
+        config.selection.minimum_timeouts_per_reporter = 1;
+        config.selection.maximum_post_baseline_timeout_attempts =
+            shape.maximum_post_baseline_timeout_attempts;
+        config.selection.responsiveness_policy.policy_version =
+            "adaptive-v2-v9-n31-controller-v1";
+        config.selection.responsiveness_policy.attempt_window = 64;
+        config.selection.responsiveness_policy.minimum_attempts = 2;
+        config.selection.responsiveness_policy.minimum_response_rate_ppm =
+            1'000'000;
+        config.selection.responsiveness_policy.maximum_timeout_rate_ppm = 0;
+        config.selection.responsiveness_policy.trailing_timeout_streak = 2;
+        config.selection.responsiveness_policy
+            .latency_percentile_basis_points = 5'000;
+        config.selection.snapshot_seed = kSnapshotSeed;
+        config.selection.fault_window_arm_required = true;
+        config.selection.cardinality_policy =
+            hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1;
+        config.reputation_limits.maximum_audit_updates =
+            shape.ingress_limits.evidence_store.maximum_accepted_records;
+        config.placement = TreePlacementInput{
+            members,
+            shape.tree_shape,
+            kSnapshotSeed,
+            "adaptive-v2-v9-n31-controller-v1"};
+        config.activation_delay_blocks = 5;
+        config.issuer_id = kIssuerId;
+        config.issuer_private_key = key;
+        config.bundle_limits = shape.bundle_limits;
+        config.transition_policy.intent = TreePolicyKind::fault_containment;
+        for (std::uint32_t tree_id = 0;
+             tree_id < shape.tree_shape.tree_count;
+             ++tree_id)
+        {
+            const auto &tree = ingress.current_epoch().trees()[tree_id];
+            config.transition_policy.containment_baseline_roots.push_back(
+                BaselineRoot{
+                    tree.tree_id,
+                    tree.members_breadth_first.front()});
+        }
+        controller = std::make_unique<AdaptiveV2ManagerController>(
+            ingress, config);
+    }
+
+    void ready_quorum(const std::set<ReplicaID> &excluded = {})
+    {
+        std::size_t admitted = 0;
+        for (const auto source : members)
+        {
+            if (excluded.count(source) != 0)
+                continue;
+            const AdaptiveV2ReadinessNotice notice{
+                hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
+                source,
+                ++readiness_sequences[source],
+                ingress.current_configuration(),
+                ingress.activation_generation(),
+                static_cast<std::uint64_t>(100 + source)};
+            const auto result = ingress.ingest_readiness(
+                AuthenticatedReporter{source},
+                hotstuff::encode_adaptive_v2_readiness_notice(
+                    notice, shape.ingress_limits.readiness_wire));
+            REQUIRE(result.status ==
+                    AdaptiveV2ManagerIngressStatus::processed);
+            if (++admitted == ingress.quorum_metadata().quorum)
+                break;
+        }
+        REQUIRE(ingress.operationally_ready());
+    }
+
+    std::uint32_t nonroot_tree(ReplicaID target) const
+    {
+        for (const auto &tree : ingress.current_epoch().trees())
+        {
+            if (!tree.members_breadth_first.empty() &&
+                tree.members_breadth_first.front() != target)
+            {
+                return tree.tree_id;
+            }
+        }
+        throw std::logic_error("N31 fixture has no nonroot tree");
+    }
+
+    uint256_t proposal(
+        const std::string &phase,
+        std::uint32_t tree_id)
+    {
+        const auto key = std::make_pair(phase, tree_id);
+        const auto existing = admitted_proposals.find(key);
+        if (existing != admitted_proposals.end())
+            return existing->second;
+
+        const auto block_hash = digest(
+            phase + "-" + std::to_string(tree_id));
+        const ProposalKey proposal_key{
+            ConfigurationId{
+                ingress.current_epoch().epoch_number(),
+                tree_id,
+                ingress.current_epoch().epoch_digest()},
+            block_hash};
+        for (ReplicaID source = 0;
+             source <= ingress.quorum_metadata().fault_threshold;
+             ++source)
+        {
+            const ProposalLifecycleNotice notice{
+                hotstuff::kProposalLifecycleNoticeSchemaVersion,
+                source,
+                ++lifecycle_sequences[source],
+                ProposalLifecycleFact{
+                    NormalProposalRuntimeInitialized{proposal_key}}};
+            const auto result = ingress.ingest_lifecycle(
+                AuthenticatedReporter{source},
+                hotstuff::encode_proposal_lifecycle_notice(
+                    notice, shape.ingress_limits.lifecycle_wire));
+            CHECK(result.status ==
+                  (source < ingress.quorum_metadata().fault_threshold
+                       ? AdaptiveV2ManagerIngressStatus::
+                             awaiting_corroboration
+                       : AdaptiveV2ManagerIngressStatus::processed));
+        }
+        admitted_proposals.emplace(key, block_hash);
+        return block_hash;
+    }
+
+    void record(
+        ReplicaID target,
+        std::uint32_t tree_id,
+        ResponseOutcome outcome,
+        const std::string &phase,
+        std::uint64_t attempt_start_ns)
+    {
+        const auto &trees = ingress.current_epoch().trees();
+        const auto tree = std::find_if(
+            trees.begin(), trees.end(),
+            [tree_id](const auto &candidate) {
+                return candidate.tree_id == tree_id;
+            });
+        REQUIRE(tree != trees.end());
+        const auto found = std::find(
+            tree->members_breadth_first.begin(),
+            tree->members_breadth_first.end(),
+            target);
+        REQUIRE(found != tree->members_breadth_first.end());
+        const auto position = static_cast<std::size_t>(std::distance(
+            tree->members_breadth_first.begin(), found));
+        REQUIRE(position != 0);
+        const auto reporter = tree->members_breadth_first[
+            (position - 1U) / tree->fanout];
+        const bool internal =
+            ((position * tree->fanout) + 1U) <
+            tree->members_breadth_first.size();
+
+        ResponseObservation observation;
+        observation.schema_version =
+            hotstuff::kResponseObservationSchemaVersionV3;
+        observation.reporter_id = reporter;
+        observation.observed_replica_id = target;
+        observation.configuration = {
+            ingress.current_epoch().epoch_number(),
+            tree_id,
+            ingress.current_epoch().epoch_digest()};
+        observation.block_hash = proposal(phase, tree_id);
+        observation.expected_message_type = internal
+            ? ExpectedMessageType::aggregate_relay
+            : ExpectedMessageType::direct_vote;
+        observation.outcome = outcome;
+        observation.response_duration_us =
+            outcome == ResponseOutcome::on_time ? 50 : 0;
+        observation.deadline_duration_us = 100;
+        observation.attempt_start_monotonic_ns = attempt_start_ns;
+        observation.reporter_monotonic_ns = attempt_start_ns +
+            (outcome == ResponseOutcome::on_time ? 50'000U : 100'000U);
+        observation.reporter_sequence =
+            ++evidence_sequences[reporter];
+        if (outcome == ResponseOutcome::on_time)
+            observation.signer_set = {target};
+        observation.observation_id =
+            hotstuff::compute_response_observation_id(observation);
+        const auto result = ingress.ingest_evidence(
+            AuthenticatedReporter{reporter},
+            hotstuff::encode_evidence_batch(
+                ResponseObservationBatch{
+                    hotstuff::kEvidenceBatchSchemaVersion,
+                    {observation}},
+                shape.ingress_limits.evidence_wire));
+        REQUIRE(result.status ==
+                AdaptiveV2ManagerIngressStatus::processed);
+        REQUIRE(result.accepted_observations == 1);
+    }
+
+    void record_responsive(
+        const std::vector<ReplicaID> &targets,
+        const std::string &phase,
+        std::uint64_t minimum_attempt_start_ns = 0)
+    {
+        next_attempt_start_ns = std::max(
+            next_attempt_start_ns, minimum_attempt_start_ns);
+        for (const auto target : targets)
+        {
+            for (std::uint32_t attempt = 0; attempt < 2; ++attempt)
+            {
+                record(
+                    target,
+                    nonroot_tree(target),
+                    ResponseOutcome::on_time,
+                    phase,
+                    next_attempt_start_ns++);
+            }
+        }
+    }
+};
+
 enum class InheritedEpochShape : std::uint8_t
 {
     exact = 1,
     undersized,
+    oversized,
     inconsistent,
 };
 
@@ -640,6 +895,15 @@ EpochDefinitionInput exact_epoch_one(
         std::vector<ReplicaID> inherited{0, 1};
         if (inherited_shape == InheritedEpochShape::undersized)
             inherited = {0};
+        else if (inherited_shape == InheritedEpochShape::oversized)
+        {
+            const auto replica_two = std::find(
+                ordered.begin(), ordered.end(), ReplicaID{2});
+            REQUIRE(replica_two != ordered.end());
+            ordered.erase(replica_two);
+            ordered.push_back(2);
+            inherited = {0, 1, 2};
+        }
         else if (inherited_shape == InheritedEpochShape::inconsistent &&
                  root_index == 1)
             inherited = {0, 2};
@@ -1250,6 +1514,175 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "N31 v9 controller carries the slot05 guarded cohort through E2",
+    "[adaptive-v2][manager-controller][all-guarded][v9][n31][recurring]")
+{
+    N31ControllerFixture fixture;
+    fixture.ready_quorum();
+    fixture.record_responsive(
+        fixture.members, "v9-cycle0-baseline");
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+
+    constexpr std::uint64_t kEvidenceStartNs = 1'000'000;
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number =
+        fixture.ingress.current_epoch().epoch_number();
+    arm.predecessor_epoch_digest =
+        fixture.ingress.current_epoch().epoch_digest();
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 20;
+    for (std::uint32_t offset = 0; offset < 17; ++offset)
+        arm.required_tree_ids.push_back((20U + offset) % 31U);
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_attempt_start_v1;
+    arm.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    REQUIRE(fixture.controller->arm_fault_window(arm));
+
+    const std::vector<ReplicaID> guarded{
+        10, 11, 12, 15, 21, 22, 23};
+    const std::set<ReplicaID> guarded_set(
+        guarded.begin(), guarded.end());
+    std::vector<ReplicaID> survivors;
+    for (const auto member : fixture.members)
+    {
+        if (guarded_set.count(member) == 0)
+            survivors.push_back(member);
+    }
+    fixture.record_responsive(
+        survivors,
+        "v9-cycle0-survivors",
+        kEvidenceStartNs + 10'000U);
+
+    std::uint64_t start = kEvidenceStartNs + 100'000U;
+    const auto timeout_on =
+        [&fixture, &start](
+            ReplicaID target,
+            const std::vector<std::uint32_t> &trees) {
+            for (const auto tree : trees)
+            {
+                fixture.record(
+                    target,
+                    tree,
+                    ResponseOutcome::timeout,
+                    "v9-cycle0-timeout",
+                    start++);
+            }
+        };
+    timeout_on(21, {20, 24, 25, 26, 28, 29, 30, 0, 2, 3, 4, 5});
+    timeout_on(22, {20, 24, 25, 26, 27, 29, 30, 0, 1, 3, 5});
+    timeout_on(23, {20, 24, 25, 26, 27, 28, 30, 0, 1, 2, 5});
+    for (const auto target : std::vector<ReplicaID>{10, 11, 12, 15})
+    {
+        std::vector<std::uint32_t> trees;
+        for (std::uint32_t offset = 0; offset < 17; ++offset)
+        {
+            const auto tree = (20U + offset) % 31U;
+            if (tree != target)
+                trees.push_back(tree);
+        }
+        timeout_on(target, trees);
+    }
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    auto selected_cycle_zero =
+        fixture.controller->selection_audit()->selected_replicas;
+    std::sort(selected_cycle_zero.begin(), selected_cycle_zero.end());
+    CHECK(selected_cycle_zero == guarded);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    const auto epoch_one =
+        fixture.controller->successor_bundle()->definition();
+    for (const auto &tree : epoch_one.trees)
+        CHECK(tree.wait_exempt_leaves == guarded);
+
+    fixture.controller.reset();
+    REQUIRE(fixture.ingress.rotate_to_successor(epoch_one, 0) ==
+            AdaptiveV2ManagerIngressStatus::processed);
+    fixture.config.selection.fault_window_arm_required = false;
+    fixture.config.transition_policy.intent =
+        TreePolicyKind::performance_optimization;
+    fixture.config.transition_policy.containment_baseline_roots.clear();
+    fixture.admitted_proposals.clear();
+    fixture.next_attempt_start_ns = start + 200'000U;
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    REQUIRE(fixture.controller->healthy());
+
+    fixture.ready_quorum(guarded_set);
+    fixture.record_responsive(
+        survivors, "v9-cycle1-baseline");
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    fixture.record_responsive(
+        survivors, "v9-cycle1-ranking");
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    CHECK(fixture.controller->selection_audit()->constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::
+              inherited_consensus_wait_exempt);
+    CHECK(fixture.controller->selection_audit()->selected_replicas ==
+          guarded);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    CHECK(fixture.controller->successor_bundle()
+              ->definition()
+              .epoch_number == 2);
+    for (const auto &tree :
+         fixture.controller->successor_bundle()->definition().trees)
+    {
+        CHECK(tree.wait_exempt_leaves == guarded);
+    }
+}
+
+TEST_CASE(
+    "v9 recurring selection preserves an inherited cohort above its minimum",
+    "[adaptive-v2][manager-controller][inheritance][all-guarded][v9][n7]")
+{
+    Fixture fixture(5, 4096, 1);
+    fixture.controller.reset();
+    fixture.config.selection.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    rotate_to_exact_epoch_one(
+        fixture, TreePolicyKind::performance_optimization);
+    ready_live_survivors(fixture);
+    record_live_survivor_baseline(fixture);
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    record_ranked_live_survivor_suffix(fixture);
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    const auto &selection = *fixture.controller->selection_audit();
+    CHECK(selection.constraint_basis ==
+          AdaptiveV2SelectionConstraintBasis::
+              inherited_consensus_wait_exempt);
+    CHECK(selection.metadata.required_nonresponsive == 1);
+    CHECK(selection.metadata.cardinality_policy ==
+          hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+              all_guarded_up_to_fault_bound_v1);
+    CHECK(selection.selected_replicas ==
+          std::vector<ReplicaID>{0, 1});
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    for (const auto &tree :
+         fixture.controller->successor_bundle()->definition().trees)
+    {
+        CHECK(tree.wait_exempt_leaves ==
+              std::vector<ReplicaID>{0, 1});
+    }
+}
+
+TEST_CASE(
     "N7 recurring containment keeps freshly responsive inherited actors "
     "as leaves",
     "[adaptive-v2][manager-controller][inheritance][recovered]"
@@ -1333,6 +1766,55 @@ TEST_CASE(
             CHECK(fixture.controller->successor_bundle() == nullptr);
             CHECK(fixture.controller->selection_audit() == nullptr);
         }
+    }
+}
+
+TEST_CASE(
+    "v9 recurring selection rejects inherited cohorts outside its safe range",
+    "[adaptive-v2][manager-controller][inheritance][all-guarded]"
+    "[fail-closed][v9][n7]")
+{
+    SECTION("below minimum")
+    {
+        Fixture fixture;
+        fixture.controller.reset();
+        fixture.config.selection.cardinality_policy =
+            hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1;
+        rotate_to_exact_epoch_one(
+            fixture,
+            TreePolicyKind::performance_optimization,
+            InheritedEpochShape::undersized);
+        CHECK_FALSE(fixture.controller->healthy());
+        CHECK(fixture.controller->evaluate() ==
+              AdaptiveV2ManagerControllerStatus::unhealthy);
+    }
+
+    SECTION("above N minus Q")
+    {
+        Fixture fixture(5, 4096, 1);
+        fixture.controller.reset();
+        const auto successor = exact_epoch_one(
+            fixture.ingress, InheritedEpochShape::oversized);
+        CHECK(fixture.ingress.rotate_to_successor(successor, 0) ==
+              AdaptiveV2ManagerIngressStatus::rejected_configuration);
+        CHECK(fixture.ingress.current_epoch().epoch_number() == 0);
+    }
+
+    SECTION("tree mutation")
+    {
+        Fixture fixture(5, 4096, 1);
+        fixture.controller.reset();
+        fixture.config.selection.cardinality_policy =
+            hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1;
+        rotate_to_exact_epoch_one(
+            fixture,
+            TreePolicyKind::performance_optimization,
+            InheritedEpochShape::inconsistent);
+        CHECK_FALSE(fixture.controller->healthy());
+        CHECK(fixture.controller->evaluate() ==
+              AdaptiveV2ManagerControllerStatus::unhealthy);
     }
 }
 

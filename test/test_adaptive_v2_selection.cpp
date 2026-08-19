@@ -1774,10 +1774,18 @@ TEST_CASE(
         *fixture.ledger, fixture.members, fixture.epoch, config);
     AdaptiveV2ByzantineSelection h17(
         *fixture.ledger, fixture.members, fixture.epoch, config);
+    auto v9_config = config;
+    v9_config.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    AdaptiveV2ByzantineSelection v9(
+        *fixture.ledger, fixture.members, fixture.epoch, v9_config);
     const auto baseline_cutoff = fixture.ledger->high_watermark();
     REQUIRE(h16.freeze_baseline(baseline_cutoff) ==
             AdaptiveV2SelectionStatus::baseline_frozen);
     REQUIRE(h17.freeze_baseline(baseline_cutoff) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    REQUIRE(v9.freeze_baseline(baseline_cutoff) ==
             AdaptiveV2SelectionStatus::baseline_frozen);
 
     const auto arm = [&](std::uint32_t horizon) {
@@ -1798,6 +1806,11 @@ TEST_CASE(
     };
     REQUIRE(h16.arm_fault_window(arm(16)));
     REQUIRE(h17.arm_fault_window(arm(17)));
+    auto v9_arm = arm(17);
+    v9_arm.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    REQUIRE(v9.arm_fault_window(std::move(v9_arm)));
 
     // Causal snapshot evidence is deliberately wider than the guard prefix.
     // Every survivor is responsive; only 21/22/23 can become candidates.
@@ -1841,6 +1854,12 @@ TEST_CASE(
           AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
     CHECK(h17_before_tree5.status ==
           AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    const auto v9_below_minimum = v9.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(v9_below_minimum.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(v9_below_minimum.eligible_candidates.size() < 3);
+    CHECK(v9_below_minimum.selected_replicas.empty());
     REQUIRE(candidate(h17_before_tree5.eligible_candidates, 21) != nullptr);
     CHECK(candidate(h17_before_tree5.eligible_candidates, 21)
               ->qualifying_reporters.size() == 11);
@@ -1858,6 +1877,10 @@ TEST_CASE(
     const auto selected = h17.select_through(fixture.ledger->high_watermark());
     REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
     CHECK(selected.selected_replicas == targets);
+    const auto v9_targets = v9.select_through(
+        fixture.ledger->high_watermark());
+    REQUIRE(v9_targets.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(v9_targets.selected_replicas == targets);
     REQUIRE(candidate(selected.eligible_candidates, 21) != nullptr);
     REQUIRE(candidate(selected.eligible_candidates, 22) != nullptr);
     REQUIRE(candidate(selected.eligible_candidates, 23) != nullptr);
@@ -1870,12 +1893,50 @@ TEST_CASE(
 
     // Guard eligibility is not sufficient when causal snapshot evidence also
     // makes an unselected survivor nonresponsive.
-    (void)emit_twice(10, 6);
+    const std::vector<ReplicaID> dependent_nonresponsive{10, 11, 12, 15};
+    for (const auto replica : dependent_nonresponsive)
+    {
+        for (std::uint32_t offset = 0; offset < 17; ++offset)
+        {
+            const auto tree = (20U + offset) % 31U;
+            if (tree != replica)
+                (void)emit_twice(replica, tree);
+        }
+    }
     const auto extra_survivor = h17.select_through(fixture.ledger->high_watermark());
     CHECK(extra_survivor.status ==
           AdaptiveV2SelectionStatus::insufficient_eligible_roots);
     CHECK(extra_survivor.selected_replicas.empty());
     CHECK(extra_survivor.eligible_roots.empty());
+    CHECK(extra_survivor.eligible_candidates.size() == 7);
+    const auto slot05_shaped = v9.select_through(
+        fixture.ledger->high_watermark());
+    REQUIRE(slot05_shaped.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(slot05_shaped.eligible_candidates.size() == 7);
+    auto selected_slot05 = slot05_shaped.selected_replicas;
+    std::sort(selected_slot05.begin(), selected_slot05.end());
+    CHECK(selected_slot05 ==
+          std::vector<ReplicaID>{10, 11, 12, 15, 21, 22, 23});
+    CHECK(slot05_shaped.eligible_roots.size() == 21);
+
+    // More than N-Q guarded candidates is outside the consensus-safe
+    // containment envelope and is terminal, never a wider placement.
+    for (const auto replica : std::vector<ReplicaID>{16, 17, 18, 19})
+    {
+        for (std::uint32_t offset = 0; offset < 17; ++offset)
+        {
+            const auto tree = (20U + offset) % 31U;
+            if (tree != replica)
+                (void)emit_twice(replica, tree);
+        }
+    }
+    const auto over_bound = v9.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(over_bound.status == AdaptiveV2SelectionStatus::
+          guarded_candidate_bound_exceeded);
+    CHECK(over_bound.eligible_candidates.size() == 11);
+    CHECK(over_bound.selected_replicas.empty());
+    CHECK_FALSE(v9.healthy());
 
     // Exact late compensation applies only to the matching schema3 ID. It
     // removes reporter 8's two tree-5 attempts for target 22 and reopens the
@@ -1884,7 +1945,7 @@ TEST_CASE(
     fixture.late(tree5_22.second, tree5_22.second.reporter_monotonic_ns + 200'000U);
     const auto late_pending = h17.select_through(fixture.ledger->high_watermark());
     CHECK(late_pending.status ==
-          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
     const auto accepted_before_bad_late = fixture.ledger->accepted().size();
     auto mismatched_late = tree5_22.first;
     mismatched_late.outcome = ResponseOutcome::late;

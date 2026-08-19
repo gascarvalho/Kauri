@@ -1,0 +1,180 @@
+{
+  "active_tree_id": 6,
+  "bfs_member_order": [
+    6,
+    0,
+    1,
+    2,
+    3,
+    4,
+    5
+  ],
+  "epoch_zero_digest": "f550407e56cc54a8fd4e93d1997ebe658b75699f4f2a9e955f4cc829b52bec81",
+  "fanout": 2,
+  "internal_descendant_sets": {
+    "0": [
+      2,
+      3
+    ],
+    "1": [
+      4,
+      5
+    ],
+    "6": [
+      0,
+      2,
+      3,
+      1,
+      4,
+      5
+    ]
+  },
+  "members": [
+    {
+      "bfs_index": 0,
+      "depth": 0,
+      "replica_id": 6,
+      "role": "root"
+    },
+    {
+      "bfs_index": 1,
+      "depth": 1,
+      "replica_id": 0,
+      "role": "internal"
+    },
+    {
+      "bfs_index": 2,
+      "depth": 1,
+      "replica_id": 1,
+      "role": "internal"
+    },
+    {
+      "bfs_index": 3,
+      "depth": 2,
+      "replica_id": 2,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 4,
+      "depth": 2,
+      "replica_id": 3,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 5,
+      "depth": 2,
+      "replica_id": 4,
+      "role": "leaf"
+    },
+    {
+      "bfs_index": 6,
+      "depth": 2,
+      "replica_id": 5,
+      "role": "leaf"
+    }
+  ],
+  "profile_id": "n7-f2-q5-two-crash-pair-smoke-v9",
+  "profile_sha256": "fb29c2a8c0a8f88177ecfade5b62255ca5966e359b523c1e3aa918500c10d74f",
+  "root_replica_id": 6,
+  "schema_version": 1,
+  "source": "native_epoch_profile_digest",
+  "target_derivation": {
+    "deepest_member_ids": [
+      0,
+      1
+    ],
+    "pairwise_disjoint": true,
+    "reporter_coverage_capacity": {
+      "domain": "kauri-topology-fault-window-reporter-capacity-v1",
+      "minimum_topology_eligible_reporter_capacity": 3,
+      "prefix_tree_ids": [
+        6,
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+      "schema_version": 1,
+      "targets": [
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 6
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 0
+        },
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 6
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 1
+        }
+      ]
+    },
+    "selected_target_replica_ids": [
+      0,
+      1
+    ]
+  }
+}

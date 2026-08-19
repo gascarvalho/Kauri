@@ -517,6 +517,7 @@ const char *selection_status_name(
         case AdaptiveV2SelectionStatus::baseline_frozen: return "baseline_frozen";
         case AdaptiveV2SelectionStatus::selected: return "selected";
         case AdaptiveV2SelectionStatus::insufficient_guarded_candidates: return "insufficient_guarded_candidates";
+        case AdaptiveV2SelectionStatus::guarded_candidate_bound_exceeded: return "guarded_candidate_bound_exceeded";
         case AdaptiveV2SelectionStatus::insufficient_eligible_roots: return "insufficient_eligible_roots";
         case AdaptiveV2SelectionStatus::invalid_state: return "invalid_state";
         case AdaptiveV2SelectionStatus::invalid_cutoff: return "invalid_cutoff";
@@ -1102,6 +1103,7 @@ bool valid_manager_session_terminal_payload(
             switch (status)
             {
                 case AdaptiveV2SelectionStatus::invalid_state:
+                case AdaptiveV2SelectionStatus::guarded_candidate_bound_exceeded:
                 case AdaptiveV2SelectionStatus::invalid_cutoff:
                 case AdaptiveV2SelectionStatus::ledger_unhealthy:
                 case AdaptiveV2SelectionStatus::mixed_epoch:
@@ -1346,22 +1348,34 @@ bool valid_fault_window_armed_payload(
         event.clock_domain.empty() &&
         event.required_observation_schema == 0 &&
         event.timeout_evidence_basis.empty() &&
-        event.snapshot_evidence_basis.empty();
+        event.snapshot_evidence_basis.empty() &&
+        event.selection_cardinality_policy.empty();
     const bool v2 = event.schema_version == 2 &&
         event.kind == "kauri-focused-fault-window-arm-v2" &&
         event.clock_domain == "same_host_clock_monotonic_raw" &&
         event.required_observation_schema == 3 &&
         event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
-        event.snapshot_evidence_basis.empty();
+        event.snapshot_evidence_basis.empty() &&
+        event.selection_cardinality_policy.empty();
     const bool v3 = event.schema_version == 3 &&
         event.kind == "kauri-focused-fault-window-arm-v3" &&
         event.clock_domain == "same_host_clock_monotonic_raw" &&
         event.required_observation_schema == 3 &&
         event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
         event.snapshot_evidence_basis ==
-            "exact_post_fault_attempt_start_v1";
+            "exact_post_fault_attempt_start_v1" &&
+        event.selection_cardinality_policy.empty();
+    const bool v4 = event.schema_version == 4 &&
+        event.kind == "kauri-focused-fault-window-arm-v4" &&
+        event.clock_domain == "same_host_clock_monotonic_raw" &&
+        event.required_observation_schema == 3 &&
+        event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
+        event.snapshot_evidence_basis ==
+            "exact_post_fault_attempt_start_v1" &&
+        event.selection_cardinality_policy ==
+            "all_guarded_up_to_fault_bound_v1";
     return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
-        (v1 || v2 || v3) &&
+        (v1 || v2 || v3 || v4) &&
         !event.run_id.empty() && !event.profile_id.empty() &&
         event.epoch_digest != uint256_t{} &&
         event.evidence_start_monotonic_ns != 0 &&
@@ -2026,14 +2040,20 @@ void append_fault_window_armed_payload(
     builder.append(",\"prefault_tree_id\":"); builder.append_integer(event.prefault_tree_id);
     builder.append(",\"required_tree_positions\":"); builder.append_integer(event.required_tree_positions);
     builder.append(",\"required_tree_ids\":"); append_u32_ids(builder, event.required_tree_ids);
-    if (event.schema_version == 2 || event.schema_version == 3)
+    if (event.schema_version == 2 || event.schema_version == 3 ||
+        event.schema_version == 4)
     {
         builder.append(",\"clock_domain\":"); builder.append_escaped(event.clock_domain);
         builder.append(",\"required_observation_schema\":"); builder.append_integer(event.required_observation_schema);
-        if (event.schema_version == 3)
+        if (event.schema_version == 3 || event.schema_version == 4)
         {
             builder.append(",\"snapshot_evidence_basis\":");
             builder.append_escaped(event.snapshot_evidence_basis);
+        }
+        if (event.schema_version == 4)
+        {
+            builder.append(",\"selection_cardinality_policy\":");
+            builder.append_escaped(event.selection_cardinality_policy);
         }
         builder.append(",\"timeout_evidence_basis\":"); builder.append_escaped(event.timeout_evidence_basis);
     }

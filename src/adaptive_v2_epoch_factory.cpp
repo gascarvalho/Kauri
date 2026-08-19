@@ -75,6 +75,15 @@ bool exact_selection_metadata(
     default:
         return false;
     }
+    switch (metadata.cardinality_policy)
+    {
+    case AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1:
+    case AdaptiveV2FaultWindowCardinalityPolicy::
+        all_guarded_up_to_fault_bound_v1:
+        break;
+    default:
+        return false;
+    }
     return metadata.replica_count == quorum.replica_count &&
            metadata.fault_threshold == quorum.fault_threshold &&
            metadata.quorum == quorum.quorum &&
@@ -178,9 +187,20 @@ bool valid_guarded_candidates(
         }
     }
 
-    for (std::size_t index = 0;
-         index < selection.metadata.required_nonresponsive;
-         ++index)
+    const auto expected_selected =
+        selection.metadata.cardinality_policy ==
+            AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1
+        ? selection.eligible_candidates.size()
+        : static_cast<std::size_t>(
+              selection.metadata.required_nonresponsive);
+    if (selection.selected_replicas.size() != expected_selected ||
+        (selection.metadata.cardinality_policy ==
+             AdaptiveV2FaultWindowCardinalityPolicy::
+                 all_guarded_up_to_fault_bound_v1 &&
+         expected_selected > membership.size() - quorum.quorum))
+        return false;
+    for (std::size_t index = 0; index < expected_selected; ++index)
     {
         if (selection.eligible_candidates[index].replica_id !=
             selection.selected_replicas[index])
@@ -281,10 +301,26 @@ AdaptiveV2EpochFactoryStatus validate_selection(
 {
     if (selection.status != AdaptiveV2SelectionStatus::selected ||
         selection.snapshot == nullptr ||
-        !exact_selection_metadata(selection, quorum) ||
-        selection.selected_replicas.size() !=
-            selection.metadata.required_nonresponsive)
+        !exact_selection_metadata(selection, quorum))
     {
+        return AdaptiveV2EpochFactoryStatus::invalid_selection;
+    }
+    switch (selection.metadata.cardinality_policy)
+    {
+    case AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1:
+        if (selection.selected_replicas.size() !=
+            selection.metadata.required_nonresponsive)
+            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+        break;
+    case AdaptiveV2FaultWindowCardinalityPolicy::
+        all_guarded_up_to_fault_bound_v1:
+        if (selection.selected_replicas.size() <
+                selection.metadata.required_nonresponsive ||
+            selection.selected_replicas.size() >
+                membership.size() - quorum.quorum)
+            return AdaptiveV2EpochFactoryStatus::invalid_selection;
+        break;
+    default:
         return AdaptiveV2EpochFactoryStatus::invalid_selection;
     }
 

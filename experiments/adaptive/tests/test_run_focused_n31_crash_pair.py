@@ -31,6 +31,8 @@ N7_PROFILE_V7 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v7.json"
 N31_PROFILE_V7 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v7.json"
 N7_PROFILE_V8 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v8.json"
 N31_PROFILE_V8 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v8.json"
+N7_PROFILE_V9 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v9.json"
+N31_PROFILE_V9 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v9.json"
 
 
 def _runner() -> Any:
@@ -57,7 +59,7 @@ def _inputs(
         "authorization": tmp_path / "authorization.json",
         "trusted": tmp_path / "trusted.json",
     }
-    source_profile = N7_PROFILE_V8 if mode == "smoke" else N31_PROFILE_V8
+    source_profile = N7_PROFILE_V9 if mode == "smoke" else N31_PROFILE_V9
     profile = json.loads(source_profile.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(source_profile, profile)
     values["proof"] = tmp_path / profile["topology"]["proof_path"]
@@ -1514,7 +1516,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
-    profile = runtime.load_focused_profile(N7_PROFILE_V8)
+    profile = runtime.load_focused_profile(N7_PROFILE_V9)
     assert profile.issuer_public_key is None
     checks = _CliPreflightChecks()
     captured: list[dict[str, object]] = []
@@ -1530,7 +1532,7 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
                 "--mode",
                 "smoke",
                 "--profile",
-                str(N7_PROFILE_V8),
+                str(N7_PROFILE_V9),
                 "--pairs",
                 "1",
                 "--output",
@@ -1553,11 +1555,11 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
     assert context["issuer_public_key"] == native_fixture.ISSUER_PUBLIC_KEY
     assert (
         preflight["profile_sha256"]
-        == "dfadb278014e21224b0326b1d4654f2dad0029e5dc1892aae7312e979170e64f"
+        == "fb29c2a8c0a8f88177ecfade5b62255ca5966e359b523c1e3aa918500c10d74f"
     )
     assert (
         preflight["topology_proof_sha256"]
-        == "1f88b12272e78546614a4467ccbbe790cadfa3e5cafec3336e457e8f1226a82f"
+        == "652d310c0df2795ba28ccb56d49a8f276b9acfb68e0ec7064cdcb967dae83089"
     )
     request = runtime.build_focused_authorization_request(preflight)
     request_document = json.loads(request)
@@ -1594,23 +1596,23 @@ def test_default_cli_preflight_binds_checks_and_generated_issuer_into_auth_bytes
         (
             "smoke",
             1,
-            "n7-f2-q5-two-crash-pair-smoke-v8",
-            "dfadb278014e21224b0326b1d4654f2dad0029e5dc1892aae7312e979170e64f",
-            "1f88b12272e78546614a4467ccbbe790cadfa3e5cafec3336e457e8f1226a82f",
+            "n7-f2-q5-two-crash-pair-smoke-v9",
+            "fb29c2a8c0a8f88177ecfade5b62255ca5966e359b523c1e3aa918500c10d74f",
+            "652d310c0df2795ba28ccb56d49a8f276b9acfb68e0ec7064cdcb967dae83089",
         ),
         (
             "pair",
             1,
-            "n31-f5-q21-three-crash-pair-v8",
-            "9d015b2c38c294d0b598cb8f48f579e33d116d276a612ba5edc36cd7edc883a9",
-            "ba6e0670a9d2070b4344a404c7e4974f938beb57a12714865883a74a047f6c0f",
+            "n31-f5-q21-three-crash-pair-v9",
+            "bdb796bd1b8cf3fcf1c10c30df80b2e46d6b5fe1b2c4b9e1d037031ead1b04b0",
+            "a50bd106887e5e3baf550875217db37c96fb9b07d40c39a98e80cef20e435ced",
         ),
         (
             "campaign",
             5,
-            "n31-f5-q21-three-crash-pair-v8",
-            "9d015b2c38c294d0b598cb8f48f579e33d116d276a612ba5edc36cd7edc883a9",
-            "ba6e0670a9d2070b4344a404c7e4974f938beb57a12714865883a74a047f6c0f",
+            "n31-f5-q21-three-crash-pair-v9",
+            "bdb796bd1b8cf3fcf1c10c30df80b2e46d6b5fe1b2c4b9e1d037031ead1b04b0",
+            "a50bd106887e5e3baf550875217db37c96fb9b07d40c39a98e80cef20e435ced",
         ),
     ),
 )
@@ -1934,7 +1936,7 @@ def test_default_preflight_persists_and_execution_reloads_pair_issuer_material(
                 "--mode",
                 "campaign",
                 "--profile",
-                str(N31_PROFILE_V8),
+                str(N31_PROFILE_V9),
                 "--pairs",
                 "5",
                 "--output",

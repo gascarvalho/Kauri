@@ -908,7 +908,9 @@ FaultWindowArmedStructuredEvent fault_window_armed_event(
         ? "kauri-focused-fault-window-arm-v1"
         : schema_version == 2
               ? "kauri-focused-fault-window-arm-v2"
-              : "kauri-focused-fault-window-arm-v3";
+              : schema_version == 3
+                    ? "kauri-focused-fault-window-arm-v3"
+                    : "kauri-focused-fault-window-arm-v4";
     event.run_id = "run-fault-window-arm";
     event.profile_id = "n7-f2-q5-two-crash-pair-smoke-v7";
     event.profile_sha256 = digest("fault-window-profile").to_hex();
@@ -928,11 +930,14 @@ FaultWindowArmedStructuredEvent fault_window_armed_event(
         event.required_observation_schema = 3;
         event.timeout_evidence_basis = "exact_timeout_attempt_id_v1";
     }
-    if (schema_version == 3)
+    if (schema_version >= 3)
     {
         event.snapshot_evidence_basis =
             "exact_post_fault_attempt_start_v1";
     }
+    if (schema_version == 4)
+        event.selection_cardinality_policy =
+            "all_guarded_up_to_fault_bound_v1";
     return event;
 }
 
@@ -3089,7 +3094,7 @@ TEST_CASE("fault-window armed events partition schema-only fields",
     };
 
     for (const auto schema : {std::uint32_t{1}, std::uint32_t{2},
-                              std::uint32_t{3}})
+                              std::uint32_t{3}, std::uint32_t{4}})
     {
         auto event = fault_window_armed_event(schema);
         FakeClock clock({8'101 + schema});
@@ -3116,6 +3121,9 @@ TEST_CASE("fault-window armed events partition schema-only fields",
         {
             CHECK(text.find("\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\"") !=
                   std::string::npos);
+            CHECK((text.find("\"selection_cardinality_policy\":"
+                             "\"all_guarded_up_to_fault_bound_v1\"") !=
+                   std::string::npos) == (schema == 4));
         }
     }
 
@@ -3133,6 +3141,13 @@ TEST_CASE("fault-window armed events partition schema-only fields",
     CHECK(rejects(std::move(invalid)));
     invalid = fault_window_armed_event(3);
     invalid.snapshot_evidence_basis = "wrong";
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(4);
+    invalid.selection_cardinality_policy.clear();
+    CHECK(rejects(std::move(invalid)));
+    invalid = fault_window_armed_event(3);
+    invalid.selection_cardinality_policy =
+        "all_guarded_up_to_fault_bound_v1";
     CHECK(rejects(std::move(invalid)));
 }
 

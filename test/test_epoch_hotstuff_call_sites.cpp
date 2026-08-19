@@ -2934,14 +2934,17 @@ TEST_CASE(
     CHECK(contains_in_order(
         manager,
         {"opt_fault_window_arm_snapshot_evidence_basis",
+         "opt_fault_window_arm_selection_cardinality_policy",
          "\"fault-window-arm-snapshot-evidence-basis\"",
+         "\"fault-window-arm-selection-cardinality-policy\"",
          "const std::array<const std::string *, 13> common_arm_values",
-         "const std::array<const std::string *, 4> extended_arm_values",
+         "const std::array<const std::string *, 5> extended_arm_values",
          "const auto timeout_evidence_basis =",
          "const auto required_observation_schema =",
          "const auto clock_domain =",
          "const auto snapshot_evidence_basis =",
-         "if (arm.schema_version == 2 || arm.schema_version == 3)"}));
+         "const auto selection_cardinality_policy =",
+         "arm.schema_version == 4"}));
     CHECK(contains_all(
         manager,
         {"arm.schema_version == 1 &&",
@@ -2949,13 +2952,18 @@ TEST_CASE(
          "!required_observation_schema.empty()",
          "!clock_domain.empty()",
          "!snapshot_evidence_basis.empty()",
+         "!selection_cardinality_policy.empty()",
          "common_arm_values",
          "extended_arm_values",
          "extended_arm_values.begin(), extended_arm_values.end()",
          "arm.schema_version == 2 && (arm.domain != \"kauri-focused-fault-window-arm-v2\" ||",
          "!arm.snapshot_evidence_basis.empty()",
          "arm.schema_version == 3 && (arm.domain != \"kauri-focused-fault-window-arm-v3\" ||",
-         "arm.snapshot_evidence_basis != \"exact_post_fault_attempt_start_v1\""}));
+         "arm.snapshot_evidence_basis != \"exact_post_fault_attempt_start_v1\"",
+         "arm.schema_version == 4 &&",
+         "arm.domain != \"kauri-focused-fault-window-arm-v4\"",
+         "arm.selection_cardinality_policy !=",
+         "\"all_guarded_up_to_fault_bound_v1\""}));
 }
 
 TEST_CASE(

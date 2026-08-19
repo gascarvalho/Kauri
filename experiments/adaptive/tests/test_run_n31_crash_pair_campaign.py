@@ -8,7 +8,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import pytest
 
@@ -23,6 +23,11 @@ PROFILE_SHA256 = "d" * 64
 TOPOLOGY_SHA256 = "e" * 64
 CAMPAIGN_SEED = 41_719
 PAIR_SEEDS = (41_720, 41_721, 41_722, 41_723, 41_724)
+SCIENTIFIC_THRESHOLDS = {
+    "adaptive_ratio_min_ppm": 1_100_000,
+    "containment_over_baseline_min_ppm": 800_000,
+    "paired_ratio_min_ppm": 1_100_000,
+}
 EXPECTED_SCHEDULE_SHA256 = (
     "d6f67df39400f44575927a4660d73c4706f33157396ffdc86b202affc2e1c166"
 )
@@ -377,13 +382,23 @@ def _fault_receipt() -> dict[str, object]:
     }
 
 
-def _raw_child_events(slot: Mapping[str, Any]) -> list[dict[str, object]]:
+def _raw_child_events(
+    slot: Mapping[str, Any],
+    *,
+    adaptive_late_milli_tps: Sequence[int] | None = None,
+) -> list[dict[str, object]]:
     _, epoch1, _, epoch2 = pair_fixture._native_epoch_chain()
     pair_ordinal = int(slot["pair_ordinal"])
+    adaptive_late = (
+        (110_000, 105_000, 98_000, 120_000, 90_000)
+        if adaptive_late_milli_tps is None
+        else tuple(adaptive_late_milli_tps)
+    )
+    assert len(adaptive_late) == 5
     desired_milli_tps = (
         100_000
         if slot["arm"] == "control"
-        else (110_000, 105_000, 98_000, 120_000, 90_000)[pair_ordinal - 1]
+        else adaptive_late[pair_ordinal - 1]
     )
     transactions = (500, 400, 450, desired_milli_tps // 200)
     specifications: list[tuple[str, str, int, str, Mapping[str, object]]] = []
@@ -905,15 +920,26 @@ def _reconstruct_raw_evidence(
 
 
 def _children(
-    plan: Mapping[str, Any], tmp_path: Path
+    plan: Mapping[str, Any],
+    tmp_path: Path,
+    *,
+    scientific_thresholds: Mapping[str, int] | None = None,
+    scientific_threshold_overrides: Mapping[str, Mapping[str, int]] | None = None,
+    scientific_contract_overrides: Mapping[str, Mapping[str, object]] | None = None,
+    scientific_opt_out_slots: Sequence[str] = (),
+    adaptive_late_milli_tps: Sequence[int] | None = None,
 ) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
+    opt_out_slots = frozenset(scientific_opt_out_slots)
     for slot in plan["slots"]:
         run_directory = tmp_path / f"neutral-{slot['execution_ordinal']:02d}"
         epoch1_wire, _, epoch2_wire, _ = pair_fixture._native_epoch_chain()
         _write_json_lines(
             run_directory / "raw/events.jsonl",
-            _raw_child_events(slot),
+            _raw_child_events(
+                slot,
+                adaptive_late_milli_tps=adaptive_late_milli_tps,
+            ),
         )
         (run_directory / "raw/epoch1.bundle").write_bytes(epoch1_wire)
         if slot["arm"] == "adaptive":
@@ -924,6 +950,32 @@ def _children(
         (run_directory / "raw/fault-receipt.json").write_bytes(
             _canonical(_fault_receipt())
         )
+        support_enabled = (
+            scientific_thresholds is not None
+            and str(slot["slot_id"]) not in opt_out_slots
+        )
+        if support_enabled:
+            contract = {
+                "schema_version": 1,
+                "domain": "kauri-focused-campaign-scientific-support-v1",
+            }
+            if scientific_contract_overrides is not None:
+                contract.update(
+                    scientific_contract_overrides.get(str(slot["slot_id"]), {})
+                )
+            thresholds = dict(scientific_thresholds)
+            if scientific_threshold_overrides is not None:
+                thresholds.update(
+                    scientific_threshold_overrides.get(str(slot["slot_id"]), {})
+                )
+            (run_directory / "profile.json").write_bytes(
+                _canonical(
+                    {
+                        "campaign": {"scientific_support_contract": contract},
+                        "thresholds": thresholds,
+                    }
+                )
+            )
         expected_raw_files = [
             "raw/epoch1.bundle",
             "raw/events.jsonl",
@@ -932,6 +984,8 @@ def _children(
         ]
         if slot["arm"] == "adaptive":
             expected_raw_files.append("raw/epoch2.bundle")
+        if support_enabled:
+            expected_raw_files.append("profile.json")
         assert sorted(
             str(path.relative_to(run_directory))
             for path in run_directory.rglob("*")
@@ -956,18 +1010,12 @@ def _children(
                 "child_tree_sha256": seal.tree_sha256,
                 "child_seal_sha256": seal.seal_sha256,
                 "sealed_child_directory": run_directory,
-                "source_inventory_sha256": reconstructed[
-                    "source_inventory_sha256"
-                ],
+                "source_inventory_sha256": reconstructed["source_inventory_sha256"],
                 "authoritative_commit_identity_sha256": reconstructed[
                     "authoritative_commit_identity_sha256"
                 ],
-                "epoch_identity_sha256": reconstructed[
-                    "epoch_identity_sha256"
-                ],
-                "ranking_identity_sha256": reconstructed[
-                    "ranking_identity_sha256"
-                ],
+                "epoch_identity_sha256": reconstructed["epoch_identity_sha256"],
+                "ranking_identity_sha256": reconstructed["ranking_identity_sha256"],
             }
         )
     return result
@@ -996,6 +1044,39 @@ def _blind_classifier(
         verify_seal=True,
         classify_fault_receipt=True,
     )
+    measurements = reconstructed["scientific_measurements"]
+    if (run_directory / "profile.json").is_file():
+        stable_phases: list[dict[str, object]] = []
+        for phase_index, raw_phase in enumerate(measurements["phases"]):
+            phase = dict(raw_phase)
+            bucket_transactions = int(phase["transactions"])
+            bucket_tps = int(phase["mean_milli_tps"])
+            start_ns = phase_index * 30_000_000_000
+            buckets = [
+                {
+                    "bucket_index": bucket,
+                    "start_ns": start_ns + bucket * 5_000_000_000,
+                    "end_ns": start_ns + (bucket + 1) * 5_000_000_000,
+                    "transactions": bucket_transactions,
+                    "mean_milli_tps": bucket_tps,
+                }
+                for bucket in range(6)
+            ]
+            stable_phases.append(
+                {
+                    **phase,
+                    "start_ns": start_ns,
+                    "end_ns": start_ns + 30_000_000_000,
+                    "transactions": bucket_transactions * 6,
+                    "mean_milli_tps": bucket_tps,
+                    "buckets": buckets,
+                    "median_milli_tps": bucket_tps,
+                }
+            )
+        measurements = {
+            "phases": stable_phases,
+            "late_window_throughput_milli_tps": stable_phases[-1]["median_milli_tps"],
+        }
     result = {
         "outcome": "PASS",
         "integrity_valid": True,
@@ -1017,7 +1098,7 @@ def _blind_classifier(
         "native_bundles_decoded": reconstructed["native_bundles_decoded"],
         "runtime_graph_validated": reconstructed["runtime_graph_validated"],
         "epoch2_present": reconstructed["epoch2_present"],
-        "scientific_measurements": reconstructed["scientific_measurements"],
+        "scientific_measurements": measurements,
         "reconstructed_from_raw_evidence": True,
     }
     if override_identity_field is not None:
@@ -1065,6 +1146,8 @@ def test_source_blind_campaign_joins_ten_valid_children_into_five_pair_effects(
     assert summary["validated_claim_slot_count"] == 10
     assert summary["campaign_acceptance"] == "ACCEPTED"
     assert summary["figure_eligible"] is True
+    assert "claim_eligible" not in summary
+    assert "scientific_support" not in summary
     assert len(summary["child_verdicts"]) == 10
     assert all(
         {
@@ -1100,9 +1183,241 @@ def test_source_blind_campaign_joins_ten_valid_children_into_five_pair_effects(
         -10_000,
     ]
     assert any(
-        pair["scientific_outcome"] == "UNFAVORABLE"
+        pair["scientific_outcome"] == "UNFAVORABLE" for pair in summary["pair_verdicts"]
+    )
+
+
+def _source_blind_summary(
+    plan: Mapping[str, Any],
+    children: list[dict[str, object]],
+    *,
+    classify: Any = _blind_classifier,
+) -> dict[str, Any]:
+    runner = _runner()
+    ledger = _ledger(plan)
+    for record, child in zip(ledger, children, strict=True):
+        record["child_tree_sha256"] = child["child_tree_sha256"]
+        record["child_seal_sha256"] = child["child_seal_sha256"]
+    _rehash_ledger(plan, ledger)
+    return _document(
+        runner.validate_campaign_source_blind(
+            plan,
+            children,
+            ledger_records=ledger,
+            validate_child=classify,
+            trusted_provenance=TRUSTED_PROVENANCE,
+        )
+    )
+
+
+def test_v9_scientific_gate_keeps_artifact_pass_distinct_from_support(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+    )
+
+    summary = _source_blind_summary(plan, children)
+
+    assert summary["campaign_acceptance"] == "ACCEPTED"
+    assert summary["figure_eligible"] is True
+    assert summary["claim_eligible"] is False
+    support = summary["scientific_support"]
+    assert support["domain"] == "kauri-focused-campaign-scientific-support-v1"
+    assert support["thresholds_ppm"] == SCIENTIFIC_THRESHOLDS
+    assert support["containment_pass_count"] == 10
+    assert support["adaptive_positive_pair_count"] == 4
+    assert support["paired_positive_pair_count"] == 3
+    assert support["median_adaptive_ratio_ppm"] == 1_166_666
+    assert support["median_paired_ratio_ppm"] == 1_050_000
+    assert support["supported"] is False
+
+
+def test_v9_scientific_gate_accepts_exact_five_pair_thresholds(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+        adaptive_late_milli_tps=(120_000, 120_000, 120_000, 120_000, 100_000),
+    )
+
+    summary = _source_blind_summary(plan, children)
+
+    assert summary["campaign_acceptance"] == "ACCEPTED"
+    assert summary["figure_eligible"] is True
+    assert summary["claim_eligible"] is True
+    support = summary["scientific_support"]
+    assert support["containment_pass_count"] == 10
+    assert support["adaptive_positive_pair_count"] == 5
+    assert support["paired_positive_pair_count"] == 4
+    assert support["median_adaptive_ratio_ppm"] == 1_333_333
+    assert support["median_paired_ratio_ppm"] == 1_200_000
+    assert support["supported"] is True
+    assert all(
+        {
+            "adaptive_ratio_ppm",
+            "paired_ratio_ppm",
+            "control_containment_over_baseline_ppm",
+            "adaptive_containment_over_baseline_ppm",
+        }
+        <= set(pair)
         for pair in summary["pair_verdicts"]
     )
+
+
+def test_v9_scientific_gate_does_not_promote_one_favorable_bucket(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+        adaptive_late_milli_tps=(120_000,) * 5,
+    )
+
+    def classify(
+        run_directory: Path, *, trusted_provenance: object
+    ) -> dict[str, object]:
+        result = _blind_classifier(
+            run_directory,
+            trusted_provenance=trusted_provenance,
+        )
+        if result["epoch2_present"] is not True:
+            return result
+        phases = result["scientific_measurements"]["phases"]  # type: ignore[index]
+        late = phases[-1]
+        bucket_transactions = (1_500, 450, 450, 450, 450, 450)
+        for bucket, transactions in zip(
+            late["buckets"], bucket_transactions, strict=True
+        ):
+            bucket["transactions"] = transactions
+            bucket["mean_milli_tps"] = transactions * 200
+        late["transactions"] = sum(bucket_transactions)
+        late["mean_milli_tps"] = 125_000
+        late["median_milli_tps"] = 90_000
+        result["scientific_measurements"][  # type: ignore[index]
+            "late_window_throughput_milli_tps"
+        ] = 90_000
+        return result
+
+    summary = _source_blind_summary(plan, children, classify=classify)
+
+    assert summary["campaign_acceptance"] == "ACCEPTED"
+    assert summary["figure_eligible"] is True
+    assert summary["claim_eligible"] is False
+    support = summary["scientific_support"]
+    assert support["adaptive_positive_pair_count"] == 0
+    assert support["supported"] is False
+
+
+def test_v9_scientific_gate_treats_zero_denominators_as_no_support(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+        adaptive_late_milli_tps=(120_000,) * 5,
+    )
+
+    def classify(
+        run_directory: Path, *, trusted_provenance: object
+    ) -> dict[str, object]:
+        result = _blind_classifier(
+            run_directory,
+            trusted_provenance=trusted_provenance,
+        )
+        phases = result["scientific_measurements"]["phases"]  # type: ignore[index]
+        phases[0]["transactions"] = 0  # type: ignore[index]
+        phases[0]["mean_milli_tps"] = 0  # type: ignore[index]
+        phases[0]["median_milli_tps"] = 0  # type: ignore[index]
+        for bucket in phases[0]["buckets"]:  # type: ignore[index]
+            bucket["transactions"] = 0
+            bucket["mean_milli_tps"] = 0
+        return result
+
+    summary = _source_blind_summary(plan, children, classify=classify)
+
+    assert summary["campaign_acceptance"] == "ACCEPTED"
+    assert summary["figure_eligible"] is True
+    assert summary["claim_eligible"] is False
+    support = summary["scientific_support"]
+    assert support["containment_pass_count"] == 0
+    assert support["supported"] is False
+    assert all(
+        pair["control_containment_over_baseline_ppm"] is None
+        and pair["adaptive_containment_over_baseline_ppm"] is None
+        for pair in summary["pair_verdicts"]
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("threshold-mismatch", "contract-drift", "missing-opt-in"),
+)
+def test_v9_scientific_gate_rejects_unbound_contract_or_thresholds(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    threshold_overrides = None
+    contract_overrides = None
+    opt_out_slots: Sequence[str] = ()
+    if mutation == "threshold-mismatch":
+        threshold_overrides = {"slot-02": {"adaptive_ratio_min_ppm": 1_200_000}}
+    elif mutation == "contract-drift":
+        contract_overrides = {"slot-02": {"domain": "unreviewed-support"}}
+    else:
+        opt_out_slots = ("slot-02",)
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+        scientific_threshold_overrides=threshold_overrides,
+        scientific_contract_overrides=contract_overrides,
+        scientific_opt_out_slots=opt_out_slots,
+    )
+
+    with pytest.raises(_runner().N31CrashPairCampaignError):
+        _source_blind_summary(plan, children)
+
+
+def test_v9_scientific_gate_rejects_profile_mutated_by_child_validator(
+    tmp_path: Path,
+) -> None:
+    plan = _plan(_runner())
+    children = _children(
+        plan,
+        tmp_path,
+        scientific_thresholds=SCIENTIFIC_THRESHOLDS,
+    )
+
+    def classify(
+        run_directory: Path, *, trusted_provenance: object
+    ) -> dict[str, object]:
+        result = _blind_classifier(
+            run_directory,
+            trusted_provenance=trusted_provenance,
+        )
+        profile_path = run_directory / "profile.json"
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        profile["thresholds"]["paired_ratio_min_ppm"] = 1
+        profile_path.write_bytes(_canonical(profile))
+        return result
+
+    with pytest.raises(
+        _runner().N31CrashPairCampaignError,
+        match="mutated during validation",
+    ):
+        _source_blind_summary(plan, children, classify=classify)
 
 
 @pytest.mark.parametrize(

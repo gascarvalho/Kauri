@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import asdict
 from datetime import datetime
 import hashlib
@@ -112,6 +112,19 @@ _FCRASH_H_V8_IDENTITIES = {
         "ba6e0670a9d2070b4344a404c7e4974f938beb57a12714865883a74a047f6c0f",
     ),
 }
+_FCRASH_H_V9_PROFILE_IDS = frozenset(
+    {"n7-f2-q5-two-crash-pair-smoke-v9", "n31-f5-q21-three-crash-pair-v9"}
+)
+_FCRASH_H_V9_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v9": (
+        "fb29c2a8c0a8f88177ecfade5b62255ca5966e359b523c1e3aa918500c10d74f",
+        "652d310c0df2795ba28ccb56d49a8f276b9acfb68e0ec7064cdcb967dae83089",
+    ),
+    "n31-f5-q21-three-crash-pair-v9": (
+        "bdb796bd1b8cf3fcf1c10c30df80b2e46d6b5fe1b2c4b9e1d037031ead1b04b0",
+        "a50bd106887e5e3baf550875217db37c96fb9b07d40c39a98e80cef20e435ced",
+    ),
+}
 _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     {
         "n7-f2-q5-two-crash-pair-smoke-v1",
@@ -126,6 +139,7 @@ _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
     | _FCRASH_H_V8_PROFILE_IDS
+    | _FCRASH_H_V9_PROFILE_IDS
 )
 _FAULT_WINDOW_PROFILE_IDS = (
     _FCRASH_H_V4_PROFILE_IDS
@@ -133,10 +147,12 @@ _FAULT_WINDOW_PROFILE_IDS = (
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
     | _FCRASH_H_V8_PROFILE_IDS
+    | _FCRASH_H_V9_PROFILE_IDS
 )
 _FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
 _FAULT_WINDOW_ARM_DOMAIN_V3 = "kauri-focused-fault-window-arm-v3"
+_FAULT_WINDOW_ARM_DOMAIN_V4 = "kauri-focused-fault-window-arm-v4"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _EVENT_KEYS = {
     "event_schema_version",
@@ -244,6 +260,7 @@ def _validate_controller_failure_terminal(
         "nonmember_evidence",
         "projection_failed",
         "capacity_exceeded",
+        "guarded_candidate_bound_exceeded",
         "snapshot_failed",
         "internal_failure",
     }
@@ -490,6 +507,7 @@ def _is_v5_contract(contract: Mapping[str, object]) -> bool:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
+        | _FCRASH_H_V9_PROFILE_IDS
     )
 
 
@@ -503,6 +521,14 @@ def _is_v7_contract(contract: Mapping[str, object]) -> bool:
 
 def _is_v8_contract(contract: Mapping[str, object]) -> bool:
     return contract.get("profile_id") in _FCRASH_H_V8_PROFILE_IDS
+
+
+def _is_v9_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V9_PROFILE_IDS
+
+
+def _is_v8_or_v9_contract(contract: Mapping[str, object]) -> bool:
+    return _is_v8_contract(contract) or _is_v9_contract(contract)
 
 
 def _v7_n31_target_selection_metric() -> dict[str, object]:
@@ -658,6 +684,33 @@ def _v8_reporter_capacity_document(
     }
 
 
+def _is_v9_guard_relation(
+    contract: Mapping[str, object],
+    *,
+    target: int,
+    reporter: int,
+    tree_id: int,
+    message_type: str,
+    prefix: Collection[int],
+) -> bool:
+    """Independently validate a topology relation for an inferred v9 cohort."""
+
+    members = tuple(int(member) for member in contract["members"])
+    count = len(members)
+    fanout = _integer(contract.get("fanout"), "tree fanout", 1)
+    position = (target - tree_id) % count
+    leaf_start = (count - 1 + fanout - 1) // fanout
+    return (
+        tree_id in prefix
+        and target in members
+        and reporter in members
+        and position != 0
+        and _cyclic_parent(count, fanout, tree_id, target) == reporter
+        and message_type
+        == ("aggregate_relay" if position < leaf_start else "direct_vote")
+    )
+
+
 def _mapping(value: object, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         _error(f"{label} must be an object")
@@ -741,7 +794,7 @@ def _derive_reporter_coverage_plan(
     }
     if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
-    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_V9_PROFILE_IDS:
         expected_guard_keys |= {
             "reporter_selection_basis",
             "minimum_topology_eligible_reporter_capacity",
@@ -759,7 +812,7 @@ def _derive_reporter_coverage_plan(
     if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
         _error("FCRASH-H guard or timer schema drifted")
     required = fault_threshold + 1
-    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_V9_PROFILE_IDS:
         topology = _mapping(profile.get("topology"), "profile topology")
         arm = _mapping(profile.get("fault_window_arm"), "fault-window arm")
         capacity = _v8_reporter_capacity_document(
@@ -972,8 +1025,9 @@ def validate_fcrash_h_evidence(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
     )
     is_v6 = _is_v6_contract(contract)
-    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
-    is_v8 = _is_v8_contract(contract)
+    is_v7 = _is_v7_contract(contract) or _is_v8_or_v9_contract(contract)
+    is_v8 = _is_v8_or_v9_contract(contract)
+    is_v9 = _is_v9_contract(contract)
     expected_keys = {
         "fault_monotonic_ns",
         "nonresponse_monotonic_ns",
@@ -986,8 +1040,10 @@ def validate_fcrash_h_evidence(
     required_progress = coverage.get("required_postfault_tree_positions")
     if required_progress is not None:
         expected_keys.add("postfault_progress")
-    if is_v6 or is_v7 or _is_v8_contract(contract):
+    if is_v6 or is_v7 or _is_v8_or_v9_contract(contract):
         expected_keys.add("eligible_guard_drawdowns")
+    if is_v9:
+        expected_keys.add("guarded_nonresponsive_replica_ids")
     if set(witness) != expected_keys:
         _error("FCRASH-H witness schema drifted")
     fault_ns = _integer(witness.get("fault_monotonic_ns"), "fault timestamp")
@@ -1039,8 +1095,24 @@ def validate_fcrash_h_evidence(
         )
     ):
         _error("FCRASH-H causal timestamp or deadline drifted")
+    guarded_targets: tuple[int, ...] | None = None
+    if is_v9:
+        guarded_targets = tuple(
+            _integer(target, "guarded cohort member")
+            for target in _sequence(
+                witness.get("guarded_nonresponsive_replica_ids"), "guarded cohort"
+            )
+        )
+        if (
+            guarded_targets != tuple(sorted(set(guarded_targets)))
+            or not set(contract["targets"]).issubset(guarded_targets)
+            or len(guarded_targets) < len(tuple(contract["targets"]))
+            or len(guarded_targets)
+            > len(tuple(contract["members"])) - int(contract["quorum"])
+        ):
+            _error("v9 guarded cohort cardinality or crash binding drifted")
     relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
-    if is_v8:
+    if is_v8 and not is_v9:
         for row in _sequence(coverage.get("targets"), "coverage targets"):
             target_row = _mapping(row, "coverage target")
             target = _integer(target_row.get("target_replica_id"), "coverage target")
@@ -1061,6 +1133,9 @@ def validate_fcrash_h_evidence(
             }
         expected = {target: dict(reporters) for target, reporters in relations.items()}
         expected_trees: dict[tuple[int, int], int] = {}
+    elif is_v9:
+        expected = {target: {} for target in guarded_targets or ()}
+        expected_trees = {}
     else:
         expected = {
             int(row["target_replica_id"]): {
@@ -1083,10 +1158,14 @@ def validate_fcrash_h_evidence(
                 "first qualifying reporters",
             )
         }
-    counts = {
-        target: {reporter: 0 for reporter in reporters}
-        for target, reporters in expected.items()
-    }
+    counts = (
+        {target: {} for target in expected}
+        if is_v9
+        else {
+            target: {reporter: 0 for reporter in reporters}
+            for target, reporters in expected.items()
+        }
+    )
     for raw in _sequence(witness.get("timeout_observations"), "timeout observations"):
         observation = _mapping(raw, "timeout observation")
         expected_observation_keys = {
@@ -1110,7 +1189,27 @@ def validate_fcrash_h_evidence(
         if (
             observation.get("epoch_number") != 0
             or (
+                is_v9
+                and not _is_v9_guard_relation(
+                    contract,
+                    target=target,
+                    reporter=reporter,
+                    tree_id=_integer(observation.get("tree_id"), "timeout tree"),
+                    message_type=str(observation.get("expected_message_type")),
+                    prefix=_sequence(
+                        _mapping(
+                            _mapping(contract.get("profile"), "focused profile").get(
+                                "fault_window_arm"
+                            ),
+                            "fault-window arm",
+                        ).get("ordered_tree_prefix"),
+                        "fault-window prefix",
+                    ),
+                )
+            )
+            or (
                 is_v8
+                and not is_v9
                 and (
                     _integer(observation.get("tree_id"), "timeout tree"),
                     str(observation.get("expected_message_type")),
@@ -1124,11 +1223,11 @@ def validate_fcrash_h_evidence(
             or observation.get("outcome") != "timeout"
             or observation.get("compensated") is not False
             or target not in counts
-            or reporter not in counts[target]
+            or (not is_v9 and reporter not in counts[target])
             or not (fault_ns < timestamp <= nonresponse_ns)
         ):
             _error("timeout observation is not exact post-fault evidence")
-        counts[target][reporter] += 1
+        counts[target][reporter] = counts[target].get(reporter, 0) + 1
     minimum = _integer(
         coverage.get("minimum_timeouts_per_reporter"),
         "minimum timeouts per reporter",
@@ -1420,6 +1519,7 @@ def _v4_replay_fault_window_anchors(
     baseline_cutoff: int,
     current_cutoff: int,
     audit: Mapping[str, Any],
+    guarded_targets: Sequence[int] | None = None,
 ) -> tuple[list[dict[str, object]], dict[str, int], int]:
     """Replay the v4 arm's source-blind post-fault proposal boundary.
 
@@ -1429,8 +1529,9 @@ def _v4_replay_fault_window_anchors(
     intentionally does not use the manager's selected ranking.
     """
 
-    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
-    is_v8 = _is_v8_contract(contract)
+    is_v7 = _is_v7_contract(contract) or _is_v8_or_v9_contract(contract)
+    is_v8 = _is_v8_or_v9_contract(contract)
+    is_v9 = _is_v9_contract(contract)
     is_v6 = _is_v6_contract(contract) or is_v7
     armed = [
         event
@@ -1539,7 +1640,7 @@ def _v4_replay_fault_window_anchors(
     anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
 
     v8_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
-    if is_v8:
+    if is_v8 and not is_v9:
         for row in _sequence(coverage.get("targets"), "coverage targets"):
             target = _integer(
                 _mapping(row, "coverage target").get("target_replica_id"),
@@ -1579,10 +1680,19 @@ def _v4_replay_fault_window_anchors(
     ] = {}
     filtered_completed: set[str] = set()
     global_outstanding: dict[str, tuple[int, int, tuple[int, int, str, str]]] = {}
-    global_drawdowns = {
-        int(row["target_replica_id"])
-        for row in _sequence(coverage.get("targets"), "coverage targets")
-    }
+    if is_v9:
+        if (
+            guarded_targets is None
+            or any(type(target) is not int for target in guarded_targets)
+            or tuple(guarded_targets) != tuple(sorted(set(guarded_targets)))
+        ):
+            _error("v9 guarded cohort is malformed")
+        global_drawdowns = set(guarded_targets)
+    else:
+        global_drawdowns = {
+            int(row["target_replica_id"])
+            for row in _sequence(coverage.get("targets"), "coverage targets")
+        }
     drawdowns = {target: 0 for target in global_drawdowns}
     for _ingestion_sequence, observation, event in sorted(
         accepted, key=lambda row: row[0]
@@ -1779,10 +1889,26 @@ def _v4_replay_fault_window_anchors(
         expected_message_type,
     ) in filtered_outstanding.values():
         if (
-            is_v8
-            and (key[1], expected_message_type)
-            not in v8_relations.get(target, {}).get(reporter, set())
-        ) or (not is_v8 and expected_trees.get((target, reporter)) != key[1]):
+            (is_v9 and target not in global_drawdowns)
+            or (
+                is_v9
+                and not _is_v9_guard_relation(
+                    contract,
+                    target=target,
+                    reporter=reporter,
+                    tree_id=key[1],
+                    message_type=expected_message_type,
+                    prefix=prefix,
+                )
+            )
+            or (
+                is_v8
+                and not is_v9
+                and (key[1], expected_message_type)
+                not in v8_relations.get(target, {}).get(reporter, set())
+            )
+            or (not is_v8 and expected_trees.get((target, reporter)) != key[1])
+        ):
             continue
         row: dict[str, object] = {
             "epoch_number": 0,
@@ -1809,6 +1935,8 @@ def _fcrash_h_witness_from_events(
     fault_receipt: Mapping[str, Any],
     activations1: Sequence[Mapping[str, Any]],
     activations2: Sequence[Mapping[str, Any]],
+    *,
+    guarded_targets: Sequence[int] | None = None,
 ) -> dict[str, object]:
     coverage = _mapping(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
@@ -1859,6 +1987,7 @@ def _fcrash_h_witness_from_events(
             baseline_cutoff=baseline_cutoff,
             current_cutoff=cutoff,
             audit=audits[0],
+            guarded_targets=guarded_targets,
         )
         if not rows:
             _error("FCRASH-H contains no qualifying timeout evidence")
@@ -1883,14 +2012,22 @@ def _fcrash_h_witness_from_events(
             "timeout_observations": rows,
             "guard_drawdowns": guard_drawdowns,
         }
+        if _is_v9_contract(contract):
+            if guarded_targets is None:
+                _error("v9 witness lacks its guarded cohort")
+            witness["guarded_nonresponsive_replica_ids"] = list(guarded_targets)
         if (
             _is_v6_contract(contract)
             or _is_v7_contract(contract)
-            or _is_v8_contract(contract)
+            or _is_v8_or_v9_contract(contract)
         ):
             witness["eligible_guard_drawdowns"] = {
                 str(target): -sum(row["observed_replica_id"] == target for row in rows)
-                for target in tuple(contract["targets"])
+                for target in (
+                    tuple(guarded_targets)
+                    if _is_v9_contract(contract) and guarded_targets is not None
+                    else tuple(contract["targets"])
+                )
             }
         if coverage.get("required_postfault_tree_positions") is not None:
             witness["postfault_progress"] = _fcrash_h_postfault_progress(
@@ -2119,6 +2256,15 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     profile_id = profile.get("profile_id")
     if profile_id not in _REVIEWED_FOCUSED_PROFILE_IDS:
         _error("focused profile identity is not reviewed")
+    campaign = _mapping(profile.get("campaign"), "profile campaign")
+    if profile_id in _FCRASH_H_V9_PROFILE_IDS:
+        if campaign.get("scientific_support_contract") != {
+            "schema_version": 1,
+            "domain": "kauri-focused-campaign-scientific-support-v1",
+        }:
+            _error("v9 scientific-support campaign contract drifted")
+    elif "scientific_support_contract" in campaign:
+        _error("archived campaign profile contains a prospective support contract")
     if profile_id in _FAULT_WINDOW_PROFILE_IDS:
         arm_metadata = _mapping(
             profile.get("fault_window_arm"), "fault-window arm metadata"
@@ -2148,22 +2294,33 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             _FCRASH_H_V6_PROFILE_IDS
             | _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
+            | _FCRASH_H_V9_PROFILE_IDS
         ):
             expected_arm_keys |= {
                 "clock_domain",
                 "required_observation_schema",
                 "timeout_evidence_basis",
             }
-        if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS:
+        if profile_id in (
+            _FCRASH_H_V7_PROFILE_IDS
+            | _FCRASH_H_V8_PROFILE_IDS
+            | _FCRASH_H_V9_PROFILE_IDS
+        ):
             expected_arm_keys.add("snapshot_evidence_basis")
+        if profile_id in _FCRASH_H_V9_PROFILE_IDS:
+            expected_arm_keys.add("selection_cardinality_policy")
         if (
             set(arm_metadata) != expected_arm_keys
             or type(arm_metadata.get("schema_version")) is not int
             or arm_metadata.get("schema_version")
             != (
-                3
-                if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
-                else 2 if profile_id in _FCRASH_H_V6_PROFILE_IDS else 1
+                4
+                if profile_id in _FCRASH_H_V9_PROFILE_IDS
+                else (
+                    3
+                    if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
+                    else 2 if profile_id in _FCRASH_H_V6_PROFILE_IDS else 1
+                )
             )
             or arm_metadata.get("domain") != "epoch_zero_native_cyclic_tree_positions"
             or arm_metadata.get("manager_visibility")
@@ -2186,6 +2343,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             _FCRASH_H_V6_PROFILE_IDS
             | _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
+            | _FCRASH_H_V9_PROFILE_IDS
         ) and (
             arm_metadata.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm_metadata.get("required_observation_schema") != 3
@@ -2194,11 +2352,20 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         ):
             _error("v6 fault-window timeout evidence metadata drifted")
         if (
-            profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
+            profile_id
+            in _FCRASH_H_V7_PROFILE_IDS
+            | _FCRASH_H_V8_PROFILE_IDS
+            | _FCRASH_H_V9_PROFILE_IDS
             and arm_metadata.get("snapshot_evidence_basis")
             != "exact_post_fault_attempt_start_v1"
         ):
             _error("v7 fault-window snapshot evidence metadata drifted")
+        if (
+            profile_id in _FCRASH_H_V9_PROFILE_IDS
+            and arm_metadata.get("selection_cardinality_policy")
+            != "all_guarded_up_to_fault_bound_v1"
+        ):
+            _error("v9 fault-window selection cardinality policy drifted")
     protocol = _mapping(profile.get("protocol"), "profile protocol")
     count = _integer(protocol.get("N"), "profile replica count", 1)
     threshold = _integer(protocol.get("f"), "profile fault threshold")
@@ -2240,6 +2407,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
+        | _FCRASH_H_V9_PROFILE_IDS
     ):
         expected_measurement_keys.add("phase_window_contract")
     if set(measurement) != expected_measurement_keys:
@@ -2251,6 +2419,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
+        | _FCRASH_H_V9_PROFILE_IDS
     ):
         raw_phase_contract = _mapping(
             measurement.get("phase_window_contract"), "phase-window contract"
@@ -2326,7 +2495,10 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "target_derivation",
     }
     is_v7_n31 = profile_id == "n31-f5-q21-three-crash-pair-v7"
-    is_v8_n31 = profile_id == "n31-f5-q21-three-crash-pair-v8"
+    is_v8_n31 = profile_id in {
+        "n31-f5-q21-three-crash-pair-v8",
+        "n31-f5-q21-three-crash-pair-v9",
+    }
     order = [members[(active_tree + offset) % count] for offset in range(count)]
     if (
         proof.get("source") != "native_epoch_profile_digest"
@@ -2363,7 +2535,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         proof.get("target_derivation"), "target derivation"
     ):
         _error("archived topology contains a prospective target selection metric")
-    if _is_v8_contract({"profile_id": profile_id}):
+    if _is_v8_or_v9_contract({"profile_id": profile_id}):
         arm = _mapping(profile.get("fault_window_arm"), "fault-window arm")
         capacity = _v8_reporter_capacity_document(
             replica_count=count,
@@ -2388,12 +2560,14 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
+        | _FCRASH_H_V9_PROFILE_IDS
         and (
             profile_sha,
             proof_sha,
         )
         != (
-            _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
+            _FCRASH_H_V9_IDENTITIES.get(str(profile_id))
+            or _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V7_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V6_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V5_IDENTITIES[str(profile_id)]
@@ -2479,7 +2653,12 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
                         ),
                     )
                 }
-                if is_v8_n31 or profile_id == "n7-f2-q5-two-crash-pair-smoke-v8"
+                if is_v8_n31
+                or profile_id
+                in {
+                    "n7-f2-q5-two-crash-pair-smoke-v8",
+                    "n7-f2-q5-two-crash-pair-smoke-v9",
+                }
                 else {}
             ),
         }
@@ -2616,7 +2795,7 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
     if (
         _is_v6_contract(contract)
         or _is_v7_contract(contract)
-        or _is_v8_contract(contract)
+        or _is_v8_or_v9_contract(contract)
     ):
         for replica in tuple(contract["members"]):
             replica_path = root / "config" / f"replica-{replica}.conf"
@@ -2762,10 +2941,12 @@ def _decode_bundle(
 
 
 def _canonical_tree_members(
-    root: int, contract: Mapping[str, object]
+    root: int, contract: Mapping[str, object], selected: Sequence[int] | None = None
 ) -> tuple[int, ...]:
-    survivors = tuple(contract["survivors"])
-    targets = tuple(contract["targets"])
+    targets = tuple(contract["targets"] if selected is None else selected)
+    survivors = tuple(
+        replica for replica in contract["members"] if replica not in targets
+    )
     fanout = int(contract["fanout"])
     internal = tuple(replica for replica in survivors if replica != root)[:fanout]
     leaves = tuple(replica for replica in survivors if replica not in (root, *internal))
@@ -2777,6 +2958,7 @@ def _validate_trees(
     roots: Sequence[int],
     label: str,
     contract: Mapping[str, object],
+    selected: Sequence[int] | None = None,
 ) -> None:
     quorum = int(contract["quorum"])
     if tuple(tree.tree_id for tree in decoded.trees) != tuple(range(quorum)):
@@ -2788,12 +2970,13 @@ def _validate_trees(
         in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
     )
     members = tuple(_integer(member, "tree member") for member in contract["members"])
+    selected_targets = tuple(contract["targets"] if selected is None else selected)
     first_leaf = (len(members) - 2) // int(contract["fanout"]) + 1
     for tree, root in zip(decoded.trees, roots, strict=True):
         if (
             tree.fanout != contract["fanout"]
             or tree.pipeline_stretch != contract["pipeline_stretch"]
-            or tuple(tree.wait_exempt) != tuple(contract["targets"])
+            or tuple(tree.wait_exempt) != selected_targets
         ):
             _error(f"{label} native placement structure drifted")
         if is_v3:
@@ -2803,11 +2986,13 @@ def _validate_trees(
                 or tuple(tree.members[:1]) != (root,)
                 or any(
                     target not in tree.members[first_leaf:]
-                    for target in contract["targets"]
+                    for target in selected_targets
                 )
             ):
                 _error(f"{label} native placement structure drifted")
-        elif tuple(tree.members) != _canonical_tree_members(root, contract):
+        elif tuple(tree.members) != _canonical_tree_members(
+            root, contract, selected_targets
+        ):
             _error(f"{label} native placement structure drifted")
 
 
@@ -2827,7 +3012,7 @@ def _containment_roots(
     if (
         _is_v6_contract(contract)
         or _is_v7_contract(contract)
-        or _is_v8_contract(contract)
+        or _is_v8_or_v9_contract(contract)
     ):
         # v6 freezes the native containment fallback independently of scorer
         # order.  Healthy baseline roots still retain their tree slots.
@@ -2847,6 +3032,34 @@ def _containment_roots(
     if len(set(roots)) != len(roots):
         _error("containment placement repeats a root")
     return tuple(roots)
+
+
+def _v9_optimization_roots(
+    ranked_ids: Sequence[int],
+    inherited_wait_exempt: Sequence[int],
+    contract: Mapping[str, object],
+) -> tuple[int, ...]:
+    """Reconstruct native recurring roots while preserving inherited leaves."""
+
+    inherited = tuple(
+        _integer(replica, "inherited wait-exempt member")
+        for replica in inherited_wait_exempt
+    )
+    members = tuple(int(replica) for replica in contract["members"])
+    quorum = int(contract["quorum"])
+    if (
+        inherited != tuple(sorted(set(inherited)))
+        or not set(contract["targets"]).issubset(inherited)
+        or not set(inherited).issubset(members)
+        or len(inherited) > len(members) - quorum
+    ):
+        _error("v9 optimization inherited cohort drifted")
+    roots = tuple(replica for replica in ranked_ids if replica not in set(inherited))[
+        :quorum
+    ]
+    if len(roots) != quorum:
+        _error("v9 optimization lacks Q unconstrained responsive roots")
+    return roots
 
 
 def _command_payload(decoded: Any, payload: Mapping[str, Any]) -> dict[str, object]:
@@ -3035,7 +3248,16 @@ def _ranking(
     contract: Mapping[str, object],
     *,
     predecessor_epoch: int,
-) -> tuple[list[int], list[str], tuple[int, ...], str | None, int | None, int | None]:
+    inherited_wait_exempt: Sequence[int] | None = None,
+) -> tuple[
+    list[int],
+    list[str],
+    tuple[int, ...],
+    str | None,
+    int | None,
+    int | None,
+    tuple[int, ...],
+]:
     manager_events = [
         event for event in events if event["source_kind"] == "adaptation_manager"
     ]
@@ -3074,7 +3296,7 @@ def _ranking(
             if event["event_type"] == "adaptive_v2_evidence_snapshot"
         ]
         v7_arm_start_ns: int | None = None
-        if _is_v7_contract(contract) or _is_v8_contract(contract):
+        if _is_v7_contract(contract) or _is_v8_or_v9_contract(contract):
             armed = [
                 event
                 for event in manager_events
@@ -3145,7 +3367,7 @@ def _ranking(
                 if (
                     _is_v6_contract(contract)
                     or _is_v7_contract(contract)
-                    or _is_v8_contract(contract)
+                    or _is_v8_or_v9_contract(contract)
                 )
                 else frozenset({1})
             ),
@@ -3195,7 +3417,7 @@ def _ranking(
                     if (
                         _is_v6_contract(contract)
                         or _is_v7_contract(contract)
-                        or _is_v8_contract(contract)
+                        or _is_v8_or_v9_contract(contract)
                     )
                     else frozenset({1})
                 ),
@@ -3245,18 +3467,38 @@ def _ranking(
             _error("legacy ranking evidence membership drifted")
         ranked = [replica for _latency, replica in sorted(responsive)]
     timeout_targets = tuple(sorted(set(members) - set(ranked)))
-    if len(ranked) != len(survivors) or timeout_targets != expected_targets:
+    if _is_v9_contract(contract):
+        if (
+            len(timeout_targets) < len(expected_targets)
+            or len(timeout_targets) > len(members) - int(contract["quorum"])
+            or not set(expected_targets).issubset(timeout_targets)
+            or len(ranked) < int(contract["quorum"])
+        ):
+            _error("v9 ranking does not reconstruct a guarded nonresponsive cohort")
+    elif len(ranked) != len(survivors) or timeout_targets != expected_targets:
         _error("ranking eligibility does not identify exactly the focused nonresponses")
-    if (
-        audited_eligible_ranking is not None
-        and _mapping(contract["profile"], "focused profile").get("profile_id")
-        in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
-    ):
-        expected_audit_roots = (
+    profile_id = _mapping(contract["profile"], "focused profile").get("profile_id")
+    expected_audit_roots = (
+        (
             _containment_roots(ranked, contract)
-            if predecessor_epoch == 0
+            if profile_id in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
+            else tuple(range(int(contract["quorum"])))
+        )
+        if predecessor_epoch == 0
+        else (
+            _v9_optimization_roots(
+                ranked,
+                inherited_wait_exempt or (),
+                contract,
+            )
+            if _is_v9_contract(contract)
             else tuple(ranked[: int(contract["quorum"])])
         )
+    )
+    if (
+        audited_eligible_ranking is not None
+        and profile_id in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
+    ):
         if audited_eligible_ranking != expected_audit_roots:
             _error("native audit eligible ranking drifted")
     observation_ids = sorted(
@@ -3277,6 +3519,7 @@ def _ranking(
         replay_snapshot_id,
         replay_cutoff,
         replay_audit_ns,
+        expected_audit_roots,
     )
 
 
@@ -3431,6 +3674,19 @@ def _v5_causal_phase_windows(
         _error("causal phase-window contract drifted")
     width_ns = _integer(contract.get("bucket_width_seconds"), "bucket width", 1)
     width_ns *= 1_000_000_000
+    stable_seconds = _integer(
+        _mapping(
+            _mapping(contract.get("profile"), "focused profile").get("timers"),
+            "profile timers",
+        ).get("stable_phase_seconds"),
+        "stable phase",
+        1,
+    )
+    phase_duration_ns = (
+        stable_seconds * 1_000_000_000 if _is_v9_contract(contract) else width_ns
+    )
+    if phase_duration_ns % width_ns != 0:
+        _error("causal stable phase is not an exact bucket multiple")
     stabilization_ns = (
         _integer(
             raw_contract.get("stabilization_offset_seconds"),
@@ -3468,7 +3724,7 @@ def _v5_causal_phase_windows(
         )
         for outcome in outcomes
     )
-    baseline_start = prefault_ns - width_ns
+    baseline_start = prefault_ns - phase_duration_ns
     if baseline_start < 0:
         _error("causal baseline window precedes the event clock")
     epoch0_commits = [
@@ -3478,14 +3734,6 @@ def _v5_causal_phase_windows(
     ]
     if not epoch0_commits:
         _error("causal phase windows lack Epoch-0 commits")
-    stable_seconds = _integer(
-        _mapping(
-            _mapping(contract.get("profile"), "focused profile").get("timers"),
-            "profile timers",
-        ).get("stable_phase_seconds"),
-        "stable phase",
-        1,
-    )
     if (
         min(
             _integer(event.get("source_monotonic_ns"), "Epoch-0 commit timestamp")
@@ -3504,7 +3752,7 @@ def _v5_causal_phase_windows(
         )
         == 1
     ]
-    if not command1_times or fault_ns + width_ns >= min(command1_times):
+    if not command1_times or fault_ns + phase_duration_ns >= min(command1_times):
         _error("causal fault window overlaps the Epoch-1 transition")
     activations1 = [
         event
@@ -3531,11 +3779,11 @@ def _v5_causal_phase_windows(
         contract=contract,
     )
     epoch1_start = max(activation1_ns, common1_ns) + stabilization_ns
-    epoch1_end = epoch1_start + width_ns
+    epoch1_end = epoch1_start + phase_duration_ns
 
     windows: list[tuple[str, int, int, int]] = [
         ("baseline", baseline_start, prefault_ns, 0),
-        ("fault", fault_ns, fault_ns + width_ns, 0),
+        ("fault", fault_ns, fault_ns + phase_duration_ns, 0),
         ("epoch1", epoch1_start, epoch1_end, 1),
     ]
     if epoch2 is not None:
@@ -3575,7 +3823,7 @@ def _v5_causal_phase_windows(
     else:
         late_start = epoch1_end + control_hold_ns
         late_epoch = 1
-    windows.append(("late", late_start, late_start + width_ns, late_epoch))
+    windows.append(("late", late_start, late_start + phase_duration_ns, late_epoch))
 
     if tuple(name for name, _start, _end, _epoch in windows) != tuple(
         contract["phase_names"]
@@ -3613,6 +3861,58 @@ def _v5_causal_phase_windows(
         ):
             _error("causal phase transactions or exact epoch drifted")
     return windows
+
+
+def _complete_phase_buckets(
+    commits: Sequence[Mapping[str, Any]],
+    *,
+    start_ns: int,
+    end_ns: int,
+    bucket_width_ns: int,
+) -> tuple[list[dict[str, int]], int]:
+    """Reconstruct every fixed-width bucket and its exact conventional median."""
+
+    if (
+        bucket_width_ns <= 0
+        or end_ns <= start_ns
+        or (end_ns - start_ns) % bucket_width_ns != 0
+    ):
+        _error("scientific phase is not an exact complete-bucket interval")
+    buckets: list[dict[str, int]] = []
+    for index in range((end_ns - start_ns) // bucket_width_ns):
+        bucket_start = start_ns + index * bucket_width_ns
+        bucket_end = bucket_start + bucket_width_ns
+        transactions = sum(
+            _integer(
+                _mapping(event.get("payload"), "bucket commit").get(
+                    "transaction_count"
+                ),
+                "bucket transactions",
+            )
+            for event in commits
+            if bucket_start
+            <= _integer(event.get("source_monotonic_ns"), "bucket commit timestamp")
+            < bucket_end
+        )
+        buckets.append(
+            {
+                "bucket_index": index,
+                "start_ns": bucket_start,
+                "end_ns": bucket_end,
+                "transactions": transactions,
+                "mean_milli_tps": transactions * 1_000_000_000_000 // bucket_width_ns,
+            }
+        )
+    throughputs = sorted(bucket["mean_milli_tps"] for bucket in buckets)
+    middle = len(throughputs) // 2
+    if len(throughputs) % 2:
+        median = throughputs[middle]
+    else:
+        median_sum = throughputs[middle - 1] + throughputs[middle]
+        if median_sum % 2:
+            _error("scientific phase median is not an integral milli-TPS value")
+        median = median_sum // 2
+    return buckets, median
 
 
 def _commit_reconstruction(
@@ -3914,20 +4214,31 @@ def _commit_reconstruction(
         allow_zero_fault = _is_v5_contract(contract) and phase == "fault"
         if not allow_zero_fault and transaction_count <= 0:
             _error("throughput phase has no authoritative committed transactions")
-        phase_rows.append(
-            {
-                "phase": phase,
-                "start_ns": start,
-                "end_ns": end,
-                "transactions": transaction_count,
-                "mean_milli_tps": transaction_count
-                * 1_000_000_000_000
-                // (end - start),
-            }
-        )
+        row: dict[str, object] = {
+            "phase": phase,
+            "start_ns": start,
+            "end_ns": end,
+            "transactions": transaction_count,
+            "mean_milli_tps": transaction_count * 1_000_000_000_000 // (end - start),
+        }
+        if _is_v9_contract(contract):
+            buckets, median = _complete_phase_buckets(
+                authoritative_commits,
+                start_ns=start,
+                end_ns=end,
+                bucket_width_ns=width_ns,
+            )
+            row["buckets"] = buckets
+            row["median_milli_tps"] = median
+        phase_rows.append(row)
+    late_throughput = (
+        phase_rows[-1]["median_milli_tps"]
+        if _is_v9_contract(contract)
+        else phase_rows[-1]["mean_milli_tps"]
+    )
     return authoritative_commits, {
         "phases": phase_rows,
-        "late_window_throughput_milli_tps": phase_rows[-1]["mean_milli_tps"],
+        "late_window_throughput_milli_tps": late_throughput,
     }
 
 
@@ -4031,7 +4342,8 @@ def _validate_manager_boundary(
         "--fault-window-arm-timeout-evidence-basis",
     }
     v7_arm_options = {"--fault-window-arm-snapshot-evidence-basis"}
-    common_arm_options = arm_options - v6_arm_options - v7_arm_options
+    v9_arm_options = {"--fault-window-arm-selection-cardinality-policy"}
+    common_arm_options = arm_options - v6_arm_options - v7_arm_options - v9_arm_options
     if _is_v4_contract(contract):
         if (
             any(counts.get(option) != 1 for option in common_arm_options)
@@ -4039,7 +4351,7 @@ def _validate_manager_boundary(
                 (
                     _is_v6_contract(contract)
                     or _is_v7_contract(contract)
-                    or _is_v8_contract(contract)
+                    or _is_v8_or_v9_contract(contract)
                 )
                 and any(counts.get(option) != 1 for option in v6_arm_options)
             )
@@ -4047,17 +4359,25 @@ def _validate_manager_boundary(
                 not (
                     _is_v6_contract(contract)
                     or _is_v7_contract(contract)
-                    or _is_v8_contract(contract)
+                    or _is_v8_or_v9_contract(contract)
                 )
                 and any(counts.get(option, 0) for option in v6_arm_options)
             )
             or (
-                (_is_v7_contract(contract) or _is_v8_contract(contract))
+                (_is_v7_contract(contract) or _is_v8_or_v9_contract(contract))
                 and any(counts.get(option) != 1 for option in v7_arm_options)
             )
             or (
-                not (_is_v7_contract(contract) or _is_v8_contract(contract))
+                not (_is_v7_contract(contract) or _is_v8_or_v9_contract(contract))
                 and any(counts.get(option, 0) for option in v7_arm_options)
+            )
+            or (
+                _is_v9_contract(contract)
+                and any(counts.get(option) != 1 for option in v9_arm_options)
+            )
+            or (
+                not _is_v9_contract(contract)
+                and any(counts.get(option, 0) for option in v9_arm_options)
             )
         ):
             _error("v4 manager launch lacks exact fault-window arm bindings")
@@ -4086,9 +4406,10 @@ def _validate_fault_window_arm(
     is_v6 = (
         _is_v6_contract(contract)
         or _is_v7_contract(contract)
-        or _is_v8_contract(contract)
+        or _is_v8_or_v9_contract(contract)
     )
-    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
+    is_v7 = _is_v7_contract(contract) or _is_v8_or_v9_contract(contract)
+    is_v9 = _is_v9_contract(contract)
     path = (root / "runtime" / _FAULT_WINDOW_ARM_FILENAME).resolve()
     if (
         path.parent != (root / "runtime").resolve()
@@ -4124,14 +4445,25 @@ def _validate_fault_window_arm(
         }
     if is_v7:
         expected_keys.add("snapshot_evidence_basis")
+    if is_v9:
+        expected_keys.add("selection_cardinality_policy")
     if (
         set(arm) != expected_keys
-        or arm.get("schema_version") != (3 if is_v7 else 2 if is_v6 else 1)
+        or arm.get("schema_version")
+        != (4 if is_v9 else 3 if is_v7 else 2 if is_v6 else 1)
         or arm.get("kind")
         != (
-            _FAULT_WINDOW_ARM_DOMAIN_V3
-            if is_v7
-            else _FAULT_WINDOW_ARM_DOMAIN_V2 if is_v6 else _FAULT_WINDOW_ARM_DOMAIN_V1
+            _FAULT_WINDOW_ARM_DOMAIN_V4
+            if is_v9
+            else (
+                _FAULT_WINDOW_ARM_DOMAIN_V3
+                if is_v7
+                else (
+                    _FAULT_WINDOW_ARM_DOMAIN_V2
+                    if is_v6
+                    else _FAULT_WINDOW_ARM_DOMAIN_V1
+                )
+            )
         )
     ):
         _error("v4 fault-window arm schema drifted")
@@ -4147,6 +4479,12 @@ def _validate_fault_window_arm(
         and arm.get("snapshot_evidence_basis") != "exact_post_fault_attempt_start_v1"
     ):
         _error("v7 fault-window arm snapshot evidence binding drifted")
+    if (
+        is_v9
+        and arm.get("selection_cardinality_policy")
+        != "all_guarded_up_to_fault_bound_v1"
+    ):
+        _error("v9 fault-window arm cardinality policy drifted")
     _integer(arm.get("epoch_number"), "fault-window epoch number")
     _integer(arm.get("evidence_start_monotonic_ns"), "fault-window evidence start", 1)
     for key in (
@@ -4306,11 +4644,21 @@ def _validate_fault_window_arm(
     pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
     expected_argv = {
         "--fault-window-arm-path": str(historical_arm_path),
-        "--fault-window-arm-schema-version": "3" if is_v7 else "2" if is_v6 else "1",
+        "--fault-window-arm-schema-version": (
+            "4" if is_v9 else "3" if is_v7 else "2" if is_v6 else "1"
+        ),
         "--fault-window-arm-domain": (
-            _FAULT_WINDOW_ARM_DOMAIN_V3
-            if is_v7
-            else _FAULT_WINDOW_ARM_DOMAIN_V2 if is_v6 else _FAULT_WINDOW_ARM_DOMAIN_V1
+            _FAULT_WINDOW_ARM_DOMAIN_V4
+            if is_v9
+            else (
+                _FAULT_WINDOW_ARM_DOMAIN_V3
+                if is_v7
+                else (
+                    _FAULT_WINDOW_ARM_DOMAIN_V2
+                    if is_v6
+                    else _FAULT_WINDOW_ARM_DOMAIN_V1
+                )
+            )
         ),
         "--fault-window-arm-run-id": str(arm["run_id"]),
         "--fault-window-arm-profile-id": str(arm["profile_id"]),
@@ -4340,6 +4688,10 @@ def _validate_fault_window_arm(
     if is_v7:
         expected_argv["--fault-window-arm-snapshot-evidence-basis"] = (
             "exact_post_fault_attempt_start_v1"
+        )
+    if is_v9:
+        expected_argv["--fault-window-arm-selection-cardinality-policy"] = (
+            "all_guarded_up_to_fault_bound_v1"
         )
     if any(pairs.get(key) != value for key, value in expected_argv.items()):
         _error("v4 manager arm bindings differ from the persisted arm")
@@ -4812,6 +5164,7 @@ def validate_sealed_arm(
         epoch1_snapshot_id,
         epoch1_cutoff,
         epoch1_audit_ns,
+        _epoch1_roots,
     ) = _ranking(events, epoch1, contract, predecessor_epoch=0)
     if epoch1_snapshot_id is not None and (
         epoch1.evidence_snapshot_id != epoch1_snapshot_id
@@ -4824,7 +5177,13 @@ def validate_sealed_arm(
         in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
         else tuple(range(int(contract["quorum"])))
     )
-    _validate_trees(epoch1, epoch1_roots, "Epoch 1", contract)
+    _validate_trees(
+        epoch1,
+        epoch1_roots,
+        "Epoch 1",
+        contract,
+        containment_timeout_targets if _is_v9_contract(contract) else None,
+    )
     if epoch2 is None:
         if any(
             event["event_type"] in {"epoch.command_committed", "epoch.activated"}
@@ -4845,19 +5204,32 @@ def validate_sealed_arm(
             epoch2_snapshot_id,
             epoch2_cutoff,
             epoch2_audit_ns,
-        ) = _ranking(events, epoch1, contract, predecessor_epoch=1)
+            epoch2_roots,
+        ) = _ranking(
+            events,
+            epoch1,
+            contract,
+            predecessor_epoch=1,
+            inherited_wait_exempt=(
+                containment_timeout_targets if _is_v9_contract(contract) else None
+            ),
+        )
         if epoch2_snapshot_id is None or (
             epoch2.evidence_snapshot_id != epoch2_snapshot_id
             or epoch2.evidence_cutoff != epoch2_cutoff
         ):
             _error("Epoch 2 bundle is not bound to its native snapshot audit")
-        if timeout_targets != containment_timeout_targets:
+        if _is_v9_contract(contract):
+            if not set(timeout_targets).issubset(containment_timeout_targets):
+                _error("optimization introduces a new nonresponsive cohort member")
+        elif timeout_targets != containment_timeout_targets:
             _error("containment and optimization evidence disagree on fault targets")
         _validate_trees(
             epoch2,
-            tuple(ranked_ids[: int(contract["quorum"])]),
+            epoch2_roots,
             "Epoch 2",
             contract,
+            containment_timeout_targets if _is_v9_contract(contract) else None,
         )
         commands2, activations2 = _validate_transition(events, epoch2, contract)
         if (
@@ -4940,7 +5312,7 @@ def validate_sealed_arm(
     commits, measurements = _commit_reconstruction(
         root, events, epoch1, epoch2, contract
     )
-    if timeout_targets != tuple(contract["targets"]):
+    if not _is_v9_contract(contract) and timeout_targets != tuple(contract["targets"]):
         _error("source-blind nonresponse reconstruction drifted")
     replica_sources = {
         int(str(event["source_id"]).removeprefix("replica-"))
@@ -4981,6 +5353,14 @@ def validate_sealed_arm(
         ):
             _error("crashed replica emitted an event after confirmed SIGKILL")
     _validate_atomic_fault_receipt(contract, fault_receipt)
+    receipt_targets = {
+        _integer(outcome.get("replica_id"), "fault outcome replica")
+        for outcome in _sequence(fault_receipt["sigkill_outcomes"], "SIGKILL outcomes")
+    }
+    if _is_v9_contract(contract) and not receipt_targets.issubset(
+        containment_timeout_targets
+    ):
+        _error("v9 crash receipt targets are outside the guarded cohort")
     if "reporter_coverage_plan" in contract:
         fault_ns = max(confirmations.values())
         prefault_ns = min(
@@ -4999,6 +5379,9 @@ def validate_sealed_arm(
             fault_receipt,
             activations1,
             activations2,
+            guarded_targets=(
+                containment_timeout_targets if _is_v9_contract(contract) else None
+            ),
         )
         validate_fcrash_h_evidence(contract, coverage_witness)
         audit_ns = _integer(
@@ -5081,6 +5464,13 @@ def validate_sealed_arm(
         "native_bundles_decoded": True,
         "runtime_graph_validated": True,
         "ranking_reconstructed_from_raw": True,
+        "guarded_nonresponsive_replica_ids": list(containment_timeout_targets),
+        "dependent_nonresponsive_replica_ids": (
+            sorted(set(containment_timeout_targets) - set(receipt_targets))
+            if _is_v9_contract(contract)
+            else []
+        ),
+        "exact_crash_equality_claimed": False if _is_v9_contract(contract) else True,
         "epoch2_present": epoch2 is not None,
         "profile_sha256": profile_sha,
         "topology_proof_sha256": proof_sha,
@@ -5266,7 +5656,7 @@ def validate_sealed_campaign(
         }
         for pair in source_blind["pair_verdicts"]
     ]
-    return {
+    result: dict[str, object] = {
         "schema_version": 1,
         "verdict": (
             "PASS" if source_blind["campaign_acceptance"] == "ACCEPTED" else "FAIL"
@@ -5279,6 +5669,10 @@ def validate_sealed_campaign(
         "figure_eligible": source_blind["figure_eligible"],
         "ledger_head_sha256": source_blind["ledger_head_sha256"],
     }
+    if "scientific_support" in source_blind:
+        result["scientific_support"] = source_blind["scientific_support"]
+        result["claim_eligible"] = source_blind["claim_eligible"]
+    return result
 
 
 __all__ = [

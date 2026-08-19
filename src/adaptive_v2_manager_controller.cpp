@@ -44,7 +44,9 @@ ConsensusConstraints
 consensus_inherited_wait_exempt(
     const EpochDefinition &current,
     const std::vector<ReplicaID> &membership,
-    std::size_t required_count)
+    std::size_t required_count,
+    std::size_t maximum_count,
+    AdaptiveV2FaultWindowCardinalityPolicy cardinality_policy)
 {
     if (current.trees().empty() || required_count == 0)
         return {};
@@ -65,7 +67,17 @@ consensus_inherited_wait_exempt(
                 : ConsensusConstraintStatus::invalid,
             {}};
     }
-    if (canonical.size() != required_count ||
+    const bool valid_cardinality =
+        cardinality_policy ==
+                AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1
+            ? canonical.size() == required_count
+            : cardinality_policy ==
+                      AdaptiveV2FaultWindowCardinalityPolicy::
+                          all_guarded_up_to_fault_bound_v1
+                  ? canonical.size() >= required_count &&
+                        canonical.size() <= maximum_count
+                  : false;
+    if (!valid_cardinality ||
         !std::is_sorted(canonical.begin(), canonical.end()) ||
         std::adjacent_find(canonical.begin(), canonical.end()) !=
             canonical.end())
@@ -265,7 +277,10 @@ struct AdaptiveV2ManagerController::State
             const auto inherited = consensus_inherited_wait_exempt(
                 ingress.current_epoch(),
                 ingress.membership(),
-                config.selection.required_nonresponsive);
+                config.selection.required_nonresponsive,
+                ingress.membership().size() -
+                    ingress.quorum_metadata().quorum,
+                config.selection.cardinality_policy);
             if (inherited.status ==
                 ConsensusConstraintStatus::invalid)
             {
@@ -550,6 +565,7 @@ struct AdaptiveV2ManagerController::State
         case AdaptiveV2SelectionStatus::selected:
             break;
         case AdaptiveV2SelectionStatus::baseline_frozen:
+        case AdaptiveV2SelectionStatus::guarded_candidate_bound_exceeded:
         case AdaptiveV2SelectionStatus::invalid_state:
         case AdaptiveV2SelectionStatus::invalid_cutoff:
         case AdaptiveV2SelectionStatus::ledger_unhealthy:

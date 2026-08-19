@@ -715,6 +715,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N7_PROFILE_V9,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N31_PROFILE_V9,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (21, 22, 23),
+                "survivors": tuple((*range(21), *range(24, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -742,6 +768,17 @@ def test_validator_contract_is_derived_from_each_focused_profile(
     assert (
         contract["adaptive_transition_count"] == expected["adaptive_transition_count"]
     )
+    if profile_path in {runtime_fixture.N7_PROFILE_V9, runtime_fixture.N31_PROFILE_V9}:
+        assert contract["phase_window_contract"] == {
+            "schema_version": 1,
+            "domain": "kauri-focused-causal-phase-windows-v1",
+            "stabilization_offset_seconds": 30,
+            "control_optimization_hold_seconds": 30,
+        }
+        assert (
+            contract["profile"]["fault_window_arm"]["selection_cardinality_policy"]
+            == "all_guarded_up_to_fault_bound_v1"
+        )
 
 
 @pytest.mark.parametrize(
@@ -898,6 +935,96 @@ def test_v7_ranking_replays_epoch_zero_sibling_with_arm_boundary(
     assert observed == [(1, None), (0, 100)]
 
 
+def test_v9_source_blind_optimization_roots_exclude_recovered_inherited_cohort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovered inherited leaves remain responsive but cannot become roots."""
+
+    validation = _validation()
+    members = tuple(range(31))
+    crashes = (21, 22, 23)
+    inherited = (11, 21, 22, 23)
+    ranked = tuple(replica for replica in members if replica not in crashes)
+    expected_roots = tuple(
+        replica for replica in ranked if replica not in inherited
+    )[:21]
+    contract = {
+        "profile_id": "n31-f5-q21-three-crash-pair-v9",
+        "profile": {"profile_id": "n31-f5-q21-three-crash-pair-v9"},
+        "members": members,
+        "targets": crashes,
+        "survivors": tuple(replica for replica in members if replica not in crashes),
+        "quorum": 21,
+        "epoch_zero_digest": "00" * 32,
+    }
+    monkeypatch.setattr(
+        validation,
+        "reconstruct_focused_ranking",
+        lambda *_args, **_kwargs: {
+            "snapshot_id": "aa" * 32,
+            "ranked_ids": list(ranked),
+        },
+    )
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "fault_window_armed",
+            "source_monotonic_ns": 1,
+            "payload": {"evidence_start_monotonic_ns": 2},
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "evidence.observation_accepted",
+            "source_monotonic_ns": 10,
+            "payload": {
+                "ingestion_sequence": 1,
+                "observation": {
+                    "observation_id": "bb" * 32,
+                    "configuration": {"epoch_number": 1},
+                },
+            },
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "source_monotonic_ns": 11,
+            "payload": {
+                "predecessor_epoch_number": 1,
+                "predecessor_epoch_digest": "11" * 32,
+                "baseline_cutoff": 0,
+                "current_cutoff": 1,
+                "eligible_ranking": list(expected_roots),
+            },
+        },
+    ]
+    epoch1 = SimpleNamespace(epoch_digest="11" * 32, generation_seed=1)
+
+    result = validation._ranking(
+        events,
+        epoch1,
+        contract,
+        predecessor_epoch=1,
+        inherited_wait_exempt=inherited,
+    )
+
+    assert result[0] == list(ranked)
+    assert result[2] == crashes
+    assert result[6] == expected_roots
+
+    events[2]["payload"]["eligible_ranking"] = list(ranked[:21])
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="native audit eligible ranking drifted",
+    ):
+        validation._ranking(
+            events,
+            epoch1,
+            contract,
+            predecessor_epoch=1,
+            inherited_wait_exempt=inherited,
+        )
+
+
 @pytest.mark.parametrize(
     "profile_path", (runtime_fixture.N7_PROFILE_V2, runtime_fixture.N31_PROFILE_V2)
 )
@@ -992,6 +1119,200 @@ def test_independent_validator_rechecks_fcrash_h_guard_and_deadline_caps(
             )
         with pytest.raises(validation.FocusedCrashPairValidationError):
             validation.validate_fcrash_h_evidence(contract, changed)
+
+
+def test_v9_witness_requires_full_dependent_guarded_cohort() -> None:
+    validation = _validation()
+    prefix = tuple(range(20, 31)) + tuple(range(6))
+    cohort = (11, 21, 22, 23)
+    contract = {
+        "profile_id": "n31-f5-q21-three-crash-pair-v9",
+        "profile": {"fault_window_arm": {"ordered_tree_prefix": list(prefix)}},
+        "members": tuple(range(31)),
+        "targets": (21, 22, 23),
+        "quorum": 21,
+        "fanout": 5,
+        "reporter_coverage_plan": {
+            "required_qualifying_reporters": 11,
+            "minimum_timeouts_per_reporter": 2,
+            "minimum_score_drop": 22,
+            "deadlines_seconds": {
+                "evidence_seconds": 180,
+                "epoch1_activation_seconds": 270,
+                "optimization_activation_seconds": 90,
+            },
+            "targets": [],
+        },
+    }
+    rows: list[dict[str, object]] = []
+    for target in cohort:
+        relations: dict[int, tuple[int, str]] = {}
+        for tree_id in prefix:
+            for reporter in range(31):
+                for message_type in ("direct_vote", "aggregate_relay"):
+                    if validation._is_v9_guard_relation(
+                        contract,
+                        target=target,
+                        reporter=reporter,
+                        tree_id=tree_id,
+                        message_type=message_type,
+                        prefix=prefix,
+                    ):
+                        relations.setdefault(reporter, (tree_id, message_type))
+        assert len(relations) >= 11
+        for reporter, (tree_id, message_type) in list(relations.items())[:11]:
+            for ordinal in range(2):
+                rows.append(
+                    {
+                        "epoch_number": 0,
+                        "tree_id": tree_id,
+                        "observed_replica_id": target,
+                        "reporter_id": reporter,
+                        "outcome": "timeout",
+                        "compensated": False,
+                        "source_monotonic_ns": 101 + ordinal,
+                        "expected_message_type": message_type,
+                    }
+                )
+    witness = {
+        "fault_monotonic_ns": 100,
+        "nonresponse_monotonic_ns": 102,
+        "snapshot_audit_monotonic_ns": 103,
+        "epoch1_activation_monotonic_ns": 104,
+        "epoch2_activation_monotonic_ns": 105,
+        "timeout_observations": rows,
+        "guard_drawdowns": {str(target): -22 for target in cohort},
+        "eligible_guard_drawdowns": {str(target): -22 for target in cohort},
+        "guarded_nonresponsive_replica_ids": list(cohort),
+    }
+    assert validation.validate_fcrash_h_evidence(contract, witness) is None
+
+    missing = deepcopy(witness)
+    dependent_reporter = next(
+        int(row["reporter_id"])
+        for row in missing["timeout_observations"]
+        if row["observed_replica_id"] == 11
+    )
+    missing["timeout_observations"] = [
+        row
+        for row in missing["timeout_observations"]
+        if not (
+            row["observed_replica_id"] == 11
+            and row["reporter_id"] == dependent_reporter
+        )
+    ]
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation.validate_fcrash_h_evidence(contract, missing)
+
+
+def test_v9_complete_phase_buckets_retain_zeros_and_use_the_six_bucket_median() -> None:
+    validation = _validation()
+    bucket_width_ns = 5_000_000_000
+    commits = [
+        {
+            "source_monotonic_ns": index * bucket_width_ns + 1,
+            "payload": {"transaction_count": transactions},
+        }
+        for index, transactions in ((0, 100), (2, 200), (4, 300))
+    ]
+
+    buckets, median = validation._complete_phase_buckets(
+        commits,
+        start_ns=0,
+        end_ns=6 * bucket_width_ns,
+        bucket_width_ns=bucket_width_ns,
+    )
+
+    assert [bucket["transactions"] for bucket in buckets] == [100, 0, 200, 0, 300, 0]
+    assert [bucket["mean_milli_tps"] for bucket in buckets] == [
+        20_000,
+        0,
+        40_000,
+        0,
+        60_000,
+        0,
+    ]
+    assert median == 10_000
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="complete-bucket interval",
+    ):
+        validation._complete_phase_buckets(
+            commits,
+            start_ns=0,
+            end_ns=6 * bucket_width_ns - 1,
+            bucket_width_ns=bucket_width_ns,
+        )
+
+
+@pytest.mark.parametrize("include_support", (False, True))
+def test_sealed_campaign_propagates_only_v9_scientific_support(
+    include_support: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = _validation()
+    root = tmp_path / "campaign"
+    root.mkdir()
+    (root / "campaign-ledger.jsonl").write_text(
+        json.dumps(
+            {
+                "child_tree_sha256": "a" * 64,
+                "child_seal_sha256": "b" * 64,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    plan = {"slots": [{"slot_id": "slot-01", "pair_id": "pair-01", "arm": "control"}]}
+    monkeypatch.setattr(validation, "verify_evidence_seal", lambda _root: None)
+    monkeypatch.setattr(validation, "_read_json", lambda _path, _label: plan)
+    monkeypatch.setattr(
+        validation.campaign_contracts,
+        "validate_campaign_ledger",
+        lambda _plan, _ledger: None,
+    )
+    monkeypatch.setattr(
+        validation,
+        "_aggregate_child_provenance",
+        lambda _trusted, _directory: {},
+    )
+    monkeypatch.setattr(
+        validation,
+        "validate_sealed_arm",
+        lambda _directory, *, trusted_provenance: {
+            "source_inventory_sha256": "1" * 64,
+            "authoritative_commit_identity_sha256": "2" * 64,
+            "epoch_identity_sha256": "3" * 64,
+            "ranking_identity_sha256": "4" * 64,
+        },
+    )
+    source_blind: dict[str, object] = {
+        "campaign_acceptance": "ACCEPTED",
+        "pair_verdicts": [],
+        "figure_eligible": True,
+        "ledger_head_sha256": "5" * 64,
+    }
+    if include_support:
+        source_blind.update(
+            {
+                "scientific_support": {"supported": False},
+                "claim_eligible": False,
+            }
+        )
+    monkeypatch.setattr(
+        validation.campaign_contracts,
+        "validate_campaign_source_blind",
+        lambda *_args, **_kwargs: source_blind,
+    )
+
+    result = validation.validate_sealed_campaign(root, trusted_provenance={})
+
+    assert ("scientific_support" in result) is include_support
+    assert ("claim_eligible" in result) is include_support
+    if include_support:
+        assert result["scientific_support"] == {"supported": False}
+        assert result["claim_eligible"] is False
 
 
 def _v3_progress_contract(tmp_path: Path) -> dict[str, object]:

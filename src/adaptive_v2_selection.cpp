@@ -29,6 +29,16 @@ ValidatedSelectionInputs validate_inputs(
         throw std::invalid_argument(
             "unsupported adaptive-v2 selection schema");
     }
+    switch (config.cardinality_policy)
+    {
+    case AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1:
+    case AdaptiveV2FaultWindowCardinalityPolicy::
+        all_guarded_up_to_fault_bound_v1:
+        break;
+    default:
+        throw std::invalid_argument(
+            "unsupported adaptive-v2 cardinality policy");
+    }
 
     std::sort(membership.begin(), membership.end());
     if (membership.empty() ||
@@ -912,7 +922,8 @@ struct AdaptiveV2ByzantineSelection::State
                 ? AdaptiveV2TimeoutAuditBasis::
                       unfiltered_post_baseline
                 : AdaptiveV2TimeoutAuditBasis::
-                      post_fault_proposal_filtered};
+                      post_fault_proposal_filtered,
+            config.cardinality_policy};
     }
 
     AdaptiveV2SelectionResult result(
@@ -1098,15 +1109,26 @@ struct AdaptiveV2ByzantineSelection::State
                 return output;
             }
 
-            output.selected_replicas.reserve(
-                config.required_nonresponsive);
-            for (std::size_t index = 0;
-                 index < config.required_nonresponsive;
-                 ++index)
+            const bool select_all_guarded =
+                output.metadata.cardinality_policy ==
+                AdaptiveV2FaultWindowCardinalityPolicy::
+                    all_guarded_up_to_fault_bound_v1;
+            if (select_all_guarded &&
+                output.eligible_candidates.size() >
+                    membership.size() - quorum.quorum)
             {
+                healthy = false;
+                output.status = AdaptiveV2SelectionStatus::
+                    guarded_candidate_bound_exceeded;
+                return output;
+            }
+            const auto selected_count = select_all_guarded
+                ? output.eligible_candidates.size()
+                : static_cast<std::size_t>(config.required_nonresponsive);
+            output.selected_replicas.reserve(selected_count);
+            for (std::size_t index = 0; index < selected_count; ++index)
                 output.selected_replicas.push_back(
                     output.eligible_candidates[index].replica_id);
-            }
 
             const std::set<ReplicaID> selected(
                 output.selected_replicas.begin(),
@@ -1362,6 +1384,27 @@ bool AdaptiveV2ByzantineSelection::arm_fault_window(
             AdaptiveV2FaultWindowEvidenceBasis::
                 exact_timeout_attempt_id_v1)
         return false;
+    switch (arm.cardinality_policy)
+    {
+    case AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1:
+    case AdaptiveV2FaultWindowCardinalityPolicy::
+        all_guarded_up_to_fault_bound_v1:
+        break;
+    default:
+        return false;
+    }
+    if (arm.cardinality_policy != state.config.cardinality_policy)
+        return false;
+    if (arm.cardinality_policy ==
+            AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1 &&
+        (arm.evidence_basis !=
+             AdaptiveV2FaultWindowEvidenceBasis::
+                 exact_timeout_attempt_id_v1 ||
+         arm.snapshot_evidence_basis !=
+             AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                 exact_post_fault_attempt_start_v1))
+        return false;
     const auto tree_count = state.membership.size();
     if (arm.required_tree_ids.size() > tree_count)
         return false;
@@ -1424,6 +1467,16 @@ AdaptiveV2ByzantineSelection::select_through(
     {
         return state.result(
             AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
+            evidence_cutoff);
+    }
+    if (state.config.cardinality_policy ==
+            AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1 &&
+        !state.config.fault_window_arm.has_value())
+    {
+        state.healthy = false;
+        return state.result(
+            AdaptiveV2SelectionStatus::invalid_state,
             evidence_cutoff);
     }
 
@@ -1705,8 +1758,20 @@ AdaptiveV2ByzantineSelection::rank_inheriting_constraints_through(
         return inherited_result(
             AdaptiveV2SelectionStatus::capacity_exceeded);
     }
-    if (canonical_inherited.size() !=
-            state.config.required_nonresponsive ||
+    const bool valid_cardinality =
+        state.config.cardinality_policy ==
+            AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1
+        ? canonical_inherited.size() ==
+              state.config.required_nonresponsive
+        : state.config.cardinality_policy ==
+                  AdaptiveV2FaultWindowCardinalityPolicy::
+                      all_guarded_up_to_fault_bound_v1
+              ? canonical_inherited.size() >=
+                    state.config.required_nonresponsive &&
+                    canonical_inherited.size() <=
+                        state.membership.size() - state.quorum.quorum
+              : false;
+    if (!valid_cardinality ||
         std::adjacent_find(
             canonical_inherited.begin(), canonical_inherited.end()) !=
             canonical_inherited.end() ||

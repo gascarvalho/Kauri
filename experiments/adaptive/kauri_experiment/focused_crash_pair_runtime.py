@@ -7,7 +7,7 @@ runtime primitives, while every external effect remains injectable for tests.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 import ctypes
 from dataclasses import asdict, dataclass, field, is_dataclass
 import errno
@@ -112,6 +112,7 @@ _RUNTIME_EVENT_KEYS = {
 _FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
 _FAULT_WINDOW_ARM_DOMAIN_V3 = "kauri-focused-fault-window-arm-v3"
+_FAULT_WINDOW_ARM_DOMAIN_V4 = "kauri-focused-fault-window-arm-v4"
 _FAULT_WINDOW_ARM_FILENAME = "fault-window-arm.json"
 _V6_TIMEOUT_OBSERVATION_DOMAIN = b"kauri-response-observation-v3"
 
@@ -209,13 +210,13 @@ def _v6_timeout_observation_id(
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v4", "-v5", "-v6", "-v7", "-v8")
+        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9")
     )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v5", "-v6", "-v7", "-v8")
+        ("-v5", "-v6", "-v7", "-v8", "-v9")
     )
 
 
@@ -229,6 +230,16 @@ def _is_v7_profile(profile: FocusedProfile | object) -> bool:
 
 def _is_v8_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith("-v8")
+
+
+def _is_v9_profile(profile: FocusedProfile | object) -> bool:
+    """Return whether this is the prospective guarded-cohort contract."""
+
+    return str(getattr(profile, "profile_id", "")).endswith("-v9")
+
+
+def _is_v8_or_v9_profile(profile: FocusedProfile | object) -> bool:
+    return _is_v8_profile(profile) or _is_v9_profile(profile)
 
 
 def _reporter_capacity_document(
@@ -309,7 +320,7 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         "required_tree_ids",
     }
     schema_version = arm.get("schema_version")
-    if type(schema_version) is not int or schema_version not in {1, 2, 3}:
+    if type(schema_version) is not int or schema_version not in {1, 2, 3, 4}:
         _error("fault-window arm schema version drifted")
     v2 = {
         "clock_domain",
@@ -317,17 +328,24 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         "timeout_evidence_basis",
     }
     v3 = v2 | {"snapshot_evidence_basis"}
+    v4 = v3 | {"selection_cardinality_policy"}
     if set(arm) != common | (
-        v3 if schema_version == 3 else v2 if schema_version == 2 else set()
+        v4
+        if schema_version == 4
+        else v3 if schema_version == 3 else v2 if schema_version == 2 else set()
     ):
         _error("fault-window arm schema drifted")
     if arm.get("kind") != (
-        _FAULT_WINDOW_ARM_DOMAIN_V3
-        if schema_version == 3
+        _FAULT_WINDOW_ARM_DOMAIN_V4
+        if schema_version == 4
         else (
-            _FAULT_WINDOW_ARM_DOMAIN_V2
-            if schema_version == 2
-            else _FAULT_WINDOW_ARM_DOMAIN_V1
+            _FAULT_WINDOW_ARM_DOMAIN_V3
+            if schema_version == 3
+            else (
+                _FAULT_WINDOW_ARM_DOMAIN_V2
+                if schema_version == 2
+                else _FAULT_WINDOW_ARM_DOMAIN_V1
+            )
         )
     ):
         _error("fault-window arm kind drifted")
@@ -360,7 +378,7 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         or len(set(required_ids)) != len(required_ids)
     ):
         _error("fault-window arm required tree IDs drifted")
-    if schema_version in {2, 3} and (
+    if schema_version in {2, 3, 4} and (
         arm.get("clock_domain") != "same_host_clock_monotonic_raw"
         or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
         or type(arm.get("required_observation_schema")) is not int
@@ -368,10 +386,16 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
     ):
         _error("fault-window arm v2 timeout evidence contract drifted")
     if (
-        schema_version == 3
+        schema_version in {3, 4}
         and arm.get("snapshot_evidence_basis") != "exact_post_fault_attempt_start_v1"
     ):
         _error("fault-window arm v3 snapshot evidence contract drifted")
+    if (
+        schema_version == 4
+        and arm.get("selection_cardinality_policy")
+        != "all_guarded_up_to_fault_bound_v1"
+    ):
+        _error("fault-window arm v4 cardinality policy drifted")
     payload = _canonical_json(arm)
     parent = path.parent
     if (
@@ -463,6 +487,7 @@ def _validate_controller_failure_terminal(
         "nonmember_evidence",
         "projection_failed",
         "capacity_exceeded",
+        "guarded_candidate_bound_exceeded",
         "snapshot_failed",
         "internal_failure",
     }
@@ -931,11 +956,12 @@ def _validate_topology_proof(
     if profile.get("profile_id") in {
         "n31-f5-q21-three-crash-pair-v7",
         "n31-f5-q21-three-crash-pair-v8",
+        "n31-f5-q21-three-crash-pair-v9",
     }:
         metric = topology.get("target_selection_metric")
         expected_metric = (
             _v8_n31_target_selection_metric()
-            if str(profile.get("profile_id", "")).endswith("-v8")
+            if str(profile.get("profile_id", "")).endswith(("-v8", "-v9"))
             else _v7_n31_target_selection_metric()
         )
         if metric != expected_metric:
@@ -945,7 +971,7 @@ def _validate_topology_proof(
         "target_selection_metric" in topology or "target_selection_metric" in derivation
     ):
         _error("archived topology contains a prospective target selection metric")
-    if str(profile.get("profile_id", "")).endswith("-v8"):
+    if str(profile.get("profile_id", "")).endswith(("-v8", "-v9")):
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         expected_capacity = _reporter_capacity_document(
             replica_count=replica_count,
@@ -996,6 +1022,21 @@ def load_focused_profile(path: Path) -> FocusedProfile:
     profile_id = profile.get("profile_id")
     if not isinstance(profile_id, str) or not profile_id:
         _error("focused profile ID is invalid")
+    if _is_v9_profile(SimpleNamespace(profile_id=profile_id)):
+        campaign = _document(profile.get("campaign"), "v9 campaign contract")
+        support = _document(
+            campaign.get("scientific_support_contract"),
+            "v9 scientific-support contract",
+        )
+        if support != {
+            "schema_version": 1,
+            "domain": "kauri-focused-campaign-scientific-support-v1",
+        }:
+            _error("v9 scientific-support campaign contract drifted")
+    elif "scientific_support_contract" in _document(
+        profile.get("campaign"), "campaign contract"
+    ):
+        _error("archived campaign profile contains a prospective support contract")
     if _is_v4_profile(SimpleNamespace(profile_id=profile_id)):
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         blinding = _document(profile.get("blinding"), "profile blinding")
@@ -1022,26 +1063,36 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         if (
             _is_v6_profile(SimpleNamespace(profile_id=profile_id))
             or _is_v7_profile(SimpleNamespace(profile_id=profile_id))
-            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v8_or_v9_profile(SimpleNamespace(profile_id=profile_id))
         ):
             expected_arm_keys |= {
                 "clock_domain",
                 "required_observation_schema",
                 "timeout_evidence_basis",
             }
-        if _is_v7_profile(SimpleNamespace(profile_id=profile_id)) or _is_v8_profile(
+        if _is_v7_profile(
             SimpleNamespace(profile_id=profile_id)
-        ):
+        ) or _is_v8_or_v9_profile(SimpleNamespace(profile_id=profile_id)):
             expected_arm_keys.add("snapshot_evidence_basis")
+        if _is_v9_profile(SimpleNamespace(profile_id=profile_id)):
+            expected_arm_keys.add("selection_cardinality_policy")
         if (
             set(arm) != expected_arm_keys
             or type(arm.get("schema_version")) is not int
             or arm.get("schema_version")
             != (
-                3
-                if _is_v7_profile(SimpleNamespace(profile_id=profile_id))
-                or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
-                else 2 if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) else 1
+                4
+                if _is_v9_profile(SimpleNamespace(profile_id=profile_id))
+                else (
+                    3
+                    if _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+                    or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
+                    else (
+                        2
+                        if _is_v6_profile(SimpleNamespace(profile_id=profile_id))
+                        else 1
+                    )
+                )
             )
             or arm.get("domain") != "epoch_zero_native_cyclic_tree_positions"
             or arm.get("manager_visibility")
@@ -1063,7 +1114,7 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         if (
             _is_v6_profile(SimpleNamespace(profile_id=profile_id))
             or _is_v7_profile(SimpleNamespace(profile_id=profile_id))
-            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v8_or_v9_profile(SimpleNamespace(profile_id=profile_id))
         ) and (
             arm.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm.get("required_observation_schema") != 3
@@ -1072,9 +1123,15 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             _error("v6 fault-window timeout evidence metadata drifted")
         if (
             _is_v7_profile(SimpleNamespace(profile_id=profile_id))
-            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v8_or_v9_profile(SimpleNamespace(profile_id=profile_id))
         ) and arm.get("snapshot_evidence_basis") != "exact_post_fault_attempt_start_v1":
             _error("v7 fault-window snapshot evidence metadata drifted")
+        if (
+            _is_v9_profile(SimpleNamespace(profile_id=profile_id))
+            and arm.get("selection_cardinality_policy")
+            != "all_guarded_up_to_fault_bound_v1"
+        ):
+            _error("v9 fault-window selection cardinality policy drifted")
     protocol = _document(profile.get("protocol"), "profile protocol")
     topology = _document(profile.get("topology"), "profile topology")
     replica_count = _integer(protocol.get("N"), "replica count", 1)
@@ -1216,6 +1273,74 @@ def _cyclic_parent(
     return (tree_root + (position - 1) // fanout) % replica_count
 
 
+def _v9_eligible_guard_reporters(
+    profile: FocusedProfile, target: int
+) -> frozenset[int]:
+    """Derive reporters with at least one proof-bound relation for a v9 cohort member."""
+
+    protocol = _document(profile.raw.get("protocol"), "profile protocol")
+    arm = _document(profile.raw.get("fault_window_arm"), "fault-window arm")
+    fanout = _integer(protocol.get("fanout"), "profile fanout", 1)
+    prefix = _sequence(arm.get("ordered_tree_prefix"), "fault-window prefix")
+    crashed = set(profile.target_replica_ids)
+    replica_count = len(profile.replica_ids)
+    return frozenset(
+        reporter
+        for reporter in profile.replica_ids
+        if reporter not in crashed
+        and any(
+            tree_id not in crashed
+            and tree_id != target
+            and _cyclic_parent(replica_count, fanout, tree_id, target) == reporter
+            for tree_id in prefix
+        )
+    )
+
+
+def _v9_optimization_roots(
+    ranked_ids: Sequence[int],
+    inherited_wait_exempt: Sequence[int],
+    quorum: int,
+) -> tuple[int, ...]:
+    """Mirror native recurring selection without promoting inherited leaves."""
+
+    inherited = set(inherited_wait_exempt)
+    roots = tuple(replica for replica in ranked_ids if replica not in inherited)[:quorum]
+    if len(roots) != quorum:
+        _error("v9 optimization lacks Q unconstrained responsive roots")
+    return roots
+
+
+def _v9_inherited_cohort(profile: FocusedProfile, decoded: Any) -> tuple[int, ...]:
+    """Bind every native tree to one exact inherited leaf/wait-exempt cohort."""
+
+    if not decoded.trees:
+        _error("v9 epoch lacks inherited trees")
+    cohort = tuple(decoded.trees[0].wait_exempt)
+    members = set(profile.replica_ids)
+    fanout = int(profile.raw["protocol"]["fanout"])
+    pipeline_stretch = int(profile.raw["protocol"]["pipeline_stretch"])
+    first_leaf = (len(profile.replica_ids) - 2) // fanout + 1
+    if (
+        cohort != tuple(sorted(set(cohort)))
+        or not set(profile.target_replica_ids).issubset(cohort)
+        or not set(cohort).issubset(members)
+        or len(cohort) > len(profile.replica_ids) - profile.quorum
+        or any(
+            tree.fanout != fanout
+            or tree.pipeline_stretch != pipeline_stretch
+            or tuple(tree.wait_exempt) != cohort
+            or len(tree.members) != len(profile.replica_ids)
+            or set(tree.members) != members
+            or tuple(tree.members[-len(cohort) :]) != cohort
+            or any(target not in tree.members[first_leaf:] for target in cohort)
+            for tree in decoded.trees
+        )
+    ):
+        _error("v9 epoch inherited cohort or leaf placement drifted")
+    return cohort
+
+
 def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     """Derive and verify the frozen FCRASH-H reporter-coverage contract."""
 
@@ -1240,7 +1365,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         profile, "profile_id", None
     ) in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile):
         expected_guard_keys.add("required_postfault_tree_positions")
-    if _is_v8_profile(profile):
+    if _is_v8_or_v9_profile(profile):
         expected_guard_keys |= {
             "reporter_selection_basis",
             "minimum_topology_eligible_reporter_capacity",
@@ -1264,7 +1389,7 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     required = fault_threshold + 1
     minimum_timeouts = 2
     targets = profile.target_replica_ids
-    if _is_v8_profile(profile):
+    if _is_v8_or_v9_profile(profile):
         arm = _document(raw.get("fault_window_arm"), "fault-window arm metadata")
         capacity = _reporter_capacity_document(
             replica_count=replica_count,
@@ -1497,17 +1622,25 @@ def _fault_window_arm_document(
         _error("fault-window required tree prefix is not unique")
     arm = {
         "schema_version": (
-            3
-            if _is_v7_profile(profile) or _is_v8_profile(profile)
-            else 2 if _is_v6_profile(profile) else 1
+            4
+            if _is_v9_profile(profile)
+            else (
+                3
+                if _is_v7_profile(profile) or _is_v8_profile(profile)
+                else 2 if _is_v6_profile(profile) else 1
+            )
         ),
         "kind": (
-            _FAULT_WINDOW_ARM_DOMAIN_V3
-            if _is_v7_profile(profile) or _is_v8_profile(profile)
+            "kauri-focused-fault-window-arm-v4"
+            if _is_v9_profile(profile)
             else (
-                _FAULT_WINDOW_ARM_DOMAIN_V2
-                if _is_v6_profile(profile)
-                else _FAULT_WINDOW_ARM_DOMAIN_V1
+                _FAULT_WINDOW_ARM_DOMAIN_V3
+                if _is_v7_profile(profile) or _is_v8_profile(profile)
+                else (
+                    _FAULT_WINDOW_ARM_DOMAIN_V2
+                    if _is_v6_profile(profile)
+                    else _FAULT_WINDOW_ARM_DOMAIN_V1
+                )
             )
         ),
         "run_id": str(configuration["run_id"]),
@@ -1525,7 +1658,11 @@ def _fault_window_arm_document(
         "required_tree_positions": positions,
         "required_tree_ids": required_ids,
     }
-    if _is_v6_profile(profile) or _is_v7_profile(profile) or _is_v8_profile(profile):
+    if (
+        _is_v6_profile(profile)
+        or _is_v7_profile(profile)
+        or _is_v8_or_v9_profile(profile)
+    ):
         arm.update(
             {
                 "clock_domain": "same_host_clock_monotonic_raw",
@@ -1533,8 +1670,10 @@ def _fault_window_arm_document(
                 "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
             }
         )
-    if _is_v7_profile(profile) or _is_v8_profile(profile):
+    if _is_v7_profile(profile) or _is_v8_or_v9_profile(profile):
         arm["snapshot_evidence_basis"] = "exact_post_fault_attempt_start_v1"
+    if _is_v9_profile(profile):
+        arm["selection_cardinality_policy"] = "all_guarded_up_to_fault_bound_v1"
     return arm
 
 
@@ -2379,10 +2518,18 @@ def _drive_arm_state_machine(
             _error("fault boundary lacks the exact latched active configuration")
     nonresponse = hooks.wait_for_nonresponse()
     nonresponse_ns = _timestamp(nonresponse, "nonresponse")
-    if (
-        nonresponse_ns <= fault_ns
-        or tuple(nonresponse.get("detected_target_ids", ())) != targets
-    ):
+    guarded_cohort = tuple(nonresponse.get("detected_target_ids", ()))
+    if _is_v9_profile(profile):
+        guarded_valid = (
+            all(type(replica) is int for replica in guarded_cohort)
+            and guarded_cohort == tuple(sorted(set(guarded_cohort)))
+            and set(targets).issubset(guarded_cohort)
+            and set(guarded_cohort).issubset(replicas)
+            and len(targets) <= len(guarded_cohort) <= len(replicas) - quorum
+        )
+    else:
+        guarded_valid = guarded_cohort == targets
+    if nonresponse_ns <= fault_ns or not guarded_valid:
         _error("runtime nonresponse does not match the confirmed fault set")
     if coverage is not None:
         deadline = _document(coverage["deadlines_seconds"], "coverage deadlines")
@@ -2399,7 +2546,40 @@ def _drive_arm_state_machine(
         ):
             _error("runtime nonresponse exceeded the crash-anchored evidence cap")
         observed_counts = nonresponse.get("qualifying_timeout_counts")
-        if _is_v8_profile(profile):
+        if _is_v9_profile(profile):
+            required = _integer(
+                coverage.get("required_qualifying_reporters"),
+                "required qualifying reporters",
+                1,
+            )
+            minimum = _integer(
+                coverage.get("minimum_timeouts_per_reporter"),
+                "minimum timeouts per reporter",
+                1,
+            )
+            expected_target_keys = {str(target) for target in guarded_cohort}
+            eligible_reporters = {
+                str(target): _v9_eligible_guard_reporters(profile, target)
+                for target in guarded_cohort
+            }
+            if (
+                not isinstance(observed_counts, Mapping)
+                or set(observed_counts) != expected_target_keys
+                or any(
+                    not isinstance(observed_counts[target], Mapping)
+                    or len(observed_counts[target]) < required
+                    or any(
+                        not str(reporter).isdigit()
+                        or int(reporter) not in eligible_reporters[target]
+                        or type(count) is not int
+                        or count != minimum
+                        for reporter, count in observed_counts[target].items()
+                    )
+                    for target in expected_target_keys
+                )
+            ):
+                _error("runtime nonresponse lacks the full guarded-cohort coverage")
+        elif _is_v8_profile(profile):
             required = _integer(
                 coverage.get("required_qualifying_reporters"),
                 "required qualifying reporters",
@@ -2446,10 +2626,17 @@ def _drive_arm_state_machine(
             coverage.get("minimum_score_drop"), "minimum score drop", 1
         )
         drawdowns = nonresponse.get("guard_drawdowns")
-        if not isinstance(drawdowns, Mapping) or any(
-            type(drawdowns.get(str(target))) is not int
-            or int(drawdowns[str(target)]) > -minimum_drop
-            for target in targets
+        if (
+            not isinstance(drawdowns, Mapping)
+            or (
+                _is_v9_profile(profile)
+                and set(drawdowns) != {str(target) for target in guarded_cohort}
+            )
+            or any(
+                type(drawdowns.get(str(target))) is not int
+                or int(drawdowns[str(target)]) > -minimum_drop
+                for target in guarded_cohort
+            )
         ):
             _error("runtime nonresponse lacks the frozen score drawdown")
         required_progress = coverage.get("required_postfault_tree_positions")
@@ -2494,6 +2681,11 @@ def _drive_arm_state_machine(
     epoch1_wire, epoch1 = _decoded_bundle(epoch1_snapshot, issuer, "epoch 1")
     if epoch1.epoch_number != 1:
         _error("epoch 1 bundle has the wrong epoch number")
+    if (
+        _is_v9_profile(profile)
+        and _v9_inherited_cohort(profile, epoch1) != guarded_cohort
+    ):
+        _error("Epoch 1 does not preserve the full guarded cohort")
     command1 = hooks.wait_for_epoch_commands(1)
     command1_ns = _transition_barrier(
         command1,
@@ -2553,14 +2745,37 @@ def _drive_arm_state_machine(
         ranking_ns = _timestamp(ranking, "ranking")
         ranked_ids = tuple(ranking.get("ranked_ids", ()))
         selected_root_ids = tuple(ranking.get("selected_root_ids", ()))
+        current_nonresponses = tuple(ranking.get("detected_target_ids", ()))
+        if _is_v9_profile(profile):
+            ranking_membership_valid = (
+                all(
+                    type(replica) is int
+                    for replica in (*ranked_ids, *current_nonresponses)
+                )
+                and ranked_ids == tuple(dict.fromkeys(ranked_ids))
+                and current_nonresponses == tuple(sorted(set(current_nonresponses)))
+                and set(ranked_ids).isdisjoint(current_nonresponses)
+                and set(ranked_ids) | set(current_nonresponses) == set(replicas)
+                and set(targets).issubset(current_nonresponses)
+                and set(current_nonresponses).issubset(guarded_cohort)
+                and len(ranked_ids) >= quorum
+            )
+        else:
+            ranking_membership_valid = set(ranked_ids) == set(survivors) and len(
+                ranked_ids
+            ) == len(survivors)
+        expected_root_ids = (
+            _v9_optimization_roots(ranked_ids, guarded_cohort, quorum)
+            if _is_v9_profile(profile) and ranking_membership_valid
+            else ranked_ids[: len(selected_root_ids)]
+        )
         if (
             ranking_ns <= max(commit1_ns, containment_ns)
             or ranking.get("predecessor_epoch_digest") != epoch1.epoch_digest
             or ranking.get("fresh_after_common_commit") is not True
-            or set(ranked_ids) != set(survivors)
-            or len(ranked_ids) != len(survivors)
+            or not ranking_membership_valid
             or not selected_root_ids
-            or ranked_ids[: len(selected_root_ids)] != selected_root_ids
+            or selected_root_ids != expected_root_ids
         ):
             _error("adaptive ranking is stale or membership-incomplete")
         epoch2_snapshot = hooks.issue_epoch_request(2)
@@ -2573,6 +2788,11 @@ def _drive_arm_state_machine(
             or epoch2.previous_epoch_digest != epoch1.epoch_digest
         ):
             _error("epoch 2 is not the exact successor of epoch 1")
+        if (
+            _is_v9_profile(profile)
+            and _v9_inherited_cohort(profile, epoch2) != guarded_cohort
+        ):
+            _error("Epoch 2 does not preserve the inherited guarded cohort")
         if selected_root_ids != tuple(tree.members[0] for tree in epoch2.trees):
             _error("epoch 2 roots differ from the frozen ranking")
         command2 = hooks.wait_for_epoch_commands(2)
@@ -3269,7 +3489,7 @@ class FocusedRawEvidenceSource:
             _error("raw ranking audit predecessor drifted")
         causal_start_ns: int | None = None
         if (
-            _is_v7_profile(self._profile) or _is_v8_profile(self._profile)
+            _is_v7_profile(self._profile) or _is_v8_or_v9_profile(self._profile)
         ) and predecessor == 0:
             armed = [
                 event
@@ -3305,7 +3525,7 @@ class FocusedRawEvidenceSource:
                     if (
                         _is_v6_profile(self._profile)
                         or _is_v7_profile(self._profile)
-                        or _is_v8_profile(self._profile)
+                        or _is_v8_or_v9_profile(self._profile)
                     )
                     else frozenset({1})
                 ),
@@ -3325,7 +3545,16 @@ class FocusedRawEvidenceSource:
             if row.get("eligible") is True
         ]
         targets = tuple(sorted(set(self._profile.replica_ids) - set(ranked)))
-        if targets != self._profile.target_replica_ids:
+        if _is_v9_profile(self._profile):
+            ranking_valid = (
+                set(self._profile.target_replica_ids).issubset(targets)
+                and len(targets)
+                <= len(self._profile.replica_ids) - self._profile.quorum
+                and len(ranked) >= self._profile.quorum
+            )
+        else:
+            ranking_valid = targets == self._profile.target_replica_ids
+        if not ranking_valid:
             _error("raw ranking does not identify the exact nonresponses")
         accepted = [
             event
@@ -3350,10 +3579,26 @@ class FocusedRawEvidenceSource:
         ]
         if not accepted:
             _error("raw ranking has no accepted evidence in its exact window")
+        selected_root_ids: Sequence[int] = ranked[: self._profile.quorum]
+        if _is_v9_profile(self._profile) and predecessor == 1:
+            inherited_wait_exempt = _v9_inherited_cohort(self._profile, epoch1)
+            selected_root_ids = _v9_optimization_roots(
+                ranked,
+                inherited_wait_exempt,
+                self._profile.quorum,
+            )
+            audited_roots = tuple(
+                _integer(replica, "v9 native audit root")
+                for replica in _sequence(
+                    audit.get("eligible_ranking"), "v9 native audit roots"
+                )
+            )
+            if audited_roots != selected_root_ids:
+                _error("v9 native audit roots differ from inherited constraints")
         return {
             "detected_target_ids": list(targets),
             "ranked_ids": ranked,
-            "selected_root_ids": ranked[: self._profile.quorum],
+            "selected_root_ids": list(selected_root_ids),
             "predecessor_epoch_digest": epoch1.epoch_digest,
             "fresh_after_common_commit": predecessor == 1,
             "source_monotonic_ns": max(
@@ -3374,6 +3619,35 @@ class FocusedRawEvidenceSource:
             ),
         }
 
+    def _is_v9_guard_relation(
+        self,
+        *,
+        target: int,
+        reporter: int,
+        tree_id: int,
+        message_type: str,
+        prefix: Collection[int],
+    ) -> bool:
+        """Validate one native topology relation for an inferred v9 cohort member."""
+
+        count = len(self._profile.replica_ids)
+        fanout = _integer(
+            _document(self._profile.raw.get("protocol"), "profile protocol").get(
+                "fanout"
+            ),
+            "tree fanout",
+            1,
+        )
+        position = (target - tree_id) % count
+        leaf_start = (count - 1 + fanout - 1) // fanout
+        return (
+            tree_id in prefix
+            and position != 0
+            and _cyclic_parent(count, fanout, tree_id, target) == reporter
+            and message_type
+            == ("aggregate_relay" if position < leaf_start else "direct_vote")
+        )
+
     def _qualifying_timeout_counts(
         self,
         events: Sequence[Mapping[str, Any]],
@@ -3381,17 +3655,19 @@ class FocusedRawEvidenceSource:
         fault_ns: int,
         baseline_cutoff: int,
         current_cutoff: int,
+        candidate_targets: Sequence[int] | None = None,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
         if (
             _is_v6_profile(self._profile)
             or _is_v7_profile(self._profile)
-            or _is_v8_profile(self._profile)
+            or _is_v8_or_v9_profile(self._profile)
         ):
             return self._qualifying_v6_timeout_counts(
                 events,
                 fault_ns=fault_ns,
                 baseline_cutoff=baseline_cutoff,
                 current_cutoff=current_cutoff,
+                candidate_targets=candidate_targets,
             )
         coverage = derive_reporter_coverage_plan(self._profile)
         topology = _document(self._profile.raw.get("topology"), "profile topology")
@@ -3541,6 +3817,7 @@ class FocusedRawEvidenceSource:
         fault_ns: int,
         baseline_cutoff: int,
         current_cutoff: int,
+        candidate_targets: Sequence[int] | None = None,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
         """Replay only post-arm native v3 timeout attempts for the live guard."""
 
@@ -3557,7 +3834,17 @@ class FocusedRawEvidenceSource:
             for tree_id in _sequence(arm.get("ordered_tree_prefix"), "v6 tree prefix")
         }
         v8_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
-        if _is_v8_profile(self._profile):
+        if _is_v9_profile(self._profile):
+            if (
+                candidate_targets is None
+                or any(type(target) is not int for target in candidate_targets)
+                or len(set(candidate_targets)) != len(candidate_targets)
+                or not set(candidate_targets).issubset(self._profile.replica_ids)
+            ):
+                _error("v9 guarded-cohort timeout targets are malformed")
+            expected = {int(target): set() for target in candidate_targets}
+            expected_trees: dict[tuple[int, int], int] = {}
+        elif _is_v8_profile(self._profile):
             for row in coverage["targets"]:
                 target = int(row["target_replica_id"])
                 v8_relations[target] = {
@@ -3688,7 +3975,9 @@ class FocusedRawEvidenceSource:
             ):
                 _error("v6 accepted observation timing or signer drifted")
             if (
-                not (_is_v7_profile(self._profile) or _is_v8_profile(self._profile))
+                not (
+                    _is_v7_profile(self._profile) or _is_v8_or_v9_profile(self._profile)
+                )
                 or attempt_start >= fault_ns
             ):
                 if outcome == "timeout":
@@ -3713,15 +4002,28 @@ class FocusedRawEvidenceSource:
                 attempt_start < fault_ns
                 or tree_id not in prefix
                 or target not in expected
-                or reporter not in expected[target]
+                or (
+                    not _is_v9_profile(self._profile)
+                    and reporter not in expected[target]
+                )
                 or (
                     _is_v8_profile(self._profile)
                     and (tree_id, str(message_type))
                     not in v8_relations[target][reporter]
                 )
                 or (
-                    not _is_v8_profile(self._profile)
+                    not _is_v8_or_v9_profile(self._profile)
                     and expected_trees.get((target, reporter)) != tree_id
+                )
+                or (
+                    _is_v9_profile(self._profile)
+                    and not self._is_v9_guard_relation(
+                        target=target,
+                        reporter=reporter,
+                        tree_id=tree_id,
+                        message_type=str(message_type),
+                        prefix=prefix,
+                    )
                 )
             ):
                 continue
@@ -3741,17 +4043,21 @@ class FocusedRawEvidenceSource:
                 int(event["source_monotonic_ns"]),
                 reporter_ns,
             )
-        counts = {
-            target: {reporter: 0 for reporter in reporters}
-            for target, reporters in expected.items()
-        }
+        counts = (
+            {target: {} for target in expected}
+            if _is_v9_profile(self._profile)
+            else {
+                target: {reporter: 0 for reporter in reporters}
+                for target, reporters in expected.items()
+            }
+        )
         timestamps: list[int] = []
         for observation, accepted_ns, reporter_ns in latest.values():
             if observation.get("outcome") != "timeout":
                 continue
             target = int(observation["observed_replica_id"])
             reporter = int(observation["reporter_id"])
-            counts[target][reporter] += 1
+            counts[target][reporter] = counts[target].get(reporter, 0) + 1
             timestamps.extend((accepted_ns, reporter_ns))
         minimum = _integer(
             coverage.get("minimum_timeouts_per_reporter"),
@@ -3761,7 +4067,7 @@ class FocusedRawEvidenceSource:
         minimum_drop = _integer(
             coverage.get("minimum_score_drop"), "minimum score drop", 1
         )
-        if _is_v8_profile(self._profile):
+        if _is_v8_or_v9_profile(self._profile):
             complete = all(
                 sum(count >= minimum for count in reporters.values())
                 >= _integer(
@@ -5300,6 +5606,11 @@ class FocusedRawEvidenceSource:
                         "ranking current cutoff",
                         1,
                     ),
+                    candidate_targets=(
+                        tuple(ranking["detected_target_ids"])
+                        if _is_v9_profile(self._profile)
+                        else None
+                    ),
                 )
                 if qualified is None:
                     return None
@@ -5413,6 +5724,9 @@ class FocusedRawEvidenceSource:
                 width_ns, stabilization_ns, _control_hold_ns = _v5_phase_parameters(
                     self._profile
                 )
+                phase_duration_ns = _phase_measurement_duration_ns(
+                    self._profile, width_ns
+                )
                 activation_ns = _integer(
                     activation.get("source_monotonic_ns"),
                     "Epoch-1 activation timestamp",
@@ -5424,7 +5738,7 @@ class FocusedRawEvidenceSource:
                     after_ns=activation_ns,
                 )
                 start_ns = max(activation_ns, common_ns) + stabilization_ns
-                end_ns = start_ns + width_ns
+                end_ns = start_ns + phase_duration_ns
                 authoritative = _runtime_authoritative_commits(events, self._profile)
                 if (
                     not authoritative
@@ -5522,6 +5836,9 @@ class FocusedRawEvidenceSource:
                 width_ns, stabilization_ns, control_hold_ns = _v5_phase_parameters(
                     self._profile
                 )
+                phase_duration_ns = _phase_measurement_duration_ns(
+                    self._profile, width_ns
+                )
                 activation_ns = _integer(
                     activation.get("source_monotonic_ns"),
                     "final activation timestamp",
@@ -5534,8 +5851,8 @@ class FocusedRawEvidenceSource:
                 )
                 start_ns = max(activation_ns, common_ns) + stabilization_ns
                 if self._arm == "C":
-                    start_ns += width_ns + control_hold_ns
-                end_ns = start_ns + width_ns
+                    start_ns += phase_duration_ns + control_hold_ns
+                end_ns = start_ns + phase_duration_ns
                 authoritative = _runtime_authoritative_commits(events, self._profile)
                 if (
                     not authoritative
@@ -5650,6 +5967,28 @@ def _v5_phase_parameters(profile: FocusedProfile) -> tuple[int, int, int]:
         )
         * 1_000_000_000,
     )
+
+
+def _phase_measurement_duration_ns(
+    profile: FocusedProfile, bucket_width_ns: int
+) -> int:
+    """Use the frozen 30-second stable phase only for v9 scientific support."""
+
+    if not _is_v9_profile(profile):
+        return bucket_width_ns
+    stable_ns = (
+        _integer(
+            _document(profile.raw.get("timers"), "profile timers").get(
+                "stable_phase_seconds"
+            ),
+            "stable phase",
+            1,
+        )
+        * 1_000_000_000
+    )
+    if stable_ns % bucket_width_ns != 0:
+        _error("v9 stable phase is not an exact bucket multiple")
+    return stable_ns
 
 
 def _runtime_commit_epoch(event: Mapping[str, Any], label: str) -> int:
@@ -5799,6 +6138,7 @@ def _v5_phase_window_document(
     source: FocusedRawEvidenceSource,
 ) -> dict[str, object]:
     width_ns, stabilization_ns, control_hold_ns = _v5_phase_parameters(profile)
+    phase_duration_ns = _phase_measurement_duration_ns(profile, width_ns)
     source._common_commit(events, 1)
     if arm == "adaptive":
         source._common_commit(events, 2)
@@ -5853,7 +6193,7 @@ def _v5_phase_window_document(
         )
         == 1
     ]
-    if not command1_times or fault_ns + width_ns >= min(command1_times):
+    if not command1_times or fault_ns + phase_duration_ns >= min(command1_times):
         _error("causal fault window overlaps the Epoch-1 transition")
     activation1 = source._transition(events, 1, activation=True)
     if activation1 is None:
@@ -5865,10 +6205,10 @@ def _v5_phase_window_document(
         events, profile, epoch_number=1, after_ns=activation1_ns
     )
     epoch1_start = max(activation1_ns, common1_ns) + stabilization_ns
-    epoch1_end = epoch1_start + width_ns
+    epoch1_end = epoch1_start + phase_duration_ns
     windows: list[tuple[str, int, int, int]] = [
-        ("baseline", prefault_ns - width_ns, prefault_ns, 0),
-        ("fault", fault_ns, fault_ns + width_ns, 0),
+        ("baseline", prefault_ns - phase_duration_ns, prefault_ns, 0),
+        ("fault", fault_ns, fault_ns + phase_duration_ns, 0),
         ("epoch1", epoch1_start, epoch1_end, 1),
     ]
     if arm == "adaptive":
@@ -5899,7 +6239,7 @@ def _v5_phase_window_document(
         late_epoch = 1
     else:
         _error("causal phase window arm is invalid")
-    windows.append(("late", late_start, late_start + width_ns, late_epoch))
+    windows.append(("late", late_start, late_start + phase_duration_ns, late_epoch))
     if any(right[1] < left[2] for left, right in zip(windows, windows[1:])):
         _error("causal phase windows overlap")
     if any(
@@ -6128,6 +6468,7 @@ def _validate_manager_launch_boundary(
         "--fault-window-arm-required-observation-schema",
         "--fault-window-arm-timeout-evidence-basis",
         "--fault-window-arm-snapshot-evidence-basis",
+        "--fault-window-arm-selection-cardinality-policy",
         "--replica",
     }
     if len(requested) % 2 == 0:
@@ -6481,18 +6822,26 @@ def _focused_manager_command(
                 str(fault_window_arm_path),
                 "--fault-window-arm-schema-version",
                 (
-                    "3"
-                    if _is_v7_profile(profile) or _is_v8_profile(profile)
-                    else "2" if _is_v6_profile(profile) else "1"
+                    "4"
+                    if _is_v9_profile(profile)
+                    else (
+                        "3"
+                        if _is_v7_profile(profile) or _is_v8_profile(profile)
+                        else "2" if _is_v6_profile(profile) else "1"
+                    )
                 ),
                 "--fault-window-arm-domain",
                 (
-                    _FAULT_WINDOW_ARM_DOMAIN_V3
-                    if _is_v7_profile(profile) or _is_v8_profile(profile)
+                    _FAULT_WINDOW_ARM_DOMAIN_V4
+                    if _is_v9_profile(profile)
                     else (
-                        _FAULT_WINDOW_ARM_DOMAIN_V2
-                        if _is_v6_profile(profile)
-                        else _FAULT_WINDOW_ARM_DOMAIN_V1
+                        _FAULT_WINDOW_ARM_DOMAIN_V3
+                        if _is_v7_profile(profile) or _is_v8_profile(profile)
+                        else (
+                            _FAULT_WINDOW_ARM_DOMAIN_V2
+                            if _is_v6_profile(profile)
+                            else _FAULT_WINDOW_ARM_DOMAIN_V1
+                        )
                     )
                 ),
                 "--fault-window-arm-run-id",
@@ -6524,7 +6873,7 @@ def _focused_manager_command(
         if (
             _is_v6_profile(profile)
             or _is_v7_profile(profile)
-            or _is_v8_profile(profile)
+            or _is_v8_or_v9_profile(profile)
         ):
             command.extend(
                 (
@@ -6536,11 +6885,18 @@ def _focused_manager_command(
                     "exact_timeout_attempt_id_v1",
                 )
             )
-        if _is_v7_profile(profile) or _is_v8_profile(profile):
+        if _is_v7_profile(profile) or _is_v8_or_v9_profile(profile):
             command.extend(
                 (
                     "--fault-window-arm-snapshot-evidence-basis",
                     "exact_post_fault_attempt_start_v1",
+                )
+            )
+        if _is_v9_profile(profile):
+            command.extend(
+                (
+                    "--fault-window-arm-selection-cardinality-policy",
+                    "all_guarded_up_to_fault_bound_v1",
                 )
             )
     for request, output in _focused_transition_requests(run_directory, arm):
@@ -6813,7 +7169,7 @@ class FocusedLaunchBackend:
         if (
             _is_v6_profile(profile)
             or _is_v7_profile(profile)
-            or _is_v8_profile(profile)
+            or _is_v8_or_v9_profile(profile)
         ):
             _enable_v6_timeout_attempt_evidence(run_directory, profile.replica_ids)
             artifacts = [
