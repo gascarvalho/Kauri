@@ -3727,6 +3727,93 @@ def test_fault_window_arm_document_binds_finalized_sigkill_outcomes(
     assert arm["required_tree_ids"] == [6, 0, 1, 2, 3, 4]
 
 
+def test_v6_fault_window_arm_document_publishes_canonical_v2_bytes(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V6)
+    topology = profile.raw["topology"]
+    barrier = [
+        {
+            "replica_id": replica,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": topology["active_tree_id"],
+                "epoch_digest": topology["epoch_zero_digest"],
+            },
+        }
+        for replica in profile.replica_ids
+    ]
+    receipt = {
+        "schema_version": 1,
+        "sigkill_outcomes": [
+            {"confirmed_monotonic_ns": 100},
+            {"confirmed_monotonic_ns": 101},
+        ],
+    }
+    raw = tmp_path / "raw"
+    runtime_directory = tmp_path / "runtime"
+    raw.mkdir()
+    runtime_directory.mkdir()
+    (raw / "fault-receipt.json").write_bytes(runtime._canonical_json(receipt))
+    arm = runtime._fault_window_arm_document(
+        {
+            "profile": profile,
+            "run_directory": tmp_path,
+            "run_id": "run-v6",
+            "parent_request_sha256": "a" * 64,
+        },
+        receipt,
+        barrier,
+    )
+    target = runtime_directory / "fault-window-arm.json"
+    digest = runtime._publish_fault_window_arm(target, arm)
+    assert arm["schema_version"] == 2
+    assert arm["kind"] == "kauri-focused-fault-window-arm-v2"
+    assert arm["clock_domain"] == "same_host_clock_monotonic_raw"
+    assert arm["required_observation_schema"] == 3
+    assert arm["timeout_evidence_basis"] == "exact_timeout_attempt_id_v1"
+    assert target.read_bytes() == runtime._canonical_json(arm)
+    assert digest == hashlib.sha256(target.read_bytes()).hexdigest()
+
+
+@pytest.mark.parametrize("mutation", ("unknown", "schema-bool", "observation-bool"))
+def test_fault_window_arm_publication_rejects_v2_schema_and_type_drift(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    target = (tmp_path / "runtime" / "fault-window-arm.json").resolve()
+    target.parent.mkdir()
+    arm: dict[str, object] = {
+        "schema_version": 2,
+        "kind": "kauri-focused-fault-window-arm-v2",
+        "run_id": "run-v6",
+        "profile_id": "n7-f2-q5-two-crash-pair-smoke-v6",
+        "profile_sha256": "a" * 64,
+        "topology_proof_sha256": "b" * 64,
+        "request_sha256": "c" * 64,
+        "epoch_number": 0,
+        "epoch_digest": "d" * 64,
+        "fault_receipt_sha256": "e" * 64,
+        "evidence_start_monotonic_ns": 9,
+        "prefault_tree_id": 6,
+        "required_tree_positions": 2,
+        "required_tree_ids": [6, 0],
+        "clock_domain": "same_host_clock_monotonic_raw",
+        "required_observation_schema": 3,
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+    }
+    if mutation == "unknown":
+        arm["unexpected"] = None
+    elif mutation == "schema-bool":
+        arm["schema_version"] = True
+    else:
+        arm["required_observation_schema"] = True
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._publish_fault_window_arm(target, arm)
+    assert not target.exists()
+
+
 def test_v4_manager_binds_the_profile_tree_horizon(tmp_path: Path) -> None:
     runtime = _runtime()
     profile = runtime.load_focused_profile(

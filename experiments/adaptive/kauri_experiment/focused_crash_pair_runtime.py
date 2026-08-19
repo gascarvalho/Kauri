@@ -230,7 +230,7 @@ def _fault_window_arm_path(run_directory: Path) -> Path:
 def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
     """Publish one canonical arm without exposing a partial or replacement file."""
 
-    expected = {
+    common = {
         "schema_version",
         "kind",
         "run_id",
@@ -246,8 +246,56 @@ def _publish_fault_window_arm(path: Path, arm: Mapping[str, object]) -> str:
         "required_tree_positions",
         "required_tree_ids",
     }
-    if set(arm) != expected:
+    schema_version = arm.get("schema_version")
+    if type(schema_version) is not int or schema_version not in {1, 2}:
+        _error("fault-window arm schema version drifted")
+    v2 = {
+        "clock_domain",
+        "required_observation_schema",
+        "timeout_evidence_basis",
+    }
+    if set(arm) != common | (v2 if schema_version == 2 else set()):
         _error("fault-window arm schema drifted")
+    if arm.get("kind") != (
+        _FAULT_WINDOW_ARM_DOMAIN_V2 if schema_version == 2 else _FAULT_WINDOW_ARM_DOMAIN_V1
+    ):
+        _error("fault-window arm kind drifted")
+    for key in (
+        "run_id",
+        "profile_id",
+    ):
+        if not isinstance(arm.get(key), str) or not arm[key]:
+            _error(f"fault-window arm {key} drifted")
+    for key in (
+        "profile_sha256",
+        "topology_proof_sha256",
+        "request_sha256",
+        "epoch_digest",
+        "fault_receipt_sha256",
+    ):
+        _digest(arm.get(key), f"fault-window arm {key}")
+    for key, minimum in (
+        ("epoch_number", 0),
+        ("evidence_start_monotonic_ns", 1),
+        ("prefault_tree_id", 0),
+        ("required_tree_positions", 1),
+    ):
+        _integer(arm.get(key), f"fault-window arm {key}", minimum)
+    required_ids = arm.get("required_tree_ids")
+    if (
+        not isinstance(required_ids, list)
+        or len(required_ids) != arm["required_tree_positions"]
+        or any(type(tree_id) is not int or tree_id < 0 for tree_id in required_ids)
+        or len(set(required_ids)) != len(required_ids)
+    ):
+        _error("fault-window arm required tree IDs drifted")
+    if schema_version == 2 and (
+        arm.get("clock_domain") != "same_host_clock_monotonic_raw"
+        or arm.get("timeout_evidence_basis") != "exact_timeout_attempt_id_v1"
+        or type(arm.get("required_observation_schema")) is not int
+        or arm.get("required_observation_schema") != 3
+    ):
+        _error("fault-window arm v2 timeout evidence contract drifted")
     payload = _canonical_json(arm)
     parent = path.parent
     if (
