@@ -99,6 +99,19 @@ _FCRASH_H_V7_IDENTITIES = {
         "60b53e89d24c76ff2016f43f49dbfdd8c88d80da9c4b96a15251d89a3bc870f3",
     ),
 }
+_FCRASH_H_V8_PROFILE_IDS = frozenset(
+    {"n7-f2-q5-two-crash-pair-smoke-v8", "n31-f5-q21-three-crash-pair-v8"}
+)
+_FCRASH_H_V8_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v8": (
+        "dfadb278014e21224b0326b1d4654f2dad0029e5dc1892aae7312e979170e64f",
+        "1f88b12272e78546614a4467ccbbe790cadfa3e5cafec3336e457e8f1226a82f",
+    ),
+    "n31-f5-q21-three-crash-pair-v8": (
+        "9d015b2c38c294d0b598cb8f48f579e33d116d276a612ba5edc36cd7edc883a9",
+        "ba6e0670a9d2070b4344a404c7e4974f938beb57a12714865883a74a047f6c0f",
+    ),
+}
 _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     {
         "n7-f2-q5-two-crash-pair-smoke-v1",
@@ -112,12 +125,14 @@ _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     | _FCRASH_H_V5_PROFILE_IDS
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
+    | _FCRASH_H_V8_PROFILE_IDS
 )
 _FAULT_WINDOW_PROFILE_IDS = (
     _FCRASH_H_V4_PROFILE_IDS
     | _FCRASH_H_V5_PROFILE_IDS
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
+    | _FCRASH_H_V8_PROFILE_IDS
 )
 _FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
@@ -474,6 +489,7 @@ def _is_v5_contract(contract: Mapping[str, object]) -> bool:
         in _FCRASH_H_V5_PROFILE_IDS
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
+        | _FCRASH_H_V8_PROFILE_IDS
     )
 
 
@@ -483,6 +499,10 @@ def _is_v6_contract(contract: Mapping[str, object]) -> bool:
 
 def _is_v7_contract(contract: Mapping[str, object]) -> bool:
     return contract.get("profile_id") in _FCRASH_H_V7_PROFILE_IDS
+
+
+def _is_v8_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V8_PROFILE_IDS
 
 
 def _v7_n31_target_selection_metric() -> dict[str, object]:
@@ -535,6 +555,106 @@ def _v7_n31_target_selection_metric() -> dict[str, object]:
         ],
         "selected_target_replica_ids": list(selected),
         "tie_break": "lexicographic_replica_id",
+    }
+
+
+def _v8_n31_target_selection_metric() -> dict[str, object]:
+    """Independently recompute the frozen v8 topology-only selection table."""
+
+    replica_count, fanout = 31, 5
+    candidates = (21, 22, 23, 24, 25)
+    prefix = (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 0, 1, 2, 3, 4, 5)
+    order = tuple(range(20, 31)) + tuple(range(20))
+    rows: list[tuple[tuple[int, int, int], int, int, int]] = []
+    for targets in combinations(candidates, 3):
+        per_tree: list[int] = []
+        for root in prefix:
+            shadow = 0
+            for member in range(replica_count):
+                if member in targets:
+                    continue
+                position = (member - root) % replica_count
+                while True:
+                    if (root + position) % replica_count in targets:
+                        shadow += 1
+                        break
+                    if position == 0:
+                        break
+                    position = (position - 1) // fanout
+            per_tree.append(shadow)
+        fixed = sum(per_tree[prefix.index(target)] for target in targets)
+        rows.append((targets, sum(per_tree), fixed, max(per_tree)))
+    minimum_total = min(row[1] for row in rows)
+    selected = min(
+        targets for targets, total, _fixed, _maximum in rows if total == minimum_total
+    )
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-survivor-path-shadow-v1",
+        "candidate_internal_replica_ids": list(candidates),
+        "prefix_tree_ids": list(prefix),
+        "fanout": fanout,
+        "bfs_member_order": list(order),
+        "triple_scores": [
+            {
+                "target_replica_ids": list(targets),
+                "total_survivor_path_shadow": total,
+                "fixed_root_shadow": fixed,
+                "collateral_survivor_path_shadow": total - fixed,
+                "maximum_per_tree_survivor_path_shadow": maximum,
+            }
+            for targets, total, fixed, maximum in rows
+        ],
+        "selected_target_replica_ids": list(selected),
+        "tie_break": "lexicographic_replica_id",
+    }
+
+
+def _v8_reporter_capacity_document(
+    *, replica_count: int, fanout: int, targets: Sequence[int], prefix: Sequence[int]
+) -> dict[str, object]:
+    """Independently derive the v8 topology-only reporter relation capacity."""
+
+    leaf_start = (replica_count - 1 + fanout - 1) // fanout
+    crashed = set(targets)
+    rows: list[dict[str, object]] = []
+    for target in sorted(targets):
+        reporters: list[dict[str, object]] = []
+        for reporter in range(replica_count):
+            if reporter in crashed:
+                continue
+            relations: list[dict[str, object]] = []
+            for root in prefix:
+                if root in crashed:
+                    continue
+                position = (target - root) % replica_count
+                if (
+                    position == 0
+                    or _cyclic_parent(replica_count, fanout, root, target) != reporter
+                ):
+                    continue
+                relations.append(
+                    {
+                        "tree_id": root,
+                        "expected_message_type": (
+                            "aggregate_relay"
+                            if position < leaf_start
+                            else "direct_vote"
+                        ),
+                    }
+                )
+            if relations:
+                reporters.append({"reporter_id": reporter, "tree_relations": relations})
+        rows.append({"target_replica_id": target, "eligible_reporters": reporters})
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-fault-window-reporter-capacity-v1",
+        "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+        "prefix_tree_ids": list(prefix),
+        "minimum_topology_eligible_reporter_capacity": min(
+            len(row["eligible_reporters"]) for row in rows
+        ),
+        "targets": rows,
     }
 
 
@@ -621,6 +741,11 @@ def _derive_reporter_coverage_plan(
     }
     if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS:
+        expected_guard_keys |= {
+            "reporter_selection_basis",
+            "minimum_topology_eligible_reporter_capacity",
+        }
     expected_timer_keys = {
         "adaptation_interval_seconds",
         "stable_phase_seconds",
@@ -634,6 +759,89 @@ def _derive_reporter_coverage_plan(
     if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
         _error("FCRASH-H guard or timer schema drifted")
     required = fault_threshold + 1
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS:
+        topology = _mapping(profile.get("topology"), "profile topology")
+        arm = _mapping(profile.get("fault_window_arm"), "fault-window arm")
+        capacity = _v8_reporter_capacity_document(
+            replica_count=len(members),
+            fanout=fanout,
+            targets=targets,
+            prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+        )
+        horizon = len(capacity["prefix_tree_ids"])
+        expected_guard = {
+            "schedule": "native_cyclic_epoch_zero",
+            "tree_switch_period_blocks": 2,
+            "horizon_tree_positions": horizon,
+            "required_postfault_tree_positions": horizon,
+            "required_qualifying_reporters": required,
+            "minimum_timeouts_per_reporter": 2,
+            "minimum_score_drop": 2 * required,
+            "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+            "minimum_topology_eligible_reporter_capacity": capacity[
+                "minimum_topology_eligible_reporter_capacity"
+            ],
+        }
+        if (
+            dict(guard) != expected_guard
+            or topology.get("reporter_coverage_capacity") != capacity
+        ):
+            _error("v8 frozen evidence guard differs from topology derivation")
+        deadlines = {
+            "evidence_seconds": _integer(
+                timers.get("nonresponse_evidence_deadline_seconds"),
+                "nonresponse evidence deadline",
+                1,
+            ),
+            "epoch1_activation_seconds": _integer(
+                timers.get("containment_activation_deadline_seconds"),
+                "containment activation deadline",
+                1,
+            ),
+            "optimization_activation_seconds": _integer(
+                timers.get("optimization_activation_deadline_seconds"),
+                "optimization activation deadline",
+                1,
+            ),
+            "arm_hard_seconds": _integer(
+                timers.get("arm_hard_deadline_seconds"), "arm hard deadline", 1
+            ),
+        }
+        if (
+            deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
+            or deadlines["epoch1_activation_seconds"] >= deadlines["arm_hard_seconds"]
+            or deadlines["optimization_activation_seconds"]
+            >= deadlines["arm_hard_seconds"]
+        ):
+            _error("FCRASH-H phase deadlines are not strictly nested")
+        return {
+            "schema_version": 1,
+            "profile_id": profile["profile_id"],
+            "active_tree_id": active_tree,
+            "horizon_tree_positions": horizon,
+            "required_postfault_tree_positions": horizon,
+            "required_qualifying_reporters": required,
+            "minimum_timeouts_per_reporter": 2,
+            "minimum_score_drop": 2 * required,
+            "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+            "minimum_topology_eligible_reporter_capacity": capacity[
+                "minimum_topology_eligible_reporter_capacity"
+            ],
+            "reporter_coverage_capacity": capacity,
+            "deadlines_seconds": deadlines,
+            "stable_phase_seconds": _integer(
+                timers.get("stable_phase_seconds"), "stable phase", 1
+            ),
+            "readiness_timeout_seconds": _integer(
+                timers.get("readiness_timeout_seconds"), "readiness timeout", 1
+            ),
+            "manager_convergence_timeout_seconds": _integer(
+                timers.get("manager_convergence_timeout_seconds"),
+                "manager convergence timeout",
+                1,
+            ),
+            "targets": capacity["targets"],
+        }
     target_rows: list[dict[str, object]] = []
     reporter_sets: list[set[int]] = []
     horizon = 0
@@ -764,7 +972,8 @@ def validate_fcrash_h_evidence(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
     )
     is_v6 = _is_v6_contract(contract)
-    is_v7 = _is_v7_contract(contract)
+    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
+    is_v8 = _is_v8_contract(contract)
     expected_keys = {
         "fault_monotonic_ns",
         "nonresponse_monotonic_ns",
@@ -777,7 +986,7 @@ def validate_fcrash_h_evidence(
     required_progress = coverage.get("required_postfault_tree_positions")
     if required_progress is not None:
         expected_keys.add("postfault_progress")
-    if is_v6 or is_v7:
+    if is_v6 or is_v7 or _is_v8_contract(contract):
         expected_keys.add("eligible_guard_drawdowns")
     if set(witness) != expected_keys:
         _error("FCRASH-H witness schema drifted")
@@ -830,35 +1039,57 @@ def validate_fcrash_h_evidence(
         )
     ):
         _error("FCRASH-H causal timestamp or deadline drifted")
-    expected = {
-        int(row["target_replica_id"]): {
-            _integer(reporter["reporter_id"], "coverage reporter"): _integer(
-                reporter["tree_id"], "coverage first qualifying tree"
+    relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
+    if is_v8:
+        for row in _sequence(coverage.get("targets"), "coverage targets"):
+            target_row = _mapping(row, "coverage target")
+            target = _integer(target_row.get("target_replica_id"), "coverage target")
+            relations[target] = {
+                _integer(reporter.get("reporter_id"), "coverage reporter"): {
+                    (
+                        _integer(relation.get("tree_id"), "coverage tree"),
+                        str(relation.get("expected_message_type")),
+                    )
+                    for relation in _sequence(
+                        _mapping(reporter, "eligible reporter").get("tree_relations"),
+                        "coverage tree relations",
+                    )
+                }
+                for reporter in _sequence(
+                    target_row.get("eligible_reporters"), "eligible reporters"
+                )
+            }
+        expected = {target: dict(reporters) for target, reporters in relations.items()}
+        expected_trees: dict[tuple[int, int], int] = {}
+    else:
+        expected = {
+            int(row["target_replica_id"]): {
+                _integer(reporter["reporter_id"], "coverage reporter"): _integer(
+                    reporter["tree_id"], "coverage first qualifying tree"
+                )
+                for reporter in _sequence(
+                    row["first_qualifying_reporters"], "first qualifying reporters"
+                )
+            }
+            for row in _sequence(coverage.get("targets"), "coverage targets")
+        }
+        expected_trees = {
+            (int(row["target_replica_id"]), int(first["reporter_id"])): int(
+                first["tree_id"]
             )
-            for reporter in _sequence(
-                row["first_qualifying_reporters"], "first qualifying reporters"
+            for row in _sequence(coverage.get("targets"), "coverage targets")
+            for first in _sequence(
+                _mapping(row, "coverage target").get("first_qualifying_reporters"),
+                "first qualifying reporters",
             )
         }
-        for row in _sequence(coverage.get("targets"), "coverage targets")
-    }
-    expected_trees = {
-        (
-            int(row["target_replica_id"]),
-            int(first["reporter_id"]),
-        ): int(first["tree_id"])
-        for row in _sequence(coverage.get("targets"), "coverage targets")
-        for first in _sequence(
-            _mapping(row, "coverage target").get("first_qualifying_reporters"),
-            "first qualifying reporters",
-        )
-    }
     counts = {
         target: {reporter: 0 for reporter in reporters}
         for target, reporters in expected.items()
     }
     for raw in _sequence(witness.get("timeout_observations"), "timeout observations"):
         observation = _mapping(raw, "timeout observation")
-        if set(observation) != {
+        expected_observation_keys = {
             "epoch_number",
             "tree_id",
             "observed_replica_id",
@@ -866,7 +1097,10 @@ def validate_fcrash_h_evidence(
             "outcome",
             "compensated",
             "source_monotonic_ns",
-        }:
+        }
+        if is_v8:
+            expected_observation_keys.add("expected_message_type")
+        if set(observation) != expected_observation_keys:
             _error("timeout observation schema drifted")
         target = _integer(observation.get("observed_replica_id"), "timeout target")
         reporter = _integer(observation.get("reporter_id"), "timeout reporter")
@@ -875,7 +1109,18 @@ def validate_fcrash_h_evidence(
         )
         if (
             observation.get("epoch_number") != 0
-            or observation.get("tree_id") != expected_trees.get((target, reporter))
+            or (
+                is_v8
+                and (
+                    _integer(observation.get("tree_id"), "timeout tree"),
+                    str(observation.get("expected_message_type")),
+                )
+                not in relations.get(target, {}).get(reporter, set())
+            )
+            or (
+                not is_v8
+                and observation.get("tree_id") != expected_trees.get((target, reporter))
+            )
             or observation.get("outcome") != "timeout"
             or observation.get("compensated") is not False
             or target not in counts
@@ -889,9 +1134,24 @@ def validate_fcrash_h_evidence(
         "minimum timeouts per reporter",
         1,
     )
-    if any(
-        count < minimum for reporters in counts.values() for count in reporters.values()
-    ):
+    required_reporters = _integer(
+        coverage.get("required_qualifying_reporters"),
+        "required qualifying reporters",
+        1,
+    )
+    complete = (
+        all(
+            sum(count >= minimum for count in reporters.values()) >= required_reporters
+            for reporters in counts.values()
+        )
+        if is_v8
+        else all(
+            count >= minimum
+            for reporters in counts.values()
+            for count in reporters.values()
+        )
+    )
+    if not complete:
         _error("FCRASH-H reporter timeout coverage is incomplete")
     drawdowns = _mapping(witness.get("guard_drawdowns"), "guard drawdowns")
     minimum_drop = _integer(coverage.get("minimum_score_drop"), "minimum score drop", 1)
@@ -901,7 +1161,7 @@ def validate_fcrash_h_evidence(
         for target in expected
     ):
         _error("FCRASH-H score drawdown is incomplete")
-    if is_v6:
+    if is_v6 or is_v7:
         eligible = _mapping(
             witness.get("eligible_guard_drawdowns"), "eligible guard drawdowns"
         )
@@ -1169,7 +1429,8 @@ def _v4_replay_fault_window_anchors(
     intentionally does not use the manager's selected ranking.
     """
 
-    is_v7 = _is_v7_contract(contract)
+    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
+    is_v8 = _is_v8_contract(contract)
     is_v6 = _is_v6_contract(contract) or is_v7
     armed = [
         event
@@ -1257,14 +1518,18 @@ def _v4_replay_fault_window_anchors(
     coverage = _mapping(
         contract.get("reporter_coverage_plan"), "reporter coverage plan"
     )
-    frozen_anchor_trees = {
-        _integer(reporter.get("tree_id"), "coverage anchor tree")
-        for row in _sequence(coverage.get("targets"), "coverage targets")
-        for reporter in _sequence(
-            _mapping(row, "coverage target").get("first_qualifying_reporters"),
-            "first qualifying reporters",
-        )
-    }
+    frozen_anchor_trees = (
+        {
+            _integer(reporter.get("tree_id"), "coverage anchor tree")
+            for row in _sequence(coverage.get("targets"), "coverage targets")
+            for reporter in _sequence(
+                _mapping(row, "coverage target").get("first_qualifying_reporters"),
+                "first qualifying reporters",
+            )
+        }
+        if not is_v6
+        else set()
+    )
     if not is_v6 and (
         not frozen_anchor_trees
         or not frozen_anchor_trees.issubset(anchors)
@@ -1273,20 +1538,45 @@ def _v4_replay_fault_window_anchors(
         _error("v4 proposal-anchor replay lacks a frozen eligible-tree anchor")
     anchored_keys = frozenset(key for keys in anchors.values() for key in keys)
 
-    expected_trees = {
-        (
-            int(row["target_replica_id"]),
-            _integer(reporter["reporter_id"], "coverage reporter"),
-        ): _integer(reporter["tree_id"], "coverage tree")
-        for row in _sequence(coverage.get("targets"), "coverage targets")
-        for reporter in _sequence(
-            _mapping(row, "coverage target").get("first_qualifying_reporters"),
-            "first qualifying reporters",
-        )
-    }
-    filtered_outstanding: dict[str, tuple[int, int, tuple[int, int, str, str], int]] = (
-        {}
-    )
+    v8_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
+    if is_v8:
+        for row in _sequence(coverage.get("targets"), "coverage targets"):
+            target = _integer(
+                _mapping(row, "coverage target").get("target_replica_id"),
+                "coverage target",
+            )
+            v8_relations[target] = {
+                _integer(reporter.get("reporter_id"), "coverage reporter"): {
+                    (
+                        _integer(relation.get("tree_id"), "coverage tree"),
+                        str(relation.get("expected_message_type")),
+                    )
+                    for relation in _sequence(
+                        _mapping(reporter, "eligible reporter").get("tree_relations"),
+                        "coverage tree relations",
+                    )
+                }
+                for reporter in _sequence(
+                    _mapping(row, "coverage target").get("eligible_reporters"),
+                    "eligible reporters",
+                )
+            }
+        expected_trees: dict[tuple[int, int], int] = {}
+    else:
+        expected_trees = {
+            (
+                int(row["target_replica_id"]),
+                _integer(reporter["reporter_id"], "coverage reporter"),
+            ): _integer(reporter["tree_id"], "coverage tree")
+            for row in _sequence(coverage.get("targets"), "coverage targets")
+            for reporter in _sequence(
+                _mapping(row, "coverage target").get("first_qualifying_reporters"),
+                "first qualifying reporters",
+            )
+        }
+    filtered_outstanding: dict[
+        str, tuple[int, int, tuple[int, int, str, str], int, str]
+    ] = {}
     filtered_completed: set[str] = set()
     global_outstanding: dict[str, tuple[int, int, tuple[int, int, str, str]]] = {}
     global_drawdowns = {
@@ -1312,6 +1602,7 @@ def _v4_replay_fault_window_anchors(
         observation_id = observation.get("observation_id")
         reporter = observation.get("reporter_id")
         target = observation.get("observed_replica_id")
+        expected_message_type = observation.get("expected_message_type")
         if (
             not isinstance(observation_id, str)
             or type(reporter) is not int
@@ -1467,6 +1758,7 @@ def _v4_replay_fault_window_anchors(
                         "evidence reporter time",
                     ),
                 ),
+                str(expected_message_type),
             )
             continue
         previous = filtered_outstanding.pop(observation_id, None)
@@ -1479,20 +1771,31 @@ def _v4_replay_fault_window_anchors(
         filtered_completed.add(observation_id)
 
     rows: list[dict[str, object]] = []
-    for reporter, target, key, timestamp in filtered_outstanding.values():
-        if expected_trees.get((target, reporter)) != key[1]:
+    for (
+        reporter,
+        target,
+        key,
+        timestamp,
+        expected_message_type,
+    ) in filtered_outstanding.values():
+        if (
+            is_v8
+            and (key[1], expected_message_type)
+            not in v8_relations.get(target, {}).get(reporter, set())
+        ) or (not is_v8 and expected_trees.get((target, reporter)) != key[1]):
             continue
-        rows.append(
-            {
-                "epoch_number": 0,
-                "tree_id": key[1],
-                "observed_replica_id": target,
-                "reporter_id": reporter,
-                "outcome": "timeout",
-                "compensated": False,
-                "source_monotonic_ns": timestamp,
-            }
-        )
+        row: dict[str, object] = {
+            "epoch_number": 0,
+            "tree_id": key[1],
+            "observed_replica_id": target,
+            "reporter_id": reporter,
+            "outcome": "timeout",
+            "compensated": False,
+            "source_monotonic_ns": timestamp,
+        }
+        if is_v8:
+            row["expected_message_type"] = expected_message_type
+        rows.append(row)
     return (
         rows,
         {str(target): drawdowns[target] for target in sorted(drawdowns)},
@@ -1580,7 +1883,11 @@ def _fcrash_h_witness_from_events(
             "timeout_observations": rows,
             "guard_drawdowns": guard_drawdowns,
         }
-        if _is_v6_contract(contract) or _is_v7_contract(contract):
+        if (
+            _is_v6_contract(contract)
+            or _is_v7_contract(contract)
+            or _is_v8_contract(contract)
+        ):
             witness["eligible_guard_drawdowns"] = {
                 str(target): -sum(row["observed_replica_id"] == target for row in rows)
                 for target in tuple(contract["targets"])
@@ -1837,13 +2144,17 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             "required_for_new_executions",
             "required_postfault_tree_positions",
         }
-        if profile_id in _FCRASH_H_V6_PROFILE_IDS | _FCRASH_H_V7_PROFILE_IDS:
+        if profile_id in (
+            _FCRASH_H_V6_PROFILE_IDS
+            | _FCRASH_H_V7_PROFILE_IDS
+            | _FCRASH_H_V8_PROFILE_IDS
+        ):
             expected_arm_keys |= {
                 "clock_domain",
                 "required_observation_schema",
                 "timeout_evidence_basis",
             }
-        if profile_id in _FCRASH_H_V7_PROFILE_IDS:
+        if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS:
             expected_arm_keys.add("snapshot_evidence_basis")
         if (
             set(arm_metadata) != expected_arm_keys
@@ -1851,7 +2162,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             or arm_metadata.get("schema_version")
             != (
                 3
-                if profile_id in _FCRASH_H_V7_PROFILE_IDS
+                if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
                 else 2 if profile_id in _FCRASH_H_V6_PROFILE_IDS else 1
             )
             or arm_metadata.get("domain") != "epoch_zero_native_cyclic_tree_positions"
@@ -1871,7 +2182,11 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             ]
         ):
             _error("fault-window arm metadata drifted")
-        if profile_id in _FCRASH_H_V6_PROFILE_IDS | _FCRASH_H_V7_PROFILE_IDS and (
+        if profile_id in (
+            _FCRASH_H_V6_PROFILE_IDS
+            | _FCRASH_H_V7_PROFILE_IDS
+            | _FCRASH_H_V8_PROFILE_IDS
+        ) and (
             arm_metadata.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm_metadata.get("required_observation_schema") != 3
             or arm_metadata.get("timeout_evidence_basis")
@@ -1879,7 +2194,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         ):
             _error("v6 fault-window timeout evidence metadata drifted")
         if (
-            profile_id in _FCRASH_H_V7_PROFILE_IDS
+            profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
             and arm_metadata.get("snapshot_evidence_basis")
             != "exact_post_fault_attempt_start_v1"
         ):
@@ -1924,6 +2239,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         in _FCRASH_H_V5_PROFILE_IDS
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
+        | _FCRASH_H_V8_PROFILE_IDS
     ):
         expected_measurement_keys.add("phase_window_contract")
     if set(measurement) != expected_measurement_keys:
@@ -1934,6 +2250,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         in _FCRASH_H_V5_PROFILE_IDS
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
+        | _FCRASH_H_V8_PROFILE_IDS
     ):
         raw_phase_contract = _mapping(
             measurement.get("phase_window_contract"), "phase-window contract"
@@ -2009,6 +2326,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "target_derivation",
     }
     is_v7_n31 = profile_id == "n31-f5-q21-three-crash-pair-v7"
+    is_v8_n31 = profile_id == "n31-f5-q21-three-crash-pair-v8"
     order = [members[(active_tree + offset) % count] for offset in range(count)]
     if (
         proof.get("source") != "native_epoch_profile_digest"
@@ -2027,8 +2345,12 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         != list(targets)
     ):
         _error("topology proof is not bound to the native focused tree")
-    if is_v7_n31:
-        metric = _v7_n31_target_selection_metric()
+    if is_v7_n31 or is_v8_n31:
+        metric = (
+            _v8_n31_target_selection_metric()
+            if is_v8_n31
+            else _v7_n31_target_selection_metric()
+        )
         if (
             topology.get("target_selection_metric") != metric
             or _mapping(proof.get("target_derivation"), "target derivation").get(
@@ -2036,27 +2358,48 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             )
             != metric
         ):
-            _error("v7 topology-only target selection metric drifted")
+            _error("reviewed topology-only target selection metric drifted")
     elif "target_selection_metric" in topology or "target_selection_metric" in _mapping(
         proof.get("target_derivation"), "target derivation"
     ):
         _error("archived topology contains a prospective target selection metric")
+    if _is_v8_contract({"profile_id": profile_id}):
+        arm = _mapping(profile.get("fault_window_arm"), "fault-window arm")
+        capacity = _v8_reporter_capacity_document(
+            replica_count=count,
+            fanout=fanout,
+            targets=targets,
+            prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+        )
+        derivation = _mapping(proof.get("target_derivation"), "target derivation")
+        guard = _mapping(profile.get("evidence_guard"), "evidence guard")
+        if (
+            topology.get("reporter_coverage_capacity") != capacity
+            or derivation.get("reporter_coverage_capacity") != capacity
+            or guard.get("reporter_selection_basis")
+            != capacity["reporter_selection_basis"]
+            or guard.get("minimum_topology_eligible_reporter_capacity")
+            != capacity["minimum_topology_eligible_reporter_capacity"]
+        ):
+            _error("v8 topology reporter capacity drifted")
     if (
         profile_id
         in _FCRASH_H_V5_PROFILE_IDS
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
+        | _FCRASH_H_V8_PROFILE_IDS
         and (
             profile_sha,
             proof_sha,
         )
         != (
-            _FCRASH_H_V7_IDENTITIES.get(str(profile_id))
+            _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
+            or _FCRASH_H_V7_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V6_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V5_IDENTITIES[str(profile_id)]
         )
     ):
-        _error("v5/v6 profile or topology proof is not the frozen reviewed identity")
+        _error("reviewed profile or topology proof is not the frozen reviewed identity")
     children = {
         index: tuple(
             child
@@ -2109,18 +2452,37 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         proof.get("members") != expected_members
         or proof.get("internal_descendant_sets") != expected_descendants
         or proof.get("target_derivation")
-        != (
-            {
-                "deepest_member_ids": deepest,
-                "selected_target_replica_ids": list(targets),
-                "pairwise_disjoint": True,
-                **(
-                    {"target_selection_metric": _v7_n31_target_selection_metric()}
-                    if is_v7_n31
+        != {
+            "deepest_member_ids": deepest,
+            "selected_target_replica_ids": list(targets),
+            "pairwise_disjoint": True,
+            **(
+                {"target_selection_metric": _v7_n31_target_selection_metric()}
+                if is_v7_n31
+                else (
+                    {"target_selection_metric": _v8_n31_target_selection_metric()}
+                    if is_v8_n31
                     else {}
-                ),
-            }
-        )
+                )
+            ),
+            **(
+                {
+                    "reporter_coverage_capacity": _v8_reporter_capacity_document(
+                        replica_count=count,
+                        fanout=fanout,
+                        targets=targets,
+                        prefix=_sequence(
+                            _mapping(
+                                profile.get("fault_window_arm"), "fault-window arm"
+                            ).get("ordered_tree_prefix"),
+                            "fault-window prefix",
+                        ),
+                    )
+                }
+                if is_v8_n31 or profile_id == "n7-f2-q5-two-crash-pair-smoke-v8"
+                else {}
+            ),
+        }
         or not disjoint
     ):
         _error("topology proof roles, depths, or descendants drifted")
@@ -2251,7 +2613,11 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         _error("main runtime overrides the sealed client tree configuration")
     if len(options.get("replica", ())) != len(tuple(contract["members"])):
         _error("main runtime replica membership cardinality drifted")
-    if _is_v6_contract(contract) or _is_v7_contract(contract):
+    if (
+        _is_v6_contract(contract)
+        or _is_v7_contract(contract)
+        or _is_v8_contract(contract)
+    ):
         for replica in tuple(contract["members"]):
             replica_path = root / "config" / f"replica-{replica}.conf"
             if replica_path.is_symlink() or not replica_path.is_file():
@@ -2458,7 +2824,11 @@ def _containment_roots(
         _error("containment ranking duplicates an eligible replica")
     preserved = {root for root in baseline if root in eligible}
     replacement_ids = tuple(replica for replica in eligible if replica not in preserved)
-    if _is_v6_contract(contract) or _is_v7_contract(contract):
+    if (
+        _is_v6_contract(contract)
+        or _is_v7_contract(contract)
+        or _is_v8_contract(contract)
+    ):
         # v6 freezes the native containment fallback independently of scorer
         # order.  Healthy baseline roots still retain their tree slots.
         replacement_ids = tuple(sorted(replacement_ids))
@@ -2704,7 +3074,7 @@ def _ranking(
             if event["event_type"] == "adaptive_v2_evidence_snapshot"
         ]
         v7_arm_start_ns: int | None = None
-        if _is_v7_contract(contract):
+        if _is_v7_contract(contract) or _is_v8_contract(contract):
             armed = [
                 event
                 for event in manager_events
@@ -2772,7 +3142,11 @@ def _ranking(
             suffix_only=suffix_only,
             allowed_schema_versions=(
                 frozenset({3})
-                if _is_v6_contract(contract) or _is_v7_contract(contract)
+                if (
+                    _is_v6_contract(contract)
+                    or _is_v7_contract(contract)
+                    or _is_v8_contract(contract)
+                )
                 else frozenset({1})
             ),
             minimum_attempt_start_monotonic_ns=causal_start_ns,
@@ -2818,7 +3192,11 @@ def _ranking(
                 suffix_only=other_epoch == 1,
                 allowed_schema_versions=(
                     frozenset({3})
-                    if _is_v6_contract(contract) or _is_v7_contract(contract)
+                    if (
+                        _is_v6_contract(contract)
+                        or _is_v7_contract(contract)
+                        or _is_v8_contract(contract)
+                    )
                     else frozenset({1})
                 ),
                 minimum_attempt_start_monotonic_ns=(
@@ -3658,19 +4036,27 @@ def _validate_manager_boundary(
         if (
             any(counts.get(option) != 1 for option in common_arm_options)
             or (
-                (_is_v6_contract(contract) or _is_v7_contract(contract))
+                (
+                    _is_v6_contract(contract)
+                    or _is_v7_contract(contract)
+                    or _is_v8_contract(contract)
+                )
                 and any(counts.get(option) != 1 for option in v6_arm_options)
             )
             or (
-                not (_is_v6_contract(contract) or _is_v7_contract(contract))
+                not (
+                    _is_v6_contract(contract)
+                    or _is_v7_contract(contract)
+                    or _is_v8_contract(contract)
+                )
                 and any(counts.get(option, 0) for option in v6_arm_options)
             )
             or (
-                _is_v7_contract(contract)
+                (_is_v7_contract(contract) or _is_v8_contract(contract))
                 and any(counts.get(option) != 1 for option in v7_arm_options)
             )
             or (
-                not _is_v7_contract(contract)
+                not (_is_v7_contract(contract) or _is_v8_contract(contract))
                 and any(counts.get(option, 0) for option in v7_arm_options)
             )
         ):
@@ -3697,8 +4083,12 @@ def _validate_fault_window_arm(
 
     if not _is_v4_contract(contract):
         return
-    is_v6 = _is_v6_contract(contract) or _is_v7_contract(contract)
-    is_v7 = _is_v7_contract(contract)
+    is_v6 = (
+        _is_v6_contract(contract)
+        or _is_v7_contract(contract)
+        or _is_v8_contract(contract)
+    )
+    is_v7 = _is_v7_contract(contract) or _is_v8_contract(contract)
     path = (root / "runtime" / _FAULT_WINDOW_ARM_FILENAME).resolve()
     if (
         path.parent != (root / "runtime").resolve()

@@ -689,6 +689,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N7_PROFILE_V8,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N31_PROFILE_V8,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (21, 22, 23),
+                "survivors": tuple((*range(21), *range(24, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -1273,6 +1299,84 @@ def test_source_blind_postfault_aggregate_timeout_counts_without_direct_vote_anc
         }
     ]
     assert latest == 20_003
+
+
+def test_v8_source_blind_replay_uses_any_proof_bound_relation_and_keeps_late_exact() -> (
+    None
+):
+    """V8 admits a later valid relation, but only its exact outstanding ID."""
+
+    validation = _validation()
+    contract, events, audit = _source_blind_postfault_attempt_fixture("v6")
+    contract["profile_id"] = "n7-f2-q5-two-crash-pair-smoke-v8"
+    contract["reporter_coverage_plan"] = {
+        "required_qualifying_reporters": 1,
+        "minimum_timeouts_per_reporter": 2,
+        "targets": [
+            {
+                "target_replica_id": 2,
+                "eligible_reporters": [
+                    {
+                        "reporter_id": 1,
+                        "tree_relations": [
+                            {
+                                "tree_id": 7,
+                                "expected_message_type": "aggregate_relay",
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    first = events[2]["payload"]["observation"]
+    second = json.loads(json.dumps(first))
+    second["attempt_start_monotonic_ns"] = 10_100
+    second["reporter_monotonic_ns"] = 11_100
+    second["block_hash"] = "05" * 32
+    second["observation_id"] = validation._v6_timeout_observation_id(
+        reporter_id=1,
+        observed_replica_id=2,
+        epoch_number=0,
+        tree_id=7,
+        epoch_digest=str(contract["epoch_zero_digest"]),
+        block_hash=second["block_hash"],
+        expected_message_type="aggregate_relay",
+        attempt_start_monotonic_ns=10_100,
+        deadline_duration_us=1,
+    )
+    events.append(
+        {
+            **events[2],
+            "source_sequence": 6,
+            "source_monotonic_ns": 20_006,
+            "payload": {"ingestion_sequence": 5, "observation": second},
+        }
+    )
+    rows, _drawdowns, _latest = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=5, audit=audit
+    )
+    assert len(rows) == 2
+    assert all(row["expected_message_type"] == "aggregate_relay" for row in rows)
+
+    late = json.loads(json.dumps(second))
+    late["outcome"] = "late"
+    late["response_duration_us"] = 1
+    late["reporter_monotonic_ns"] = 11_102
+    late["signer_set"] = [1]
+    events.append(
+        {
+            **events[2],
+            "source_sequence": 7,
+            "source_monotonic_ns": 20_007,
+            "payload": {"ingestion_sequence": 6, "observation": late},
+        }
+    )
+    rows, _drawdowns, _latest = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=6, audit=audit
+    )
+    assert len(rows) == 1
+    assert rows[0]["source_monotonic_ns"] == 20_003
 
 
 def test_source_blind_postfault_aggregate_late_observation_compensates_same_attempt() -> (

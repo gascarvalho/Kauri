@@ -50,10 +50,10 @@ class FocusedCrashPairCliError(RuntimeError):
 FOCUSED_LAUNCH_BACKEND = FocusedLaunchBackend()
 FOCUSED_PREFLIGHT_CHECKS: object = FocusedLivePreflightChecks
 _PROFILE_DIRECTORY = Path(__file__).resolve().parent / "profiles"
-_V7_PROFILES = {
-    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v7.json",
-    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v7.json",
-    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v7.json",
+_V8_PROFILES = {
+    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v8.json",
+    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v8.json",
+    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v8.json",
 }
 
 
@@ -912,9 +912,9 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
-    canonical_path = _V7_PROFILES.get(mode)
+    canonical_path = _V8_PROFILES.get(mode)
     if canonical_path is None:
-        raise FocusedCrashPairCliError("execution mode has no frozen v7 profile")
+        raise FocusedCrashPairCliError("execution mode has no frozen v8 profile")
     canonical = load_focused_profile(canonical_path)
     if (
         profile.profile_id,
@@ -931,11 +931,11 @@ def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
 
 
 def _profile_path(profile: Path | None, mode: str) -> Path:
-    """Use the immutable v7 profile unless an explicit path is supplied."""
+    """Use the immutable v8 profile; archived v7 paths fail exact binding."""
 
-    if mode not in _V7_PROFILES:
-        raise FocusedCrashPairCliError("execution mode has no frozen v7 profile")
-    return _V7_PROFILES[mode] if profile is None else profile
+    if mode not in _V8_PROFILES:
+        raise FocusedCrashPairCliError("execution mode has no frozen v8 profile")
+    return _V8_PROFILES[mode] if profile is None else profile
 
 
 def _authorized_execution(

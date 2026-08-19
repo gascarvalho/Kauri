@@ -209,12 +209,14 @@ def _v6_timeout_observation_id(
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v4", "-v5", "-v6", "-v7")
+        ("-v4", "-v5", "-v6", "-v7", "-v8")
     )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith(("-v5", "-v6", "-v7"))
+    return str(getattr(profile, "profile_id", "")).endswith(
+        ("-v5", "-v6", "-v7", "-v8")
+    )
 
 
 def _is_v6_profile(profile: FocusedProfile | object) -> bool:
@@ -223,6 +225,58 @@ def _is_v6_profile(profile: FocusedProfile | object) -> bool:
 
 def _is_v7_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith("-v7")
+
+
+def _is_v8_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v8")
+
+
+def _reporter_capacity_document(
+    *, replica_count: int, fanout: int, targets: Sequence[int], prefix: Sequence[int]
+) -> dict[str, object]:
+    """Derive the public topology-only reporter capacity for one fault arm."""
+
+    leaf_start = (replica_count - 1 + fanout - 1) // fanout
+    rows: list[dict[str, object]] = []
+    crashed = set(targets)
+    for target in sorted(targets):
+        reporters: list[dict[str, object]] = []
+        for reporter in range(replica_count):
+            if reporter in crashed:
+                continue
+            relations: list[dict[str, object]] = []
+            for root in prefix:
+                if root in crashed:
+                    continue
+                position = (target - root) % replica_count
+                if (
+                    position == 0
+                    or _cyclic_parent(replica_count, fanout, root, target) != reporter
+                ):
+                    continue
+                relations.append(
+                    {
+                        "tree_id": root,
+                        "expected_message_type": (
+                            "aggregate_relay"
+                            if position < leaf_start
+                            else "direct_vote"
+                        ),
+                    }
+                )
+            if relations:
+                reporters.append({"reporter_id": reporter, "tree_relations": relations})
+        rows.append({"target_replica_id": target, "eligible_reporters": reporters})
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-fault-window-reporter-capacity-v1",
+        "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+        "prefix_tree_ids": list(prefix),
+        "minimum_topology_eligible_reporter_capacity": min(
+            len(row["eligible_reporters"]) for row in rows
+        ),
+        "targets": rows,
+    }
 
 
 def _fault_window_arm_path(run_directory: Path) -> Path:
@@ -719,6 +773,58 @@ def _v7_n31_target_selection_metric() -> dict[str, object]:
     }
 
 
+def _v8_n31_target_selection_metric() -> dict[str, object]:
+    """Independently derive the H17 topology-only survivor-path table."""
+
+    replica_count, fanout = 31, 5
+    candidates = (21, 22, 23, 24, 25)
+    prefix = (20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 0, 1, 2, 3, 4, 5)
+    rows: list[tuple[tuple[int, int, int], int, int, int]] = []
+    for targets in combinations(candidates, 3):
+        per_tree: list[int] = []
+        for root in prefix:
+            shadow = 0
+            for member in range(replica_count):
+                if member in targets:
+                    continue
+                position = (member - root) % replica_count
+                while True:
+                    if (root + position) % replica_count in targets:
+                        shadow += 1
+                        break
+                    if position == 0:
+                        break
+                    position = (position - 1) // fanout
+            per_tree.append(shadow)
+        fixed = sum(per_tree[prefix.index(target)] for target in targets)
+        rows.append((targets, sum(per_tree), fixed, max(per_tree)))
+    selected = min(
+        targets
+        for targets, total, _fixed, _maximum in rows
+        if total == min(row[1] for row in rows)
+    )
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-survivor-path-shadow-v1",
+        "candidate_internal_replica_ids": list(candidates),
+        "prefix_tree_ids": list(prefix),
+        "fanout": fanout,
+        "bfs_member_order": list(range(20, 31)) + list(range(20)),
+        "triple_scores": [
+            {
+                "target_replica_ids": list(targets),
+                "total_survivor_path_shadow": total,
+                "fixed_root_shadow": fixed,
+                "collateral_survivor_path_shadow": total - fixed,
+                "maximum_per_tree_survivor_path_shadow": maximum,
+            }
+            for targets, total, fixed, maximum in rows
+        ],
+        "selected_target_replica_ids": list(selected),
+        "tie_break": "lexicographic_replica_id",
+    }
+
+
 def _validate_topology_proof(
     proof: Mapping[str, Any],
     *,
@@ -822,9 +928,16 @@ def _validate_topology_proof(
         "selected_target_replica_ids": list(targets),
         "pairwise_disjoint": True,
     }
-    if profile.get("profile_id") == "n31-f5-q21-three-crash-pair-v7":
+    if profile.get("profile_id") in {
+        "n31-f5-q21-three-crash-pair-v7",
+        "n31-f5-q21-three-crash-pair-v8",
+    }:
         metric = topology.get("target_selection_metric")
-        expected_metric = _v7_n31_target_selection_metric()
+        expected_metric = (
+            _v8_n31_target_selection_metric()
+            if str(profile.get("profile_id", "")).endswith("-v8")
+            else _v7_n31_target_selection_metric()
+        )
         if metric != expected_metric:
             _error("v7 topology target selection metric is absent")
         expected_derivation["target_selection_metric"] = expected_metric
@@ -832,6 +945,20 @@ def _validate_topology_proof(
         "target_selection_metric" in topology or "target_selection_metric" in derivation
     ):
         _error("archived topology contains a prospective target selection metric")
+    if str(profile.get("profile_id", "")).endswith("-v8"):
+        arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
+        expected_capacity = _reporter_capacity_document(
+            replica_count=replica_count,
+            fanout=fanout,
+            targets=targets,
+            prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+        )
+        if (
+            topology.get("reporter_coverage_capacity") != expected_capacity
+            or derivation.get("reporter_coverage_capacity") != expected_capacity
+        ):
+            _error("v8 topology reporter capacity differs from topology derivation")
+        expected_derivation["reporter_coverage_capacity"] = expected_capacity
     if (
         members != expected_members
         or descendants != expected_descendants
@@ -892,15 +1019,19 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             "required_for_new_executions",
             "required_postfault_tree_positions",
         }
-        if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) or _is_v7_profile(
-            SimpleNamespace(profile_id=profile_id)
+        if (
+            _is_v6_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
         ):
             expected_arm_keys |= {
                 "clock_domain",
                 "required_observation_schema",
                 "timeout_evidence_basis",
             }
-        if _is_v7_profile(SimpleNamespace(profile_id=profile_id)):
+        if _is_v7_profile(SimpleNamespace(profile_id=profile_id)) or _is_v8_profile(
+            SimpleNamespace(profile_id=profile_id)
+        ):
             expected_arm_keys.add("snapshot_evidence_basis")
         if (
             set(arm) != expected_arm_keys
@@ -909,6 +1040,7 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             != (
                 3
                 if _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+                or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
                 else 2 if _is_v6_profile(SimpleNamespace(profile_id=profile_id)) else 1
             )
             or arm.get("domain") != "epoch_zero_native_cyclic_tree_positions"
@@ -931,6 +1063,7 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         if (
             _is_v6_profile(SimpleNamespace(profile_id=profile_id))
             or _is_v7_profile(SimpleNamespace(profile_id=profile_id))
+            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
         ) and (
             arm.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm.get("required_observation_schema") != 3
@@ -939,9 +1072,8 @@ def load_focused_profile(path: Path) -> FocusedProfile:
             _error("v6 fault-window timeout evidence metadata drifted")
         if (
             _is_v7_profile(SimpleNamespace(profile_id=profile_id))
-            and arm.get("snapshot_evidence_basis")
-            != "exact_post_fault_attempt_start_v1"
-        ):
+            or _is_v8_profile(SimpleNamespace(profile_id=profile_id))
+        ) and arm.get("snapshot_evidence_basis") != "exact_post_fault_attempt_start_v1":
             _error("v7 fault-window snapshot evidence metadata drifted")
     protocol = _document(profile.get("protocol"), "profile protocol")
     topology = _document(profile.get("topology"), "profile topology")
@@ -1108,6 +1240,11 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         profile, "profile_id", None
     ) in _FCRASH_H_V3_PROFILE_IDS or _is_v4_profile(profile):
         expected_guard_keys.add("required_postfault_tree_positions")
+    if _is_v8_profile(profile):
+        expected_guard_keys |= {
+            "reporter_selection_basis",
+            "minimum_topology_eligible_reporter_capacity",
+        }
     expected_timer_keys = {
         "adaptation_interval_seconds",
         "stable_phase_seconds",
@@ -1127,6 +1264,86 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
     required = fault_threshold + 1
     minimum_timeouts = 2
     targets = profile.target_replica_ids
+    if _is_v8_profile(profile):
+        arm = _document(raw.get("fault_window_arm"), "fault-window arm metadata")
+        capacity = _reporter_capacity_document(
+            replica_count=replica_count,
+            fanout=fanout,
+            targets=targets,
+            prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+        )
+        if topology.get("reporter_coverage_capacity") != capacity:
+            _error("v8 reporter capacity differs from topology derivation")
+        expected_guard = {
+            "schedule": "native_cyclic_epoch_zero",
+            "tree_switch_period_blocks": 2,
+            "horizon_tree_positions": len(capacity["prefix_tree_ids"]),
+            "required_postfault_tree_positions": len(capacity["prefix_tree_ids"]),
+            "required_qualifying_reporters": required,
+            "minimum_timeouts_per_reporter": minimum_timeouts,
+            "minimum_score_drop": minimum_timeouts * required,
+            "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+            "minimum_topology_eligible_reporter_capacity": capacity[
+                "minimum_topology_eligible_reporter_capacity"
+            ],
+        }
+        if dict(guard) != expected_guard:
+            _error("v8 frozen evidence guard differs from topology derivation")
+        deadlines = {
+            "evidence_seconds": _integer(
+                timers.get("nonresponse_evidence_deadline_seconds"),
+                "nonresponse evidence deadline",
+                1,
+            ),
+            "epoch1_activation_seconds": _integer(
+                timers.get("containment_activation_deadline_seconds"),
+                "containment activation deadline",
+                1,
+            ),
+            "optimization_activation_seconds": _integer(
+                timers.get("optimization_activation_deadline_seconds"),
+                "optimization activation deadline",
+                1,
+            ),
+            "arm_hard_seconds": _integer(
+                timers.get("arm_hard_deadline_seconds"), "arm hard deadline", 1
+            ),
+        }
+        if (
+            deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
+            or deadlines["epoch1_activation_seconds"] >= deadlines["arm_hard_seconds"]
+            or deadlines["optimization_activation_seconds"]
+            >= deadlines["arm_hard_seconds"]
+        ):
+            _error("FCRASH-H phase deadlines are not strictly nested")
+        return {
+            "schema_version": 1,
+            "profile_id": profile.profile_id,
+            "active_tree_id": active_tree,
+            "horizon_tree_positions": len(capacity["prefix_tree_ids"]),
+            "required_postfault_tree_positions": len(capacity["prefix_tree_ids"]),
+            "required_qualifying_reporters": required,
+            "minimum_timeouts_per_reporter": minimum_timeouts,
+            "minimum_score_drop": minimum_timeouts * required,
+            "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+            "minimum_topology_eligible_reporter_capacity": capacity[
+                "minimum_topology_eligible_reporter_capacity"
+            ],
+            "reporter_coverage_capacity": capacity,
+            "deadlines_seconds": deadlines,
+            "stable_phase_seconds": _integer(
+                timers.get("stable_phase_seconds"), "stable phase", 1
+            ),
+            "readiness_timeout_seconds": _integer(
+                timers.get("readiness_timeout_seconds"), "readiness timeout", 1
+            ),
+            "manager_convergence_timeout_seconds": _integer(
+                timers.get("manager_convergence_timeout_seconds"),
+                "manager convergence timeout",
+                1,
+            ),
+            "targets": capacity["targets"],
+        }
     target_rows: list[dict[str, object]] = []
     first_sets: list[set[int]] = []
     horizon = 0
@@ -1280,11 +1497,13 @@ def _fault_window_arm_document(
         _error("fault-window required tree prefix is not unique")
     arm = {
         "schema_version": (
-            3 if _is_v7_profile(profile) else 2 if _is_v6_profile(profile) else 1
+            3
+            if _is_v7_profile(profile) or _is_v8_profile(profile)
+            else 2 if _is_v6_profile(profile) else 1
         ),
         "kind": (
             _FAULT_WINDOW_ARM_DOMAIN_V3
-            if _is_v7_profile(profile)
+            if _is_v7_profile(profile) or _is_v8_profile(profile)
             else (
                 _FAULT_WINDOW_ARM_DOMAIN_V2
                 if _is_v6_profile(profile)
@@ -1306,7 +1525,7 @@ def _fault_window_arm_document(
         "required_tree_positions": positions,
         "required_tree_ids": required_ids,
     }
-    if _is_v6_profile(profile) or _is_v7_profile(profile):
+    if _is_v6_profile(profile) or _is_v7_profile(profile) or _is_v8_profile(profile):
         arm.update(
             {
                 "clock_domain": "same_host_clock_monotonic_raw",
@@ -1314,7 +1533,7 @@ def _fault_window_arm_document(
                 "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
             }
         )
-    if _is_v7_profile(profile):
+    if _is_v7_profile(profile) or _is_v8_profile(profile):
         arm["snapshot_evidence_basis"] = "exact_post_fault_attempt_start_v1"
     return arm
 
@@ -2179,15 +2398,50 @@ def _drive_arm_state_machine(
             _integer(deadline.get("evidence_seconds"), "evidence deadline", 1),
         ):
             _error("runtime nonresponse exceeded the crash-anchored evidence cap")
-        expected_counts = {
-            str(row["target_replica_id"]): {
-                str(reporter): coverage["minimum_timeouts_per_reporter"]
-                for reporter in row["authenticated_reporter_ids"]
+        observed_counts = nonresponse.get("qualifying_timeout_counts")
+        if _is_v8_profile(profile):
+            required = _integer(
+                coverage.get("required_qualifying_reporters"),
+                "required qualifying reporters",
+                1,
+            )
+            minimum = _integer(
+                coverage.get("minimum_timeouts_per_reporter"),
+                "minimum timeouts per reporter",
+                1,
+            )
+            expected_targets = {
+                str(row["target_replica_id"]): {
+                    str(reporter["reporter_id"])
+                    for reporter in row["eligible_reporters"]
+                }
+                for row in coverage["targets"]
             }
-            for row in coverage["targets"]
-        }
-        if nonresponse.get("qualifying_timeout_counts") != expected_counts:
-            _error("runtime nonresponse lacks the frozen reporter coverage")
+            if (
+                not isinstance(observed_counts, Mapping)
+                or set(observed_counts) != set(expected_targets)
+                or any(
+                    not isinstance(observed_counts[target], Mapping)
+                    or not set(observed_counts[target]).issubset(allowed_reporters)
+                    or len(observed_counts[target]) < required
+                    or any(
+                        type(count) is not int or count != minimum
+                        for count in observed_counts[target].values()
+                    )
+                    for target, allowed_reporters in expected_targets.items()
+                )
+            ):
+                _error("runtime nonresponse lacks the frozen reporter coverage")
+        else:
+            expected_counts = {
+                str(row["target_replica_id"]): {
+                    str(reporter): coverage["minimum_timeouts_per_reporter"]
+                    for reporter in row["authenticated_reporter_ids"]
+                }
+                for row in coverage["targets"]
+            }
+            if observed_counts != expected_counts:
+                _error("runtime nonresponse lacks the frozen reporter coverage")
         minimum_drop = _integer(
             coverage.get("minimum_score_drop"), "minimum score drop", 1
         )
@@ -3014,7 +3268,9 @@ class FocusedRawEvidenceSource:
         ):
             _error("raw ranking audit predecessor drifted")
         causal_start_ns: int | None = None
-        if _is_v7_profile(self._profile) and predecessor == 0:
+        if (
+            _is_v7_profile(self._profile) or _is_v8_profile(self._profile)
+        ) and predecessor == 0:
             armed = [
                 event
                 for event in manager
@@ -3046,7 +3302,11 @@ class FocusedRawEvidenceSource:
                 suffix_only=predecessor == 1,
                 allowed_schema_versions=(
                     frozenset({3})
-                    if _is_v6_profile(self._profile) or _is_v7_profile(self._profile)
+                    if (
+                        _is_v6_profile(self._profile)
+                        or _is_v7_profile(self._profile)
+                        or _is_v8_profile(self._profile)
+                    )
                     else frozenset({1})
                 ),
                 minimum_attempt_start_monotonic_ns=causal_start_ns,
@@ -3122,7 +3382,11 @@ class FocusedRawEvidenceSource:
         baseline_cutoff: int,
         current_cutoff: int,
     ) -> tuple[dict[str, dict[str, int]], dict[str, int], int] | None:
-        if _is_v6_profile(self._profile) or _is_v7_profile(self._profile):
+        if (
+            _is_v6_profile(self._profile)
+            or _is_v7_profile(self._profile)
+            or _is_v8_profile(self._profile)
+        ):
             return self._qualifying_v6_timeout_counts(
                 events,
                 fault_ns=fault_ns,
@@ -3292,19 +3556,38 @@ class FocusedRawEvidenceSource:
             _integer(tree_id, "v6 fault-window tree")
             for tree_id in _sequence(arm.get("ordered_tree_prefix"), "v6 tree prefix")
         }
-        expected = {
-            int(row["target_replica_id"]): {
-                int(reporter) for reporter in row["authenticated_reporter_ids"]
+        v8_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
+        if _is_v8_profile(self._profile):
+            for row in coverage["targets"]:
+                target = int(row["target_replica_id"])
+                v8_relations[target] = {
+                    int(reporter_row["reporter_id"]): {
+                        (
+                            int(relation["tree_id"]),
+                            str(relation["expected_message_type"]),
+                        )
+                        for relation in reporter_row["tree_relations"]
+                    }
+                    for reporter_row in row["eligible_reporters"]
+                }
+            expected = {
+                target: set(reporters) for target, reporters in v8_relations.items()
             }
-            for row in coverage["targets"]
-        }
-        expected_trees = {
-            (int(row["target_replica_id"]), int(first["reporter_id"])): int(
-                first["tree_id"]
-            )
-            for row in coverage["targets"]
-            for first in row["first_qualifying_reporters"]
-        }
+            expected_trees: dict[tuple[int, int], int] = {}
+        else:
+            expected = {
+                int(row["target_replica_id"]): {
+                    int(reporter) for reporter in row["authenticated_reporter_ids"]
+                }
+                for row in coverage["targets"]
+            }
+            expected_trees = {
+                (int(row["target_replica_id"]), int(first["reporter_id"])): int(
+                    first["tree_id"]
+                )
+                for row in coverage["targets"]
+                for first in row["first_qualifying_reporters"]
+            }
         outstanding: dict[str, tuple[int, int]] = {}
         latest: dict[str, tuple[Mapping[str, Any], int, int]] = {}
         eligible_drawdowns = {target: 0 for target in expected}
@@ -3404,7 +3687,10 @@ class FocusedRawEvidenceSource:
                 )
             ):
                 _error("v6 accepted observation timing or signer drifted")
-            if not _is_v7_profile(self._profile) or attempt_start >= fault_ns:
+            if (
+                not (_is_v7_profile(self._profile) or _is_v8_profile(self._profile))
+                or attempt_start >= fault_ns
+            ):
                 if outcome == "timeout":
                     if observation_id in raw_outstanding:
                         _error("v6 raw timeout attempt is duplicated")
@@ -3428,7 +3714,15 @@ class FocusedRawEvidenceSource:
                 or tree_id not in prefix
                 or target not in expected
                 or reporter not in expected[target]
-                or expected_trees.get((target, reporter)) != tree_id
+                or (
+                    _is_v8_profile(self._profile)
+                    and (tree_id, str(message_type))
+                    not in v8_relations[target][reporter]
+                )
+                or (
+                    not _is_v8_profile(self._profile)
+                    and expected_trees.get((target, reporter)) != tree_id
+                )
             ):
                 continue
             if outcome == "timeout":
@@ -3467,20 +3761,36 @@ class FocusedRawEvidenceSource:
         minimum_drop = _integer(
             coverage.get("minimum_score_drop"), "minimum score drop", 1
         )
-        if (
-            not timestamps
-            or any(
-                count < minimum
+        if _is_v8_profile(self._profile):
+            complete = all(
+                sum(count >= minimum for count in reporters.values())
+                >= _integer(
+                    coverage.get("required_qualifying_reporters"),
+                    "required qualifying reporters",
+                    1,
+                )
+                for reporters in counts.values()
+            )
+        else:
+            complete = all(
+                count >= minimum
                 for reporters in counts.values()
                 for count in reporters.values()
             )
+        if (
+            not timestamps
+            or not complete
             or any(drawdown > -minimum_drop for drawdown in raw_drawdowns.values())
             or any(drawdown > -minimum_drop for drawdown in eligible_drawdowns.values())
         ):
             return None
         return (
             {
-                str(target): {str(reporter): minimum for reporter in sorted(reporters)}
+                str(target): {
+                    str(reporter): minimum
+                    for reporter, count in sorted(reporters.items())
+                    if count >= minimum
+                }
                 for target, reporters in counts.items()
             },
             {
@@ -6172,13 +6482,13 @@ def _focused_manager_command(
                 "--fault-window-arm-schema-version",
                 (
                     "3"
-                    if _is_v7_profile(profile)
+                    if _is_v7_profile(profile) or _is_v8_profile(profile)
                     else "2" if _is_v6_profile(profile) else "1"
                 ),
                 "--fault-window-arm-domain",
                 (
                     _FAULT_WINDOW_ARM_DOMAIN_V3
-                    if _is_v7_profile(profile)
+                    if _is_v7_profile(profile) or _is_v8_profile(profile)
                     else (
                         _FAULT_WINDOW_ARM_DOMAIN_V2
                         if _is_v6_profile(profile)
@@ -6211,7 +6521,11 @@ def _focused_manager_command(
                 ),
             )
         )
-        if _is_v6_profile(profile) or _is_v7_profile(profile):
+        if (
+            _is_v6_profile(profile)
+            or _is_v7_profile(profile)
+            or _is_v8_profile(profile)
+        ):
             command.extend(
                 (
                     "--fault-window-arm-clock-domain",
@@ -6222,7 +6536,7 @@ def _focused_manager_command(
                     "exact_timeout_attempt_id_v1",
                 )
             )
-        if _is_v7_profile(profile):
+        if _is_v7_profile(profile) or _is_v8_profile(profile):
             command.extend(
                 (
                     "--fault-window-arm-snapshot-evidence-basis",
@@ -6496,7 +6810,11 @@ class FocusedLaunchBackend:
                 include_issuer_identity_artifact=False,
             )
         )
-        if _is_v6_profile(profile) or _is_v7_profile(profile):
+        if (
+            _is_v6_profile(profile)
+            or _is_v7_profile(profile)
+            or _is_v8_profile(profile)
+        ):
             _enable_v6_timeout_attempt_evidence(run_directory, profile.replica_ids)
             artifacts = [
                 (

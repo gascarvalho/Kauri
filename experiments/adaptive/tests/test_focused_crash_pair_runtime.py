@@ -37,6 +37,8 @@ N7_PROFILE_V6 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v6.json"
 N31_PROFILE_V6 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v6.json"
 N7_PROFILE_V7 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v7.json"
 N31_PROFILE_V7 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v7.json"
+N7_PROFILE_V8 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v8.json"
+N31_PROFILE_V8 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v8.json"
 
 
 def test_v7_profiles_bind_arm_v3_and_independently_recomputed_n31_metric() -> None:
@@ -69,6 +71,37 @@ def test_v7_profiles_bind_arm_v3_and_independently_recomputed_n31_metric() -> No
     mutated = deepcopy(metric)
     mutated["selected_target_replica_ids"] = [21, 22, 24]
     assert mutated != runtime._v7_n31_target_selection_metric()
+
+
+def test_v8_profiles_bind_independent_capacity_and_metric() -> None:
+    runtime = _runtime()
+    validator = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    n7 = runtime.load_focused_profile(N7_PROFILE_V8)
+    n31 = runtime.load_focused_profile(N31_PROFILE_V8)
+    assert (
+        runtime._v8_n31_target_selection_metric()
+        == validator._v8_n31_target_selection_metric()
+    )
+    for profile in (n7, n31):
+        capacity = runtime._reporter_capacity_document(
+            replica_count=len(profile.replica_ids),
+            fanout=int(profile.raw["protocol"]["fanout"]),
+            targets=profile.target_replica_ids,
+            prefix=profile.raw["fault_window_arm"]["ordered_tree_prefix"],
+        )
+        assert capacity == validator._v8_reporter_capacity_document(
+            replica_count=len(profile.replica_ids),
+            fanout=int(profile.raw["protocol"]["fanout"]),
+            targets=profile.target_replica_ids,
+            prefix=profile.raw["fault_window_arm"]["ordered_tree_prefix"],
+        )
+        assert profile.raw["topology"]["reporter_coverage_capacity"] == capacity
+    assert (
+        n31.raw["topology"]["target_selection_metric"]
+        == runtime._v8_n31_target_selection_metric()
+    )
 
 
 def test_v7_runtime_loader_rejects_mutated_metric_recomputation(
@@ -214,13 +247,36 @@ def _v6_runtime_timeout_events(profile: Any) -> list[dict[str, object]]:
 
     # A valid pre-R timeout and on-time fact compensate in the raw suffix but
     # cannot enter the exact post-arm reporter guard.
-    first = coverage["targets"][0]["first_qualifying_reporters"][0]
+    first = (
+        coverage["targets"][0]["first_qualifying_reporters"][0]
+        if "first_qualifying_reporters" in coverage["targets"][0]
+        else {
+            "reporter_id": coverage["targets"][0]["eligible_reporters"][0][
+                "reporter_id"
+            ],
+            "tree_id": coverage["targets"][0]["eligible_reporters"][0][
+                "tree_relations"
+            ][0]["tree_id"],
+            "expected_message_type": coverage["targets"][0]["eligible_reporters"][0][
+                "tree_relations"
+            ][0]["expected_message_type"],
+        }
+    )
     append(
         target=int(coverage["targets"][0]["target_replica_id"]),
         reporter=int(first["reporter_id"]),
         tree=int(first["tree_id"]),
         message_type=(
-            "aggregate_relay" if int(first["reporter_id"]) == 6 else "direct_vote"
+            str(
+                first.get(
+                    "expected_message_type",
+                    (
+                        "aggregate_relay"
+                        if int(first["reporter_id"]) == 6
+                        else "direct_vote"
+                    ),
+                )
+            )
         ),
         outcome="timeout",
         start=9_000,
@@ -231,7 +287,16 @@ def _v6_runtime_timeout_events(profile: Any) -> list[dict[str, object]]:
         reporter=int(first["reporter_id"]),
         tree=int(first["tree_id"]),
         message_type=(
-            "aggregate_relay" if int(first["reporter_id"]) == 6 else "direct_vote"
+            str(
+                first.get(
+                    "expected_message_type",
+                    (
+                        "aggregate_relay"
+                        if int(first["reporter_id"]) == 6
+                        else "direct_vote"
+                    ),
+                )
+            )
         ),
         outcome="on_time",
         start=9_100,
@@ -239,7 +304,21 @@ def _v6_runtime_timeout_events(profile: Any) -> list[dict[str, object]]:
     )
     ordinal = 0
     for row in coverage["targets"]:
-        for reporter_row in row["first_qualifying_reporters"]:
+        reporter_rows = (
+            row["first_qualifying_reporters"]
+            if "first_qualifying_reporters" in row
+            else [
+                {
+                    "reporter_id": reporter["reporter_id"],
+                    "tree_id": reporter["tree_relations"][0]["tree_id"],
+                    "expected_message_type": reporter["tree_relations"][0][
+                        "expected_message_type"
+                    ],
+                }
+                for reporter in row["eligible_reporters"]
+            ]
+        )
+        for reporter_row in reporter_rows:
             for _ in range(2):
                 ordinal += 1
                 reporter = int(reporter_row["reporter_id"])
@@ -248,7 +327,12 @@ def _v6_runtime_timeout_events(profile: Any) -> list[dict[str, object]]:
                     reporter=reporter,
                     tree=int(reporter_row["tree_id"]),
                     message_type=(
-                        "aggregate_relay" if reporter == 6 else "direct_vote"
+                        str(
+                            reporter_row.get(
+                                "expected_message_type",
+                                "aggregate_relay" if reporter == 6 else "direct_vote",
+                            )
+                        )
                     ),
                     outcome="timeout",
                     start=10_000 + ordinal,
@@ -300,6 +384,90 @@ def test_v7_runtime_raw_drawdown_excludes_pre_arm_timeout() -> None:
     assert legacy_result is not None and causal_result is not None
     assert legacy_result[1] == {"0": -7, "1": -6}
     assert causal_result[1] == {"0": -6, "1": -6}
+
+
+def test_v8_runtime_requires_any_eleven_topology_valid_reporters() -> None:
+    """The v8 guard admits any 11 proof-bound reporters, not a first tree."""
+
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N31_PROFILE_V8)
+    backend = object.__new__(runtime.FocusedRawEvidenceSource)
+    backend._profile = profile
+    events = _v6_runtime_timeout_events(profile)
+    # Reporter 0 has two valid target-21 relations.  The alternate tree 27
+    # must count in v8 even though the fixture starts on tree 26.
+    for event in events:
+        observation = event["payload"]["observation"]
+        if observation["reporter_id"] != 0 or observation["observed_replica_id"] != 21:
+            continue
+        observation["configuration"]["tree_id"] = 27
+        observation["observation_id"] = runtime._v6_timeout_observation_id(
+            reporter_id=0,
+            observed_replica_id=21,
+            epoch_number=0,
+            tree_id=27,
+            epoch_digest=str(profile.raw["topology"]["epoch_zero_digest"]),
+            block_hash=str(observation["block_hash"]),
+            expected_message_type="direct_vote",
+            attempt_start_monotonic_ns=int(observation["attempt_start_monotonic_ns"]),
+            deadline_duration_us=1,
+        )
+    eleven = [
+        event
+        for event in events
+        if event["payload"]["observation"]["reporter_id"] != 30
+    ]
+    cutoff = max(event["payload"]["ingestion_sequence"] for event in eleven)
+    assert (
+        backend._qualifying_timeout_counts(
+            eleven, fault_ns=10_000, baseline_cutoff=0, current_cutoff=cutoff
+        )
+        is not None
+    )
+    ten = [
+        event
+        for event in eleven
+        if event["payload"]["observation"]["reporter_id"] != 29
+    ]
+    cutoff = max(event["payload"]["ingestion_sequence"] for event in ten)
+    assert (
+        backend._qualifying_timeout_counts(
+            ten, fault_ns=10_000, baseline_cutoff=0, current_cutoff=cutoff
+        )
+        is None
+    )
+
+
+def test_v7_runtime_preserves_first_tree_requirement() -> None:
+    """A relation only v8 admits cannot satisfy the archived v7 guard."""
+
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V7)
+    backend = object.__new__(runtime.FocusedRawEvidenceSource)
+    backend._profile = profile
+    events = _v6_runtime_timeout_events(profile)
+    for event in events:
+        observation = event["payload"]["observation"]
+        if observation["reporter_id"] != 4 or observation["observed_replica_id"] != 0:
+            continue
+        observation["configuration"]["tree_id"] = 3
+        observation["observation_id"] = runtime._v6_timeout_observation_id(
+            reporter_id=4,
+            observed_replica_id=0,
+            epoch_number=0,
+            tree_id=3,
+            epoch_digest=str(profile.raw["topology"]["epoch_zero_digest"]),
+            block_hash=str(observation["block_hash"]),
+            expected_message_type="direct_vote",
+            attempt_start_monotonic_ns=int(observation["attempt_start_monotonic_ns"]),
+            deadline_duration_us=1,
+        )
+    assert (
+        backend._qualifying_timeout_counts(
+            events, fault_ns=10_000, baseline_cutoff=0, current_cutoff=len(events)
+        )
+        is None
+    )
 
 
 def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:
@@ -1172,8 +1340,23 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
         ],
     }
     timeout_observations: list[dict[str, object]] = []
+    qualifying_counts: dict[str, dict[str, int]] = {}
     for target in plan["targets"]:
-        for reporter in target["authenticated_reporter_ids"]:
+        reporters = (
+            target["authenticated_reporter_ids"]
+            if "authenticated_reporter_ids" in target
+            else [
+                reporter["reporter_id"]
+                for reporter in target["eligible_reporters"][
+                    : plan["required_qualifying_reporters"]
+                ]
+            ]
+        )
+        qualifying_counts[str(target["target_replica_id"])] = {
+            str(reporter): int(plan["minimum_timeouts_per_reporter"])
+            for reporter in reporters
+        }
+        for reporter in reporters:
             for ordinal in range(2):
                 timeout_observations.append(
                     {
@@ -1194,13 +1377,7 @@ def _fcrash_h_snapshots(profile: object, arm: str) -> dict[str, Mapping[str, obj
             str(target["target_replica_id"]): -int(plan["minimum_score_drop"])
             for target in plan["targets"]
         },
-        "qualifying_timeout_counts": {
-            str(target["target_replica_id"]): {
-                str(reporter): plan["minimum_timeouts_per_reporter"]
-                for reporter in target["authenticated_reporter_ids"]
-            }
-            for target in plan["targets"]
-        },
+        "qualifying_timeout_counts": qualifying_counts,
         **(
             {
                 "postfault_progress": {
@@ -3063,6 +3240,47 @@ def test_fcrash_h_state_machine_requires_exact_barrier_and_guarded_timeouts(
         hooks, _ = _arm_hooks(runtime, rejected)
         with pytest.raises(runtime.FocusedCrashPairRuntimeError):
             runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+
+def test_v8_state_machine_accepts_exactly_any_eleven_eligible_reporters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The production gate accepts the v8 subset, but not ten or an outsider."""
+
+    runtime = _runtime()
+    original_profile = runtime.load_focused_profile(N31_PROFILE_V8)
+    coverage = deepcopy(runtime.derive_reporter_coverage_plan(original_profile))
+    profile = replace(
+        original_profile,
+        # The existing native transition fixture is fixed to 22/23/24.  Keep
+        # its valid transitions while supplying a v8-shaped coverage plan.
+        target_replica_ids=(22, 23, 24),
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+    )
+    for row, target in zip(coverage["targets"], profile.target_replica_ids):
+        row["target_replica_id"] = target
+    monkeypatch.setattr(
+        runtime, "derive_reporter_coverage_plan", lambda _profile: coverage
+    )
+    accepted = _fcrash_h_snapshots(profile, "A")
+    hooks, _ = _arm_hooks(runtime, accepted)
+    runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    target = str(profile.target_replica_ids[0])
+    ten = _fcrash_h_snapshots(profile, "A")
+    ten["nonresponse"]["qualifying_timeout_counts"][target].popitem()
+    hooks, _ = _arm_hooks(runtime, ten)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="reporter coverage"):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    outsider = _fcrash_h_snapshots(profile, "A")
+    counts = outsider["nonresponse"]["qualifying_timeout_counts"][target]
+    reporter, value = counts.popitem()
+    assert reporter != "999"
+    counts["999"] = value
+    hooks, _ = _arm_hooks(runtime, outsider)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="reporter coverage"):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
 
 @pytest.mark.parametrize("profile_path", (N7_PROFILE_V3, N31_PROFILE_V3))

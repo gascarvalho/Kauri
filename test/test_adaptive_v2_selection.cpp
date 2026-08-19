@@ -685,6 +685,147 @@ struct Fixture
     }
 };
 
+std::vector<ReplicaID> n31_membership()
+{
+    std::vector<ReplicaID> members;
+    members.reserve(31);
+    for (ReplicaID replica = 0; replica < 31; ++replica)
+        members.push_back(replica);
+    return members;
+}
+
+std::vector<EpochTreeDefinition> production_n31_trees()
+{
+    std::vector<EpochTreeDefinition> trees;
+    trees.reserve(31);
+    for (std::uint32_t root = 0; root < 31; ++root)
+    {
+        std::vector<ReplicaID> breadth_first;
+        breadth_first.reserve(31);
+        for (std::uint32_t position = 0; position < 31; ++position)
+            breadth_first.push_back((root + position) % 31U);
+        trees.push_back({root, 5, 2, std::move(breadth_first), {}});
+    }
+    return trees;
+}
+
+struct N31Fixture
+{
+    std::vector<ReplicaID> members{n31_membership()};
+    EpochStore epochs{members};
+    MutableEvidenceWindow window;
+    AdaptationEpochId epoch;
+    std::unique_ptr<EvidenceLedger> ledger;
+    std::map<ReplicaID, std::uint64_t> reporter_sequences;
+    std::uint64_t attempt_number{0};
+
+    N31Fixture()
+    {
+        EpochDefinitionInput input;
+        input.schema_version = hotstuff::kEpochDefinitionSchemaVersion;
+        input.epoch_number = 0;
+        input.membership_digest = hotstuff::canonical_membership_digest(members);
+        input.trees = production_n31_trees();
+        input.activation_height = 15;
+        input.generation_seed = 0x31'0000;
+        input.policy_version = "adaptive-v2-selection-n31-v8-test";
+        input.evidence_snapshot_id = "adaptive-v2-selection-n31-v8";
+        const auto &definition = epochs.stage(input, validation_context(10));
+        epoch = {definition.epoch_number(), definition.epoch_digest()};
+        ledger = std::make_unique<EvidenceLedger>(
+            epochs, window, EvidenceStoreLimits{512, 64});
+    }
+
+    const EpochTreeDefinition &tree(std::uint32_t id) const
+    {
+        const auto *const definition = epochs.find_epoch(epoch.epoch_number);
+        REQUIRE(definition != nullptr);
+        const auto found = std::find_if(
+            definition->trees().begin(), definition->trees().end(),
+            [id](const auto &value) { return value.tree_id == id; });
+        REQUIRE(found != definition->trees().end());
+        return *found;
+    }
+
+    ResponseObservation v3_in_tree(
+        ReplicaID target, std::uint32_t tree_id, ResponseOutcome outcome,
+        std::uint64_t attempt_start_ns)
+    {
+        const auto &definition = tree(tree_id);
+        const auto target_found = std::find(
+            definition.members_breadth_first.begin(),
+            definition.members_breadth_first.end(), target);
+        REQUIRE(target_found != definition.members_breadth_first.end());
+        const auto position = static_cast<std::size_t>(
+            target_found - definition.members_breadth_first.begin());
+        REQUIRE(position != 0);
+        const auto reporter = definition.members_breadth_first[
+            (position - 1U) / definition.fanout];
+        const bool internal =
+            ((position * definition.fanout) + 1U) <
+            definition.members_breadth_first.size();
+
+        ResponseObservation value;
+        value.schema_version = hotstuff::kResponseObservationSchemaVersionV3;
+        value.reporter_id = reporter;
+        value.observed_replica_id = target;
+        value.configuration = {epoch.epoch_number, tree_id, epoch.epoch_digest};
+        value.block_hash = digest(
+            "adaptive-v2-n31-v8-" + std::to_string(++attempt_number));
+        value.expected_message_type = internal
+            ? ExpectedMessageType::aggregate_relay
+            : ExpectedMessageType::direct_vote;
+        value.outcome = outcome;
+        value.deadline_duration_us = 100;
+        value.attempt_start_monotonic_ns = attempt_start_ns;
+        value.reporter_monotonic_ns = attempt_start_ns +
+            (outcome == ResponseOutcome::on_time ? 50'000U : 100'000U);
+        value.response_duration_us = outcome == ResponseOutcome::on_time ? 50 : 0;
+        if (outcome == ResponseOutcome::on_time)
+            value.signer_set = {target};
+        value.reporter_sequence = ++reporter_sequences[reporter];
+        value.observation_id = hotstuff::compute_response_observation_id(value);
+        window.admit(value.proposal_key());
+        const auto accepted_before = ledger->accepted().size();
+        ledger->ingest(AuthenticatedReporter{reporter}, value);
+        REQUIRE(ledger->accepted().size() == accepted_before + 1U);
+        return value;
+    }
+
+    ResponseObservation timeout(
+        ReplicaID target, std::uint32_t tree_id,
+        std::uint64_t attempt_start_ns)
+    {
+        return v3_in_tree(target, tree_id, ResponseOutcome::timeout,
+                          attempt_start_ns);
+    }
+
+    void on_time(ReplicaID target, std::uint32_t tree_id,
+                 std::uint64_t attempt_start_ns)
+    {
+        (void)v3_in_tree(target, tree_id, ResponseOutcome::on_time,
+                         attempt_start_ns);
+    }
+
+    void late(const ResponseObservation &timeout,
+              std::uint64_t reporter_monotonic_ns)
+    {
+        auto value = timeout;
+        value.outcome = ResponseOutcome::late;
+        value.reporter_monotonic_ns = reporter_monotonic_ns;
+        value.response_duration_us =
+            (reporter_monotonic_ns - value.attempt_start_monotonic_ns) /
+            1'000U;
+        value.signer_set = {value.observed_replica_id};
+        value.reporter_sequence = ++reporter_sequences[value.reporter_id];
+        REQUIRE(value.observation_id ==
+                hotstuff::compute_response_observation_id(value));
+        const auto accepted_before = ledger->accepted().size();
+        ledger->ingest(AuthenticatedReporter{value.reporter_id}, value);
+        REQUIRE(ledger->accepted().size() == accepted_before + 1U);
+    }
+};
+
 int baseline_score(
     const std::vector<AdaptiveV2ReplicaScore> &scores,
     ReplicaID replica_id)
@@ -1608,6 +1749,176 @@ TEST_CASE(
     const auto poisoned = selector.select_through(fixture.ledger->high_watermark());
     CHECK(poisoned.status == AdaptiveV2SelectionStatus::projection_failed);
     CHECK_FALSE(selector.healthy());
+}
+
+TEST_CASE(
+    "v8 H17 N31 guard admits every topology-valid prefix reporter",
+    "[adaptive-v2][selection][fault-window-arm][v8][n31][h17]")
+{
+    constexpr std::uint64_t kEvidenceStartNs = 1'000'000;
+    N31Fixture fixture;
+    const std::vector<ReplicaID> targets{21, 22, 23};
+
+    // A v7 causal arm requires schema3 throughout the predecessor epoch.
+    // Freeze that baseline before the post-fault rows below.
+    for (const auto member : fixture.members)
+    {
+        fixture.on_time(member, (member + 1U) % 31U,
+                        kEvidenceStartNs - 100'000U);
+    }
+
+    auto config = selection_config(22, 2, 512);
+    config.required_nonresponsive = 3;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection h16(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    AdaptiveV2ByzantineSelection h17(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    const auto baseline_cutoff = fixture.ledger->high_watermark();
+    REQUIRE(h16.freeze_baseline(baseline_cutoff) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    REQUIRE(h17.freeze_baseline(baseline_cutoff) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    const auto arm = [&](std::uint32_t horizon) {
+        AdaptiveV2FaultWindowArm value;
+        value.predecessor_epoch_number = fixture.epoch.epoch_number;
+        value.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+        value.evidence_start_monotonic_ns = kEvidenceStartNs;
+        value.prefault_tree_id = 20;
+        for (std::uint32_t offset = 0; offset < horizon; ++offset)
+            value.required_tree_ids.push_back((20U + offset) % 31U);
+        value.evidence_basis =
+            hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+                exact_timeout_attempt_id_v1;
+        value.snapshot_evidence_basis =
+            hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_attempt_start_v1;
+        return value;
+    };
+    REQUIRE(h16.arm_fault_window(arm(16)));
+    REQUIRE(h17.arm_fault_window(arm(17)));
+
+    // Causal snapshot evidence is deliberately wider than the guard prefix.
+    // Every survivor is responsive; only 21/22/23 can become candidates.
+    for (const auto member : fixture.members)
+    {
+        if (std::find(targets.begin(), targets.end(), member) == targets.end())
+            fixture.on_time(member, (member + 1U) % 31U,
+                            kEvidenceStartNs + 10'000U);
+    }
+
+    std::uint64_t start = kEvidenceStartNs + 100'000U;
+    const auto emit_twice = [&](ReplicaID target, std::uint32_t tree) {
+        const auto first = fixture.timeout(target, tree, start);
+        start += 1'000U;
+        const auto second = fixture.timeout(target, tree, start);
+        start += 1'000U;
+        return std::pair<ResponseObservation, ResponseObservation>{
+            first, second};
+    };
+
+    // H16 has 11/10/10 qualifying reporters.  These include aggregate and
+    // direct observations from any topology-valid prefix tree, rather than a
+    // profile-preselected reporter/tree subset.
+    for (const auto tree : std::vector<std::uint32_t>{
+             20, 24, 25, 26, 28, 29, 30, 0, 2, 3, 4})
+        (void)emit_twice(21, tree);
+    for (const auto tree : std::vector<std::uint32_t>{
+             20, 24, 25, 26, 27, 29, 30, 0, 1, 3})
+        (void)emit_twice(22, tree);
+    for (const auto tree : std::vector<std::uint32_t>{
+             20, 24, 25, 26, 27, 28, 30, 0, 1, 2})
+        (void)emit_twice(23, tree);
+
+    // A pre-R schema3 row is authenticated but cannot enter either v7/H17
+    // causal replay or exact timeout-ID guard replay.
+    (void)fixture.timeout(22, 5, kEvidenceStartNs - 1'000U);
+    (void)fixture.timeout(22, 5, kEvidenceStartNs - 500U);
+    const auto h16_pending = h16.select_through(fixture.ledger->high_watermark());
+    const auto h17_before_tree5 = h17.select_through(fixture.ledger->high_watermark());
+    CHECK(h16_pending.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(h17_before_tree5.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    REQUIRE(candidate(h17_before_tree5.eligible_candidates, 21) != nullptr);
+    CHECK(candidate(h17_before_tree5.eligible_candidates, 21)
+              ->qualifying_reporters.size() == 11);
+
+    // Tree 5 is outside H16 but inside H17. Its live parent 8 directly
+    // observes all three targets; two exact attempts provide K=2.
+    const auto tree5_21 = emit_twice(21, 5);
+    const auto tree5_22 = emit_twice(22, 5);
+    const auto tree5_23 = emit_twice(23, 5);
+    (void)tree5_21;
+    (void)tree5_23;
+    const auto still_h16 = h16.select_through(fixture.ledger->high_watermark());
+    CHECK(still_h16.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    const auto selected = h17.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(selected.selected_replicas == targets);
+    REQUIRE(candidate(selected.eligible_candidates, 21) != nullptr);
+    REQUIRE(candidate(selected.eligible_candidates, 22) != nullptr);
+    REQUIRE(candidate(selected.eligible_candidates, 23) != nullptr);
+    CHECK(candidate(selected.eligible_candidates, 21)
+              ->qualifying_reporters.size() == 12);
+    CHECK(candidate(selected.eligible_candidates, 22)
+              ->qualifying_reporters.size() == 11);
+    CHECK(candidate(selected.eligible_candidates, 23)
+              ->qualifying_reporters.size() == 11);
+
+    // Guard eligibility is not sufficient when causal snapshot evidence also
+    // makes an unselected survivor nonresponsive.
+    (void)emit_twice(10, 6);
+    const auto extra_survivor = h17.select_through(fixture.ledger->high_watermark());
+    CHECK(extra_survivor.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(extra_survivor.selected_replicas.empty());
+    CHECK(extra_survivor.eligible_roots.empty());
+
+    // Exact late compensation applies only to the matching schema3 ID. It
+    // removes reporter 8's two tree-5 attempts for target 22 and reopens the
+    // H17 guard; a target-mutated late carrying that ID is rejected.
+    fixture.late(tree5_22.first, tree5_22.first.reporter_monotonic_ns + 200'000U);
+    fixture.late(tree5_22.second, tree5_22.second.reporter_monotonic_ns + 200'000U);
+    const auto late_pending = h17.select_through(fixture.ledger->high_watermark());
+    CHECK(late_pending.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    const auto accepted_before_bad_late = fixture.ledger->accepted().size();
+    auto mismatched_late = tree5_22.first;
+    mismatched_late.outcome = ResponseOutcome::late;
+    mismatched_late.observed_replica_id = 23;
+    mismatched_late.reporter_monotonic_ns += 300'000U;
+    mismatched_late.response_duration_us =
+        (mismatched_late.reporter_monotonic_ns -
+         mismatched_late.attempt_start_monotonic_ns) / 1'000U;
+    mismatched_late.signer_set = {23};
+    mismatched_late.reporter_sequence =
+        ++fixture.reporter_sequences[mismatched_late.reporter_id];
+    fixture.ledger->ingest(
+        AuthenticatedReporter{mismatched_late.reporter_id}, mismatched_late);
+    CHECK(fixture.ledger->accepted().size() == accepted_before_bad_late);
+    CHECK(fixture.ledger->rejected().back().reason ==
+          hotstuff::EvidenceRejectionReason::observation_id_mismatch);
+
+    // This fixture already has a schema3 stream for reporter 8. A later
+    // legacy timestamp is therefore rejected by the ledger before it can
+    // reach the selector; the preceding v7 test covers an accepted legacy
+    // current-epoch record poisoning the causal projection.
+    auto legacy = tree5_21.first;
+    legacy.schema_version = hotstuff::kResponseObservationSchemaVersionV1;
+    legacy.attempt_start_monotonic_ns = 0;
+    legacy.block_hash = digest("adaptive-v2-n31-v8-legacy-poison");
+    legacy.reporter_sequence = ++fixture.reporter_sequences[legacy.reporter_id];
+    legacy.observation_id = hotstuff::compute_response_observation_id(
+        legacy.attempt_identity());
+    fixture.window.admit(legacy.proposal_key());
+    const auto accepted_before_legacy = fixture.ledger->accepted().size();
+    fixture.ledger->ingest(AuthenticatedReporter{legacy.reporter_id}, legacy);
+    CHECK(fixture.ledger->accepted().size() == accepted_before_legacy);
+    CHECK(fixture.ledger->rejected().back().reason ==
+          hotstuff::EvidenceRejectionReason::reporter_timestamp_regression);
 }
 
 TEST_CASE(
