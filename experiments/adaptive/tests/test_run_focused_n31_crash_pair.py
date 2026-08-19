@@ -425,6 +425,418 @@ def test_execution_never_invokes_or_self_promotes_aggregate_validation(
         assert validation["pending_external_provenance"]["evidence_tree_sha256"]
 
 
+def test_campaign_run_arm_failure_seals_only_an_incomplete_abort_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runtime failure retains its exact prefix but can never become a campaign."""
+
+    runner = _runner()
+    output = tmp_path / "aborted-campaign"
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    validation_module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    actual_validate_campaign = runner.validate_sealed_campaign
+    pair_calls, campaign_calls = _stub_aggregate_validators(runner, monkeypatch)
+    seal_order: list[Path] = []
+    original_seal = runner.create_evidence_seal
+
+    def seal(directory: Path) -> object:
+        directory = Path(directory)
+        seal_order.append(directory)
+        if directory.name == "slot-02":
+            assert (directory / "cleanup.json").is_file()
+            assert (directory / "slot-abort.json").is_file()
+        elif directory == output:
+            assert (output / "campaign-abort-prefix.json").is_file()
+            assert (output / "children" / "slot-02" / "evidence-seal.json").is_file()
+        return original_seal(directory)
+
+    monkeypatch.setattr(runner, "create_evidence_seal", seal)
+
+    class AbortingBackend(_RecordingLaunchBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failure = runtime.FocusedCrashPairRuntimeError("native arm failed")
+
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            configuration = dict(
+                super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                )
+            )
+            root = Path(context["slot_directory"])
+            root.mkdir(parents=True, exist_ok=False)
+            configuration["run_directory"] = root
+            configuration["slot_id"] = str(context["slot_id"])
+            return configuration
+
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            self._record("run", configuration)
+            if configuration["slot_id"] == "slot-02":
+                raise self.failure
+            return {"runtime_graph": "complete"}
+
+        def cleanup(
+            self, configuration: Mapping[str, object], processes: object
+        ) -> Mapping[str, object]:
+            self._record("cleanup", configuration)
+            return {
+                "complete": True,
+                "outcomes": [
+                    {
+                        "name": "adaptive-manager",
+                        "replica_id": -1,
+                        "pid": 101,
+                        "pgid": 101,
+                        "signal_number": 15,
+                        "returncode": -15,
+                    }
+                ],
+            }
+
+        def seal(
+            self,
+            configuration: Mapping[str, object],
+            outcome: Mapping[str, object],
+            cleanup: Mapping[str, object],
+        ) -> Mapping[str, object]:
+            self._record("seal", configuration)
+            metadata = original_seal(Path(configuration["run_directory"]))
+            return {
+                "tree_sha256": metadata.tree_sha256,
+                "seal_sha256": metadata.seal_sha256,
+            }
+
+    backend = AbortingBackend()
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="campaign"), backend=backend
+        )
+    assert raised.value is backend.failure
+    failed_root = output / "children" / "slot-02"
+    cleanup = json.loads((failed_root / "cleanup.json").read_text())
+    abort = json.loads((failed_root / "slot-abort.json").read_text())
+    prefix = json.loads((output / "campaign-abort-prefix.json").read_text())
+    assert cleanup["outcomes"][0]["returncode"] == -15
+    assert abort == {
+        "schema_version": 1,
+        "kind": "kauri-focused-slot-abort-v1",
+        "state": "INCOMPLETE",
+        "claim_eligible": False,
+        "plan_sha256": prefix["plan_sha256"],
+        "slot_id": "slot-02",
+        "pair_id": "pair-01",
+        "arm": "adaptive",
+        "pair_seed": 41_720,
+        "execution_ordinal": 2,
+        "attempt_ordinal": 1,
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "failure": {"category": "runtime_error", "reason": "native arm failed"},
+    }
+    assert [row["slot_id"] for row in prefix["completed_prefix"]] == ["slot-01"]
+    assert prefix["failed_slot"]["slot_id"] == "slot-02"
+    completed_seal = runner.verify_evidence_seal(output / "children" / "slot-01")
+    assert (
+        prefix["completed_prefix"][0]["child_tree_sha256"] == completed_seal.tree_sha256
+    )
+    assert (
+        prefix["completed_prefix"][0]["child_seal_sha256"] == completed_seal.seal_sha256
+    )
+    assert [row["slot_id"] for row in prefix["not_started"]] == [
+        f"slot-{ordinal:02d}" for ordinal in range(3, 11)
+    ]
+    assert seal_order == [failed_root, output]
+    assert (failed_root / "evidence-seal.json").is_file()
+    assert (output / "evidence-seal.json").is_file()
+    assert not (output / "campaign-ledger.jsonl").exists()
+    assert not (output / "campaign-summary.json").exists()
+    assert not tuple(output.glob("pair-*"))
+    assert pair_calls == []
+    assert campaign_calls == []
+    assert [call for call in backend.calls if call[0] == "configuration"] == [
+        ("configuration", "pair-01", "control"),
+        ("configuration", "pair-01", "adaptive"),
+    ]
+    assert not [
+        call
+        for call in backend.calls
+        if call[2] == "adaptive" and call[0] in {"seal", "validate", "ledger"}
+    ]
+    with pytest.raises(
+        runner.FocusedCrashPairValidationError, match="ledger is absent"
+    ):
+        actual_validate_campaign(output, trusted_provenance={})
+    with pytest.raises(validation_module.FocusedCrashPairValidationError):
+        validation_module.validate_sealed_arm(failed_root, trusted_provenance={})
+
+
+@pytest.mark.parametrize(
+    ("completed_seal_mode", "expected_reason", "completed_seal_exists"),
+    (
+        ("missing", "evidence seal is missing", False),
+        ("mismatched", "differs from its persisted evidence", True),
+    ),
+)
+def test_campaign_abort_rejects_unverified_completed_prefix_seals(
+    completed_seal_mode: str,
+    expected_reason: str,
+    completed_seal_exists: bool,
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    output = tmp_path / completed_seal_mode
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+
+    class InvalidCompletedSealBackend(_RecordingLaunchBackend):
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            configuration = dict(
+                super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                )
+            )
+            root = Path(context["slot_directory"])
+            root.mkdir(parents=True, exist_ok=False)
+            configuration["run_directory"] = root
+            configuration["slot_id"] = str(context["slot_id"])
+            return configuration
+
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            self._record("run", configuration)
+            if configuration["slot_id"] == "slot-02":
+                raise runtime.FocusedCrashPairRuntimeError("native arm failed")
+            return {"runtime_graph": "complete"}
+
+        def cleanup(
+            self, configuration: Mapping[str, object], processes: object
+        ) -> Mapping[str, object]:
+            self._record("cleanup", configuration)
+            return {"complete": True, "outcomes": []}
+
+        def seal(
+            self,
+            configuration: Mapping[str, object],
+            outcome: Mapping[str, object],
+            cleanup: Mapping[str, object],
+        ) -> Mapping[str, object]:
+            self._record("seal", configuration)
+            if completed_seal_mode == "mismatched":
+                runner.create_evidence_seal(Path(configuration["run_directory"]))
+            return {"tree_sha256": "a" * 64, "seal_sha256": "b" * 64}
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="native arm failed"):
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="campaign"),
+            backend=InvalidCompletedSealBackend(),
+        )
+
+    completed_root = output / "children" / "slot-01"
+    failed_root = output / "children" / "slot-02"
+    finalization_failure = json.loads(
+        (failed_root / "abort-finalization-failure.json").read_text(encoding="utf-8")
+    )
+    assert expected_reason in finalization_failure["reason"]
+    assert (completed_root / "evidence-seal.json").exists() is completed_seal_exists
+    assert not (failed_root / "evidence-seal.json").exists()
+    assert not (output / "campaign-abort-prefix.json").exists()
+    assert not (output / "evidence-seal.json").exists()
+
+
+@pytest.mark.parametrize("cleanup_mode", ("raises", "incomplete"))
+def test_campaign_run_arm_failure_records_unsealed_cleanup_failure(
+    cleanup_mode: str,
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    output = tmp_path / cleanup_mode
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+
+    class CleanupFailureBackend(_RecordingLaunchBackend):
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            configuration = dict(
+                super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                )
+            )
+            root = Path(context["slot_directory"])
+            root.mkdir(parents=True, exist_ok=False)
+            configuration["run_directory"] = root
+            configuration["slot_id"] = str(context["slot_id"])
+            return configuration
+
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            self._record("run", configuration)
+            raise runtime.FocusedCrashPairRuntimeError("native arm failed")
+
+        def cleanup(
+            self, configuration: Mapping[str, object], processes: object
+        ) -> Mapping[str, object]:
+            self._record("cleanup", configuration)
+            if cleanup_mode == "raises":
+                raise RuntimeError("cleanup failed")
+            return {"complete": False, "outcomes": []}
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="native arm failed"):
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="campaign"),
+            backend=CleanupFailureBackend(),
+        )
+    slot = output / "children" / "slot-01"
+    failure = json.loads((slot / "cleanup-failure.json").read_text())
+    assert failure["state"] == "INCOMPLETE"
+    assert failure["claim_eligible"] is False
+    assert not (slot / "evidence-seal.json").exists()
+    assert not (output / "campaign-abort-prefix.json").exists()
+    assert not (output / "evidence-seal.json").exists()
+
+
+def test_campaign_run_arm_failure_keeps_original_error_when_abort_finalization_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    output = tmp_path / "finalizer-failure"
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+
+    class FinalizerFailureBackend(_RecordingLaunchBackend):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failure = runtime.FocusedCrashPairRuntimeError("native arm failed")
+
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            configuration = dict(
+                super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                )
+            )
+            root = Path(context["slot_directory"])
+            root.mkdir(parents=True, exist_ok=False)
+            configuration["run_directory"] = root
+            configuration["slot_id"] = str(context["slot_id"])
+            return configuration
+
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            raise self.failure
+
+        def cleanup(
+            self, configuration: Mapping[str, object], processes: object
+        ) -> Mapping[str, object]:
+            return {"complete": True, "outcomes": []}
+
+    monkeypatch.setattr(
+        runner,
+        "create_evidence_seal",
+        lambda _directory: (_ for _ in ()).throw(RuntimeError("seal failed")),
+    )
+    monkeypatch.setattr(
+        runner.sys,
+        "stderr",
+        SimpleNamespace(
+            write=lambda _message: (_ for _ in ()).throw(OSError("stderr closed"))
+        ),
+    )
+    backend = FinalizerFailureBackend()
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="campaign"),
+            backend=backend,
+        )
+    assert raised.value is backend.failure
+    slot = output / "children" / "slot-01"
+    assert (slot / "cleanup.json").is_file()
+    assert (slot / "slot-abort.json").is_file()
+    failure = json.loads(
+        (slot / "abort-finalization-failure.json").read_text(encoding="utf-8")
+    )
+    assert failure["state"] == "INCOMPLETE"
+    assert failure["category"] == "finalization_error"
+    assert not (slot / "evidence-seal.json").exists()
+    assert not (output / "evidence-seal.json").exists()
+
+
+def test_campaign_runtime_abort_keeps_cli_exit_two(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    monkeypatch.setattr(
+        runner,
+        "_authorized_execution",
+        lambda _arguments: (SimpleNamespace(), {}, {}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_focused_campaign",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runtime.FocusedCrashPairRuntimeError("native arm failed")
+        ),
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        runner.main(
+            [
+                "campaign",
+                "--pairs",
+                "5",
+                "--preflight-receipt",
+                str(tmp_path / "preflight.json"),
+                "--authorization-receipt",
+                str(tmp_path / "authorization.json"),
+                "--output",
+                str(tmp_path / "output"),
+                "--retries",
+                "0",
+            ]
+        )
+
+    assert raised.value.code == 2
+
+
 @pytest.mark.parametrize(
     ("child_validation", "expected_outcome", "expected_integrity", "expected_claim"),
     (

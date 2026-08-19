@@ -3830,6 +3830,48 @@ def test_default_backend_registry_cleanup_precedes_materialization_and_seal(
     assert trace == ["registry-cleanup", "materialize", "seal"]
 
 
+def test_default_backend_cleanup_closes_every_writer_after_registry_failure(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    trace: list[str] = []
+    failure = RuntimeError("registry cleanup failed")
+
+    class Log:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def close(self) -> None:
+            trace.append(f"close-{self.name}")
+
+    class Evidence:
+        def __exit__(self, *_args: object) -> None:
+            trace.append("close-evidence")
+
+    def cleanup_registry(_processes: object) -> tuple[object, ...]:
+        trace.append("registry-cleanup")
+        raise failure
+
+    backend = runtime.FocusedLaunchBackend(cleanup_registry=cleanup_registry)
+    processes = SimpleNamespace(
+        registry=object(),
+        records=(),
+        logs=(Log("manager"), Log("client")),
+        evidence=Evidence(),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        backend.cleanup({"run_directory": tmp_path}, processes)
+
+    assert raised.value is failure
+    assert trace == [
+        "registry-cleanup",
+        "close-manager",
+        "close-client",
+        "close-evidence",
+    ]
+
+
 def test_default_backend_rejects_one_shot_artifact_existence_without_polling(
     tmp_path: Path,
 ) -> None:

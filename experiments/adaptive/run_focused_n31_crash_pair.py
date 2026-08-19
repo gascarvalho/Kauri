@@ -32,6 +32,7 @@ from experiments.adaptive.kauri_experiment.focused_crash_pair_validation import 
 )
 from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
     create_evidence_seal,
+    verify_evidence_seal,
 )
 from experiments.adaptive import run_n31_crash_pair_campaign as campaign_contracts
 
@@ -117,6 +118,171 @@ def _pending_external_provenance(
     }
 
 
+def _bounded_failure_reason(error: BaseException) -> str:
+    """Project one exception into a bounded, non-control diagnostic string."""
+
+    raw = str(error)
+    printable = "".join(
+        character if " " <= character <= "~" else "?" for character in raw
+    )
+    return (printable or type(error).__name__)[:256]
+
+
+def _sha256_field(value: object, label: str) -> str:
+    if (
+        not isinstance(value, str)
+        or len(value) != 64
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        raise FocusedCrashPairCliError(f"{label} is not a canonical SHA-256 digest")
+    return value
+
+
+def _finalize_campaign_abort(
+    *,
+    output_root: Path,
+    plan: Mapping[str, object],
+    slot: Mapping[str, object],
+    slot_directory: Path,
+    completed_records: Sequence[Mapping[str, object]],
+    runtime_error: FocusedCrashPairRuntimeError,
+    cleanup: Mapping[str, object] | None,
+    cleanup_error: BaseException | None,
+) -> None:
+    """Persist a non-claimable campaign prefix without normal aggregation."""
+
+    slot_abort = {
+        "schema_version": 1,
+        "kind": "kauri-focused-slot-abort-v1",
+        "state": "INCOMPLETE",
+        "claim_eligible": False,
+        "plan_sha256": _sha256_field(plan.get("plan_sha256"), "campaign plan"),
+        "slot_id": str(slot["slot_id"]),
+        "pair_id": str(slot["pair_id"]),
+        "arm": str(slot["arm"]),
+        "pair_seed": int(slot["pair_seed"]),
+        "execution_ordinal": int(slot["execution_ordinal"]),
+        "attempt_ordinal": 1,
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "failure": {
+            "category": "runtime_error",
+            "reason": _bounded_failure_reason(runtime_error),
+        },
+    }
+    _write_exclusive_json(slot_directory / "slot-abort.json", slot_abort)
+
+    if cleanup is not None:
+        _write_exclusive_json(slot_directory / "cleanup.json", dict(cleanup))
+    if (
+        cleanup_error is not None
+        or cleanup is None
+        or cleanup.get("complete") is not True
+    ):
+        reason = cleanup_error or FocusedCrashPairRuntimeError(
+            "cleanup did not establish a quiescent process set"
+        )
+        _write_exclusive_json(
+            slot_directory / "cleanup-failure.json",
+            {
+                "schema_version": 1,
+                "kind": "kauri-focused-cleanup-failure-v1",
+                "state": "INCOMPLETE",
+                "claim_eligible": False,
+                "complete": False,
+                "category": "cleanup_error",
+                "reason": _bounded_failure_reason(reason),
+            },
+        )
+        return
+
+    planned_slots = {
+        str(candidate["slot_id"]): candidate for candidate in plan["slots"]
+    }
+    failed_ordinal = int(slot["execution_ordinal"])
+    completed_prefix: list[dict[str, object]] = []
+    for record in completed_records:
+        completed_slot = planned_slots[str(record["slot_id"])]
+        seal = record["seal"]
+        if not isinstance(seal, Mapping):
+            raise FocusedCrashPairCliError("completed child seal is malformed")
+        verified = verify_evidence_seal(
+            output_root / "children" / str(completed_slot["slot_id"])
+        )
+        verified_tree_sha = _sha256_field(
+            getattr(verified, "tree_sha256", None), "verified completed child tree"
+        )
+        verified_seal_sha = _sha256_field(
+            getattr(verified, "seal_sha256", None), "verified completed child seal"
+        )
+        if (
+            _sha256_field(seal.get("tree_sha256"), "completed child tree")
+            != verified_tree_sha
+            or _sha256_field(seal.get("seal_sha256"), "completed child seal")
+            != verified_seal_sha
+        ):
+            raise FocusedCrashPairCliError(
+                "completed child seal differs from its persisted evidence"
+            )
+        completed_prefix.append(
+            {
+                "execution_ordinal": int(completed_slot["execution_ordinal"]),
+                "slot_id": str(completed_slot["slot_id"]),
+                "pair_id": str(completed_slot["pair_id"]),
+                "arm": str(completed_slot["arm"]),
+                "child_tree_sha256": verified_tree_sha,
+                "child_seal_sha256": verified_seal_sha,
+            }
+        )
+    completed_prefix.sort(key=lambda entry: int(entry["execution_ordinal"]))
+    if [int(entry["execution_ordinal"]) for entry in completed_prefix] != list(
+        range(1, failed_ordinal)
+    ):
+        raise FocusedCrashPairCliError(
+            "completed campaign prefix is not contiguous before the failed slot"
+        )
+    child_seal = create_evidence_seal(slot_directory)
+    child_tree_sha = _sha256_field(
+        getattr(child_seal, "tree_sha256", None), "incomplete child tree"
+    )
+    child_seal_sha = _sha256_field(
+        getattr(child_seal, "seal_sha256", None), "incomplete child seal"
+    )
+    not_started = [
+        {
+            "execution_ordinal": int(candidate["execution_ordinal"]),
+            "slot_id": str(candidate["slot_id"]),
+        }
+        for candidate in plan["slots"]
+        if int(candidate["execution_ordinal"]) > failed_ordinal
+    ]
+    _write_exclusive_json(
+        output_root / "campaign-abort-prefix.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-focused-campaign-abort-prefix-v1",
+            "state": "ABORTED_INCOMPLETE",
+            "claim_eligible": False,
+            "plan_sha256": _sha256_field(plan.get("plan_sha256"), "campaign plan"),
+            "failed_slot": {
+                "execution_ordinal": failed_ordinal,
+                "slot_id": str(slot["slot_id"]),
+                "pair_id": str(slot["pair_id"]),
+                "arm": str(slot["arm"]),
+                "child_tree_sha256": child_tree_sha,
+                "child_seal_sha256": child_seal_sha,
+            },
+            "completed_prefix": completed_prefix,
+            "not_started": not_started,
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "continuation": "prohibited",
+        },
+    )
+    create_evidence_seal(output_root)
+
+
 def _execute_focused(
     invocation: Mapping[str, object], *, backend: object
 ) -> Mapping[str, object]:
@@ -182,7 +348,9 @@ def _execute_focused(
         if plan is not None and not slot_directory.exists():
             slot_directory.mkdir(parents=True)
         processes = backend.spawn_processes(configuration)
-        cleanup: Mapping[str, object] | None = None
+        outcome: Mapping[str, object] | None = None
+        execution_error: BaseException | None = None
+        execution_traceback = None
         try:
             if callable(getattr(backend, "run_arm", None)):
                 outcome = backend.run_arm(configuration, processes)
@@ -193,8 +361,62 @@ def _execute_focused(
                 outcome = backend.drive_event_hooks(
                     configuration, processes, fault_receipt
                 )
-        finally:
+        except BaseException as exc:
+            execution_error = exc
+            execution_traceback = exc.__traceback__
+
+        cleanup: Mapping[str, object] | None = None
+        cleanup_error: BaseException | None = None
+        try:
             cleanup = backend.cleanup(configuration, processes)
+        except BaseException as exc:
+            cleanup_error = exc
+
+        if execution_error is not None:
+            if (
+                isinstance(execution_error, FocusedCrashPairRuntimeError)
+                and plan is not None
+            ):
+                try:
+                    _finalize_campaign_abort(
+                        output_root=output_root,
+                        plan=plan,
+                        slot=slot,
+                        slot_directory=slot_directory,
+                        completed_records=records,
+                        runtime_error=execution_error,
+                        cleanup=cleanup,
+                        cleanup_error=cleanup_error,
+                    )
+                except BaseException as finalization_error:
+                    try:
+                        _write_exclusive_json(
+                            slot_directory / "abort-finalization-failure.json",
+                            {
+                                "schema_version": 1,
+                                "kind": "kauri-focused-abort-finalization-failure-v1",
+                                "state": "INCOMPLETE",
+                                "claim_eligible": False,
+                                "category": "finalization_error",
+                                "reason": _bounded_failure_reason(finalization_error),
+                            },
+                        )
+                    except BaseException:
+                        pass
+                    try:
+                        sys.stderr.write(
+                            "campaign abort finalization failed: "
+                            f"{_bounded_failure_reason(finalization_error)}\n"
+                        )
+                    except BaseException:
+                        pass
+            raise execution_error.with_traceback(execution_traceback)
+        if cleanup_error is not None:
+            raise cleanup_error
+        if outcome is None or cleanup is None:
+            raise FocusedCrashPairCliError(
+                "arm execution did not produce terminal state"
+            )
         materialize = getattr(backend, "materialize_artifacts", None)
         if callable(materialize):
             materialize(configuration, outcome, cleanup)

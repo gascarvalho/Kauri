@@ -6151,16 +6151,35 @@ class FocusedLaunchBackend:
         configuration: Mapping[str, object],
         processes: _FocusedProcesses,
     ) -> Mapping[str, object]:
-        outcomes = (
-            self._cleanup_registry(processes)
-            if self._cleanup_registry is not None
-            else processes.registry.cleanup(timeout_s=2.0)
-        )
+        outcomes: Sequence[object] = ()
+        cleanup_error: BaseException | None = None
+        cleanup_traceback = None
+        try:
+            outcomes = (
+                self._cleanup_registry(processes)
+                if self._cleanup_registry is not None
+                else processes.registry.cleanup(timeout_s=2.0)
+            )
+        except BaseException as exc:
+            cleanup_error = exc
+            cleanup_traceback = exc.__traceback__
         for log in getattr(processes, "logs", ()):
-            log.close()
+            try:
+                log.close()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                    cleanup_traceback = exc.__traceback__
         evidence = getattr(processes, "evidence", None)
         if evidence is not None:
-            evidence.__exit__(None, None, None)
+            try:
+                evidence.__exit__(None, None, None)
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                    cleanup_traceback = exc.__traceback__
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_traceback)
         return {
             "complete": all(
                 record.process.poll() is not None
