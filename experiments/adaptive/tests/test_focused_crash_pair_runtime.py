@@ -99,6 +99,28 @@ def test_v12_profiles_bind_exact_horizons_timers_and_all_candidate_capacity() ->
     )
 
 
+def test_n7_v12_guard_relations_use_its_injected_target_capacity() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V12)
+    plan = runtime.derive_reporter_coverage_plan(profile)
+    assert "all_candidate_reporter_coverage_capacity" not in plan
+
+    expected = {
+        int(row["target_replica_id"]): {
+            int(reporter["reporter_id"]): frozenset(
+                (
+                    int(relation["tree_id"]),
+                    str(relation["expected_message_type"]),
+                )
+                for relation in reporter["tree_relations"]
+            )
+            for reporter in row["eligible_reporters"]
+        }
+        for row in plan["reporter_coverage_capacity"]["targets"]
+    }
+    assert runtime._v12_guard_relations(profile) == expected
+
+
 def test_v12_profile_and_proof_deltas_are_exactly_bounded_to_the_new_contract() -> None:
     runtime = _runtime()
     prefix = list(range(20, 31)) + list(range(20))

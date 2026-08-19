@@ -1556,10 +1556,17 @@ def _v9_eligible_guard_reporters(
 def _v12_guard_relations(
     profile: FocusedProfile,
 ) -> dict[int, dict[int, frozenset[tuple[int, str]]]]:
-    coverage = derive_reporter_coverage_plan(profile).get(
-        "all_candidate_reporter_coverage_capacity"
-    )
-    document = _document(coverage, "v12 all-candidate reporter capacity")
+    coverage = derive_reporter_coverage_plan(profile)
+    all_candidates = coverage.get("all_candidate_reporter_coverage_capacity")
+    if all_candidates is None:
+        rows = _document(
+            coverage.get("reporter_coverage_capacity"),
+            "v12 injected-target reporter capacity",
+        ).get("targets")
+    else:
+        rows = _document(
+            all_candidates, "v12 all-candidate reporter capacity"
+        ).get("candidates")
     return {
         _integer(row["target_replica_id"], "v12 candidate"): {
             _integer(reporter["reporter_id"], "v12 reporter"): frozenset(
@@ -1571,7 +1578,7 @@ def _v12_guard_relations(
             )
             for reporter in row["eligible_reporters"]
         }
-        for row in document["candidates"]
+        for row in _sequence(rows, "v12 guard relation rows")
     }
 
 
