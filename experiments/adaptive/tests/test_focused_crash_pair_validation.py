@@ -1247,6 +1247,105 @@ def _n7_v6_mixed_timeout_guard_fixture() -> (
     return contract, events, {"source_monotonic_ns": 40_000, "source_sequence": 100}
 
 
+def test_sealed_v6_witness_replays_profile_targets_without_contract_key_drift(
+    tmp_path: Path,
+) -> None:
+    """Exercise the sealed-arm witness path with the canonical N7-v6 contract.
+
+    The raw manager rows are the native schema-3 mixed timeout guard.  The
+    snapshot audit and receipt make this the same predecessor-0 witness path
+    reached by ``validate_sealed_arm``, rather than a contract-only assertion.
+    """
+
+    validation = _validation()
+    profile = json.loads(runtime_fixture.N7_PROFILE_V6.read_text(encoding="utf-8"))
+    root = tmp_path / "sealed-v6"
+    proof_source = runtime_fixture._topology_proof_path(
+        runtime_fixture.N7_PROFILE_V6, profile
+    )
+    proof_path = root / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(root / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(root))
+    _fixture_contract, events, audit = _n7_v6_mixed_timeout_guard_fixture()
+    events.append(
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": audit["source_sequence"],
+            "source_monotonic_ns": audit["source_monotonic_ns"],
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "payload": {
+                "predecessor_epoch_number": 0,
+                "baseline_cutoff": 0,
+                "current_cutoff": 12,
+            },
+        }
+    )
+    digest = str(contract["epoch_zero_digest"])
+    authoritative = "replica-2"
+    instance = "n7-v6-replica-2"
+    events.extend(
+        [
+            {
+                "source_kind": "replica",
+                "source_id": authoritative,
+                "source_instance": instance,
+                "source_sequence": 1,
+                "source_monotonic_ns": 100,
+                "event_type": "process.started",
+                "payload": {},
+            },
+            {
+                "source_kind": "replica",
+                "source_id": authoritative,
+                "source_instance": instance,
+                "source_sequence": 2,
+                "source_monotonic_ns": 200,
+                "event_type": "process.ready",
+                "payload": {},
+            },
+        ]
+    )
+    # The frozen N7 horizon starts at tree 6 and records its next five cyclic
+    # configurations before the predecessor-0 audit.
+    for sequence, tree_id in enumerate((0, 1, 2, 3, 4, 5, 6, 0, 1, 2, 3, 4), start=3):
+        position = sequence - 3
+        events.append(
+            {
+                "source_kind": "replica",
+                "source_id": authoritative,
+                "source_instance": instance,
+                "source_sequence": sequence,
+                "source_monotonic_ns": (
+                    1_000 * (position + 1)
+                    if position < 7
+                    else 10_000 + 1_000 * (position - 6)
+                ),
+                "event_type": "adaptive.configuration_active",
+                "payload": {
+                    "epoch_number": 0,
+                    "tree_id": tree_id,
+                    "epoch_digest": digest,
+                },
+            }
+        )
+    witness = validation._fcrash_h_witness_from_events(
+        contract,
+        events,
+        {
+            "sigkill_outcomes": [
+                {"requested_monotonic_ns": 9_000, "confirmed_monotonic_ns": 10_000}
+            ]
+        },
+        [{"source_monotonic_ns": 50_000}],
+        [],
+    )
+
+    assert witness["eligible_guard_drawdowns"] == {"0": -6, "1": -6}
+
+
 def test_v6_source_blind_replay_accepts_native_n7_mixed_timeout_guard() -> None:
     validation = _validation()
     contract, events, audit = _n7_v6_mixed_timeout_guard_fixture()
@@ -1600,13 +1699,16 @@ def test_ranking_reconstruction_calls_native_replay_with_minimum_attempts(
         )
 
 
-def test_v3_containment_roots_preserve_eligible_baselines_before_replacement() -> None:
+def test_archived_containment_roots_preserve_rank_ordered_replacements() -> None:
     validation = _validation()
+    v5_profile = runtime_fixture._runtime().load_focused_profile(
+        runtime_fixture.N7_PROFILE_V5
+    )
 
     # N7 native scorer order differs from containment roots: healthy baseline
     # roots retain their tree slots while failed slots consume replacements.
     assert validation._containment_roots(  # type: ignore[attr-defined]
-        [2, 6, 3, 4, 5], {"quorum": 5}
+        [2, 6, 3, 4, 5], {"quorum": 5, "profile_id": v5_profile.profile_id}
     ) == (6, 5, 2, 3, 4)
 
     # The same rule must not collapse an N31-style mixed placement into the
@@ -1618,6 +1720,24 @@ def test_v3_containment_roots_preserve_eligible_baselines_before_replacement() -
     assert validation._containment_roots(  # type: ignore[attr-defined]
         ranked, {"quorum": 21}
     ) == tuple(expected)
+
+
+def test_v6_containment_fallback_is_id_sorted_despite_n7_rank_permutation() -> None:
+    validation = _validation()
+    profile = runtime_fixture._runtime().load_focused_profile(
+        runtime_fixture.N7_PROFILE_V6
+    )
+    contract = {"quorum": 5, "profile_id": profile.profile_id}
+
+    # Roots 0 and 1 are unusable after the focused fault.  The remaining
+    # baseline roots retain their slots, while their two replacements are
+    # canonical by ID rather than scorer order.
+    assert validation._containment_roots(  # type: ignore[attr-defined]
+        [2, 6, 3, 4, 5], contract
+    ) == (5, 6, 2, 3, 4)
+    assert validation._containment_roots(  # type: ignore[attr-defined]
+        [6, 5, 4, 3, 2], contract
+    ) == (5, 6, 2, 3, 4)
 
 
 def test_trusted_provenance_is_exact_and_bound_to_the_sealed_child(

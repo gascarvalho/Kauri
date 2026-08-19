@@ -873,6 +873,35 @@ TEST_CASE(
           tree_fingerprint(optimized_second));
 }
 
+TEST_CASE(
+    "containment fallback roots are canonical despite survivor rank permutation",
+    "[t10][tree-policy][containment][fallback][determinism][n7]")
+{
+    const auto members = sequential_members(7);
+    const auto ascending = make_snapshot(members, {0, 1});
+    const auto permuted = make_snapshot(members, {0, 1}, 8, 0xA0910, true);
+    const auto input = placement_input(
+        members, 2, 3, 0xD23, "fault-containment-fallback-deterministic-v1");
+    const FaultContainmentPolicy containment{
+        {BaselineRoot{0, 0}, BaselineRoot{1, 1}, BaselineRoot{2, 2}},
+        {0, 1}};
+    const auto first = hotstuff::build_tree_placement(input, ascending, containment);
+    const auto second = hotstuff::build_tree_placement(input, permuted, containment);
+    CHECK(tree_fingerprint(first) == tree_fingerprint(second));
+    CHECK(selected_roots(first) == std::vector<ReplicaID>{3, 4, 2});
+    CHECK(first.explanation().root_decisions.at(0).reason ==
+          RootSelectionReason::fallback_ineligible_baseline);
+    CHECK(first.explanation().root_decisions.at(1).reason ==
+          RootSelectionReason::fallback_ineligible_baseline);
+
+    const auto optimization_input = placement_input(
+        members, 2, 3, 0xD23, "performance-fallback-rank-sensitive-v1");
+    CHECK(tree_fingerprint(hotstuff::build_tree_placement(
+              optimization_input, ascending, PerformanceOptimizationPolicy{})) !=
+          tree_fingerprint(hotstuff::build_tree_placement(
+              optimization_input, permuted, PerformanceOptimizationPolicy{})));
+}
+
 TEST_CASE("optimization chooses exactly the highest-ranked eligible roots",
           "[t10][tree-policy][optimization][fr7][intentional-red]")
 {

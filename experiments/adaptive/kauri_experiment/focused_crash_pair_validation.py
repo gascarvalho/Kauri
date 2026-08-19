@@ -1486,7 +1486,7 @@ def _fcrash_h_witness_from_events(
         if _is_v6_contract(contract):
             witness["eligible_guard_drawdowns"] = {
                 str(target): -sum(row["observed_replica_id"] == target for row in rows)
-                for target in tuple(contract["target_replica_ids"])
+                for target in tuple(contract["targets"])
             }
         if coverage.get("required_postfault_tree_positions") is not None:
             witness["postfault_progress"] = _fcrash_h_postfault_progress(
@@ -2308,7 +2308,12 @@ def _containment_roots(
     if len(set(eligible)) != len(eligible):
         _error("containment ranking duplicates an eligible replica")
     preserved = {root for root in baseline if root in eligible}
-    replacements = iter(replica for replica in eligible if replica not in preserved)
+    replacement_ids = tuple(replica for replica in eligible if replica not in preserved)
+    if _is_v6_contract(contract):
+        # v6 freezes the native containment fallback independently of scorer
+        # order.  Healthy baseline roots still retain their tree slots.
+        replacement_ids = tuple(sorted(replacement_ids))
+    replacements = iter(replacement_ids)
     roots: list[int] = []
     for root in baseline:
         if root in preserved:

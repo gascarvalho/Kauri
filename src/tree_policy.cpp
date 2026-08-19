@@ -241,6 +241,11 @@ RootPlan containment_roots(
     RootPlan plan;
     plan.roots.resize(input.shape.tree_count);
     plan.decisions.reserve(input.shape.tree_count);
+    auto fallback_eligible = validated.eligible;
+    std::sort(fallback_eligible.begin(), fallback_eligible.end(),
+        [](const auto *left, const auto *right) {
+            return left->replica_id < right->replica_id;
+        });
     std::set<ReplicaID> chosen = reserved;
     for (std::size_t tree = 0; tree < baselines.size(); ++tree)
     {
@@ -269,12 +274,12 @@ RootPlan containment_roots(
             }
 
             const auto replacement = std::find_if(
-                validated.eligible.begin(),
-                validated.eligible.end(),
+                fallback_eligible.begin(),
+                fallback_eligible.end(),
                 [&chosen](const auto *score) {
                     return chosen.count(score->replica_id) == 0;
                 });
-            if (replacement == validated.eligible.end())
+            if (replacement == fallback_eligible.end())
                 reject("tree policy has insufficient eligible roots");
             selected = (*replacement)->replica_id;
             chosen.insert(selected);

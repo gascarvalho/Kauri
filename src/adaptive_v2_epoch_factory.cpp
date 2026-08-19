@@ -629,6 +629,7 @@ bool exact_containment_placement(
             eligible_roots.push_back(entry.replica_id);
         }
     }
+    std::sort(eligible_roots.begin(), eligible_roots.end());
     const std::set<ReplicaID> eligible(
         eligible_roots.begin(), eligible_roots.end());
     std::vector<bool> preserve(baselines->size(), false);

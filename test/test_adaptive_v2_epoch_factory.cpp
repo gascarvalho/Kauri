@@ -317,12 +317,41 @@ AdaptiveV2SelectionResult campaign_inherited_selection(
 
 AdaptiveV2SelectionResult successful_selection(
     const EpochDefinition &current,
-    std::vector<ReplicaID> selected_replicas = {0, 1})
+    std::vector<ReplicaID> selected_replicas = {0, 1},
+    std::vector<ReplicaID> responsive_rank_order = {})
 {
     const auto members = membership();
     std::sort(selected_replicas.begin(), selected_replicas.end());
     const std::set<ReplicaID> selected(
         selected_replicas.begin(), selected_replicas.end());
+    if (responsive_rank_order.empty())
+    {
+        for (const auto replica : members)
+        {
+            if (selected.count(replica) == 0)
+                responsive_rank_order.push_back(replica);
+        }
+    }
+    REQUIRE(responsive_rank_order.size() ==
+            members.size() - selected.size());
+    std::set<ReplicaID> expected_responsive;
+    for (const auto replica : members)
+    {
+        if (selected.count(replica) == 0)
+            expected_responsive.insert(replica);
+    }
+    REQUIRE(std::set<ReplicaID>(
+                responsive_rank_order.begin(),
+                responsive_rank_order.end()) ==
+            expected_responsive);
+    const auto responsive_rank = [&responsive_rank_order](ReplicaID replica) {
+        const auto position = std::find(
+            responsive_rank_order.begin(), responsive_rank_order.end(),
+            replica);
+        REQUIRE(position != responsive_rank_order.end());
+        return static_cast<std::uint32_t>(std::distance(
+            responsive_rank_order.begin(), position));
+    };
     const AdaptationEpochId epoch{
         current.epoch_number(), current.epoch_digest()};
     std::vector<AcceptedEvidenceRecord> records;
@@ -352,7 +381,8 @@ AdaptiveV2SelectionResult successful_selection(
             else
             {
                 observation.outcome = ResponseOutcome::on_time;
-                observation.response_duration_us = 20 + target;
+                observation.response_duration_us =
+                    20 + responsive_rank(target);
                 observation.signer_set = {target};
             }
             observation.observation_id =
@@ -1119,6 +1149,29 @@ TEST_CASE(
         CHECK(candidate.wait_exempt_leaves ==
               std::vector<ReplicaID>{6});
     }
+}
+
+TEST_CASE("factory verifies canonical containment fallback roots",
+          "[adaptive-v2][epoch-factory][containment][fallback][n7]")
+{
+    Fixture fixture;
+    // Construct a valid snapshot with the d23-style survivor order.  The
+    // policy must nevertheless use ID-canonical fallback roots, so deleting
+    // the factory verifier's canonical sort makes this test fail.
+    fixture.selection = successful_selection(
+        *fixture.current, {0, 1}, {6, 5, 2, 3, 4});
+    hotstuff::AdaptiveV2TransitionPolicy policy;
+    policy.intent = TreePolicyKind::fault_containment;
+    policy.containment_baseline_roots = {
+        BaselineRoot{0, 0}, BaselineRoot{1, 1}, BaselineRoot{2, 2},
+        BaselineRoot{3, 3}, BaselineRoot{4, 4}};
+    const auto result = hotstuff::build_adaptive_v2_successor_bundle(
+        *fixture.current, fixture.selection, policy, fixture.placement, 5,
+        kIssuerId, fixture.key, fixture.limits);
+    REQUIRE(result);
+    REQUIRE(result.bundle != nullptr);
+    CHECK(bundle_roots(*result.bundle) ==
+          std::vector<ReplicaID>{5, 6, 2, 3, 4});
 }
 
 TEST_CASE(
