@@ -3927,6 +3927,47 @@ def test_v4_manager_binds_the_profile_tree_horizon(tmp_path: Path) -> None:
         )
 
 
+def test_v7_manager_launch_boundary_accepts_snapshot_basis(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(
+        N7_PROFILE_V3.with_name("n7-f2-q5-two-crash-pair-smoke-v7.json")
+    )
+    adapter = runtime._profiled_adapter(profile, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
+    arm_path = tmp_path / "runtime" / "fault-window-arm.json"
+    arm_path.parent.mkdir()
+    argv = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm="control",
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=tmp_path,
+        run_id="run-v7",
+        source_instance="manager-v7",
+        fault_window_arm_path=arm_path.resolve(),
+        request_sha256="a" * 64,
+    )
+    manager_input = {
+        "input_source": "normalized_manager_launch_boundary_v1",
+        "requested_argv": list(argv),
+        "observed_argv": list(argv),
+        "stdin": "closed",
+    }
+    proof = runtime._validate_manager_launch_boundary(
+        argv,
+        argv,
+        manager_input=manager_input,
+        forbidden_values=(),
+    )
+    pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
+    assert pairs["--fault-window-arm-snapshot-evidence-basis"] == (
+        "exact_post_fault_attempt_start_v1"
+    )
+    assert proof["blinded"] is True
+
+
 def _membership_digest(replica_count: int) -> str:
     payload = b"kauri-membership-v1" + native_fixture._u(replica_count, 4)
     payload += b"".join(

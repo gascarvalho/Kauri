@@ -5817,6 +5817,7 @@ def _validate_manager_launch_boundary(
         "--fault-window-arm-clock-domain",
         "--fault-window-arm-required-observation-schema",
         "--fault-window-arm-timeout-evidence-basis",
+        "--fault-window-arm-snapshot-evidence-basis",
         "--replica",
     }
     if len(requested) % 2 == 0:
