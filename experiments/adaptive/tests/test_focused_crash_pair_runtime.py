@@ -43,6 +43,58 @@ N7_PROFILE_V9 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v9.json"
 N31_PROFILE_V9 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v9.json"
 
 
+def test_v9_inherited_cohort_binds_leaves_without_inventing_suffix_order() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V9)
+    trees = (
+        SimpleNamespace(
+            fanout=2,
+            pipeline_stretch=2,
+            members=(5, 2, 3, 6, 4, 1, 0),
+            wait_exempt=(0, 1),
+        ),
+        SimpleNamespace(
+            fanout=2,
+            pipeline_stretch=2,
+            members=(6, 4, 5, 2, 1, 3, 0),
+            wait_exempt=(0, 1),
+        ),
+        SimpleNamespace(
+            fanout=2,
+            pipeline_stretch=2,
+            members=(2, 3, 6, 0, 5, 4, 1),
+            wait_exempt=(0, 1),
+        ),
+        SimpleNamespace(
+            fanout=2,
+            pipeline_stretch=2,
+            members=(3, 2, 4, 5, 6, 1, 0),
+            wait_exempt=(0, 1),
+        ),
+        SimpleNamespace(
+            fanout=2,
+            pipeline_stretch=2,
+            members=(4, 5, 6, 2, 0, 3, 1),
+            wait_exempt=(0, 1),
+        ),
+    )
+
+    assert runtime._v9_inherited_cohort(profile, SimpleNamespace(trees=trees)) == (
+        0,
+        1,
+    )
+
+    invalid = list(trees)
+    invalid[0] = SimpleNamespace(
+        fanout=2,
+        pipeline_stretch=2,
+        members=(5, 0, 3, 6, 4, 1, 2),
+        wait_exempt=(0, 1),
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="leaf placement"):
+        runtime._v9_inherited_cohort(profile, SimpleNamespace(trees=tuple(invalid)))
+
+
 def test_v7_profiles_bind_arm_v3_and_independently_recomputed_n31_metric() -> None:
     runtime = _runtime()
     validator = importlib.import_module(

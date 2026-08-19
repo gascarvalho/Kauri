@@ -1332,7 +1332,6 @@ def _v9_inherited_cohort(profile: FocusedProfile, decoded: Any) -> tuple[int, ..
             or tuple(tree.wait_exempt) != cohort
             or len(tree.members) != len(profile.replica_ids)
             or set(tree.members) != members
-            or tuple(tree.members[-len(cohort) :]) != cohort
             or any(target not in tree.members[first_leaf:] for target in cohort)
             for tree in decoded.trees
         )
