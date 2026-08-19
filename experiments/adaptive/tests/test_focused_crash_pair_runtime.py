@@ -2913,6 +2913,357 @@ def test_n31_cached_baseline_rejects_spoofed_live_barrier_identity(
         source.poll("baseline")
 
 
+def _n31_transition_exit_fixture(
+    tmp_path: Path,
+    *,
+    missing: tuple[int, ...],
+    manager_returncode: int = 0,
+    terminal_outcome: str = "advanced",
+) -> tuple[Any, object, list[dict[str, object]]]:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N31_PROFILE_V12)
+    root = tmp_path / "transition-exit"
+    (root / "raw").mkdir(parents=True)
+    (root / "runtime").mkdir()
+    epoch_digest = "b" * 64
+    payload_digest = "c" * 64
+    decoded = SimpleNamespace(
+        epoch_digest=epoch_digest,
+        previous_epoch_digest=profile.raw["topology"]["epoch_zero_digest"],
+        command=SimpleNamespace(
+            payload_digest=payload_digest,
+            activation_delay_blocks=5,
+        ),
+    )
+    survivors = tuple(
+        replica
+        for replica in profile.replica_ids
+        if replica not in profile.target_replica_ids
+    )
+    events: list[dict[str, object]] = [
+        {
+            "source_kind": "replica",
+            "source_id": f"replica-{replica}",
+            "source_instance": f"replica-{replica}-instance",
+            "source_sequence": 1,
+            "source_monotonic_ns": 100 + replica,
+            "event_type": "epoch.activated",
+            "payload": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": epoch_digest,
+                "activation_height": 15,
+            },
+        }
+        for replica in survivors
+        if replica not in missing
+    ]
+    terminal = {
+        "cycle_ordinal": 0,
+        "policy_intent": "fault_containment",
+        "outcome": terminal_outcome,
+        "reason": (
+            "successor_converged" if terminal_outcome == "advanced" else "caller_failed"
+        ),
+        "transition_artifact_id": "e0-to-e1-containment",
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": epoch_digest,
+        "command_payload_digest": payload_digest,
+        "winning_activation": {},
+        "evidence_window_activation_generation": 1,
+        "baseline_evidence_cutoff": 1,
+        "current_evidence_cutoff": 2,
+        "controller_failure": (
+            None if terminal_outcome == "advanced" else {"stage": "caller_failed"}
+        ),
+    }
+    events.extend(
+        [
+            {
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "manager-instance",
+                "source_sequence": 1,
+                "source_monotonic_ns": 200,
+                "event_type": "adaptive_v2_session_terminal",
+                "payload": terminal,
+            },
+            {
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "manager-instance",
+                "source_sequence": 2,
+                "source_monotonic_ns": 201,
+                "event_type": "process.stopping",
+                "payload": {"exit_status": None},
+            },
+            {
+                "source_kind": "adaptation_manager",
+                "source_id": "adaptive-manager",
+                "source_instance": "manager-instance",
+                "source_sequence": 3,
+                "source_monotonic_ns": 202,
+                "event_type": "process.stopped",
+                "payload": {"exit_status": None},
+            },
+        ]
+    )
+
+    def process(returncode: int, pid: int) -> object:
+        return SimpleNamespace(pid=pid, poll=lambda: returncode)
+
+    records = [
+        SimpleNamespace(
+            name="adaptive-manager",
+            replica_id=-1,
+            pid=900,
+            pgid=900,
+            process=process(manager_returncode, 900),
+        ),
+    ]
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._root = root
+    source._profile = profile
+    source._arm = "C"
+    source._process_records = tuple(records)
+    source._expected_source_instances = {}
+    source._persist_exit_diagnostics = True
+    source._persisted_natural_exit_identities = set()
+    source._bundle = lambda epoch: (b"epoch-1", decoded)
+    source._events = lambda: events
+    source._reject_post_fault_target_events = lambda _events: None
+    return runtime, source, events
+
+
+def test_n31_successful_manager_exit_reports_exact_incomplete_survivor_barrier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime, source, _events = _n31_transition_exit_fixture(
+        tmp_path, missing=(26, 28)
+    )
+    source._manager_successfully_stopped = lambda _events: True
+    monkeypatch.setattr(
+        runtime.profiled_fault_runtime,
+        "monotonic_raw_ns",
+        lambda: 301,
+    )
+
+    with pytest.raises(
+        runtime.FocusedIncompleteTransitionError,
+        match=r"Epoch 1 activation barrier is incomplete; missing survivor IDs \[26, 28\]",
+    ):
+        source.poll("activations1")
+
+    paths = list((source._root / "runtime" / "natural-process-exits").glob("*.json"))
+    assert len(paths) == 1
+    diagnostic = json.loads(paths[0].read_text())
+    assert diagnostic["clock_domain"] == "same_host_clock_monotonic_raw"
+    assert diagnostic["replica_id"] == -1
+    assert diagnostic["detected_monotonic_raw_ns"] == 301
+    assert set(diagnostic) == {
+        "schema_version",
+        "kind",
+        "clock_domain",
+        "process_identity",
+        "name",
+        "replica_id",
+        "pid",
+        "pgid",
+        "returncode",
+        "detected_monotonic_raw_ns",
+    }
+
+
+def test_n31_transition_barrier_accepts_all_28_survivors(tmp_path: Path) -> None:
+    _runtime_module, source, events = _n31_transition_exit_fixture(
+        tmp_path, missing=()
+    )
+    snapshot = source._transition(events, 1, activation=True)
+    assert snapshot is not None
+    assert snapshot["witness_count"] == 28
+    assert snapshot["survivor_replica_ids"] == [
+        replica
+        for replica in source._profile.replica_ids
+        if replica not in source._profile.target_replica_ids
+    ]
+
+
+@pytest.mark.parametrize(
+    ("manager_returncode", "terminal_outcome"),
+    ((1, "advanced"), (0, "failed")),
+)
+def test_n31_manager_failures_do_not_masquerade_as_incomplete_barriers(
+    tmp_path: Path,
+    manager_returncode: int,
+    terminal_outcome: str,
+) -> None:
+    runtime, source, _events = _n31_transition_exit_fixture(
+        tmp_path,
+        missing=(26, 28),
+        manager_returncode=manager_returncode,
+        terminal_outcome=terminal_outcome,
+    )
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError, match="unexpected process exit"
+    ) as raised:
+        source.poll("activations1")
+    assert not isinstance(raised.value, runtime.FocusedIncompleteTransitionError)
+
+
+def test_n31_incomplete_barrier_diagnosis_requires_manager_as_sole_exit(
+    tmp_path: Path,
+) -> None:
+    runtime, source, _events = _n31_transition_exit_fixture(
+        tmp_path, missing=(26, 28)
+    )
+    source._manager_successfully_stopped = lambda _events: True
+    survivor_process = SimpleNamespace(pid=1_020, poll=lambda: 1)
+    source._process_records += (
+        SimpleNamespace(
+            name="replica-20",
+            replica_id=20,
+            pid=1_020,
+            pgid=1_020,
+            process=survivor_process,
+        ),
+    )
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError, match="unexpected process exit"
+    ) as raised:
+        source.poll("activations1")
+    assert not isinstance(raised.value, runtime.FocusedIncompleteTransitionError)
+    assert len(
+        list(
+            (source._root / "runtime" / "natural-process-exits").glob("*.json")
+        )
+    ) == 2
+
+
+@pytest.mark.parametrize(
+    ("missing", "disposition", "message"),
+    (
+        ((26, 28), "incomplete_after_cleanup", "final post-cleanup missing"),
+        ((), "completed_during_cleanup", "completed before cleanup"),
+    ),
+)
+def test_abort_barrier_materialization_replays_closed_identity_bound_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    missing: tuple[int, ...],
+    disposition: str,
+    message: str,
+) -> None:
+    runtime = _runtime()
+    root = tmp_path / disposition
+    (root / "runtime").mkdir(parents=True)
+    captured: dict[str, object] = {}
+    barriers = [
+        {
+            "phase": "commands1",
+            "epoch_number": 1,
+            "transition_kind": "command",
+            "missing_survivor_ids": [],
+        },
+        {
+            "phase": "activations1",
+            "epoch_number": 1,
+            "transition_kind": "activation",
+            "missing_survivor_ids": list(missing),
+        },
+    ]
+
+    class ClosedSource:
+        def __init__(
+            self,
+            run_directory: Path,
+            *,
+            process_records: tuple[object, ...],
+            expected_run_id: str,
+            expected_source_instances: Mapping[str, str],
+        ) -> None:
+            captured.update(
+                root=run_directory,
+                process_records=process_records,
+                run_id=expected_run_id,
+                source_instances=dict(expected_source_instances),
+            )
+            self._profile = SimpleNamespace(
+                replica_ids=tuple(range(31)), target_replica_ids=(22, 23, 24)
+            )
+
+        def _events(self) -> list[dict[str, object]]:
+            return [{"event_type": "closed"}]
+
+        def _reject_post_fault_target_events(self, _events: object) -> None:
+            return None
+
+        def _transition_barrier_states(
+            self, _events: object
+        ) -> list[dict[str, object]]:
+            return barriers
+
+    monkeypatch.setattr(runtime, "FocusedRawEvidenceSource", ClosedSource)
+    error = runtime.FocusedIncompleteTransitionError(
+        "activations1",
+        1,
+        True,
+        (26, 28),
+        live_raw_event_stream_sha256="a" * 64,
+        live_source_cutoffs=(
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": "replica-instance",
+                "source_sequence": 7,
+                "source_monotonic_ns": 70,
+            },
+        ),
+    )
+    runtime.FocusedLaunchBackend().materialize_abort_artifacts(
+        {
+            "run_directory": root,
+            "run_id": "run-identity",
+            "source_instances": {
+                "adaptive-manager": "manager-instance",
+                "replica-0": "replica-instance",
+            },
+        },
+        error,
+    )
+    assert captured == {
+        "root": root,
+        "process_records": (),
+        "run_id": "run-identity",
+        "source_instances": {
+            "adaptive-manager": "manager-instance",
+            "replica-0": "replica-instance",
+        },
+    }
+    document = json.loads(
+        (root / "runtime" / "incomplete-transition-barrier.json").read_text()
+    )
+    assert document["disposition"] == disposition
+    assert document["barriers"] == barriers
+    assert document["missing_survivor_ids"] == list(missing)
+    assert document["live_observation"] == {
+        "missing_survivor_ids": [26, 28],
+        "raw_event_stream_sha256": "a" * 64,
+        "source_cutoffs": [
+            {
+                "source_kind": "replica",
+                "source_id": "replica-0",
+                "source_instance": "replica-instance",
+                "source_sequence": 7,
+                "source_monotonic_ns": 70,
+            }
+        ],
+    }
+    assert error.live_missing_survivor_ids == (26, 28)
+    assert message in str(error)
+
+
 def _write_exact_live_tail_set(
     root: Path, profile: object, *, run_id: str = "run-a"
 ) -> object:

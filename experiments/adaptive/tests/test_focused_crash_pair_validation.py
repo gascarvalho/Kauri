@@ -3900,6 +3900,165 @@ def test_manager_clean_exit_requires_completed_native_transition_and_exact_tail(
     assert source.unexpected_exit_ids() == (-1,)
 
 
+def test_manager_clean_exit_reports_exact_26_of_28_activation_barrier(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "control"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory)
+    profile = json.loads((directory / "profile.json").read_text(encoding="utf-8"))
+    survivors = tuple(
+        replica
+        for replica in range(profile["protocol"]["N"])
+        if replica not in profile["topology"]["reviewed_target_replica_ids"]
+    )
+    assert len(survivors) == 28
+    missing = survivors[-2:]
+    events = _load_events(directory)
+    for replica in missing:
+        source_id = f"replica-{replica}"
+        removed = next(
+            event
+            for event in events
+            if event["source_id"] == source_id
+            and event["event_type"] == "epoch.activated"
+            and event["payload"]["epoch_number"] == 1
+        )
+        removed_sequence = int(removed["source_sequence"])
+        events.remove(removed)
+        for event in events:
+            if (
+                event["source_id"] == source_id
+                and int(event["source_sequence"]) > removed_sequence
+            ):
+                event["source_sequence"] = int(event["source_sequence"]) - 1
+    _write_events(directory, events)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    record = runtime_fixture.SimpleNamespace(
+        name="adaptive-manager",
+        replica_id=-1,
+        pid=20_001,
+        pgid=20_001,
+        process=process,
+    )
+    runtime = runtime_fixture._runtime()
+    source = runtime.FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(record,),
+    )
+    final_events = source._events()
+    assert source._transition_missing_survivor_ids(
+        final_events, 1, activation=True
+    ) == missing
+    assert source._manager_successfully_stopped(final_events)
+    with pytest.raises(
+        runtime.FocusedIncompleteTransitionError,
+        match=rf"missing survivor IDs \[{missing[0]}, {missing[1]}\]",
+    ):
+        source.poll("activations1")
+
+
+def test_adaptive_manager_diagnoses_26_of_28_across_all_four_barriers(
+    tmp_path: Path,
+) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    _append_successful_manager_shutdown(directory, epochs=(1, 2))
+    source_without_processes = _raw_source(directory)
+    survivors = tuple(
+        replica
+        for replica in source_without_processes._profile.replica_ids
+        if replica not in source_without_processes._profile.target_replica_ids
+    )
+    assert len(survivors) == 28
+    missing = survivors[-2:]
+    events = _load_events(directory)
+    for replica in missing:
+        source_id = f"replica-{replica}"
+        for epoch, event_type, number_key in (
+            (1, "epoch.command_committed", "successor_epoch_number"),
+            (1, "epoch.activated", "epoch_number"),
+            (2, "epoch.command_committed", "successor_epoch_number"),
+            (2, "epoch.activated", "epoch_number"),
+        ):
+            removed = next(
+                event
+                for event in events
+                if event["source_id"] == source_id
+                and event["event_type"] == event_type
+                and event["payload"][number_key] == epoch
+            )
+            removed_sequence = int(removed["source_sequence"])
+            events.remove(removed)
+            for event in events:
+                if (
+                    event["source_id"] == source_id
+                    and int(event["source_sequence"]) > removed_sequence
+                ):
+                    event["source_sequence"] = int(event["source_sequence"]) - 1
+    _write_events(directory, events)
+    process = runtime_fixture._FakeProcess(20_001)
+    process.returncode = 0
+    runtime = runtime_fixture._runtime()
+    source = runtime.FocusedRawEvidenceSource(
+        run_directory=directory,
+        poll_interval_s=0,
+        timeout_s=1,
+        process_records=(
+            runtime_fixture.SimpleNamespace(
+                name="adaptive-manager",
+                replica_id=-1,
+                pid=20_001,
+                pgid=20_001,
+                process=process,
+            ),
+        ),
+    )
+    final_events = source._events()
+    assert source._manager_successfully_stopped(final_events)
+    assert source._transition_barrier_states(final_events) == [
+        {
+            "phase": phase,
+            "epoch_number": epoch,
+            "transition_kind": kind,
+            "missing_survivor_ids": list(missing),
+        }
+        for phase, epoch, kind in (
+            ("commands1", 1, "command"),
+            ("activations1", 1, "activation"),
+            ("commands2", 2, "command"),
+            ("activations2", 2, "activation"),
+        )
+    ]
+    with pytest.raises(
+        runtime.FocusedIncompleteTransitionError,
+        match=rf"Epoch 1 command barrier.*\[{missing[0]}, {missing[1]}\]",
+    ):
+        source.poll("commands1")
+
+    terminal = next(
+        event
+        for event in final_events
+        if event["event_type"] == "adaptive_v2_session_terminal"
+        and event["payload"]["successor_epoch_number"] == 2
+    )
+    terminal["payload"]["winning_activation"]["successor_epoch_digest"] = "f" * 64
+    assert not source._manager_successfully_stopped(final_events)
+
+
 def _clean_manager_source(directory: Path, *, returncode: int) -> object:
     process = runtime_fixture._FakeProcess(20_001)
     process.returncode = returncode

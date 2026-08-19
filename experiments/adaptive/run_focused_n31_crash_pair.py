@@ -605,6 +605,16 @@ def _execute_focused(
                 and plan is not None
             ):
                 try:
+                    materialize_abort = getattr(
+                        backend, "materialize_abort_artifacts", None
+                    )
+                    if (
+                        cleanup_error is None
+                        and cleanup is not None
+                        and cleanup.get("complete") is True
+                        and callable(materialize_abort)
+                    ):
+                        materialize_abort(configuration, execution_error)
                     _finalize_campaign_abort(
                         output_root=output_root,
                         plan=plan,
@@ -643,6 +653,16 @@ def _execute_focused(
                 and invocation.get("mode") in {"smoke", "pair"}
             ):
                 try:
+                    materialize_abort = getattr(
+                        backend, "materialize_abort_artifacts", None
+                    )
+                    if (
+                        cleanup_error is None
+                        and cleanup is not None
+                        and cleanup.get("complete") is True
+                        and callable(materialize_abort)
+                    ):
+                        materialize_abort(configuration, execution_error)
                     _finalize_pair_abort(
                         output_root=output_root,
                         slot=slot,

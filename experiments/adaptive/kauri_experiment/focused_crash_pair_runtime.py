@@ -121,6 +121,49 @@ class FocusedCrashPairRuntimeError(RuntimeError):
     """The focused runtime input or observed execution state is invalid."""
 
 
+class FocusedIncompleteTransitionError(FocusedCrashPairRuntimeError):
+    """A successful manager stopped before every survivor witnessed a transition."""
+
+    def __init__(
+        self,
+        phase: str,
+        epoch: int,
+        activation: bool,
+        missing_survivor_ids: Sequence[int],
+        *,
+        live_raw_event_stream_sha256: str,
+        live_source_cutoffs: Sequence[Mapping[str, object]],
+    ) -> None:
+        self.phase = phase
+        self.epoch = epoch
+        self.activation = activation
+        self.live_missing_survivor_ids = tuple(sorted(missing_survivor_ids))
+        self.live_raw_event_stream_sha256 = live_raw_event_stream_sha256
+        self.live_source_cutoffs = tuple(dict(item) for item in live_source_cutoffs)
+        kind = "activation" if activation else "command"
+        super().__init__(
+            f"Epoch {epoch} {kind} barrier is incomplete; "
+            f"missing survivor IDs {list(self.live_missing_survivor_ids)}"
+        )
+
+    def bind_final_replay(self, missing_survivor_ids: Sequence[int]) -> None:
+        """Update the human diagnosis without overwriting the live observation."""
+
+        self.final_missing_survivor_ids = tuple(sorted(missing_survivor_ids))
+        kind = "activation" if self.activation else "command"
+        if self.final_missing_survivor_ids:
+            message = (
+                f"Epoch {self.epoch} {kind} barrier is incomplete; final post-cleanup "
+                f"missing survivor IDs {list(self.final_missing_survivor_ids)}"
+            )
+        else:
+            message = (
+                f"Epoch {self.epoch} {kind} barrier was incomplete at manager exit "
+                "but completed before cleanup; final missing survivor IDs []"
+            )
+        self.args = (message,)
+
+
 def _error(message: str) -> None:
     raise FocusedCrashPairRuntimeError(message)
 
@@ -163,6 +206,36 @@ def _canonical_json(value: object) -> bytes:
         )
     except (TypeError, ValueError) as exc:
         raise FocusedCrashPairRuntimeError("document is not canonical JSON") from exc
+
+
+def _raw_event_source_cutoffs(
+    events: Sequence[Mapping[str, Any]],
+) -> list[dict[str, object]]:
+    """Bind a live aggregate replay to each authenticated source tail."""
+
+    tails: dict[tuple[str, str, str], tuple[int, int]] = {}
+    for event in events:
+        key = (
+            str(event["source_kind"]),
+            str(event["source_id"]),
+            str(event["source_instance"]),
+        )
+        value = (
+            _integer(event["source_sequence"], "source cutoff sequence", 1),
+            _integer(event["source_monotonic_ns"], "source cutoff timestamp", 1),
+        )
+        if key not in tails or value[0] > tails[key][0]:
+            tails[key] = value
+    return [
+        {
+            "source_kind": key[0],
+            "source_id": key[1],
+            "source_instance": key[2],
+            "source_sequence": value[0],
+            "source_monotonic_ns": value[1],
+        }
+        for key, value in sorted(tails.items())
+    ]
 
 
 def _sha256(value: bytes) -> str:
@@ -3268,6 +3341,8 @@ class FocusedRawEvidenceSource:
         self._process_records = tuple(process_records)
         self._expected_run_id = expected_run_id
         self._expected_source_instances = dict(expected_source_instances or {})
+        self._persist_exit_diagnostics = True
+        self._persisted_natural_exit_identities: set[tuple[int, int, int]] = set()
         if self._timeout_s <= 0:
             _error("raw evidence polling timeout must be positive")
         profile_path = self._root / "profile.json"
@@ -4699,6 +4774,7 @@ class FocusedRawEvidenceSource:
         epoch: int,
         *,
         activation: bool,
+        diagnostic_allow_incomplete: bool = False,
     ) -> dict[str, object] | None:
         wire, decoded = self._bundle(epoch)
         event_type = "epoch.activated" if activation else "epoch.command_committed"
@@ -4823,12 +4899,16 @@ class FocusedRawEvidenceSource:
             payloads.add(_canonical_json(payload))
         if len(payloads) != 1:
             _error(f"raw Epoch {epoch} transition payloads conflict")
-        if source_ids != expected_sources:
+        if source_ids != expected_sources and not diagnostic_allow_incomplete:
             return None
         payload = _document(selected[0]["payload"], "transition payload")
         snapshot = {
-            "survivor_replica_ids": list(survivors),
-            "witness_count": len(survivors),
+            "survivor_replica_ids": [
+                replica
+                for replica in survivors
+                if f"replica-{replica}" in source_ids
+            ],
+            "witness_count": len(source_ids),
             "successor_epoch_number": epoch,
             "successor_epoch_digest": decoded.epoch_digest,
             "bundle_sha256": _sha256(wire),
@@ -5229,7 +5309,11 @@ class FocusedRawEvidenceSource:
         return snapshot
 
     def _manager_clean_exit_is_expected(
-        self, events: Sequence[Mapping[str, Any]], record: object
+        self,
+        events: Sequence[Mapping[str, Any]],
+        record: object,
+        *,
+        diagnostic_allow_incomplete_transitions: bool = False,
     ) -> bool:
         """Accept only a fully witnessed, successful manager completion."""
 
@@ -5248,6 +5332,9 @@ class FocusedRawEvidenceSource:
                     {
                         "arm": self._arm,
                         "returncode": 0,
+                        "diagnostic_allow_incomplete_transitions": (
+                            diagnostic_allow_incomplete_transitions
+                        ),
                         "bundles": {
                             str(epoch): _sha256(self._bundle(epoch)[0])
                             for epoch in expected_epochs
@@ -5353,8 +5440,22 @@ class FocusedRawEvidenceSource:
                     or payload.get("controller_failure") is not None
                 ):
                     return False
-                command = self._transition(events, epoch, activation=False)
-                activation = self._transition(events, epoch, activation=True)
+                command = self._transition(
+                    events,
+                    epoch,
+                    activation=False,
+                    diagnostic_allow_incomplete=(
+                        diagnostic_allow_incomplete_transitions
+                    ),
+                )
+                activation = self._transition(
+                    events,
+                    epoch,
+                    activation=True,
+                    diagnostic_allow_incomplete=(
+                        diagnostic_allow_incomplete_transitions
+                    ),
+                )
                 if command is None or activation is None:
                     return False
                 ranking = self._ranking(events, predecessor_epoch=epoch - 1)
@@ -5694,12 +5795,153 @@ class FocusedRawEvidenceSource:
         except (FocusedCrashPairRuntimeError, KeyError, StopIteration, TypeError):
             return False
 
+    def _manager_successfully_stopped(
+        self,
+        events: Sequence[Mapping[str, Any]],
+    ) -> bool:
+        """Reuse the full clean-exit proof with diagnostic-only partial barriers."""
+
+        records = [
+            record
+            for record in self._process_records
+            if getattr(record, "name", None) == "adaptive-manager"
+            and getattr(record, "replica_id", None) == -1
+        ]
+        return len(records) == 1 and self._manager_clean_exit_is_expected(
+            events,
+            records[0],
+            diagnostic_allow_incomplete_transitions=True,
+        )
+
+    def _transition_missing_survivor_ids(
+        self,
+        events: Sequence[Mapping[str, Any]],
+        epoch: int,
+        *,
+        activation: bool,
+    ) -> tuple[int, ...]:
+        """Validate a transition prefix and return its exact absent survivors."""
+
+        if self._transition(events, epoch, activation=activation) is not None:
+            return ()
+        event_type = "epoch.activated" if activation else "epoch.command_committed"
+        number_key = "epoch_number" if activation else "successor_epoch_number"
+        observed = {
+            int(str(event["source_id"]).removeprefix("replica-"))
+            for event in events
+            if event.get("event_type") == event_type
+            and _document(event.get("payload"), "transition payload").get(number_key)
+            == epoch
+        }
+        survivors = {
+            replica
+            for replica in self._profile.replica_ids
+            if replica not in self._profile.target_replica_ids
+        }
+        return tuple(sorted(survivors - observed))
+
+    def _transition_barrier_states(
+        self, events: Sequence[Mapping[str, Any]]
+    ) -> list[dict[str, object]]:
+        """Reconstruct every expected transition barrier from one raw snapshot."""
+
+        epochs = (1, 2) if self._arm == "A" else (1,)
+        states: list[dict[str, object]] = []
+        for epoch in epochs:
+            for activation in (False, True):
+                missing = self._transition_missing_survivor_ids(
+                    events, epoch, activation=activation
+                )
+                states.append(
+                    {
+                        "phase": (
+                            f"activations{epoch}" if activation else f"commands{epoch}"
+                        ),
+                        "epoch_number": epoch,
+                        "transition_kind": (
+                            "activation" if activation else "command"
+                        ),
+                        "missing_survivor_ids": list(missing),
+                    }
+                )
+        return states
+
+    def _persist_natural_process_exits(
+        self, exits: Sequence[Mapping[str, object]]
+    ) -> None:
+        if not exits or not getattr(self, "_persist_exit_diagnostics", False):
+            return
+        directory = self._root / "runtime" / "natural-process-exits"
+        if directory.exists() and (not directory.is_dir() or directory.is_symlink()):
+            _error("natural process exit diagnostic directory is absent")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        persisted = getattr(self, "_persisted_natural_exit_identities", set())
+        for exit_document in exits:
+            identity = (
+                int(exit_document["replica_id"]),
+                int(exit_document["pid"]),
+                int(exit_document["pgid"]),
+            )
+            if identity in persisted:
+                continue
+            document = {
+                "schema_version": 1,
+                "kind": "kauri-focused-natural-process-exit-v1",
+                "clock_domain": "same_host_clock_monotonic_raw",
+                **dict(exit_document),
+            }
+            profiled_fault_runtime.write_exclusive(
+                directory
+                / f"replica-{identity[0]}-pid-{identity[1]}-pgid-{identity[2]}.json",
+                _canonical_json(document),
+            )
+            persisted.add(identity)
+        self._persisted_natural_exit_identities = persisted
+
     def unexpected_exit_ids(
         self, events: Sequence[Mapping[str, Any]] | None = None
     ) -> tuple[int, ...]:
         if events is None:
             events = self._events()
         unexpected: set[int] = set()
+        natural_exits: list[dict[str, object]] = []
+
+        def record_natural_exit(
+            record: object, process: object, replica: int, returncode: int
+        ) -> None:
+            if not getattr(self, "_persist_exit_diagnostics", False):
+                return
+            name = getattr(record, "name", None)
+            pid = getattr(record, "pid", getattr(process, "pid", None))
+            pgid = getattr(record, "pgid", None)
+            if (
+                not isinstance(name, str)
+                or not name
+                or type(pid) is not int
+                or pid <= 0
+                or type(pgid) is not int
+                or pgid <= 0
+                or type(returncode) is not int
+            ):
+                # Lightweight source-blind fixtures intentionally omit OS
+                # identity fields. Production ProcessRecord values are
+                # complete; an incomplete record remains fatal to health but
+                # cannot truthfully produce an OS-identity diagnostic.
+                return
+            natural_exits.append(
+                {
+                    "process_identity": f"{name}:{replica}:{pid}:{pgid}",
+                    "name": name,
+                    "replica_id": replica,
+                    "pid": pid,
+                    "pgid": pgid,
+                    "returncode": returncode,
+                    "detected_monotonic_raw_ns": (
+                        profiled_fault_runtime.monotonic_raw_ns()
+                    ),
+                }
+            )
+
         for record in self._process_records:
             replica = getattr(record, "replica_id", None)
             process = getattr(record, "process", None)
@@ -5726,9 +5968,11 @@ class FocusedRawEvidenceSource:
                         unexpected.update(self.unexpected_exit_ids(refreshed))
                         continue
                 unexpected.add(replica)
+                record_natural_exit(record, process, replica, returncode)
                 continue
             if replica < 0 or replica not in self._profile.target_replica_ids:
                 unexpected.add(replica)
+                record_natural_exit(record, process, replica, returncode)
                 continue
             receipt_path = self._root / "raw" / "fault-receipt.json"
             exempt = False
@@ -5771,6 +6015,8 @@ class FocusedRawEvidenceSource:
                     )
             if not exempt:
                 unexpected.add(replica)
+                record_natural_exit(record, process, replica, returncode)
+        self._persist_natural_process_exits(natural_exits)
         for event in events:
             if event["event_type"] != "process.exited":
                 continue
@@ -5895,6 +6141,29 @@ class FocusedRawEvidenceSource:
         self._reject_post_fault_target_events(events)
         unexpected = self.unexpected_exit_ids(events)
         if unexpected:
+            transition_phase = {
+                "commands1": (1, False),
+                "activations1": (1, True),
+                "commands2": (2, False),
+                "activations2": (2, True),
+            }.get(name)
+            if transition_phase is not None and unexpected == (-1,):
+                epoch, activation = transition_phase
+                if self._manager_successfully_stopped(events):
+                    missing = self._transition_missing_survivor_ids(
+                        events, epoch, activation=activation
+                    )
+                    if missing:
+                        raise FocusedIncompleteTransitionError(
+                            name,
+                            epoch,
+                            activation,
+                            missing,
+                            live_raw_event_stream_sha256=_sha256(
+                                _canonical_json(events)
+                            ),
+                            live_source_cutoffs=_raw_event_source_cutoffs(events),
+                        )
             _error("raw process health contains an unexpected process exit")
         expected_lifecycle = {
             **{
@@ -8231,6 +8500,75 @@ class FocusedLaunchBackend:
             "fault_receipt_sha256": _sha256(_canonical_json(fault_receipt)),
             "event_count": len(events),
         }
+
+    def materialize_abort_artifacts(
+        self,
+        configuration: Mapping[str, object],
+        runtime_error: FocusedCrashPairRuntimeError,
+    ) -> None:
+        """Materialize a final barrier diagnosis only after cleanup closed writers."""
+
+        if not isinstance(runtime_error, FocusedIncompleteTransitionError):
+            return
+        root = Path(configuration["run_directory"])
+        source = FocusedRawEvidenceSource(
+            root,
+            process_records=(),
+            expected_run_id=str(configuration["run_id"]),
+            expected_source_instances=_document(
+                configuration.get("source_instances"), "source instances"
+            ),
+        )
+        events = source._events()
+        source._reject_post_fault_target_events(events)
+        barrier_states = source._transition_barrier_states(events)
+        current_state = next(
+            state for state in barrier_states if state["phase"] == runtime_error.phase
+        )
+        missing = tuple(int(item) for item in current_state["missing_survivor_ids"])
+        any_incomplete = any(state["missing_survivor_ids"] for state in barrier_states)
+        survivors = tuple(
+            replica
+            for replica in source._profile.replica_ids
+            if replica not in source._profile.target_replica_ids
+        )
+        document = {
+            "schema_version": 1,
+            "kind": "kauri-focused-transition-barrier-final-state-v1",
+            "disposition": (
+                "incomplete_after_cleanup"
+                if any_incomplete
+                else "completed_during_cleanup"
+            ),
+            "phase": runtime_error.phase,
+            "epoch_number": runtime_error.epoch,
+            "transition_kind": (
+                "activation" if runtime_error.activation else "command"
+            ),
+            "expected_survivor_ids": list(survivors),
+            "observed_survivor_ids": [
+                replica for replica in survivors if replica not in set(missing)
+            ],
+            "missing_survivor_ids": list(missing),
+            "barriers": barrier_states,
+            "live_observation": {
+                "missing_survivor_ids": list(
+                    runtime_error.live_missing_survivor_ids
+                ),
+                "raw_event_stream_sha256": (
+                    runtime_error.live_raw_event_stream_sha256
+                ),
+                "source_cutoffs": [
+                    dict(item) for item in runtime_error.live_source_cutoffs
+                ],
+            },
+            "final_raw_event_stream_sha256": _sha256(_canonical_json(events)),
+        }
+        profiled_fault_runtime.write_exclusive(
+            root / "runtime" / "incomplete-transition-barrier.json",
+            _canonical_json(document),
+        )
+        runtime_error.bind_final_replay(missing)
 
     def cleanup(
         self,

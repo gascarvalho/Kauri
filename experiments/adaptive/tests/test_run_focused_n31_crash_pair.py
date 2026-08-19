@@ -903,6 +903,7 @@ class _PairAbortBackend(_RecordingLaunchBackend):
         )
         root = Path(context["output_root"]) / str(configuration["pair_id"]) / arm
         root.mkdir(parents=True, exist_ok=False)
+        (root / "runtime").mkdir()
         configuration["run_directory"] = root
         return configuration
 
@@ -911,6 +912,28 @@ class _PairAbortBackend(_RecordingLaunchBackend):
     ) -> Mapping[str, object]:
         self._record("run", configuration)
         if configuration["arm"] == self.failed_arm:
+            exit_directory = (
+                Path(configuration["run_directory"])
+                / "runtime"
+                / "natural-process-exits"
+            )
+            exit_directory.mkdir()
+            (exit_directory / "replica-26-pid-1026-pgid-1026.json").write_bytes(
+                _canonical(
+                    {
+                        "schema_version": 1,
+                        "kind": "kauri-focused-natural-process-exit-v1",
+                        "clock_domain": "same_host_clock_monotonic_raw",
+                        "process_identity": "replica-26:26:1026:1026",
+                        "name": "replica-26",
+                        "replica_id": 26,
+                        "pid": 1026,
+                        "pgid": 1026,
+                        "returncode": 1,
+                        "detected_monotonic_raw_ns": 123,
+                    }
+                )
+            )
             raise self.failure
         return {"runtime_graph": "complete"}
 
@@ -921,6 +944,27 @@ class _PairAbortBackend(_RecordingLaunchBackend):
         if self.cleanup_mode == "raises":
             raise RuntimeError("cleanup failed")
         return {"complete": self.cleanup_mode == "complete", "outcomes": []}
+
+    def materialize_abort_artifacts(
+        self,
+        configuration: Mapping[str, object],
+        _runtime_error: BaseException,
+    ) -> None:
+        self._record("materialize-abort", configuration)
+        path = (
+            Path(configuration["run_directory"])
+            / "runtime"
+            / "incomplete-transition-barrier.json"
+        )
+        path.write_bytes(
+            _canonical(
+                {
+                    "schema_version": 1,
+                    "kind": "kauri-focused-incomplete-transition-barrier-v1",
+                    "missing_survivor_ids": [26, 28],
+                }
+            )
+        )
 
     def seal(
         self,
@@ -952,6 +996,9 @@ def test_smoke_pair_runtime_abort_seals_only_quiescent_pair_prefix(
     runtime = importlib.import_module(
         "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
     )
+    archive = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.profiled_fault_archive"
+    )
     output = tmp_path / f"{mode}-{failed_arm}"
     backend = _PairAbortBackend(runtime, failed_arm=failed_arm)
 
@@ -979,6 +1026,18 @@ def test_smoke_pair_runtime_abort_seals_only_quiescent_pair_prefix(
     assert pair_abort["failed_arm"]["tree_sha256"] == failed_seal.tree_sha256
     assert pair_abort["failed_arm"]["seal_sha256"] == failed_seal.seal_sha256
     assert pair_seal.seal_sha256
+    assert (failed_root / "runtime" / "incomplete-transition-barrier.json").is_file()
+    natural_exit_path = (
+        failed_root
+        / "runtime"
+        / "natural-process-exits"
+        / "replica-26-pid-1026-pgid-1026.json"
+    )
+    original_exit_diagnostic = natural_exit_path.read_bytes()
+    natural_exit_path.write_bytes(original_exit_diagnostic + b" ")
+    with pytest.raises(archive.EvidenceSealError):
+        runner.verify_evidence_seal(failed_root)
+    natural_exit_path.write_bytes(original_exit_diagnostic)
     assert not (output / "campaign-ledger.jsonl").exists()
     assert not (output / "campaign-summary.json").exists()
     assert [call for call in backend.calls if call[0] == "configuration"] == [
