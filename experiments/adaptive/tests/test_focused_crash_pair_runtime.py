@@ -45,6 +45,200 @@ N7_PROFILE_V10 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v10.json"
 N31_PROFILE_V10 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v10.json"
 N7_PROFILE_V11 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v11.json"
 N31_PROFILE_V11 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v11.json"
+N7_PROFILE_V12 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v12.json"
+N31_PROFILE_V12 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v12.json"
+
+
+def test_v12_profiles_bind_exact_horizons_timers_and_all_candidate_capacity() -> None:
+    runtime = _runtime()
+    validator = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+    )
+    n7 = runtime.load_focused_profile(N7_PROFILE_V12)
+    n31 = runtime.load_focused_profile(N31_PROFILE_V12)
+    assert (n7.profile_sha256, n7.topology_proof_sha256) == (
+        "54a879d783e071da2fce59773c79439a691ed549b50296c6f1bcea848694e697",
+        "dc30f42f28d7228a44efe69f734cceebf965169202923b52c786f6e58e2e81d9",
+    )
+    assert (n31.profile_sha256, n31.topology_proof_sha256) == (
+        "2686e76451dea29018e33c87756b6c722badf82fd0d0c8f3500b860b424164ea",
+        "7dbab26b7272d3f31e8bbcb38dc5778fc3666f11d5d5586dae67f499547f3ca2",
+    )
+    assert n7.raw["fault_window_arm"]["ordered_tree_prefix"] == [6, 0, 1, 2, 3, 4]
+    assert n31.raw["fault_window_arm"]["ordered_tree_prefix"] == list(
+        range(20, 31)
+    ) + list(range(20))
+    assert runtime.derive_reporter_coverage_plan(n7)["deadlines_seconds"] == {
+        "configuration_coverage_seconds": 150,
+        "evidence_seconds": 180,
+        "epoch1_activation_seconds": 270,
+        "optimization_activation_seconds": 90,
+        "arm_hard_seconds": 480,
+    }
+    plan = runtime.derive_reporter_coverage_plan(n31)
+    assert plan["deadlines_seconds"] == {
+        "configuration_coverage_seconds": 420,
+        "evidence_seconds": 480,
+        "epoch1_activation_seconds": 570,
+        "optimization_activation_seconds": 90,
+        "arm_hard_seconds": 780,
+    }
+    capacity = plan["all_candidate_reporter_coverage_capacity"]
+    assert capacity["minimum_topology_eligible_reporter_capacity"] == 19
+    assert capacity["maximum_topology_eligible_reporter_capacity"] == 23
+    assert capacity["maximum_guarded_cohort_size"] == 10
+    assert capacity["minimum_remaining_reporter_capacity"] == 13
+    assert capacity["minimum_injected_target_remaining_reporter_capacity"] == 16
+    assert len(capacity["candidates"]) == 31
+    assert capacity == validator._v12_all_candidate_reporter_capacity_document(
+        replica_count=31,
+        quorum=21,
+        fanout=5,
+        unavailable=(21, 22, 23),
+        prefix=list(range(20, 31)) + list(range(20)),
+    )
+
+
+def test_v12_profile_and_proof_deltas_are_exactly_bounded_to_the_new_contract() -> None:
+    runtime = _runtime()
+    prefix = list(range(20, 31)) + list(range(20))
+    for prior_path, current_path, coverage_seconds in (
+        (N7_PROFILE_V11, N7_PROFILE_V12, 150),
+        (N31_PROFILE_V11, N31_PROFILE_V12, 420),
+    ):
+        prior = json.loads(prior_path.read_text(encoding="utf-8"))
+        current = json.loads(current_path.read_text(encoding="utf-8"))
+        expected = deepcopy(prior)
+        expected["profile_id"] = current["profile_id"]
+        expected["topology"]["proof_path"] = current["topology"]["proof_path"]
+        expected["topology"]["proof_sha256"] = current["topology"]["proof_sha256"]
+        expected["timers"][
+            "postfault_configuration_coverage_deadline_seconds"
+        ] = coverage_seconds
+        if current_path == N31_PROFILE_V12:
+            expected["timers"].update(
+                {
+                    "nonresponse_evidence_deadline_seconds": 480,
+                    "containment_activation_deadline_seconds": 570,
+                    "arm_hard_deadline_seconds": 780,
+                }
+            )
+            expected["evidence_guard"].update(
+                {
+                    "horizon_tree_positions": 31,
+                    "minimum_topology_eligible_reporter_capacity": 23,
+                    "required_postfault_tree_positions": 31,
+                }
+            )
+            expected["fault_window_arm"].update(
+                {
+                    "ordered_tree_prefix": prefix,
+                    "required_postfault_tree_positions": 31,
+                }
+            )
+            expected["topology"][
+                "target_selection_metric"
+            ] = runtime._v12_n31_target_selection_metric()
+            expected["topology"][
+                "reporter_coverage_capacity"
+            ] = runtime._reporter_capacity_document(
+                replica_count=31,
+                fanout=5,
+                targets=(21, 22, 23),
+                prefix=prefix,
+            )
+            expected["topology"][
+                "all_candidate_reporter_coverage_capacity"
+            ] = runtime._all_candidate_reporter_capacity_document(
+                replica_count=31,
+                quorum=21,
+                fanout=5,
+                unavailable=(21, 22, 23),
+                prefix=prefix,
+            )
+        assert current == expected
+
+        prior_proof = json.loads(
+            _topology_proof_path(prior_path, prior).read_text(encoding="utf-8")
+        )
+        current_proof = json.loads(
+            _topology_proof_path(current_path, current).read_text(encoding="utf-8")
+        )
+        expected_proof = deepcopy(prior_proof)
+        expected_proof["profile_id"] = current["profile_id"]
+        expected_proof["profile_sha256"] = runtime.load_focused_profile(
+            current_path
+        ).profile_sha256
+        if current_path == N31_PROFILE_V12:
+            expected_proof["target_derivation"][
+                "target_selection_metric"
+            ] = runtime._v12_n31_target_selection_metric()
+            expected_proof["target_derivation"][
+                "reporter_coverage_capacity"
+            ] = runtime._reporter_capacity_document(
+                replica_count=31,
+                fanout=5,
+                targets=(21, 22, 23),
+                prefix=prefix,
+            )
+            expected_proof["target_derivation"][
+                "all_candidate_reporter_coverage_capacity"
+            ] = runtime._all_candidate_reporter_capacity_document(
+                replica_count=31,
+                quorum=21,
+                fanout=5,
+                unavailable=(21, 22, 23),
+                prefix=prefix,
+            )
+        assert current_proof == expected_proof
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "capacity",
+        "guarded-cohort",
+        "remaining-floor",
+        "injected-floor",
+        "timer",
+    ),
+)
+def test_v12_loader_rejects_rebound_capacity_or_timer_drift(
+    mutation: str, tmp_path: Path
+) -> None:
+    runtime = _runtime()
+    raw = json.loads(N31_PROFILE_V12.read_text(encoding="utf-8"))
+    proof = json.loads(
+        _topology_proof_path(N31_PROFILE_V12, raw).read_text(encoding="utf-8")
+    )
+    capacity_fields = {
+        "capacity": ("minimum_topology_eligible_reporter_capacity", 20),
+        "guarded-cohort": ("maximum_guarded_cohort_size", 9),
+        "remaining-floor": ("minimum_remaining_reporter_capacity", 14),
+        "injected-floor": (
+            "minimum_injected_target_remaining_reporter_capacity",
+            17,
+        ),
+    }
+    if mutation in capacity_fields:
+        field, value = capacity_fields[mutation]
+        raw["topology"]["all_candidate_reporter_coverage_capacity"][field] = value
+        proof["target_derivation"][
+            "all_candidate_reporter_coverage_capacity"
+        ][field] = value
+    else:
+        raw["timers"]["postfault_configuration_coverage_deadline_seconds"] = 480
+    proof["profile_sha256"] = _canonical_profile_sha256(raw)
+    proof_path = tmp_path / raw["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True)
+    proof_path.write_bytes(_canonical_json(proof))
+    raw["topology"]["proof_sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    profile_path = tmp_path / N31_PROFILE_V12.name
+    profile_path.write_bytes(_canonical_json(raw))
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime.load_focused_profile(profile_path)
 
 
 def test_v9_inherited_cohort_binds_leaves_without_inventing_suffix_order() -> None:
@@ -649,6 +843,39 @@ def test_v10_v11_transition_request_uses_65s_while_v9_archive_keeps_40s(
         manager_input=manager_input,
         forbidden_values=(),
     )["blinded"] is True
+
+
+def test_v12_n31_manager_argv_binds_full_cycle_hard_cap_and_65s_residence(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N31_PROFILE_V12)
+    adapter = runtime._profiled_adapter(profile, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(32)]
+    argv = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm="adaptive",
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=tmp_path / "argv-v12",
+        run_id="run-v12",
+        source_instance="manager-v12",
+        fault_window_arm_path=(
+            tmp_path / "argv-v12" / "fault-window-arm.json"
+        ).resolve(),
+        request_sha256="a" * 64,
+    )
+    pairs = dict(zip(argv[1::2], argv[2::2], strict=True))
+    assert pairs["--fault-window-arm-required-tree-positions"] == "31"
+    assert pairs["--fault-window-arm-deadline-seconds"] == "780"
+    requests = [
+        json.loads(argv[index + 1])
+        for index, value in enumerate(argv[:-1])
+        if value == "--transition-request"
+    ]
+    assert requests[1]["minimum_predecessor_residency_ms"] == 65_000
 
 
 def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:
@@ -2832,6 +3059,60 @@ def test_v4_postfault_configuration_wait_allows_receipt_exempt_sigkill() -> None
         },
         deadline_monotonic=float("inf"),
     )
+
+
+@pytest.mark.parametrize("complete", (False, True))
+def test_v12_postfault_configuration_wait_rejects_late_coverage(
+    complete: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    driver = object.__new__(runtime.FocusedLaunchBackend)
+    driver._poll_interval_s = 0
+    source = SimpleNamespace(
+        unexpected_exit_ids=lambda _events: (),
+        postfault_authoritative_configuration_prefix_complete=lambda **_kwargs: complete,
+    )
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: 150.0)
+    monkeypatch.setattr(
+        runtime.profiled_fault_runtime,
+        "monotonic_raw_ns",
+        lambda: 150_000_000_000,
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="coverage"):
+        driver._wait_for_v4_fault_window_coverage(
+            source,
+            SimpleNamespace(records=()),
+            {
+                "evidence_start_monotonic_ns": 1,
+                "prefault_tree_id": 6,
+                "required_tree_ids": [6, 0, 1, 2, 3, 4],
+            },
+            deadline_monotonic=150.0,
+            deadline_monotonic_raw_ns=150_000_000_000,
+        )
+
+
+def test_v12_coverage_waiter_uses_exact_fault_receipt_clock_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V12)
+    coverage = runtime.derive_reporter_coverage_plan(profile)
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: 200.0)
+    monkeypatch.setattr(
+        runtime.profiled_fault_runtime,
+        "monotonic_raw_ns",
+        lambda: 110_000_000_000,
+    )
+
+    deadline = runtime._v12_configuration_coverage_deadline(
+        {"evidence_start_monotonic_ns": 100_000_000_000},
+        coverage,
+        postfault_hard_deadline=680.0,
+    )
+
+    assert deadline == 340.0
 
 
 def test_v4_postfault_configuration_rejects_malformed_record_after_coverage(

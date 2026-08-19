@@ -131,6 +131,19 @@ _FCRASH_H_V10_PROFILE_IDS = frozenset(
 _FCRASH_H_V11_PROFILE_IDS = frozenset(
     {"n7-f2-q5-two-crash-pair-smoke-v11", "n31-f5-q21-three-crash-pair-v11"}
 )
+_FCRASH_H_V12_PROFILE_IDS = frozenset(
+    {"n7-f2-q5-two-crash-pair-smoke-v12", "n31-f5-q21-three-crash-pair-v12"}
+)
+_FCRASH_H_V12_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v12": (
+        "54a879d783e071da2fce59773c79439a691ed549b50296c6f1bcea848694e697",
+        "dc30f42f28d7228a44efe69f734cceebf965169202923b52c786f6e58e2e81d9",
+    ),
+    "n31-f5-q21-three-crash-pair-v12": (
+        "2686e76451dea29018e33c87756b6c722badf82fd0d0c8f3500b860b424164ea",
+        "7dbab26b7272d3f31e8bbcb38dc5778fc3666f11d5d5586dae67f499547f3ca2",
+    ),
+}
 _FCRASH_H_V11_IDENTITIES = {
     "n7-f2-q5-two-crash-pair-smoke-v11": (
         "02b3ca67f3caf1e145f80daa700531188d6828bf25d4102d61174e99dd729bbb",
@@ -152,7 +165,10 @@ _FCRASH_H_V10_IDENTITIES = {
     ),
 }
 _FCRASH_H_GUARDED_PROFILE_IDS = (
-    _FCRASH_H_V9_PROFILE_IDS | _FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS
+    _FCRASH_H_V9_PROFILE_IDS
+    | _FCRASH_H_V10_PROFILE_IDS
+    | _FCRASH_H_V11_PROFILE_IDS
+    | _FCRASH_H_V12_PROFILE_IDS
 )
 _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     {
@@ -558,7 +574,9 @@ def _is_v9_contract(contract: Mapping[str, object]) -> bool:
 
 def _is_v10_contract(contract: Mapping[str, object]) -> bool:
     return contract.get("profile_id") in (
-        _FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS
+        _FCRASH_H_V10_PROFILE_IDS
+        | _FCRASH_H_V11_PROFILE_IDS
+        | _FCRASH_H_V12_PROFILE_IDS
     )
 
 
@@ -671,6 +689,59 @@ def _v8_n31_target_selection_metric() -> dict[str, object]:
     }
 
 
+def _v12_n31_target_selection_metric() -> dict[str, object]:
+    """Independently recompute the frozen v12 full-cycle selection table."""
+
+    replica_count, fanout = 31, 5
+    candidates = (21, 22, 23, 24, 25)
+    prefix = tuple(range(20, 31)) + tuple(range(20))
+    order = tuple(range(20, 31)) + tuple(range(20))
+    rows: list[tuple[tuple[int, int, int], int, int, int]] = []
+    for targets in combinations(candidates, 3):
+        per_tree: list[int] = []
+        for root in prefix:
+            shadow = 0
+            for member in range(replica_count):
+                if member in targets:
+                    continue
+                position = (member - root) % replica_count
+                while True:
+                    if (root + position) % replica_count in targets:
+                        shadow += 1
+                        break
+                    if position == 0:
+                        break
+                    position = (position - 1) // fanout
+            per_tree.append(shadow)
+        fixed = sum(per_tree[prefix.index(target)] for target in targets)
+        rows.append((targets, sum(per_tree), fixed, max(per_tree)))
+    selected = min(
+        targets
+        for targets, total, _fixed, _maximum in rows
+        if total == min(row[1] for row in rows)
+    )
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-survivor-path-shadow-v1",
+        "candidate_internal_replica_ids": list(candidates),
+        "prefix_tree_ids": list(prefix),
+        "fanout": fanout,
+        "bfs_member_order": list(order),
+        "triple_scores": [
+            {
+                "target_replica_ids": list(targets),
+                "total_survivor_path_shadow": total,
+                "fixed_root_shadow": fixed,
+                "collateral_survivor_path_shadow": total - fixed,
+                "maximum_per_tree_survivor_path_shadow": maximum,
+            }
+            for targets, total, fixed, maximum in rows
+        ],
+        "selected_target_replica_ids": list(selected),
+        "tie_break": "lexicographic_replica_id",
+    }
+
+
 def _v8_reporter_capacity_document(
     *, replica_count: int, fanout: int, targets: Sequence[int], prefix: Sequence[int]
 ) -> dict[str, object]:
@@ -716,6 +787,80 @@ def _v8_reporter_capacity_document(
             len(row["eligible_reporters"]) for row in rows
         ),
         "targets": rows,
+    }
+
+
+def _v12_all_candidate_reporter_capacity_document(
+    *,
+    replica_count: int,
+    quorum: int,
+    fanout: int,
+    unavailable: Sequence[int],
+    prefix: Sequence[int],
+) -> dict[str, object]:
+    """Independently derive all v12 candidate relations under fixed crashes."""
+
+    leaf_start = (replica_count - 1 + fanout - 1) // fanout
+    excluded = set(unavailable)
+    rows: list[dict[str, object]] = []
+    for target in range(replica_count):
+        reporters: list[dict[str, object]] = []
+        for reporter in range(replica_count):
+            if reporter in excluded:
+                continue
+            relations: list[dict[str, object]] = []
+            for root in prefix:
+                if root in excluded:
+                    continue
+                position = (target - root) % replica_count
+                if (
+                    position == 0
+                    or _cyclic_parent(replica_count, fanout, root, target) != reporter
+                ):
+                    continue
+                relations.append(
+                    {
+                        "tree_id": root,
+                        "expected_message_type": (
+                            "aggregate_relay"
+                            if position < leaf_start
+                            else "direct_vote"
+                        ),
+                    }
+                )
+            if relations:
+                reporters.append({"reporter_id": reporter, "tree_relations": relations})
+        rows.append({"target_replica_id": target, "eligible_reporters": reporters})
+    capacities = [len(row["eligible_reporters"]) for row in rows]
+    maximum_guarded_cohort_size = replica_count - quorum
+    remaining_capacities = [
+        len(row["eligible_reporters"])
+        - min(
+            len(row["eligible_reporters"]),
+            maximum_guarded_cohort_size
+            - len(excluded | {int(row["target_replica_id"])}),
+        )
+        for row in rows
+    ]
+    injected_target_remaining_capacities = [
+        remaining
+        for row, remaining in zip(rows, remaining_capacities, strict=True)
+        if int(row["target_replica_id"]) in excluded
+    ]
+    return {
+        "schema_version": 1,
+        "domain": "kauri-topology-all-candidate-reporter-capacity-v1",
+        "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+        "unavailable_replica_ids": sorted(excluded),
+        "prefix_tree_ids": list(prefix),
+        "maximum_guarded_cohort_size": maximum_guarded_cohort_size,
+        "minimum_topology_eligible_reporter_capacity": min(capacities),
+        "maximum_topology_eligible_reporter_capacity": max(capacities),
+        "minimum_remaining_reporter_capacity": min(remaining_capacities),
+        "minimum_injected_target_remaining_reporter_capacity": min(
+            injected_target_remaining_capacities
+        ),
+        "candidates": rows,
     }
 
 
@@ -814,6 +959,7 @@ def _derive_reporter_coverage_plan(
     members: tuple[int, ...],
     targets: tuple[int, ...],
     fault_threshold: int,
+    quorum: int,
     fanout: int,
     active_tree: int,
 ) -> dict[str, object]:
@@ -844,6 +990,9 @@ def _derive_reporter_coverage_plan(
         "optimization_activation_deadline_seconds",
         "arm_hard_deadline_seconds",
     }
+    is_v12 = profile["profile_id"] in _FCRASH_H_V12_PROFILE_IDS
+    if is_v12:
+        expected_timer_keys.add("postfault_configuration_coverage_deadline_seconds")
     if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
         _error("FCRASH-H guard or timer schema drifted")
     required = fault_threshold + 1
@@ -875,7 +1024,49 @@ def _derive_reporter_coverage_plan(
             or topology.get("reporter_coverage_capacity") != capacity
         ):
             _error("v8 frozen evidence guard differs from topology derivation")
+        all_candidate_capacity = None
+        if profile["profile_id"] == "n31-f5-q21-three-crash-pair-v12":
+            all_candidate_capacity = _v12_all_candidate_reporter_capacity_document(
+                replica_count=len(members),
+                quorum=quorum,
+                fanout=fanout,
+                unavailable=targets,
+                prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+            )
+            if (
+                topology.get("all_candidate_reporter_coverage_capacity")
+                != all_candidate_capacity
+                or all_candidate_capacity[
+                    "minimum_topology_eligible_reporter_capacity"
+                ]
+                != 19
+                or all_candidate_capacity[
+                    "maximum_topology_eligible_reporter_capacity"
+                ]
+                != 23
+                or all_candidate_capacity["maximum_guarded_cohort_size"] != 10
+                or all_candidate_capacity["minimum_remaining_reporter_capacity"]
+                != 13
+                or all_candidate_capacity[
+                    "minimum_injected_target_remaining_reporter_capacity"
+                ]
+                != 16
+            ):
+                _error("v12 all-candidate reporter capacity drifted")
         deadlines = {
+            **(
+                {
+                    "configuration_coverage_seconds": _integer(
+                        timers.get(
+                            "postfault_configuration_coverage_deadline_seconds"
+                        ),
+                        "post-fault configuration coverage deadline",
+                        1,
+                    )
+                }
+                if is_v12
+                else {}
+            ),
             "evidence_seconds": _integer(
                 timers.get("nonresponse_evidence_deadline_seconds"),
                 "nonresponse evidence deadline",
@@ -896,13 +1087,18 @@ def _derive_reporter_coverage_plan(
             ),
         }
         if (
-            deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
+            (
+                is_v12
+                and deadlines["configuration_coverage_seconds"]
+                >= deadlines["evidence_seconds"]
+            )
+            or deadlines["evidence_seconds"] >= deadlines["epoch1_activation_seconds"]
             or deadlines["epoch1_activation_seconds"] >= deadlines["arm_hard_seconds"]
             or deadlines["optimization_activation_seconds"]
             >= deadlines["arm_hard_seconds"]
         ):
             _error("FCRASH-H phase deadlines are not strictly nested")
-        return {
+        result = {
             "schema_version": 1,
             "profile_id": profile["profile_id"],
             "active_tree_id": active_tree,
@@ -930,6 +1126,11 @@ def _derive_reporter_coverage_plan(
             ),
             "targets": capacity["targets"],
         }
+        if all_candidate_capacity is not None:
+            result["all_candidate_reporter_coverage_capacity"] = (
+                all_candidate_capacity
+            )
+        return result
     target_rows: list[dict[str, object]] = []
     reporter_sets: list[set[int]] = []
     horizon = 0
@@ -1049,6 +1250,28 @@ def _derive_reporter_coverage_plan(
 
 def _inside_deadline(origin_ns: int, candidate_ns: int, seconds: int) -> bool:
     return origin_ns <= candidate_ns < origin_ns + seconds * 1_000_000_000
+
+
+def _v12_arm_before_configuration_coverage_deadline(
+    contract: Mapping[str, object],
+    coverage: Mapping[str, object],
+    *,
+    evidence_start_ns: int,
+    armed_ns: int,
+) -> bool:
+    if contract.get("profile_id") not in _FCRASH_H_V12_PROFILE_IDS:
+        return True
+    return _inside_deadline(
+        evidence_start_ns,
+        armed_ns,
+        _integer(
+            _mapping(coverage["deadlines_seconds"], "coverage deadlines").get(
+                "configuration_coverage_seconds"
+            ),
+            "configuration coverage deadline",
+            1,
+        ),
+    )
 
 
 def validate_fcrash_h_evidence(
@@ -1312,12 +1535,16 @@ def validate_fcrash_h_evidence(
         required_count = _integer(
             required_progress, "required post-fault commit horizon", 1
         )
-        if set(progress) != {
+        progress_keys = {
             "required_tree_positions",
             "actual_tree_positions",
             "starting_tree_id",
             "observed_tree_ids",
-        } or (
+        }
+        is_v12 = contract.get("profile_id") in _FCRASH_H_V12_PROFILE_IDS
+        if is_v12:
+            progress_keys.add("coverage_completion_monotonic_ns")
+        if set(progress) != progress_keys or (
             _integer(
                 progress.get("required_tree_positions"), "progress required count", 1
             )
@@ -1344,6 +1571,19 @@ def validate_fcrash_h_evidence(
         )
         if observed_trees != expected_trees:
             _error("FCRASH-H post-fault progress is not the exact cyclic prefix")
+        if is_v12 and not _inside_deadline(
+            fault_ns,
+            _integer(
+                progress.get("coverage_completion_monotonic_ns"),
+                "configuration coverage completion",
+            ),
+            _integer(
+                deadlines.get("configuration_coverage_seconds"),
+                "configuration coverage deadline",
+                1,
+            ),
+        ):
+            _error("v12 configuration coverage exceeded its crash-anchored cap")
 
 
 def _fcrash_h_postfault_progress(
@@ -1539,12 +1779,18 @@ def _fcrash_h_postfault_progress(
             or generation_configuration[2] != proof_tree
         ):
             _error("sealed authoritative progress commit is not causally activated")
-    return {
+    result = {
         "required_tree_positions": required_positions,
         "actual_tree_positions": len(observed_trees),
         "starting_tree_id": starting_tree,
         "observed_tree_ids": observed_trees,
     }
+    if contract.get("profile_id") in _FCRASH_H_V12_PROFILE_IDS:
+        result["coverage_completion_monotonic_ns"] = _integer(
+            activations[required_positions - 2]["source_monotonic_ns"],
+            "configuration coverage completion",
+        )
+    return result
 
 
 def _v4_replay_fault_window_anchors(
@@ -1676,7 +1922,13 @@ def _v4_replay_fault_window_anchors(
 
     proof_bound_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
     if is_v8:
-        for row in _sequence(coverage.get("targets"), "coverage targets"):
+        capacity_rows = coverage.get("targets")
+        if contract.get("profile_id") == "n31-f5-q21-three-crash-pair-v12":
+            capacity_rows = _mapping(
+                coverage.get("all_candidate_reporter_coverage_capacity"),
+                "all-candidate reporter capacity",
+            ).get("candidates")
+        for row in _sequence(capacity_rows, "coverage targets"):
             target = _integer(
                 _mapping(row, "coverage target").get("target_replica_id"),
                 "coverage target",
@@ -2492,7 +2744,11 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     fault = _mapping(profile.get("fault"), "profile fault")
     transitions = _mapping(profile.get("transitions"), "profile transitions")
     timing = transitions.get("adaptive_timing_contract")
-    if profile_id in (_FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS):
+    if profile_id in (
+        _FCRASH_H_V10_PROFILE_IDS
+        | _FCRASH_H_V11_PROFILE_IDS
+        | _FCRASH_H_V12_PROFILE_IDS
+    ):
         expected_timing = {
             "schema_version": 1,
             "domain": "kauri-focused-v10-transition-timing-v1",
@@ -2573,6 +2829,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "n31-f5-q21-three-crash-pair-v9",
         "n31-f5-q21-three-crash-pair-v10",
         "n31-f5-q21-three-crash-pair-v11",
+        "n31-f5-q21-three-crash-pair-v12",
     }
     order = [members[(active_tree + offset) % count] for offset in range(count)]
     if (
@@ -2594,9 +2851,13 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         _error("topology proof is not bound to the native focused tree")
     if is_v7_n31 or is_v8_n31:
         metric = (
-            _v8_n31_target_selection_metric()
-            if is_v8_n31
-            else _v7_n31_target_selection_metric()
+            _v12_n31_target_selection_metric()
+            if profile_id == "n31-f5-q21-three-crash-pair-v12"
+            else (
+                _v8_n31_target_selection_metric()
+                if is_v8_n31
+                else _v7_n31_target_selection_metric()
+            )
         )
         if (
             topology.get("target_selection_metric") != metric
@@ -2629,6 +2890,29 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             != capacity["minimum_topology_eligible_reporter_capacity"]
         ):
             _error("v8 topology reporter capacity drifted")
+        if profile_id == "n31-f5-q21-three-crash-pair-v12":
+            all_capacity = _v12_all_candidate_reporter_capacity_document(
+                replica_count=count,
+                quorum=quorum,
+                fanout=fanout,
+                unavailable=targets,
+                prefix=_sequence(arm.get("ordered_tree_prefix"), "fault-window prefix"),
+            )
+            if (
+                topology.get("all_candidate_reporter_coverage_capacity")
+                != all_capacity
+                or derivation.get("all_candidate_reporter_coverage_capacity")
+                != all_capacity
+                or all_capacity["minimum_topology_eligible_reporter_capacity"] != 19
+                or all_capacity["maximum_topology_eligible_reporter_capacity"] != 23
+                or all_capacity["maximum_guarded_cohort_size"] != 10
+                or all_capacity["minimum_remaining_reporter_capacity"] != 13
+                or all_capacity[
+                    "minimum_injected_target_remaining_reporter_capacity"
+                ]
+                != 16
+            ):
+                _error("v12 all-candidate reporter capacity drifted")
     if (
         profile_id
         in _FCRASH_H_V5_PROFILE_IDS
@@ -2642,6 +2926,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         )
         != (
             _FCRASH_H_V11_IDENTITIES.get(str(profile_id))
+            or _FCRASH_H_V12_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V10_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V9_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
@@ -2711,7 +2996,13 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
                 {"target_selection_metric": _v7_n31_target_selection_metric()}
                 if is_v7_n31
                 else (
-                    {"target_selection_metric": _v8_n31_target_selection_metric()}
+                    {
+                        "target_selection_metric": (
+                            _v12_n31_target_selection_metric()
+                            if profile_id == "n31-f5-q21-three-crash-pair-v12"
+                            else _v8_n31_target_selection_metric()
+                        )
+                    }
                     if is_v8_n31
                     else {}
                 )
@@ -2737,7 +3028,29 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
                     "n7-f2-q5-two-crash-pair-smoke-v9",
                     "n7-f2-q5-two-crash-pair-smoke-v10",
                     "n7-f2-q5-two-crash-pair-smoke-v11",
+                    "n7-f2-q5-two-crash-pair-smoke-v12",
                 }
+                else {}
+            ),
+            **(
+                {
+                    "all_candidate_reporter_coverage_capacity": (
+                        _v12_all_candidate_reporter_capacity_document(
+                            replica_count=count,
+                            quorum=quorum,
+                            fanout=fanout,
+                            unavailable=targets,
+                            prefix=_sequence(
+                                _mapping(
+                                    profile.get("fault_window_arm"),
+                                    "fault-window arm",
+                                ).get("ordered_tree_prefix"),
+                                "fault-window prefix",
+                            ),
+                        )
+                    )
+                }
+                if profile_id == "n31-f5-q21-three-crash-pair-v12"
                 else {}
             ),
         }
@@ -2787,6 +3100,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             members=members,
             targets=targets,
             fault_threshold=threshold,
+            quorum=quorum,
             fanout=fanout,
             active_tree=active_tree,
         )
@@ -4863,6 +5177,13 @@ def _validate_fault_window_arm(
     armed_ns = _integer(event["source_monotonic_ns"], "fault-window armed timestamp")
     if not int(arm["evidence_start_monotonic_ns"]) <= armed_ns < snapshot_audit_ns:
         _error("v4 fault-window arm was not accepted before snapshot audit")
+    if not _v12_arm_before_configuration_coverage_deadline(
+        contract,
+        coverage,
+        evidence_start_ns=int(arm["evidence_start_monotonic_ns"]),
+        armed_ns=armed_ns,
+    ):
+        _error("v12 fault-window arm exceeded the configuration coverage cap")
     requests = [
         _integer(
             _mapping(outcome, "SIGKILL outcome").get("requested_monotonic_ns"),

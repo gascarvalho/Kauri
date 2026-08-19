@@ -793,6 +793,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N7_PROFILE_V12,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N31_PROFILE_V12,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (21, 22, 23),
+                "survivors": tuple((*range(21), *range(24, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -827,6 +853,8 @@ def test_validator_contract_is_derived_from_each_focused_profile(
         runtime_fixture.N31_PROFILE_V10,
         runtime_fixture.N7_PROFILE_V11,
         runtime_fixture.N31_PROFILE_V11,
+        runtime_fixture.N7_PROFILE_V12,
+        runtime_fixture.N31_PROFILE_V12,
     }:
         assert contract["phase_window_contract"] == {
             "schema_version": 1,
@@ -896,16 +924,18 @@ def test_archived_n7_reporter_coverage_schema_is_preserved(
         runtime_fixture.N31_PROFILE_V7,
         runtime_fixture.N7_PROFILE_V11,
         runtime_fixture.N31_PROFILE_V11,
+        runtime_fixture.N7_PROFILE_V12,
+        runtime_fixture.N31_PROFILE_V12,
     ),
 )
-def test_validator_rejects_rebound_noncanonical_v5_v11_profile(
+def test_validator_rejects_rebound_noncanonical_v5_v12_profile(
     tmp_path: Path, profile_path: Path
 ) -> None:
     validation = _validation()
     profile = json.loads(profile_path.read_text(encoding="utf-8"))
     source_proof = runtime_fixture._topology_proof_path(profile_path, profile)
     proof = json.loads(source_proof.read_text(encoding="utf-8"))
-    profile["timers"]["arm_hard_deadline_seconds"] = 481
+    profile["timers"]["arm_hard_deadline_seconds"] += 1
     proof["profile_sha256"] = runtime_fixture._canonical_profile_sha256(profile)
     proof_path = tmp_path / profile["topology"]["proof_path"]
     proof_path.parent.mkdir(parents=True)
@@ -917,6 +947,76 @@ def test_validator_rejects_rebound_noncanonical_v5_v11_profile(
     with pytest.raises(
         validation.FocusedCrashPairValidationError,
         match="not the frozen reviewed identity",
+    ):
+        validation.validation_contract_from_profile(tmp_path)
+
+
+def test_v12_validator_independently_rejects_all_candidate_capacity_mutation(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile_path = runtime_fixture.N31_PROFILE_V12
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    source_proof = runtime_fixture._topology_proof_path(profile_path, profile)
+    proof = json.loads(source_proof.read_text(encoding="utf-8"))
+    for document in (
+        profile["topology"]["all_candidate_reporter_coverage_capacity"],
+        proof["target_derivation"]["all_candidate_reporter_coverage_capacity"],
+    ):
+        document["candidates"][0]["eligible_reporters"].pop()
+        document["minimum_topology_eligible_reporter_capacity"] = 18
+    proof["profile_sha256"] = runtime_fixture._canonical_profile_sha256(profile)
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True)
+    _write_json(proof_path, proof)
+    profile["topology"]["proof_sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    _write_json(tmp_path / "profile.json", profile)
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="all-candidate reporter capacity",
+    ):
+        validation.validation_contract_from_profile(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "field",
+    (
+        "maximum_guarded_cohort_size",
+        "minimum_remaining_reporter_capacity",
+        "minimum_injected_target_remaining_reporter_capacity",
+    ),
+)
+def test_v12_validator_independently_rejects_guarded_capacity_floor_mutation(
+    field: str,
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile_path = runtime_fixture.N31_PROFILE_V12
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    proof = json.loads(
+        runtime_fixture._topology_proof_path(profile_path, profile).read_text(
+            encoding="utf-8"
+        )
+    )
+    for document in (
+        profile["topology"]["all_candidate_reporter_coverage_capacity"],
+        proof["target_derivation"]["all_candidate_reporter_coverage_capacity"],
+    ):
+        document[field] += 1
+    proof["profile_sha256"] = runtime_fixture._canonical_profile_sha256(profile)
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True)
+    _write_json(proof_path, proof)
+    profile["topology"]["proof_sha256"] = hashlib.sha256(
+        proof_path.read_bytes()
+    ).hexdigest()
+    _write_json(tmp_path / "profile.json", profile)
+
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="all-candidate reporter capacity",
     ):
         validation.validation_contract_from_profile(tmp_path)
 
@@ -1310,6 +1410,112 @@ def test_v9_witness_requires_full_dependent_guarded_cohort() -> None:
     ]
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation.validate_fcrash_h_evidence(contract, missing)
+
+
+def test_v12_witness_rejects_configuration_coverage_at_deadline() -> None:
+    validation = _validation()
+    prefix = (6, 0, 1, 2, 3, 4)
+    cohort = (0, 1)
+    contract = {
+        "profile_id": "n7-f2-q5-two-crash-pair-smoke-v12",
+        "profile": {"fault_window_arm": {"ordered_tree_prefix": list(prefix)}},
+        "members": tuple(range(7)),
+        "targets": cohort,
+        "quorum": 5,
+        "fanout": 2,
+        "reporter_coverage_plan": {
+            "required_qualifying_reporters": 3,
+            "required_postfault_tree_positions": 6,
+            "minimum_timeouts_per_reporter": 2,
+            "minimum_score_drop": 6,
+            "deadlines_seconds": {
+                "configuration_coverage_seconds": 150,
+                "evidence_seconds": 180,
+                "epoch1_activation_seconds": 270,
+                "optimization_activation_seconds": 90,
+            },
+            "targets": [],
+        },
+    }
+    rows: list[dict[str, object]] = []
+    for target in cohort:
+        relations: dict[int, tuple[int, str]] = {}
+        for tree_id in prefix:
+            for reporter in range(7):
+                for message_type in ("direct_vote", "aggregate_relay"):
+                    if validation._is_v9_guard_relation(
+                        contract,
+                        target=target,
+                        reporter=reporter,
+                        tree_id=tree_id,
+                        message_type=message_type,
+                        prefix=prefix,
+                    ):
+                        relations.setdefault(reporter, (tree_id, message_type))
+        for reporter, (tree_id, message_type) in list(relations.items())[:3]:
+            for ordinal in range(2):
+                rows.append(
+                    {
+                        "epoch_number": 0,
+                        "tree_id": tree_id,
+                        "observed_replica_id": target,
+                        "reporter_id": reporter,
+                        "outcome": "timeout",
+                        "compensated": False,
+                        "source_monotonic_ns": 101 + ordinal,
+                        "expected_message_type": message_type,
+                    }
+                )
+    witness = {
+        "fault_monotonic_ns": 100,
+        "nonresponse_monotonic_ns": 102,
+        "snapshot_audit_monotonic_ns": 103,
+        "epoch1_activation_monotonic_ns": 104,
+        "epoch2_activation_monotonic_ns": 105,
+        "timeout_observations": rows,
+        "guard_drawdowns": {str(target): -6 for target in cohort},
+        "eligible_guard_drawdowns": {str(target): -6 for target in cohort},
+        "guarded_nonresponsive_replica_ids": list(cohort),
+        "postfault_progress": {
+            "required_tree_positions": 6,
+            "actual_tree_positions": 6,
+            "starting_tree_id": 6,
+            "observed_tree_ids": list(prefix),
+            "coverage_completion_monotonic_ns": 105,
+        },
+    }
+    assert validation.validate_fcrash_h_evidence(contract, witness) is None
+
+    witness["postfault_progress"]["coverage_completion_monotonic_ns"] = (
+        100 + 150 * 1_000_000_000
+    )
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="configuration coverage",
+    ):
+        validation.validate_fcrash_h_evidence(contract, witness)
+
+
+def test_v12_source_blind_arm_coverage_cap_is_half_open() -> None:
+    validation = _validation()
+    contract = {"profile_id": "n7-f2-q5-two-crash-pair-smoke-v12"}
+    coverage = {
+        "deadlines_seconds": {"configuration_coverage_seconds": 150}
+    }
+    deadline_ns = 100 + 150 * 1_000_000_000
+
+    assert validation._v12_arm_before_configuration_coverage_deadline(
+        contract,
+        coverage,
+        evidence_start_ns=100,
+        armed_ns=deadline_ns - 1,
+    )
+    assert not validation._v12_arm_before_configuration_coverage_deadline(
+        contract,
+        coverage,
+        evidence_start_ns=100,
+        armed_ns=deadline_ns,
+    )
 
 
 def test_v9_complete_phase_buckets_retain_zeros_and_use_the_six_bucket_median() -> None:
@@ -2165,6 +2371,37 @@ def test_v3_progress_witness_is_recomputed_from_exact_authoritative_commits(
         "actual_tree_positions": 6,
         "starting_tree_id": 6,
         "observed_tree_ids": [6, 0, 1, 2, 3, 4],
+    }
+
+
+def test_v12_progress_reconstruction_binds_exact_coverage_completion(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile = json.loads(runtime_fixture.N7_PROFILE_V12.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(
+        runtime_fixture.N7_PROFILE_V12, profile
+    )
+    proof_path = tmp_path / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(tmp_path / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(tmp_path))
+
+    progress = validation._fcrash_h_postfault_progress(
+        contract,
+        _v3_progress_events(contract),
+        fault_ns=100,
+        prefault_ns=100,
+        audit_ns=200,
+    )
+
+    assert progress == {
+        "required_tree_positions": 6,
+        "actual_tree_positions": 6,
+        "starting_tree_id": 6,
+        "observed_tree_ids": [6, 0, 1, 2, 3, 4],
+        "coverage_completion_monotonic_ns": 105,
     }
 
 

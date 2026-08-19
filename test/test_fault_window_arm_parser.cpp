@@ -128,6 +128,42 @@ FaultWindowArmBindings n31_bindings()
     return result;
 }
 
+FaultWindowArmBindings n31_v4_bindings()
+{
+    auto result = v4_bindings();
+    result.profile_id = "n31-f5-q21-three-crash-pair-v12";
+    result.prefault_tree_id = 20;
+    result.required_tree_positions = 31;
+    result.tree_count = 31;
+    return result;
+}
+
+const std::string &full_n31_prefix()
+{
+    static const std::string value =
+        "[20,21,22,23,24,25,26,27,28,29,30,0,1,2,3,4,5,6,7,8,9,"
+        "10,11,12,13,14,15,16,17,18,19]";
+    return value;
+}
+
+std::string canonical_n31_v4_arm()
+{
+    auto result = canonical_v4_arm();
+    result = replace_once(
+        result,
+        "n7-f2-q5-two-crash-pair-smoke-v4",
+        "n31-f5-q21-three-crash-pair-v12");
+    result = replace_once(
+        result, "\"prefault_tree_id\":6", "\"prefault_tree_id\":20");
+    result = replace_once(
+        result, "[6,0,1,2,3,4]", full_n31_prefix());
+    result = replace_once(
+        result,
+        "\"required_tree_positions\":6",
+        "\"required_tree_positions\":31");
+    return result;
+}
+
 void require_invalid(const std::string &document)
 {
     CHECK_THROWS_AS(
@@ -307,7 +343,7 @@ TEST_CASE("fault-window parser rejects duplicate and incomplete prefix evidence"
 }
 
 TEST_CASE("fault-window parser accepts the frozen N31 cyclic prefix",
-          "[adaptive-v2][fault-window-arm][v4][parser][n31]")
+          "[adaptive-v2][fault-window-arm][v4][parser][n31][archive]")
 {
     auto text = canonical_arm();
     text = replace_once(text, "\"prefault_tree_id\":6", "\"prefault_tree_id\":20");
@@ -328,4 +364,53 @@ TEST_CASE("fault-window parser accepts the frozen N31 cyclic prefix",
                          "[20,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14]"),
             n31_bindings()).parse(),
         std::invalid_argument);
+}
+
+TEST_CASE(
+    "fault-window schema4 parser binds the complete N31 cyclic prefix",
+    "[adaptive-v2][fault-window-arm][v12][parser][n31][schema4]")
+{
+    const auto text = canonical_n31_v4_arm();
+    const auto document = FaultWindowArmJsonParser(
+        text, n31_v4_bindings()).parse();
+
+    std::vector<std::uint32_t> expected;
+    expected.reserve(31);
+    for (std::uint32_t offset = 0; offset < 31; ++offset)
+        expected.push_back((20U + offset) % 31U);
+    CHECK(document.arm.required_tree_ids == expected);
+    CHECK(document.arm.cardinality_policy ==
+          hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+              all_guarded_up_to_fault_bound_v1);
+
+    const auto shortened = replace_once(
+        text,
+        full_n31_prefix(),
+        "[20,21,22,23,24,25,26,27,28,29,30,0,1,2,3,4,5,6,7,8,9,"
+        "10,11,12,13,14,15,16,17,18]");
+    require_invalid(shortened, n31_v4_bindings());
+
+    const auto oversized = replace_once(
+        text,
+        full_n31_prefix(),
+        "[20,21,22,23,24,25,26,27,28,29,30,0,1,2,3,4,5,6,7,8,9,"
+        "10,11,12,13,14,15,16,17,18,19,20]");
+    require_invalid(oversized, n31_v4_bindings());
+
+    require_invalid(
+        replace_once(text, ",4,5,6,", ",4,4,6,"),
+        n31_v4_bindings());
+    require_invalid(
+        replace_once(text, ",4,5,6,", ",4,6,7,"),
+        n31_v4_bindings());
+    require_invalid(
+        replace_once(text, ",29,30,0,1,", ",29,30,1,0,"),
+        n31_v4_bindings());
+    require_invalid(
+        replace_once(
+            text,
+            full_n31_prefix(),
+            "[20,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
+            "19,21,22,23,24,25,26,27,28,29,30]"),
+        n31_v4_bindings());
 }

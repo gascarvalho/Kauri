@@ -25,6 +25,7 @@ using hotstuff::AdaptiveV2CandidateAudit;
 using hotstuff::AdaptiveV2ReplicaScore;
 using hotstuff::AdaptiveV2SelectionConfig;
 using hotstuff::AdaptiveV2SelectionConstraintBasis;
+using hotstuff::AdaptiveV2SelectionResult;
 using hotstuff::AdaptiveV2SelectionStatus;
 using hotstuff::AdaptiveV2TimeoutAuditBasis;
 using hotstuff::AdaptiveV2FaultContainmentCoverageStatus;
@@ -719,7 +720,7 @@ struct N31Fixture
     std::map<ReplicaID, std::uint64_t> reporter_sequences;
     std::uint64_t attempt_number{0};
 
-    N31Fixture()
+    explicit N31Fixture(std::size_t accepted_capacity = 512)
     {
         EpochDefinitionInput input;
         input.schema_version = hotstuff::kEpochDefinitionSchemaVersion;
@@ -733,7 +734,8 @@ struct N31Fixture
         const auto &definition = epochs.stage(input, validation_context(10));
         epoch = {definition.epoch_number(), definition.epoch_digest()};
         ledger = std::make_unique<EvidenceLedger>(
-            epochs, window, EvidenceStoreLimits{512, 64});
+            epochs, window,
+            EvidenceStoreLimits{accepted_capacity, 64});
     }
 
     const EpochTreeDefinition &tree(std::uint32_t id) const
@@ -825,6 +827,102 @@ struct N31Fixture
         REQUIRE(ledger->accepted().size() == accepted_before + 1U);
     }
 };
+
+AdaptiveV2FaultWindowArm full_n31_fault_window_arm(
+    const AdaptationEpochId &epoch,
+    std::uint64_t evidence_start_monotonic_ns)
+{
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = epoch.epoch_number;
+    arm.predecessor_epoch_digest = epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = evidence_start_monotonic_ns;
+    arm.prefault_tree_id = 20;
+    for (std::uint32_t offset = 0; offset < 31; ++offset)
+        arm.required_tree_ids.push_back((20U + offset) % 31U);
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_attempt_start_v1;
+    arm.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    return arm;
+}
+
+struct N31FullCycleSelectionOutcome
+{
+    AdaptiveV2SelectionResult result;
+    bool healthy{false};
+};
+
+N31FullCycleSelectionOutcome run_n31_full_cycle_selection(
+    const std::vector<ReplicaID> &guarded,
+    const std::vector<ReplicaID> &unguarded_nonresponsive = {})
+{
+    constexpr std::uint64_t kEvidenceStartNs = 1'000'000;
+    N31Fixture fixture(2048);
+    for (const auto member : fixture.members)
+    {
+        fixture.on_time(
+            member, (member + 1U) % 31U,
+            kEvidenceStartNs - 100'000U);
+    }
+
+    auto config = selection_config(22, 2, 1024);
+    config.required_nonresponsive = 3;
+    config.fault_window_arm_required = true;
+    config.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+    REQUIRE(selector.arm_fault_window(full_n31_fault_window_arm(
+        fixture.epoch, kEvidenceStartNs)));
+
+    const auto is_nonresponsive = [&](ReplicaID member) {
+        return std::find(guarded.begin(), guarded.end(), member) !=
+                   guarded.end() ||
+               std::find(
+                   unguarded_nonresponsive.begin(),
+                   unguarded_nonresponsive.end(),
+                   member) != unguarded_nonresponsive.end();
+    };
+    std::uint64_t attempt_start_ns = kEvidenceStartNs + 10'000U;
+    for (const auto member : fixture.members)
+    {
+        if (is_nonresponsive(member))
+            continue;
+        fixture.on_time(
+            member, (member + 1U) % 31U, attempt_start_ns++);
+        fixture.on_time(
+            member, (member + 1U) % 31U, attempt_start_ns++);
+    }
+
+    for (const auto target : guarded)
+    {
+        for (std::uint32_t tree = 0; tree < 31; ++tree)
+        {
+            if (tree == target)
+                continue;
+            (void)fixture.timeout(target, tree, attempt_start_ns++);
+            (void)fixture.timeout(target, tree, attempt_start_ns++);
+        }
+    }
+    for (const auto target : unguarded_nonresponsive)
+    {
+        const auto tree = (target + 1U) % 31U;
+        for (std::uint32_t attempt = 0; attempt < 30; ++attempt)
+            (void)fixture.timeout(target, tree, attempt_start_ns++);
+    }
+
+    auto result = selector.select_through(
+        fixture.ledger->high_watermark());
+    return {std::move(result), selector.healthy()};
+}
 
 int baseline_score(
     const std::vector<AdaptiveV2ReplicaScore> &scores,
@@ -1749,6 +1847,67 @@ TEST_CASE(
     const auto poisoned = selector.select_through(fixture.ledger->high_watermark());
     CHECK(poisoned.status == AdaptiveV2SelectionStatus::projection_failed);
     CHECK_FALSE(selector.healthy());
+}
+
+TEST_CASE(
+    "v12 full-cycle N31 selection preserves the all-guarded safety bound",
+    "[adaptive-v2][selection][fault-window-arm][v12][n31][full-cycle]")
+{
+    const std::vector<ReplicaID> guarded_three{21, 22, 23};
+    const std::vector<ReplicaID> guarded_ten{
+        4, 5, 8, 9, 10, 14, 16, 21, 22, 23};
+
+    SECTION("three guarded replicas select without widening the cohort")
+    {
+        auto outcome = run_n31_full_cycle_selection(guarded_three);
+        REQUIRE(outcome.result.status ==
+                AdaptiveV2SelectionStatus::selected);
+        auto selected = outcome.result.selected_replicas;
+        std::sort(selected.begin(), selected.end());
+        CHECK(selected == guarded_three);
+        CHECK(outcome.result.eligible_candidates.size() == 3);
+        CHECK(outcome.result.eligible_roots.size() == 21);
+        CHECK(outcome.healthy);
+    }
+
+    SECTION("the full N minus Q cohort remains selectable")
+    {
+        auto outcome = run_n31_full_cycle_selection(guarded_ten);
+        REQUIRE(outcome.result.status ==
+                AdaptiveV2SelectionStatus::selected);
+        auto selected = outcome.result.selected_replicas;
+        std::sort(selected.begin(), selected.end());
+        CHECK(selected == guarded_ten);
+        CHECK(outcome.result.eligible_candidates.size() == 10);
+        CHECK(outcome.result.eligible_roots.size() == 21);
+        CHECK(outcome.healthy);
+    }
+
+    SECTION("eleven guarded replicas fail closed above N minus Q")
+    {
+        auto over_bound = guarded_ten;
+        over_bound.push_back(24);
+        auto outcome = run_n31_full_cycle_selection(over_bound);
+        CHECK(outcome.result.status ==
+              AdaptiveV2SelectionStatus::
+                  guarded_candidate_bound_exceeded);
+        CHECK(outcome.result.eligible_candidates.size() == 11);
+        CHECK(outcome.result.selected_replicas.empty());
+        CHECK(outcome.result.eligible_roots.empty());
+        CHECK_FALSE(outcome.healthy);
+    }
+
+    SECTION("an unselected nonresponsive replica blocks root eligibility")
+    {
+        auto outcome = run_n31_full_cycle_selection(
+            guarded_three, {24});
+        CHECK(outcome.result.status ==
+              AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+        CHECK(outcome.result.eligible_candidates.size() == 3);
+        CHECK(outcome.result.selected_replicas.empty());
+        CHECK(outcome.result.eligible_roots.empty());
+        CHECK(outcome.healthy);
+    }
 }
 
 TEST_CASE(

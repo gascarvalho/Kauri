@@ -252,8 +252,14 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     const auto admit = active.find("admit_exact_context(");
     const auto remote_origin =
         active.find("ProposalContextOrigin::remote", admit);
-    const auto normal = active.find("on_receive_proposal(parsed)");
-    const auto acceptance_if = active.rfind("if(", normal);
+    const auto assigned_protocol_result = active.find(
+        "constboolproposal_accepted="
+        "owner.on_receive_proposal(parsed);");
+    const auto normal = active.find(
+        "owner.on_receive_proposal(parsed)",
+        assigned_protocol_result);
+    const auto acceptance_if = active.find(
+        "if(proposal_accepted)", normal);
     const auto acceptance_body = active.find('{', acceptance_if);
     const auto still_open = active.find(
         "acquire_open_context(metadata.key)", normal);
@@ -279,13 +285,15 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     REQUIRE(delivery != std::string::npos);
     REQUIRE(admit != std::string::npos);
     REQUIRE(remote_origin != std::string::npos);
+    REQUIRE(assigned_protocol_result != std::string::npos);
     REQUIRE(normal != std::string::npos);
     REQUIRE(acceptance_if != std::string::npos);
     REQUIRE(acceptance_body != std::string::npos);
-    CHECK(acceptance_if < normal);
-    CHECK(normal < acceptance_body);
-    CHECK(active.find("on_receive_proposal(parsed);") ==
-          std::string::npos);
+    CHECK(assigned_protocol_result <= normal);
+    CHECK(normal < acceptance_if);
+    CHECK(acceptance_if < acceptance_body);
+    CHECK(occurrence_count(
+              active, "owner.on_receive_proposal(parsed)") == 1);
     REQUIRE(still_open != std::string::npos);
     REQUIRE(non_v2_timing_block != std::string::npos);
     REQUIRE(expected != std::string::npos);

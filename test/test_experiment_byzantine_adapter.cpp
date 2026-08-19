@@ -2468,17 +2468,21 @@ TEST_CASE(
         "void HotStuffBase::continue_exact_contribution",
         "bool HotStuffBase::publish_exact_root_qc");
     const auto accepted = contribution.find("if (!accepted)");
+    const auto accepted_path_start = contribution.find(
+        "synchronize_experiment_post_qc_audit");
+    REQUIRE(accepted_path_start != std::string::npos);
+    const auto accepted_path = contribution.substr(accepted_path_start);
     const auto suppress =
-        contribution.find("on_verified_response");
-    const auto marker_latch = contribution.find(
+        accepted_path.find("on_verified_response");
+    const auto marker_latch = accepted_path.find(
         "consume_false_report_positive_marker");
     const auto positive =
-        contribution.find("record_verified_response");
+        accepted_path.find("record_verified_response");
     REQUIRE(accepted != std::string::npos);
     REQUIRE(suppress != std::string::npos);
     REQUIRE(marker_latch != std::string::npos);
     REQUIRE(positive != std::string::npos);
-    CHECK(accepted < suppress);
+    CHECK(accepted < accepted_path_start);
     CHECK(suppress < marker_latch);
     CHECK(marker_latch < positive);
     CHECK(

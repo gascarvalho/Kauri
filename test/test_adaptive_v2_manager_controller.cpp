@@ -856,6 +856,147 @@ struct N31ControllerFixture
     }
 };
 
+hotstuff::AdaptiveV2FaultWindowArm full_n31_controller_arm(
+    const hotstuff::EpochDefinition &epoch,
+    std::uint64_t evidence_start_monotonic_ns)
+{
+    hotstuff::AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = epoch.epoch_number();
+    arm.predecessor_epoch_digest = epoch.epoch_digest();
+    arm.evidence_start_monotonic_ns = evidence_start_monotonic_ns;
+    arm.prefault_tree_id = 20;
+    for (std::uint32_t offset = 0; offset < 31; ++offset)
+        arm.required_tree_ids.push_back((20U + offset) % 31U);
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_attempt_start_v1;
+    arm.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    return arm;
+}
+
+struct N31FullCycleControllerOutcome
+{
+    AdaptiveV2ManagerControllerStatus controller_status{
+        AdaptiveV2ManagerControllerStatus::unhealthy};
+    AdaptiveV2SelectionStatus selection_status{
+        AdaptiveV2SelectionStatus::invalid_state};
+    std::vector<ReplicaID> selected;
+    std::size_t eligible_candidates{0};
+    std::size_t eligible_roots{0};
+    bool healthy{false};
+    bool has_successor{false};
+    bool exact_wait_exempt{false};
+};
+
+N31FullCycleControllerOutcome run_n31_full_cycle_controller(
+    const std::vector<ReplicaID> &guarded,
+    const std::vector<ReplicaID> &unguarded_nonresponsive = {})
+{
+    constexpr std::uint64_t kEvidenceStartNs = 1'000'000;
+    N31ControllerFixture fixture;
+    fixture.controller.reset();
+    fixture.config.selection.minimum_score_drop = 22;
+    fixture.config.selection.minimum_timeouts_per_reporter = 2;
+    fixture.controller =
+        std::make_unique<AdaptiveV2ManagerController>(
+            fixture.ingress, fixture.config);
+    fixture.ready_quorum();
+    fixture.record_responsive(
+        fixture.members, "v12-full-cycle-baseline");
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    REQUIRE(fixture.controller->arm_fault_window(
+        full_n31_controller_arm(
+            fixture.ingress.current_epoch(), kEvidenceStartNs)));
+
+    const auto is_nonresponsive = [&](ReplicaID member) {
+        return std::find(guarded.begin(), guarded.end(), member) !=
+                   guarded.end() ||
+               std::find(
+                   unguarded_nonresponsive.begin(),
+                   unguarded_nonresponsive.end(),
+                   member) != unguarded_nonresponsive.end();
+    };
+    std::vector<ReplicaID> survivors;
+    for (const auto member : fixture.members)
+    {
+        if (!is_nonresponsive(member))
+            survivors.push_back(member);
+    }
+    fixture.record_responsive(
+        survivors,
+        "v12-full-cycle-survivors",
+        kEvidenceStartNs + 10'000U);
+
+    std::uint64_t attempt_start_ns = kEvidenceStartNs + 100'000U;
+    for (const auto target : guarded)
+    {
+        for (std::uint32_t tree = 0; tree < 31; ++tree)
+        {
+            if (tree == target)
+                continue;
+            fixture.record(
+                target,
+                tree,
+                ResponseOutcome::timeout,
+                "v12-full-cycle-timeout",
+                attempt_start_ns++);
+            fixture.record(
+                target,
+                tree,
+                ResponseOutcome::timeout,
+                "v12-full-cycle-timeout",
+                attempt_start_ns++);
+        }
+    }
+    for (const auto target : unguarded_nonresponsive)
+    {
+        const auto tree = (target + 1U) % 31U;
+        for (std::uint32_t attempt = 0; attempt < 30; ++attempt)
+        {
+            fixture.record(
+                target,
+                tree,
+                ResponseOutcome::timeout,
+                "v12-full-cycle-unselected-timeout",
+                attempt_start_ns++);
+        }
+    }
+
+    N31FullCycleControllerOutcome outcome;
+    outcome.controller_status = fixture.controller->evaluate();
+    outcome.healthy = fixture.controller->healthy();
+    const auto *const audit = fixture.controller->selection_audit();
+    if (audit != nullptr)
+    {
+        outcome.selection_status = audit->status;
+        outcome.selected = audit->selected_replicas;
+        outcome.eligible_candidates = audit->eligible_candidates.size();
+        outcome.eligible_roots = audit->eligible_roots.size();
+    }
+    const auto *const successor = fixture.controller->successor_bundle();
+    outcome.has_successor = successor != nullptr;
+    if (successor != nullptr)
+    {
+        auto expected = guarded;
+        std::sort(expected.begin(), expected.end());
+        outcome.exact_wait_exempt = std::all_of(
+            successor->definition().trees.begin(),
+            successor->definition().trees.end(),
+            [&expected](const auto &tree) {
+                auto wait_exempt = tree.wait_exempt_leaves;
+                std::sort(wait_exempt.begin(), wait_exempt.end());
+                return wait_exempt == expected;
+            });
+    }
+    return outcome;
+}
+
 enum class InheritedEpochShape : std::uint8_t
 {
     exact = 1,
@@ -1510,6 +1651,81 @@ TEST_CASE(
             CHECK(tree.wait_exempt_leaves ==
                   std::vector<ReplicaID>{0, 1});
         }
+    }
+}
+
+TEST_CASE(
+    "N31 v12 full-cycle controller preserves the guarded cohort bound",
+    "[adaptive-v2][manager-controller][all-guarded][v12][n31]"
+    "[full-cycle]")
+{
+    const std::vector<ReplicaID> guarded_three{21, 22, 23};
+    const std::vector<ReplicaID> guarded_ten{
+        4, 5, 8, 9, 10, 14, 16, 21, 22, 23};
+
+    SECTION("three guarded replicas produce an exact containment bundle")
+    {
+        auto outcome = run_n31_full_cycle_controller(guarded_three);
+        CHECK(outcome.controller_status ==
+              AdaptiveV2ManagerControllerStatus::successor_ready);
+        CHECK(outcome.selection_status ==
+              AdaptiveV2SelectionStatus::selected);
+        std::sort(outcome.selected.begin(), outcome.selected.end());
+        CHECK(outcome.selected == guarded_three);
+        CHECK(outcome.eligible_candidates == 3);
+        CHECK(outcome.eligible_roots == 21);
+        CHECK(outcome.healthy);
+        CHECK(outcome.has_successor);
+        CHECK(outcome.exact_wait_exempt);
+    }
+
+    SECTION("ten guarded replicas retain Q eligible roots")
+    {
+        auto outcome = run_n31_full_cycle_controller(guarded_ten);
+        CHECK(outcome.controller_status ==
+              AdaptiveV2ManagerControllerStatus::successor_ready);
+        CHECK(outcome.selection_status ==
+              AdaptiveV2SelectionStatus::selected);
+        std::sort(outcome.selected.begin(), outcome.selected.end());
+        CHECK(outcome.selected == guarded_ten);
+        CHECK(outcome.eligible_candidates == 10);
+        CHECK(outcome.eligible_roots == 21);
+        CHECK(outcome.healthy);
+        CHECK(outcome.has_successor);
+        CHECK(outcome.exact_wait_exempt);
+    }
+
+    SECTION("eleven guarded replicas are terminal above N minus Q")
+    {
+        auto over_bound = guarded_ten;
+        over_bound.push_back(24);
+        const auto outcome = run_n31_full_cycle_controller(over_bound);
+        CHECK(outcome.controller_status ==
+              AdaptiveV2ManagerControllerStatus::unhealthy);
+        CHECK(outcome.selection_status ==
+              AdaptiveV2SelectionStatus::
+                  guarded_candidate_bound_exceeded);
+        CHECK(outcome.eligible_candidates == 11);
+        CHECK(outcome.selected.empty());
+        CHECK(outcome.eligible_roots == 0);
+        CHECK_FALSE(outcome.healthy);
+        CHECK_FALSE(outcome.has_successor);
+    }
+
+    SECTION("an unselected nonresponsive replica blocks containment")
+    {
+        const auto outcome = run_n31_full_cycle_controller(
+            guarded_three, {24});
+        CHECK(outcome.controller_status ==
+              AdaptiveV2ManagerControllerStatus::
+                  awaiting_guarded_selection);
+        CHECK(outcome.selection_status ==
+              AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+        CHECK(outcome.eligible_candidates == 3);
+        CHECK(outcome.selected.empty());
+        CHECK(outcome.eligible_roots == 0);
+        CHECK(outcome.healthy);
+        CHECK_FALSE(outcome.has_successor);
     }
 }
 

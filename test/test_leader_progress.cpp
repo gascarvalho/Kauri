@@ -1347,22 +1347,35 @@ TEST_CASE("verified proposal progress is gated by protocol acceptance",
         hotstuff,
         "void HotStuffBase::process_active",
         "void HotStuffBase::local_vote_authorized");
-    const auto protocol = active.find("on_receive_proposal(parsed)");
+    const auto compact = without_whitespace(active);
+    const auto assigned_protocol_result = compact.find(
+        "constboolproposal_accepted="
+        "owner.on_receive_proposal(parsed);");
+    const auto protocol = compact.find(
+        "owner.on_receive_proposal(parsed)",
+        assigned_protocol_result);
+    const auto acceptance_gate = compact.find(
+        "if(proposal_accepted)", protocol);
     const auto progress =
-        active.find("LeaderProgressEvent::verified_proposal");
+        compact.find(
+            "LeaderProgressEvent::verified_proposal",
+            acceptance_gate);
 
+    REQUIRE(assigned_protocol_result != std::string::npos);
     REQUIRE(protocol != std::string::npos);
+    REQUIRE(acceptance_gate != std::string::npos);
     REQUIRE(progress != std::string::npos);
-    CHECK(progress > protocol);
     INFO("discarding the protocol result would reset on a well-formed but "
          "low/stale proposal whose existing opinion decision is false");
-    CHECK(active.find("on_receive_proposal(parsed);") == std::string::npos);
-
-    const auto gate = active.substr(
-        protocol, progress - protocol);
-    CHECK(gate.find("if") != std::string::npos);
-    CHECK(active.find("metadata.key.configuration") != std::string::npos);
-    CHECK(active.find("bool opinion") == std::string::npos);
+    CHECK(assigned_protocol_result <= protocol);
+    CHECK(protocol < acceptance_gate);
+    CHECK(acceptance_gate < progress);
+    CHECK(compact.find(
+              "owner.on_receive_proposal(parsed)",
+              protocol + 1U) == std::string::npos);
+    CHECK(compact.find("metadata.key.configuration") !=
+          std::string::npos);
+    CHECK(compact.find("boolopinion") == std::string::npos);
 }
 
 TEST_CASE("locally authored proposals do not reset leader suspicion",
