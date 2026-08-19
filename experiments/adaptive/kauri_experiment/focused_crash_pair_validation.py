@@ -125,6 +125,22 @@ _FCRASH_H_V9_IDENTITIES = {
         "a50bd106887e5e3baf550875217db37c96fb9b07d40c39a98e80cef20e435ced",
     ),
 }
+_FCRASH_H_V10_PROFILE_IDS = frozenset(
+    {"n7-f2-q5-two-crash-pair-smoke-v10", "n31-f5-q21-three-crash-pair-v10"}
+)
+_FCRASH_H_V10_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v10": (
+        "b57b6406be768305f917d7ad45d022e510733d01932bd75c91aa027e82e0b34c",
+        "b08423625ab4eedb78a3bb18eaeceda860d006f81ab67b807b228f30cd7ad5e7",
+    ),
+    "n31-f5-q21-three-crash-pair-v10": (
+        "066fbd2b1a14d6cec0d86eaafe28e19e4b52ed2a4cefb47d8a2b0079005bdf85",
+        "8a4bc9a735cd73a31110ca4641e24a296247d5e17dd32af2e704ecbf76333a3d",
+    ),
+}
+_FCRASH_H_GUARDED_PROFILE_IDS = (
+    _FCRASH_H_V9_PROFILE_IDS | _FCRASH_H_V10_PROFILE_IDS
+)
 _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     {
         "n7-f2-q5-two-crash-pair-smoke-v1",
@@ -139,7 +155,7 @@ _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
     | _FCRASH_H_V8_PROFILE_IDS
-    | _FCRASH_H_V9_PROFILE_IDS
+    | _FCRASH_H_GUARDED_PROFILE_IDS
 )
 _FAULT_WINDOW_PROFILE_IDS = (
     _FCRASH_H_V4_PROFILE_IDS
@@ -147,7 +163,7 @@ _FAULT_WINDOW_PROFILE_IDS = (
     | _FCRASH_H_V6_PROFILE_IDS
     | _FCRASH_H_V7_PROFILE_IDS
     | _FCRASH_H_V8_PROFILE_IDS
-    | _FCRASH_H_V9_PROFILE_IDS
+    | _FCRASH_H_GUARDED_PROFILE_IDS
 )
 _FAULT_WINDOW_ARM_DOMAIN_V1 = "kauri-focused-fault-window-arm-v1"
 _FAULT_WINDOW_ARM_DOMAIN_V2 = "kauri-focused-fault-window-arm-v2"
@@ -507,7 +523,7 @@ def _is_v5_contract(contract: Mapping[str, object]) -> bool:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
-        | _FCRASH_H_V9_PROFILE_IDS
+        | _FCRASH_H_GUARDED_PROFILE_IDS
     )
 
 
@@ -524,7 +540,11 @@ def _is_v8_contract(contract: Mapping[str, object]) -> bool:
 
 
 def _is_v9_contract(contract: Mapping[str, object]) -> bool:
-    return contract.get("profile_id") in _FCRASH_H_V9_PROFILE_IDS
+    return contract.get("profile_id") in _FCRASH_H_GUARDED_PROFILE_IDS
+
+
+def _is_v10_contract(contract: Mapping[str, object]) -> bool:
+    return contract.get("profile_id") in _FCRASH_H_V10_PROFILE_IDS
 
 
 def _is_v8_or_v9_contract(contract: Mapping[str, object]) -> bool:
@@ -794,7 +814,7 @@ def _derive_reporter_coverage_plan(
     }
     if profile["profile_id"] in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS:
         expected_guard_keys.add("required_postfault_tree_positions")
-    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_V9_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_GUARDED_PROFILE_IDS:
         expected_guard_keys |= {
             "reporter_selection_basis",
             "minimum_topology_eligible_reporter_capacity",
@@ -812,7 +832,7 @@ def _derive_reporter_coverage_plan(
     if set(guard) != expected_guard_keys or set(timers) != expected_timer_keys:
         _error("FCRASH-H guard or timer schema drifted")
     required = fault_threshold + 1
-    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_V9_PROFILE_IDS:
+    if profile["profile_id"] in _FCRASH_H_V8_PROFILE_IDS | _FCRASH_H_GUARDED_PROFILE_IDS:
         topology = _mapping(profile.get("topology"), "profile topology")
         arm = _mapping(profile.get("fault_window_arm"), "fault-window arm")
         capacity = _v8_reporter_capacity_document(
@@ -2257,7 +2277,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     if profile_id not in _REVIEWED_FOCUSED_PROFILE_IDS:
         _error("focused profile identity is not reviewed")
     campaign = _mapping(profile.get("campaign"), "profile campaign")
-    if profile_id in _FCRASH_H_V9_PROFILE_IDS:
+    if profile_id in _FCRASH_H_GUARDED_PROFILE_IDS:
         if campaign.get("scientific_support_contract") != {
             "schema_version": 1,
             "domain": "kauri-focused-campaign-scientific-support-v1",
@@ -2294,7 +2314,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             _FCRASH_H_V6_PROFILE_IDS
             | _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
-            | _FCRASH_H_V9_PROFILE_IDS
+            | _FCRASH_H_GUARDED_PROFILE_IDS
         ):
             expected_arm_keys |= {
                 "clock_domain",
@@ -2304,10 +2324,10 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         if profile_id in (
             _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
-            | _FCRASH_H_V9_PROFILE_IDS
+            | _FCRASH_H_GUARDED_PROFILE_IDS
         ):
             expected_arm_keys.add("snapshot_evidence_basis")
-        if profile_id in _FCRASH_H_V9_PROFILE_IDS:
+        if profile_id in _FCRASH_H_GUARDED_PROFILE_IDS:
             expected_arm_keys.add("selection_cardinality_policy")
         if (
             set(arm_metadata) != expected_arm_keys
@@ -2315,7 +2335,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             or arm_metadata.get("schema_version")
             != (
                 4
-                if profile_id in _FCRASH_H_V9_PROFILE_IDS
+                if profile_id in _FCRASH_H_GUARDED_PROFILE_IDS
                 else (
                     3
                     if profile_id in _FCRASH_H_V7_PROFILE_IDS | _FCRASH_H_V8_PROFILE_IDS
@@ -2343,7 +2363,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             _FCRASH_H_V6_PROFILE_IDS
             | _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
-            | _FCRASH_H_V9_PROFILE_IDS
+            | _FCRASH_H_GUARDED_PROFILE_IDS
         ) and (
             arm_metadata.get("clock_domain") != "same_host_clock_monotonic_raw"
             or arm_metadata.get("required_observation_schema") != 3
@@ -2355,13 +2375,13 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             profile_id
             in _FCRASH_H_V7_PROFILE_IDS
             | _FCRASH_H_V8_PROFILE_IDS
-            | _FCRASH_H_V9_PROFILE_IDS
+            | _FCRASH_H_GUARDED_PROFILE_IDS
             and arm_metadata.get("snapshot_evidence_basis")
             != "exact_post_fault_attempt_start_v1"
         ):
             _error("v7 fault-window snapshot evidence metadata drifted")
         if (
-            profile_id in _FCRASH_H_V9_PROFILE_IDS
+            profile_id in _FCRASH_H_GUARDED_PROFILE_IDS
             and arm_metadata.get("selection_cardinality_policy")
             != "all_guarded_up_to_fault_bound_v1"
         ):
@@ -2407,7 +2427,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
-        | _FCRASH_H_V9_PROFILE_IDS
+        | _FCRASH_H_GUARDED_PROFILE_IDS
     ):
         expected_measurement_keys.add("phase_window_contract")
     if set(measurement) != expected_measurement_keys:
@@ -2419,7 +2439,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
-        | _FCRASH_H_V9_PROFILE_IDS
+        | _FCRASH_H_GUARDED_PROFILE_IDS
     ):
         raw_phase_contract = _mapping(
             measurement.get("phase_window_contract"), "phase-window contract"
@@ -2457,6 +2477,45 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         _error("authoritative observer must be a survivor")
     fault = _mapping(profile.get("fault"), "profile fault")
     transitions = _mapping(profile.get("transitions"), "profile transitions")
+    timing = transitions.get("adaptive_timing_contract")
+    if profile_id in _FCRASH_H_V10_PROFILE_IDS:
+        expected_timing = {
+            "schema_version": 1,
+            "domain": "kauri-focused-v10-transition-timing-v1",
+            "epoch1_common_commit_anchor_deadline_seconds": 5,
+            "optimization_minimum_predecessor_residency_ms": 65_000,
+        }
+        if timing != expected_timing:
+            _error("v10 transition timing contract drifted")
+        if (
+            _integer(measurement.get("bucket_width_seconds"), "bucket width", 1)
+            != expected_timing["epoch1_common_commit_anchor_deadline_seconds"]
+            or expected_timing["optimization_minimum_predecessor_residency_ms"]
+            != (
+                _integer(
+                    _mapping(
+                        measurement.get("phase_window_contract"),
+                        "phase-window contract",
+                    ).get("stabilization_offset_seconds"),
+                    "phase stabilization offset",
+                    1,
+                )
+                + _integer(
+                    _mapping(profile.get("timers"), "profile timers").get(
+                        "stable_phase_seconds"
+                    ),
+                    "stable phase",
+                    1,
+                )
+                + _integer(
+                    measurement.get("bucket_width_seconds"), "bucket width", 1
+                )
+            )
+            * 1_000
+        ):
+            _error("v10 transition timing contract is not phase-derived")
+    elif timing is not None:
+        _error("archived profile contains a prospective transition timing contract")
     if (
         fault.get("target_count") != len(targets)
         or transitions.get("common_commit_quorum") != quorum
@@ -2498,6 +2557,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     is_v8_n31 = profile_id in {
         "n31-f5-q21-three-crash-pair-v8",
         "n31-f5-q21-three-crash-pair-v9",
+        "n31-f5-q21-three-crash-pair-v10",
     }
     order = [members[(active_tree + offset) % count] for offset in range(count)]
     if (
@@ -2560,13 +2620,14 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         | _FCRASH_H_V6_PROFILE_IDS
         | _FCRASH_H_V7_PROFILE_IDS
         | _FCRASH_H_V8_PROFILE_IDS
-        | _FCRASH_H_V9_PROFILE_IDS
+        | _FCRASH_H_GUARDED_PROFILE_IDS
         and (
             profile_sha,
             proof_sha,
         )
         != (
-            _FCRASH_H_V9_IDENTITIES.get(str(profile_id))
+            _FCRASH_H_V10_IDENTITIES.get(str(profile_id))
+            or _FCRASH_H_V9_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V7_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V6_IDENTITIES.get(str(profile_id))
@@ -2658,6 +2719,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
                 in {
                     "n7-f2-q5-two-crash-pair-smoke-v8",
                     "n7-f2-q5-two-crash-pair-smoke-v9",
+                    "n7-f2-q5-two-crash-pair-smoke-v10",
                 }
                 else {}
             ),
@@ -3778,6 +3840,20 @@ def _v5_causal_phase_windows(
         after_ns=activation1_ns,
         contract=contract,
     )
+    if _is_v10_contract(contract):
+        timing = _mapping(
+            _mapping(contract.get("profile"), "focused profile")
+            .get("transitions"),
+            "profile transitions",
+        )
+        timing = _mapping(timing.get("adaptive_timing_contract"), "v10 timing")
+        anchor_deadline_ns = _integer(
+            timing.get("epoch1_common_commit_anchor_deadline_seconds"),
+            "v10 common commit anchor deadline",
+            1,
+        ) * 1_000_000_000
+        if common1_ns > activation1_ns + anchor_deadline_ns:
+            _error("v10 Epoch-1 common commit exceeded its activation anchor bound")
     epoch1_start = max(activation1_ns, common1_ns) + stabilization_ns
     epoch1_end = epoch1_start + phase_duration_ns
 
@@ -4282,6 +4358,7 @@ _MANAGER_SINGLETON_OPTIONS = {
     "--fault-window-arm-required-observation-schema",
     "--fault-window-arm-timeout-evidence-basis",
     "--fault-window-arm-snapshot-evidence-basis",
+    "--fault-window-arm-selection-cardinality-policy",
 }
 _MANAGER_REPEATABLE_OPTIONS = {"--transition-request", "--bundle-output", "--replica"}
 
@@ -4331,6 +4408,32 @@ def _validate_manager_boundary(
         _error("manager launch boundary transition cardinality drifted")
     if counts.get("--bundle-output") != counts.get("--transition-request"):
         _error("manager launch boundary bundle output cardinality drifted")
+    transition_requests: list[Mapping[str, Any]] = []
+    for index, argument in enumerate(arguments[:-1]):
+        if argument != "--transition-request":
+            continue
+        try:
+            request = json.loads(arguments[index + 1])
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise FocusedCrashPairValidationError(
+                "manager transition request is invalid JSON"
+            ) from exc
+        transition_requests.append(_mapping(request, "manager transition request"))
+    if _is_v10_contract(contract):
+        residence_ms = _mapping(
+            _mapping(contract.get("profile"), "focused profile").get("transitions"),
+            "profile transitions",
+        ).get("adaptive_timing_contract", {})
+        residence_ms = _mapping(residence_ms, "v10 transition timing").get(
+            "optimization_minimum_predecessor_residency_ms"
+        )
+        expected_residencies = (0, residence_ms) if transition_count == 2 else (0,)
+        actual_residencies = tuple(
+            request.get("minimum_predecessor_residency_ms")
+            for request in transition_requests
+        )
+        if actual_residencies != expected_residencies:
+            _error("v10 manager transition residence differs from the frozen profile")
     arm_options = {
         option
         for option in _MANAGER_SINGLETON_OPTIONS

@@ -741,6 +741,32 @@ def _aggregate_trusted_provenance(
                 "adaptive_transition_count": 2,
             },
         ),
+        (
+            runtime_fixture.N7_PROFILE_V10,
+            {
+                "members": tuple(range(7)),
+                "quorum": 5,
+                "targets": (0, 1),
+                "survivors": (2, 3, 4, 5, 6),
+                "authoritative_source_id": "replica-2",
+                "fault_target_count": 2,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
+        (
+            runtime_fixture.N31_PROFILE_V10,
+            {
+                "members": tuple(range(31)),
+                "quorum": 21,
+                "targets": (21, 22, 23),
+                "survivors": tuple((*range(21), *range(24, 31))),
+                "authoritative_source_id": "replica-0",
+                "fault_target_count": 3,
+                "control_transition_count": 1,
+                "adaptive_transition_count": 2,
+            },
+        ),
     ),
 )
 def test_validator_contract_is_derived_from_each_focused_profile(
@@ -768,7 +794,12 @@ def test_validator_contract_is_derived_from_each_focused_profile(
     assert (
         contract["adaptive_transition_count"] == expected["adaptive_transition_count"]
     )
-    if profile_path in {runtime_fixture.N7_PROFILE_V9, runtime_fixture.N31_PROFILE_V9}:
+    if profile_path in {
+        runtime_fixture.N7_PROFILE_V9,
+        runtime_fixture.N31_PROFILE_V9,
+        runtime_fixture.N7_PROFILE_V10,
+        runtime_fixture.N31_PROFILE_V10,
+    }:
         assert contract["phase_window_contract"] == {
             "schema_version": 1,
             "domain": "kauri-focused-causal-phase-windows-v1",
@@ -5861,6 +5892,165 @@ def test_v5_causal_phase_reconstruction_accepts_gapped_windows(
         "late",
     ]
     assert measurements["phases"][1]["transactions"] == 0
+
+
+def _v10_causal_phase_window_fixture(
+    tmp_path: Path,
+) -> tuple[Path, list[dict[str, object]], object, object, dict[str, object]]:
+    root, events, epoch1, epoch2, contract = _v5_causal_phase_window_fixture(tmp_path)
+    second = 1_000_000_000
+    commit_times = {1: 5, 2: 36, 3: 49, 4: 85, 5: 116, 6: 160, 7: 191}
+    for event in events:
+        payload = event["payload"]
+        assert isinstance(payload, dict)
+        if event["event_type"] in {"block.committed", "block.commit_observed"}:
+            event["source_monotonic_ns"] = commit_times[int(payload["block_height"])] * second
+        elif event["event_type"] == "epoch.command_committed":
+            event["source_monotonic_ns"] = (
+                75 if payload["successor_epoch_number"] == 1 else 150
+            ) * second
+        elif event["event_type"] == "epoch.activated":
+            event["source_monotonic_ns"] = (
+                80 if payload["epoch_number"] == 1 else 155
+            ) * second
+    contract["profile_id"] = "n31-f5-q21-three-crash-pair-v10"
+    contract["profile"]["profile_id"] = contract["profile_id"]
+    contract["profile"]["transitions"] = {
+        "adaptive_timing_contract": {
+            "schema_version": 1,
+            "domain": "kauri-focused-v10-transition-timing-v1",
+            "epoch1_common_commit_anchor_deadline_seconds": 5,
+            "optimization_minimum_predecessor_residency_ms": 65_000,
+        }
+    }
+    return root, events, epoch1, epoch2, contract
+
+
+def test_v10_source_blind_timing_accepts_boundary_and_rejects_late_anchor_or_e2(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    root, events, _epoch1, epoch2, contract = _v10_causal_phase_window_fixture(
+        tmp_path
+    )
+    commits = [event for event in events if event["event_type"] == "block.committed"]
+    windows = validation._v5_causal_phase_windows(
+        root, events, commits, epoch2, contract
+    )
+    assert windows[2] == ("epoch1", 115_000_000_000, 145_000_000_000, 1)
+
+    late_anchor = deepcopy(events)
+    for event in late_anchor:
+        payload = event["payload"]
+        if (
+            event["event_type"] in {"block.committed", "block.commit_observed"}
+            and payload["block_height"] == 4
+        ):
+            event["source_monotonic_ns"] = 85_000_000_001
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="anchor bound"):
+        validation._v5_causal_phase_windows(
+            root,
+            late_anchor,
+            [e for e in late_anchor if e["event_type"] == "block.committed"],
+            epoch2,
+            contract,
+        )
+
+    early_e2 = deepcopy(events)
+    next(
+        event
+        for event in early_e2
+        if event["event_type"] == "epoch.command_committed"
+        and event["payload"]["successor_epoch_number"] == 2
+    )["source_monotonic_ns"] = 145_000_000_000
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="overlaps"):
+        validation._v5_causal_phase_windows(
+            root,
+            early_e2,
+            [e for e in early_e2 if e["event_type"] == "block.committed"],
+            epoch2,
+            contract,
+        )
+
+
+@pytest.mark.parametrize(("arm", "transition_count"), (("control", 1), ("adaptive", 2)))
+def test_v10_source_blind_manager_residence_matches_control_and_adaptive_cardinality(
+    arm: str,
+    transition_count: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    validation = _validation()
+    runtime = runtime_fixture._runtime()
+    profile = runtime.load_focused_profile(runtime_fixture.N7_PROFILE_V10)
+    root = tmp_path / "contract"
+    proof = runtime_fixture._topology_proof_path(profile.path, profile.raw)
+    target_proof = root / profile.raw["topology"]["proof_path"]
+    target_proof.parent.mkdir(parents=True)
+    target_proof.write_bytes(proof.read_bytes())
+    _write_json(root / "profile.json", profile.raw)
+    contract = validation.validation_contract_from_profile(root)
+    adapter = runtime._profiled_adapter(profile, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
+    argv = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm=arm,
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=tmp_path / arm,
+        run_id=f"run-v10-{arm}",
+        source_instance=f"manager-v10-{arm}",
+        fault_window_arm_path=(tmp_path / arm / "fault-window-arm.json").resolve(),
+        request_sha256="a" * 64,
+    )
+    manager_input = {
+        "input_source": "normalized_manager_launch_boundary_v1",
+        "requested_argv": list(argv),
+        "observed_argv": list(argv),
+        "stdin": "closed",
+    }
+    monkeypatch.setattr(
+        validation.factorial_validation,
+        "validate_manager_blinding",
+        lambda _arguments, _events: None,
+    )
+    validation._validate_manager_boundary(
+        contract,
+        argv,
+        manager_input,
+        (),
+        transition_count=transition_count,
+    )
+
+    if arm == "adaptive":
+        changed = list(argv)
+        request_index = [
+            index
+            for index, argument in enumerate(changed)
+            if argument == "--transition-request"
+        ][1]
+        request = json.loads(changed[request_index + 1])
+        request["minimum_predecessor_residency_ms"] = 64_999
+        changed[request_index + 1] = json.dumps(
+            request, separators=(",", ":"), sort_keys=True
+        )
+        changed_input = {
+            **manager_input,
+            "requested_argv": changed,
+            "observed_argv": changed,
+        }
+        with pytest.raises(
+            validation.FocusedCrashPairValidationError, match="residence"
+        ):
+            validation._validate_manager_boundary(
+                contract,
+                changed,
+                changed_input,
+                (),
+                transition_count=2,
+            )
 
 
 def test_v4_phase_fallback_is_not_figure_acceptable(tmp_path: Path) -> None:

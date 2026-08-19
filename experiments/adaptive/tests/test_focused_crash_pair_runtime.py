@@ -41,6 +41,8 @@ N7_PROFILE_V8 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v8.json"
 N31_PROFILE_V8 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v8.json"
 N7_PROFILE_V9 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v9.json"
 N31_PROFILE_V9 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v9.json"
+N7_PROFILE_V10 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v10.json"
+N31_PROFILE_V10 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v10.json"
 
 
 def test_v9_inherited_cohort_binds_leaves_without_inventing_suffix_order() -> None:
@@ -534,6 +536,72 @@ def test_v9_uses_six_complete_buckets_while_v8_keeps_archived_window_width() -> 
         runtime._phase_measurement_duration_ns(v8, bucket_width_ns) == bucket_width_ns
     )
     assert runtime._phase_measurement_duration_ns(v9, bucket_width_ns) == 30_000_000_000
+
+
+def test_v10_profiles_have_frozen_identities_and_phase_derived_residence() -> None:
+    runtime = _runtime()
+    expected = {
+        N7_PROFILE_V10: (
+            "b57b6406be768305f917d7ad45d022e510733d01932bd75c91aa027e82e0b34c",
+            "b08423625ab4eedb78a3bb18eaeceda860d006f81ab67b807b228f30cd7ad5e7",
+        ),
+        N31_PROFILE_V10: (
+            "066fbd2b1a14d6cec0d86eaafe28e19e4b52ed2a4cefb47d8a2b0079005bdf85",
+            "8a4bc9a735cd73a31110ca4641e24a296247d5e17dd32af2e704ecbf76333a3d",
+        ),
+    }
+    for path, identities in expected.items():
+        profile = runtime.load_focused_profile(path)
+        assert (profile.profile_sha256, profile.topology_proof_sha256) == identities
+        assert runtime._v10_transition_timing(profile) == (5_000_000_000, 65_000)
+
+
+def test_v10_transition_request_uses_65s_while_v9_archive_keeps_40s(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    v9 = runtime.load_focused_profile(N7_PROFILE_V9)
+    v10 = runtime.load_focused_profile(N7_PROFILE_V10)
+    v9_requests = runtime._focused_transition_requests(tmp_path / "v9", "adaptive", v9)
+    v10_requests = runtime._focused_transition_requests(
+        tmp_path / "v10", "adaptive", v10
+    )
+    assert v9_requests[1][0]["minimum_predecessor_residency_ms"] == 40_000
+    assert v10_requests[1][0]["minimum_predecessor_residency_ms"] == 65_000
+
+    adapter = runtime._profiled_adapter(v10, 41_719)
+    tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
+    argv = runtime._focused_manager_command(
+        v10,
+        adapter,
+        arm="adaptive",
+        manager_binary=Path("/build/adaptation-manager"),
+        tls=tls,
+        issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
+        run_directory=tmp_path / "argv",
+        run_id="run-v10",
+        source_instance="manager-v10",
+        fault_window_arm_path=(tmp_path / "argv" / "fault-window-arm.json").resolve(),
+        request_sha256="a" * 64,
+    )
+    raw_requests = [
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--transition-request"
+    ]
+    assert json.loads(raw_requests[1])["minimum_predecessor_residency_ms"] == 65_000
+    manager_input = {
+        "input_source": "normalized_manager_launch_boundary_v1",
+        "requested_argv": list(argv),
+        "observed_argv": list(argv),
+        "stdin": "closed",
+    }
+    assert runtime._validate_manager_launch_boundary(
+        argv,
+        argv,
+        manager_input=manager_input,
+        forbidden_values=(),
+    )["blinded"] is True
 
 
 def test_v6_runtime_exact_timeout_guard_rejects_cross_attempt_late_bleed() -> None:
@@ -4841,6 +4909,70 @@ def _arm_hooks(runtime: Any, snapshots: Mapping[str, Mapping[str, object]]) -> A
         unexpected_exit_ids=lambda: snapshots.get("unexpected", {}).get("ids", []),
     )
     return hooks, calls
+
+
+def _v10_timing_state_fixture(runtime: Any) -> tuple[Any, dict[str, Any]]:
+    loaded = runtime.load_focused_profile(N7_PROFILE_V10)
+    profile = replace(
+        loaded,
+        issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
+        raw={**loaded.raw, "schema_version": 1},
+    )
+    snapshots = _arm_snapshots(7, "A")
+    topology = profile.raw["topology"]
+    barrier = [
+        {
+            "replica_id": replica,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": topology["active_tree_id"],
+                "epoch_digest": topology["epoch_zero_digest"],
+            },
+        }
+        for replica in profile.replica_ids
+    ]
+    snapshots["fault"] = {
+        **snapshots["fault"],
+        "prefault_active_configuration_barrier": barrier,
+    }
+    snapshots["commit1"] = {
+        **snapshots["commit1"],
+        "first_common_commit_anchor_monotonic_ns": 8_000,
+    }
+    snapshots["commands2"] = {
+        **snapshots["commands2"],
+        "first_source_monotonic_ns": 12_000,
+    }
+    snapshots["ranking"] = {
+        **snapshots["ranking"],
+        "detected_target_ids": list(profile.target_replica_ids),
+    }
+    return profile, snapshots
+
+
+def test_v10_live_state_rejects_late_common_anchor_and_early_first_e2_command() -> None:
+    runtime = _runtime()
+    profile, accepted = _v10_timing_state_fixture(runtime)
+    hooks, _ = _arm_hooks(runtime, accepted)
+    runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    late_anchor = deepcopy(accepted)
+    activation1_ns = int(late_anchor["activations1"]["source_monotonic_ns"])
+    late_anchor_ns = activation1_ns + 5_000_000_001
+    late_anchor["commit1"]["first_common_commit_anchor_monotonic_ns"] = late_anchor_ns
+    late_anchor["commit1"]["source_monotonic_ns"] = late_anchor_ns
+    late_anchor["containment"]["source_monotonic_ns"] = late_anchor_ns + 1
+    hooks, _ = _arm_hooks(runtime, late_anchor)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="anchor bound"):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
+
+    early_e2 = deepcopy(accepted)
+    early_e2["commands2"]["first_source_monotonic_ns"] = early_e2["containment"][
+        "source_monotonic_ns"
+    ]
+    hooks, _ = _arm_hooks(runtime, early_e2)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="overlaps"):
+        runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
 
 @pytest.mark.parametrize(("replicas", "quorum"), ((7, 5), (31, 21)))

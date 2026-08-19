@@ -210,13 +210,13 @@ def _v6_timeout_observation_id(
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9")
+        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9", "-v10")
     )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v5", "-v6", "-v7", "-v8", "-v9")
+        ("-v5", "-v6", "-v7", "-v8", "-v9", "-v10")
     )
 
 
@@ -235,11 +235,59 @@ def _is_v8_profile(profile: FocusedProfile | object) -> bool:
 def _is_v9_profile(profile: FocusedProfile | object) -> bool:
     """Return whether this is the prospective guarded-cohort contract."""
 
-    return str(getattr(profile, "profile_id", "")).endswith("-v9")
+    return str(getattr(profile, "profile_id", "")).endswith(("-v9", "-v10"))
+
+
+def _is_v10_profile(profile: FocusedProfile | object) -> bool:
+    return str(getattr(profile, "profile_id", "")).endswith("-v10")
 
 
 def _is_v8_or_v9_profile(profile: FocusedProfile | object) -> bool:
     return _is_v8_profile(profile) or _is_v9_profile(profile)
+
+
+def _v10_transition_timing(profile: FocusedProfile) -> tuple[int, int]:
+    """Return the frozen E1 anchor margin and E2 residence for v10."""
+
+    transitions = _document(profile.raw.get("transitions"), "profile transitions")
+    timing = transitions.get("adaptive_timing_contract")
+    if not _is_v10_profile(profile):
+        if timing is not None:
+            _error("archived profile contains a prospective transition timing contract")
+        return (0, 40_000)
+    contract = _document(timing, "v10 transition timing contract")
+    expected = {
+        "schema_version": 1,
+        "domain": "kauri-focused-v10-transition-timing-v1",
+        "epoch1_common_commit_anchor_deadline_seconds": 5,
+        "optimization_minimum_predecessor_residency_ms": 65_000,
+    }
+    if contract != expected:
+        _error("v10 transition timing contract drifted")
+    measurement = _document(profile.raw.get("measurement"), "profile measurement")
+    phase = _document(
+        measurement.get("phase_window_contract"), "phase-window contract"
+    )
+    bucket_seconds = _integer(
+        measurement.get("bucket_width_seconds"), "bucket width", 1
+    )
+    stabilization_seconds = _integer(
+        phase.get("stabilization_offset_seconds"), "phase stabilization offset", 1
+    )
+    stable_seconds = _integer(
+        _document(profile.raw.get("timers"), "profile timers").get(
+            "stable_phase_seconds"
+        ),
+        "stable phase",
+        1,
+    )
+    if (
+        contract["epoch1_common_commit_anchor_deadline_seconds"] != bucket_seconds
+        or contract["optimization_minimum_predecessor_residency_ms"]
+        != (stabilization_seconds + stable_seconds + bucket_seconds) * 1_000
+    ):
+        _error("v10 transition timing contract is not phase-derived")
+    return (bucket_seconds * 1_000_000_000, 65_000)
 
 
 def _reporter_capacity_document(
@@ -957,11 +1005,12 @@ def _validate_topology_proof(
         "n31-f5-q21-three-crash-pair-v7",
         "n31-f5-q21-three-crash-pair-v8",
         "n31-f5-q21-three-crash-pair-v9",
+        "n31-f5-q21-three-crash-pair-v10",
     }:
         metric = topology.get("target_selection_metric")
         expected_metric = (
             _v8_n31_target_selection_metric()
-            if str(profile.get("profile_id", "")).endswith(("-v8", "-v9"))
+            if str(profile.get("profile_id", "")).endswith(("-v8", "-v9", "-v10"))
             else _v7_n31_target_selection_metric()
         )
         if metric != expected_metric:
@@ -971,7 +1020,7 @@ def _validate_topology_proof(
         "target_selection_metric" in topology or "target_selection_metric" in derivation
     ):
         _error("archived topology contains a prospective target selection metric")
-    if str(profile.get("profile_id", "")).endswith(("-v8", "-v9")):
+    if str(profile.get("profile_id", "")).endswith(("-v8", "-v9", "-v10")):
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         expected_capacity = _reporter_capacity_document(
             replica_count=replica_count,
@@ -1237,6 +1286,7 @@ def load_focused_profile(path: Path) -> FocusedProfile:
         issuer_public_key=issuer_key,
         raw=dict(profile),
     )
+    _v10_transition_timing(loaded)
     if schema_version == 2:
         derive_reporter_coverage_plan(loaded)
     return loaded
@@ -2728,6 +2778,18 @@ def _drive_arm_state_machine(
         quorum=quorum,
         after_ns=activation1_ns,
     )
+    if isinstance(profile, FocusedProfile) and _is_v10_profile(profile):
+        anchor_margin_ns, _residency_ms = _v10_transition_timing(profile)
+        first_common1_ns = _integer(
+            commit1.get("first_common_commit_anchor_monotonic_ns"),
+            "first Epoch-1 common commit anchor",
+        )
+        if (
+            first_common1_ns <= activation1_ns
+            or first_common1_ns > commit1_ns
+            or first_common1_ns > activation1_ns + anchor_margin_ns
+        ):
+            _error("v10 Epoch-1 common commit exceeded its activation anchor bound")
     containment = hooks.wait_for_stable_phase("containment")
     containment_ns = _timestamp(containment, "containment")
     if (
@@ -2804,6 +2866,13 @@ def _drive_arm_state_machine(
             after_ns=epoch2_ns,
             activation=False,
         )
+        if isinstance(profile, FocusedProfile) and _is_v10_profile(profile):
+            first_command2_ns = _integer(
+                command2.get("first_source_monotonic_ns"),
+                "first Epoch-2 command timestamp",
+            )
+            if first_command2_ns <= containment_ns:
+                _error("v10 first Epoch-2 command overlaps the Epoch-1 phase")
         activation2 = hooks.wait_for_epoch_activations(2)
         activation2_ns = _transition_barrier(
             activation2,
@@ -4467,6 +4536,11 @@ class FocusedRawEvidenceSource:
                 for event in selected
             ),
         }
+        if _is_v10_profile(self._profile):
+            snapshot["first_source_monotonic_ns"] = min(
+                _integer(event["source_monotonic_ns"], "transition timestamp")
+                for event in selected
+            )
         if not activation:
             snapshot["command_block_height"] = _integer(
                 payload.get("command_block_height"), "transition command height", 1
@@ -4809,7 +4883,7 @@ class FocusedRawEvidenceSource:
                 for event in witnessed
             }
         )
-        return {
+        snapshot = {
             "epoch_number": epoch,
             "epoch_digest": decoded.epoch_digest,
             "authoritative_commit_count": 1,
@@ -4828,6 +4902,27 @@ class FocusedRawEvidenceSource:
                 for event in witnessed
             ),
         }
+        if _is_v10_profile(self._profile):
+            snapshot["first_common_commit_anchor_monotonic_ns"] = (
+                _runtime_first_common_commit_anchor(
+                    events,
+                    self._profile,
+                    epoch_number=epoch,
+                    after_ns=max(
+                        _integer(
+                            event["source_monotonic_ns"],
+                            "transition activation timestamp",
+                        )
+                        for event in events
+                        if event.get("event_type") == "epoch.activated"
+                        and _document(
+                            event.get("payload"), "transition activation"
+                        ).get("epoch_number")
+                        == epoch
+                    ),
+                )
+            )
+        return snapshot
 
     def _manager_clean_exit_is_expected(
         self, events: Sequence[Mapping[str, Any]], record: object
@@ -6677,7 +6772,7 @@ def _generate_arm_identities(
 
 
 def _focused_transition_requests(
-    run_directory: Path, arm: str
+    run_directory: Path, arm: str, profile: FocusedProfile
 ) -> tuple[tuple[dict[str, object], Path], ...]:
     requests: list[tuple[dict[str, object], Path]] = []
     specifications = [
@@ -6691,6 +6786,7 @@ def _focused_transition_requests(
         )
     ]
     if arm == "adaptive":
+        _anchor_margin_ns, residence_ms = _v10_transition_timing(profile)
         specifications.append(
             (
                 "e1-to-e2-optimization",
@@ -6698,7 +6794,7 @@ def _focused_transition_requests(
                 True,
                 1,
                 2,
-                40_000,
+                residence_ms,
             )
         )
     for artifact, intent, shape, predecessor, successor, residence_ms in specifications:
@@ -6898,7 +6994,7 @@ def _focused_manager_command(
                     "all_guarded_up_to_fault_bound_v1",
                 )
             )
-    for request, output in _focused_transition_requests(run_directory, arm):
+    for request, output in _focused_transition_requests(run_directory, arm, profile):
         command.extend(
             (
                 "--transition-request",
