@@ -6414,6 +6414,8 @@ namespace hotstuff
             return;
 
         bool accepted = false;
+        auto aggregate_disposition =
+            VerifiedAggregateCertificateDisposition::rejected;
         if (kind == ExactContributionKind::direct_vote)
         {
             const auto &vote = contribution.direct_vote;
@@ -6450,13 +6452,65 @@ namespace hotstuff
             const auto &relay = contribution.aggregate_relay;
             if (relay == nullptr || relay->cert == nullptr)
                 return;
-            accepted = proposal_contexts->record_verified_aggregate_certificate(
-                lease,
-                contribution.authenticated_sender,
-                *relay->cert);
+            aggregate_disposition = proposal_contexts
+                ->record_verified_aggregate_certificate_with_disposition(
+                    lease,
+                    contribution.authenticated_sender,
+                    *relay->cert);
+            accepted = aggregate_disposition ==
+                VerifiedAggregateCertificateDisposition::accepted;
         }
         if (!accepted)
         {
+            if (kind == ExactContributionKind::aggregate_relay &&
+                aggregate_disposition ==
+                    VerifiedAggregateCertificateDisposition::redundant)
+            {
+                const auto signers =
+                    contribution.aggregate_relay->cert->get_signers();
+                const std::set<ReplicaID> contribution_signers(
+                    signers.begin(), signers.end());
+                const auto response_monotonic_ns =
+                    adaptive_evidence_monotonic_now_ns();
+                const auto false_timeout =
+                    experiment_false_timeout_states.find(lease.key());
+                const bool suppress_positive_observation =
+                    false_timeout != experiment_false_timeout_states.end() &&
+                    false_timeout->second.may_suppress(
+                        contribution.authenticated_sender) &&
+                    experiment_byzantine_adapter != nullptr &&
+                    experiment_byzantine_adapter->on_verified_response(
+                        ExperimentByzantineContext{
+                            lease.key(), experiment_diagnostic_window},
+                        contribution.authenticated_sender);
+                const bool response_fact_recorded =
+                    adaptive_v2_response_evidence != nullptr &&
+                    !suppress_positive_observation &&
+                    adaptive_v2_response_evidence
+                        ->record_verified_response(
+                            lease.key(),
+                            contribution.authenticated_sender,
+                            ExpectedMessageType::aggregate_relay,
+                            contribution_signers,
+                            response_monotonic_ns);
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_RESPONSE_EVIDENCE "
+                    "disposition=verified_redundant_aggregate_evidence_only "
+                    "consensus_accepted=0 response_fact_recorded=%u "
+                    "positive_suppressed=%u "
+                    "reporter=%u child=%u epoch=%u tree=%u "
+                    "epoch_digest=%s block=%s response_monotonic_ns=%llu",
+                    response_fact_recorded ? 1U : 0U,
+                    suppress_positive_observation ? 1U : 0U,
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(
+                        contribution.authenticated_sender),
+                    lease.key().configuration.epoch_number,
+                    lease.key().configuration.tree_id,
+                    lease.key().configuration.epoch_digest.to_hex().c_str(),
+                    lease.key().block_hash.to_hex().c_str(),
+                    static_cast<unsigned long long>(response_monotonic_ns));
+            }
             if (proposal_contexts->delta_open_enabled(lease))
                 try
                 {

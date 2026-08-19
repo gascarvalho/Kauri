@@ -2415,20 +2415,45 @@ TEST_CASE(
         "void HotStuffBase::continue_exact_contribution",
         "bool HotStuffBase::publish_exact_root_qc");
     const auto rejected = contribution.find("if (!accepted)");
-    const auto observed = contribution.find(
-        "adaptive_v2_response_evidence->record_verified_response");
+    const auto redundant_guard = contribution.find(
+        "VerifiedAggregateCertificateDisposition::redundant");
+    const auto evidence_only_call = contribution.find(
+        "record_verified_response", redundant_guard);
+    const auto evidence_only_marker = contribution.find(
+        "verified_redundant_aggregate_evidence_only");
     REQUIRE(rejected != std::string::npos);
-    REQUIRE(observed != std::string::npos);
-    CHECK(rejected < observed);
-    CHECK(contribution.substr(rejected, observed - rejected).find(
-              "return;") != std::string::npos);
-    CHECK(contribution.find("contribution.authenticated_sender", observed) !=
+    REQUIRE(redundant_guard != std::string::npos);
+    REQUIRE(evidence_only_call != std::string::npos);
+    REQUIRE(evidence_only_marker != std::string::npos);
+    CHECK(rejected < redundant_guard);
+    CHECK(redundant_guard < evidence_only_call);
+    CHECK(evidence_only_call < evidence_only_marker);
+    CHECK(contribution.find("consensus_accepted=0", evidence_only_marker) !=
           std::string::npos);
-    CHECK(contribution.find("contribution_signers", observed) !=
+    CHECK(contribution.find(
+              "response_fact_recorded=%u", evidence_only_marker) !=
+          std::string::npos);
+    CHECK(contribution.find("positive_suppressed=%u", evidence_only_marker) !=
+          std::string::npos);
+    const auto evidence_only_end = contribution.find(
+        "if (proposal_contexts->delta_open_enabled", evidence_only_marker);
+    REQUIRE(evidence_only_end != std::string::npos);
+    const auto evidence_only = contribution.substr(
+        redundant_guard, evidence_only_end - redundant_guard);
+    CHECK(evidence_only.find("may_suppress") != std::string::npos);
+    CHECK(evidence_only.find("!suppress_positive_observation") !=
+          std::string::npos);
+    CHECK(evidence_only.find("synchronize_experiment_post_qc_audit") ==
+          std::string::npos);
+    CHECK(evidence_only.find("record_exact_latency") == std::string::npos);
+    CHECK(evidence_only.find("try_finish") == std::string::npos);
+    CHECK(evidence_only.find("publish_exact_root_qc") == std::string::npos);
+    CHECK(evidence_only.find("send_exact_relay") == std::string::npos);
+    CHECK(evidence_only.find("claim_unforwarded_certificate") ==
           std::string::npos);
 
     const auto first_probe_call = contribution.find(
-        "record_verified_response");
+        "record_verified_response", evidence_only_call + 1);
     const auto second_probe_call = contribution.find(
         "record_verified_response",
         first_probe_call + 1);

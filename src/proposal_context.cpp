@@ -1041,12 +1041,24 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     ReplicaID authenticated_child,
     const QuorumCert &certificate)
 {
+    return record_verified_aggregate_certificate_with_disposition(
+               lease, authenticated_child, certificate) ==
+           VerifiedAggregateCertificateDisposition::accepted;
+}
+
+VerifiedAggregateCertificateDisposition
+ProposalContextLifecycle::
+record_verified_aggregate_certificate_with_disposition(
+    const ProposalContextLease &lease,
+    ReplicaID authenticated_child,
+    const QuorumCert &certificate)
+{
     if (certificate.get_proposal_key() != lease.key())
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     std::set<ReplicaID> certified_signers;
     if (!exact_signer_set(certificate, certified_signers) ||
         certified_signers.empty())
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     quorum_cert_bt forwarding_candidate;
     try
     {
@@ -1057,7 +1069,7 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     }
     catch (...)
     {
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     }
 
     std::lock_guard<std::mutex> lock(mutex_);
@@ -1067,16 +1079,18 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
         found->second->generation != lease.generation() ||
         !found->second->runtime.has_value() ||
         found->second->accumulator == nullptr)
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
 
     const auto subtree =
         found->second->tree->child_subtrees.find(authenticated_child);
     if (subtree == found->second->tree->child_subtrees.end())
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     for (const auto signer : certified_signers)
-        if (subtree->second.count(signer) == 0 ||
-            found->second->runtime->verified_signers.count(signer) != 0)
-            return false;
+        if (subtree->second.count(signer) == 0)
+            return VerifiedAggregateCertificateDisposition::rejected;
+    for (const auto signer : certified_signers)
+        if (found->second->runtime->verified_signers.count(signer) != 0)
+            return VerifiedAggregateCertificateDisposition::redundant;
 
     auto expected = found->second->runtime->verified_signers;
     expected.insert(
@@ -1088,18 +1102,18 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
     }
     catch (...)
     {
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     }
     std::set<ReplicaID> next_signers;
     if (!exact_signer_set(*next, next_signers) ||
         next_signers != expected)
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
     if (!retain_pending_forwarding_candidate(
             *found->second,
             next_pending_forwarding_candidate_,
             std::move(forwarding_candidate),
             certified_signers))
-        return false;
+        return VerifiedAggregateCertificateDisposition::rejected;
 
     found->second->accumulator = std::move(next);
     found->second->runtime->verified_signers = std::move(expected);
@@ -1108,7 +1122,7 @@ bool ProposalContextLifecycle::record_verified_aggregate_certificate(
         *found->second->tree,
         *found->second->runtime,
         authenticated_child);
-    return true;
+    return VerifiedAggregateCertificateDisposition::accepted;
 }
 
 quorum_cert_bt ProposalContextLifecycle::clone_accumulator(

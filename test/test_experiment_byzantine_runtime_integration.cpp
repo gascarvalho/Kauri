@@ -2,6 +2,7 @@
 #include <limits>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -512,6 +513,92 @@ public:
             .has_value();
     }
 
+    static bool seed_verified_aggregate(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        ReplicaID authenticated_child,
+        const QuorumCert &certificate)
+    {
+        const auto lease = runtime.proposal_contexts->acquire_open_context(key);
+        return lease.has_value() &&
+               runtime.proposal_contexts
+                   ->record_verified_aggregate_certificate(
+                       *lease, authenticated_child, certificate);
+    }
+
+    static bool initialize_accumulator(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        const auto lease = runtime.proposal_contexts->acquire_open_context(key);
+        return lease.has_value() &&
+               runtime.proposal_contexts->initialize_accumulator(
+                   *lease, runtime.create_quorum_cert(key));
+    }
+
+    static std::optional<ProposalContextSnapshot> context_snapshot(
+        const HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        return runtime.proposal_contexts->snapshot(key);
+    }
+
+    static bool arm_response_attempt(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const ProposalTreeSnapshot &tree,
+        std::uint64_t start_ns,
+        std::uint64_t duration_us)
+    {
+        return runtime.adaptive_v2_response_evidence != nullptr &&
+               runtime.adaptive_v2_response_evidence->arm(
+                   key, tree, start_ns, duration_us);
+    }
+
+    static std::size_t record_response_timeout(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        ReplicaID child,
+        std::uint64_t timeout_ns)
+    {
+        return runtime.adaptive_v2_response_evidence == nullptr
+            ? 0
+            : runtime.adaptive_v2_response_evidence->record_timeouts(
+                  key, {child}, timeout_ns);
+    }
+
+    static void continue_verified_aggregate(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const VoteRelay &relay,
+        ReplicaID authenticated_child,
+        std::uint64_t received_ns)
+    {
+        const auto lease = runtime.proposal_contexts->acquire_open_context(key);
+        if (!lease.has_value())
+            throw std::invalid_argument("exact context is unavailable");
+        runtime.continue_exact_contribution(
+            *lease,
+            ExactContributionKind::aggregate_relay,
+            make_exact_relay_envelope(relay, authenticated_child),
+            received_ns);
+    }
+
+    static quorum_cert_bt aggregate_certificate(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        const std::set<ReplicaID> &signers)
+    {
+        auto certificate = runtime.create_quorum_cert(key);
+        for (const auto signer : signers)
+        {
+            PrivKeyDummy private_key;
+            PartCertDummy part(private_key, key);
+            certificate->add_part(runtime.config, signer, part);
+        }
+        return certificate;
+    }
+
     static void close_exact_context(
         HotStuffBase &runtime,
         const ProposalKey &key)
@@ -955,6 +1042,40 @@ public:
     size_t get_current_epoch() override { return 0; }
 };
 
+class InconsistentAggregateCertificate final
+    : public QuorumCertDummy
+{
+public:
+    InconsistentAggregateCertificate(
+        const ReplicaConfig &config,
+        const ProposalKey &key,
+        std::vector<ReplicaID> enumerated_signers,
+        std::size_t reported_count)
+        : QuorumCertDummy(config, key),
+          enumerated_signers_(std::move(enumerated_signers)),
+          reported_count_(reported_count)
+    {}
+
+    std::vector<ReplicaID> get_signers() const override
+    {
+        return enumerated_signers_;
+    }
+
+    std::size_t get_sigs_n() override
+    {
+        return reported_count_;
+    }
+
+    InconsistentAggregateCertificate *clone() override
+    {
+        return new InconsistentAggregateCertificate(*this);
+    }
+
+private:
+    std::vector<ReplicaID> enumerated_signers_;
+    std::size_t reported_count_{0};
+};
+
 class ThrowingAggregationScheduler final : public AggregationScheduler
 {
 public:
@@ -1261,6 +1382,116 @@ block_t indirect_commit_block(
         1,
         runtime.get_genesis(),
         nullptr);
+}
+
+TEST_CASE(
+    "consensus-redundant authenticated aggregate records late evidence only",
+    "[adaptive-v2][evidence][late][aggregate][production-continuation]"
+    "[mutation]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    const ProposalKey key{
+        configuration, digest("redundant-aggregate-late-evidence")};
+    ProposalTreeSnapshot tree;
+    tree.local_replica = 1;
+    tree.root = 0;
+    tree.parent = 0;
+    tree.direct_children = {2};
+    tree.assigned_subtree = {1, 2, 3};
+    tree.child_subtrees = {{2, {2, 3}}};
+    tree.required_subtree = {1, 2, 3};
+    tree.required_child_subtrees = {{2, {2, 3}}};
+    tree.fanout = 2;
+    tree.pipeline_stretch = 2;
+    REQUIRE(Access::admit_context_with_tree(runtime, key, tree));
+    REQUIRE(Access::initialize_accumulator(runtime, key));
+
+    auto first = Access::aggregate_certificate(runtime, key, {2});
+    REQUIRE(Access::seed_verified_aggregate(runtime, key, 2, *first));
+    const auto before = Access::context_snapshot(runtime, key);
+    REQUIRE(before.has_value());
+    REQUIRE(before->verified_signers == std::set<ReplicaID>{2});
+
+    std::vector<ResponseObservation> observations;
+    runtime.bind_adaptive_v2_evidence_transport(
+        [&observations](const EvidenceReportEnvelope &report) {
+            observations.push_back(report.observation);
+            return EvidenceTransportResult::accepted;
+        });
+    constexpr std::uint64_t start_ns = 1'000'000;
+    constexpr std::uint64_t deadline_us = 1'000;
+    REQUIRE(Access::arm_response_attempt(
+        runtime, key, tree, start_ns, deadline_us));
+    REQUIRE(Access::record_response_timeout(
+                runtime, key, 2, start_ns + deadline_us * 1000) == 1);
+
+    VoteRelay malformed_cardinality(
+        key,
+        quorum_cert_bt(new InconsistentAggregateCertificate(
+            runtime.get_config(), key, {2, 3}, 3)),
+        &runtime);
+    Access::continue_verified_aggregate(
+        runtime,
+        key,
+        malformed_cardinality,
+        2,
+        start_ns + deadline_us * 1000 + 1);
+    static_cast<void>(runtime.flush_adaptive_v2_evidence());
+    REQUIRE(observations.size() == 1);
+    CHECK(observations.front().outcome == ResponseOutcome::timeout);
+
+    VoteRelay noncanonical_duplicate(
+        key,
+        quorum_cert_bt(new InconsistentAggregateCertificate(
+            runtime.get_config(), key, {2, 2}, 2)),
+        &runtime);
+    Access::continue_verified_aggregate(
+        runtime,
+        key,
+        noncanonical_duplicate,
+        2,
+        start_ns + deadline_us * 1000 + 2);
+    static_cast<void>(runtime.flush_adaptive_v2_evidence());
+    REQUIRE(observations.size() == 1);
+    CHECK(observations.front().outcome == ResponseOutcome::timeout);
+
+    auto overlapping = Access::aggregate_certificate(runtime, key, {2, 3});
+    VoteRelay relay(key, overlapping->clone(), &runtime);
+    Access::continue_verified_aggregate(
+        runtime,
+        key,
+        relay,
+        2,
+        start_ns + deadline_us * 1000 + 3);
+    static_cast<void>(runtime.flush_adaptive_v2_evidence());
+
+    REQUIRE(observations.size() == 2);
+    CHECK(observations[0].outcome == ResponseOutcome::timeout);
+    CHECK(observations[1].outcome == ResponseOutcome::late);
+    CHECK(observations[1].observed_replica_id == 2);
+    CHECK(observations[1].expected_message_type ==
+          ExpectedMessageType::aggregate_relay);
+    CHECK(observations[1].signer_set == std::vector<ReplicaID>{2, 3});
+    CHECK(observations[1].observation_id == observations[0].observation_id);
+
+    const auto after = Access::context_snapshot(runtime, key);
+    REQUIRE(after.has_value());
+    CHECK(after->verified_signers == before->verified_signers);
+    CHECK(after->forwarded_signers == before->forwarded_signers);
 }
 
 TEST_CASE(

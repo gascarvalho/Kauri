@@ -61,6 +61,13 @@ enum class ProposalTransitionResult
     terminal_closed
 };
 
+enum class VerifiedAggregateCertificateDisposition
+{
+    rejected,
+    accepted,
+    redundant
+};
+
 struct ProposalTreeSnapshot
 {
     ReplicaID local_replica{0};
@@ -236,6 +243,11 @@ public:
         const PartCert &part,
         quorum_cert_bt verified_candidate = nullptr);
     bool record_verified_aggregate_certificate(
+        const ProposalContextLease &lease,
+        ReplicaID authenticated_child,
+        const QuorumCert &certificate);
+    VerifiedAggregateCertificateDisposition
+    record_verified_aggregate_certificate_with_disposition(
         const ProposalContextLease &lease,
         ReplicaID authenticated_child,
         const QuorumCert &certificate);

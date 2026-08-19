@@ -126,6 +126,7 @@ using hotstuff::ProposalContextMetadata;
 using hotstuff::ProposalContextStatus;
 using hotstuff::ProposalKey;
 using hotstuff::ProposalTreeSnapshot;
+using hotstuff::VerifiedAggregateCertificateDisposition;
 using hotstuff::QuorumCert;
 using hotstuff::QuorumCertAggBLS;
 using hotstuff::ReplicaID;
@@ -136,6 +137,7 @@ using hotstuff::test::FakeClock;
 using hotstuff::test::add_valid_signers;
 using hotstuff::test::make_digest;
 using hotstuff::test::make_test_proposal_key;
+using hotstuff::test::serialized_hex;
 
 namespace
 {
@@ -277,6 +279,40 @@ quorum_cert_bt aggregate(BlsTestCore &core,
     REQUIRE(certificate->verify(core.get_config()));
     return certificate;
 }
+
+class InconsistentAggregateCertificate final
+    : public QuorumCertAggBLS
+{
+public:
+    InconsistentAggregateCertificate(
+        const hotstuff::ReplicaConfig &config,
+        const ProposalKey &key,
+        std::vector<ReplicaID> enumerated_signers,
+        std::size_t reported_count)
+        : QuorumCertAggBLS(config, key),
+          enumerated_signers_(std::move(enumerated_signers)),
+          reported_count_(reported_count)
+    {}
+
+    std::vector<ReplicaID> get_signers() const override
+    {
+        return enumerated_signers_;
+    }
+
+    std::size_t get_sigs_n() override
+    {
+        return reported_count_;
+    }
+
+    InconsistentAggregateCertificate *clone() override
+    {
+        return new InconsistentAggregateCertificate(*this);
+    }
+
+private:
+    std::vector<ReplicaID> enumerated_signers_;
+    std::size_t reported_count_{0};
+};
 
 class FakeAggregationScheduler final : public AggregationScheduler
 {
@@ -1147,6 +1183,10 @@ TEST_CASE("overlapping late aggregate is rejected atomically",
     REQUIRE(before.has_value());
 
     auto overlapping = aggregate(harness.core, key, {5, 6});
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, *overlapping) ==
+          VerifiedAggregateCertificateDisposition::redundant);
     CHECK_FALSE(harness.contexts.record_verified_aggregate_certificate(
         lease, 4, *overlapping));
     CHECK_FALSE(claim_unforwarded(
@@ -1158,6 +1198,148 @@ TEST_CASE("overlapping late aggregate is rejected atomically",
     REQUIRE(harness.transport.signer_sets.size() == 1);
     CHECK(harness.transport.signer_sets.front() ==
           std::set<ReplicaID>{4, 5});
+}
+
+TEST_CASE("aggregate disposition distinguishes redundancy from unsafe input",
+          "[a06][aggregation][evidence][disposition][mutation]")
+{
+    Harness harness(1);
+    const auto key = make_test_proposal_key(
+        make_digest(0xc8), 0xc9, 34, 1);
+    const auto lease = harness.admit(key, wide_internal_tree());
+
+    auto accepted = aggregate(harness.core, key, {4, 5});
+    REQUIRE(harness.contexts
+                .record_verified_aggregate_certificate_with_disposition(
+                    lease, 4, *accepted) ==
+            VerifiedAggregateCertificateDisposition::accepted);
+    const auto before = harness.contexts.snapshot(key);
+    REQUIRE(before.has_value());
+    auto before_accumulator = harness.contexts.clone_accumulator(lease);
+    REQUIRE(before_accumulator != nullptr);
+    const auto before_bytes = serialized_hex(
+        dynamic_cast<const QuorumCertAggBLS &>(*before_accumulator));
+
+    auto redundant = aggregate(harness.core, key, {5, 6});
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, *redundant) ==
+          VerifiedAggregateCertificateDisposition::redundant);
+
+    auto outside_subtree = aggregate(harness.core, key, {3, 5});
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, *outside_subtree) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 3, *redundant) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+
+    const auto wrong_key = make_test_proposal_key(
+        make_digest(0xca), 0xcb, 35, 1);
+    auto wrong_certificate = aggregate(harness.core, wrong_key, {4, 5});
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, *wrong_certificate) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+
+    // Both mutations overlap an accepted signer. They must fail canonical
+    // representation checks before overlap can be classified as evidence-only
+    // redundancy.
+    InconsistentAggregateCertificate malformed_cardinality(
+        harness.core.get_config(), key, {5, 6}, 3);
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, malformed_cardinality) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+
+    InconsistentAggregateCertificate noncanonical_duplicate(
+        harness.core.get_config(), key, {5, 5}, 2);
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, noncanonical_duplicate) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+
+    const auto after = harness.contexts.snapshot(key);
+    REQUIRE(after.has_value());
+    CHECK(after->verified_signers == before->verified_signers);
+    CHECK(after->forwarded_signers == before->forwarded_signers);
+    auto after_accumulator = harness.contexts.clone_accumulator(lease);
+    REQUIRE(after_accumulator != nullptr);
+    CHECK(serialized_hex(
+              dynamic_cast<const QuorumCertAggBLS &>(*after_accumulator)) ==
+          before_bytes);
+    REQUIRE(harness.contexts.close(
+        key, ProposalContextEvent::proposal_aborted));
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  lease, 4, *redundant) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+}
+
+TEST_CASE("stale aggregate lease cannot become redundant evidence",
+          "[a06][aggregation][evidence][disposition][generation]"
+          "[mutation]")
+{
+    Harness harness(1);
+    const auto key = make_test_proposal_key(
+        make_digest(0xcc), 0xcd, 36, 1);
+
+    ProposalContextLifecycle prior_contexts;
+    auto stale_lease = prior_contexts.admit_remote(
+        metadata(key, wide_internal_tree()));
+    REQUIRE(stale_lease.has_value());
+
+    const auto generation_padding = make_test_proposal_key(
+        make_digest(0xce), 0xcf, 37, 1);
+    REQUIRE(harness.contexts.admit_remote(
+        metadata(generation_padding, internal_tree())).has_value());
+    const auto live_lease = harness.admit(key, wide_internal_tree());
+    REQUIRE(stale_lease->generation() != live_lease.generation());
+
+    auto accepted = aggregate(harness.core, key, {4, 5});
+    REQUIRE(harness.contexts
+                .record_verified_aggregate_certificate_with_disposition(
+                    live_lease, 4, *accepted) ==
+            VerifiedAggregateCertificateDisposition::accepted);
+    const auto before = harness.contexts.snapshot(key);
+    REQUIRE(before.has_value());
+    auto before_accumulator =
+        harness.contexts.clone_accumulator(live_lease);
+    REQUIRE(before_accumulator != nullptr);
+    const auto before_bytes = serialized_hex(
+        dynamic_cast<const QuorumCertAggBLS &>(*before_accumulator));
+
+    auto overlapping = aggregate(harness.core, key, {5, 6});
+    CHECK(harness.contexts
+              .record_verified_aggregate_certificate_with_disposition(
+                  *stale_lease, 4, *overlapping) ==
+          VerifiedAggregateCertificateDisposition::rejected);
+
+    const auto after = harness.contexts.snapshot(key);
+    REQUIRE(after.has_value());
+    CHECK(after->pending_observation_children ==
+          before->pending_observation_children);
+    CHECK(after->pending_required_child_branches ==
+          before->pending_required_child_branches);
+    CHECK(after->pending_children == before->pending_children);
+    CHECK(after->latency_started == before->latency_started);
+    CHECK(after->verified_signers == before->verified_signers);
+    CHECK(after->reserved_signers == before->reserved_signers);
+    CHECK(after->forwarded_signers == before->forwarded_signers);
+    CHECK(after->initial_forwarding_signers ==
+          before->initial_forwarding_signers);
+    CHECK(after->phase == before->phase);
+    CHECK(after->pass_through == before->pass_through);
+    CHECK(after->root_qc_progress_claimed ==
+          before->root_qc_progress_claimed);
+    CHECK(after->timer_generation == before->timer_generation);
+    auto after_accumulator = harness.contexts.clone_accumulator(live_lease);
+    REQUIRE(after_accumulator != nullptr);
+    CHECK(serialized_hex(
+              dynamic_cast<const QuorumCertAggBLS &>(*after_accumulator)) ==
+          before_bytes);
 }
 
 TEST_CASE("root timeout records state and continues toward frozen 2f plus 1",
