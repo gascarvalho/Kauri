@@ -335,7 +335,8 @@ std::size_t future_capacity(
 std::vector<std::vector<ReplicaID>> assign_internal_members(
     const TreePlacementInput &input,
     const ValidatedInput &validated,
-    const std::vector<ReplicaID> &roots)
+    const std::vector<ReplicaID> &roots,
+    bool rank_sensitive)
 {
     std::vector<std::vector<ReplicaID>> assignments(
         input.shape.tree_count);
@@ -367,6 +368,14 @@ std::vector<std::vector<ReplicaID>> assign_internal_members(
             reject("tree policy internal capacity is insufficient");
         candidates.push_back(
             {score->replica_id, score->rank, base_quota, root_tree});
+    }
+    if (!rank_sensitive)
+    {
+        std::sort(
+            candidates.begin(), candidates.end(),
+            [](const auto &left, const auto &right) {
+                return left.replica_id < right.replica_id;
+            });
     }
     for (auto &candidate : candidates)
     {
@@ -422,7 +431,7 @@ std::vector<std::vector<ReplicaID>> assign_internal_members(
         std::sort(
             available.begin(),
             available.end(),
-            [&candidates](std::size_t left, std::size_t right) {
+            [&candidates, rank_sensitive](std::size_t left, std::size_t right) {
                 const auto &left_candidate = candidates[left];
                 const auto &right_candidate = candidates[right];
                 if (left_candidate.remaining != right_candidate.remaining)
@@ -430,7 +439,9 @@ std::vector<std::vector<ReplicaID>> assign_internal_members(
                     return left_candidate.remaining >
                            right_candidate.remaining;
                 }
-                return left_candidate.rank < right_candidate.rank;
+                return rank_sensitive
+                    ? left_candidate.rank < right_candidate.rank
+                    : left_candidate.replica_id < right_candidate.replica_id;
             });
         const auto needed = internal_per_tree - selected_count;
         if (available.size() < needed)
@@ -499,7 +510,8 @@ PlacementWork build_work(
     RootPlan root_plan)
 {
     const auto internal = assign_internal_members(
-        input, validated, root_plan.roots);
+        input, validated, root_plan.roots,
+        kind == TreePolicyKind::performance_optimization);
 
     PlacementWork work;
     work.trees.reserve(input.shape.tree_count);

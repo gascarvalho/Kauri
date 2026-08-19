@@ -250,7 +250,8 @@ AdaptationSnapshot make_snapshot(
     const std::vector<ReplicaID> &membership,
     const std::set<ReplicaID> &ineligible = {},
     std::uint32_t attempts_per_replica = 8,
-    std::uint64_t snapshot_seed = 0xA0910)
+    std::uint64_t snapshot_seed = 0xA0910,
+    bool reverse_healthy_ranks = false)
 {
     const AdaptationEpochId epoch{
         41, fixture_digest("t10-adaptation-epoch")};
@@ -258,13 +259,19 @@ AdaptationSnapshot make_snapshot(
     std::sort(ordered.begin(), ordered.end());
 
     std::map<ReplicaID, std::uint64_t> eligible_latency;
-    std::uint64_t next_latency = 10;
+    std::uint64_t next_latency =
+        reverse_healthy_ranks
+            ? static_cast<std::uint64_t>(ordered.size()) * 10
+            : 10;
     for (const auto replica : ordered)
     {
         if (ineligible.count(replica) == 0)
         {
             eligible_latency.emplace(replica, next_latency);
-            next_latency += 10;
+            if (reverse_healthy_ranks)
+                next_latency -= 10;
+            else
+                next_latency += 10;
         }
     }
 
@@ -412,6 +419,20 @@ std::string output_fingerprint(const TreePlacementResult &result)
                << replica.eligible << ':' << replica.position << ':'
                << static_cast<unsigned>(replica.role) << ':'
                << static_cast<unsigned>(replica.reason) << ';';
+    }
+    return output.str();
+}
+
+std::string tree_fingerprint(const TreePlacementResult &result)
+{
+    std::ostringstream output;
+    for (const auto &tree : result.trees())
+    {
+        output << tree.tree_id << ':' << tree.fanout << ':'
+               << tree.pipeline_stretch << ':';
+        for (const auto replica : tree.members_breadth_first)
+            output << replica << ',';
+        output << ';';
     }
     return output.str();
 }
@@ -806,6 +827,50 @@ TEST_CASE(
                     baseline, {0, 1, 2, 3, 4}}),
             std::invalid_argument);
     }
+}
+
+TEST_CASE(
+    "containment canonicalizes healthy internal allocation without erasing constraints",
+    "[t10][tree-policy][containment][determinism][rank-independence]")
+{
+    const auto members = sequential_members(7);
+    const auto ascending = make_snapshot(members);
+    const auto permuted = make_snapshot(members, {}, 8, 0xA0910, true);
+    const auto containment_input = placement_input(
+        members, 2, 3, 0xC0DE, "fault-containment-deterministic-v1");
+    const FaultContainmentPolicy containment{
+        {BaselineRoot{0, 0}, BaselineRoot{1, 1}, BaselineRoot{2, 2}},
+        {}};
+
+    const auto first = hotstuff::build_tree_placement(
+        containment_input, ascending, containment);
+    const auto second = hotstuff::build_tree_placement(
+        containment_input, permuted, containment);
+    CHECK(tree_fingerprint(first) == tree_fingerprint(second));
+
+    const auto constrained_three = hotstuff::build_tree_placement(
+        containment_input,
+        ascending,
+        FaultContainmentPolicy{
+            {BaselineRoot{0, 0}, BaselineRoot{1, 1}, BaselineRoot{2, 2}},
+            {3}});
+    const auto constrained_four = hotstuff::build_tree_placement(
+        containment_input,
+        ascending,
+        FaultContainmentPolicy{
+            {BaselineRoot{0, 0}, BaselineRoot{1, 1}, BaselineRoot{2, 2}},
+            {4}});
+    CHECK(tree_fingerprint(constrained_three) !=
+          tree_fingerprint(constrained_four));
+
+    const auto optimization_input = placement_input(
+        members, 2, 3, 0xC0DE, "performance-rank-sensitive-v1");
+    const auto optimized_first = hotstuff::build_tree_placement(
+        optimization_input, ascending, PerformanceOptimizationPolicy{});
+    const auto optimized_second = hotstuff::build_tree_placement(
+        optimization_input, permuted, PerformanceOptimizationPolicy{});
+    CHECK(tree_fingerprint(optimized_first) !=
+          tree_fingerprint(optimized_second));
 }
 
 TEST_CASE("optimization chooses exactly the highest-ranked eligible roots",
