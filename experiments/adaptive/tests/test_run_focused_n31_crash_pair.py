@@ -837,6 +837,347 @@ def test_campaign_runtime_abort_keeps_cli_exit_two(
     assert raised.value.code == 2
 
 
+@pytest.mark.parametrize("command", ("smoke", "pair"))
+def test_smoke_pair_runtime_abort_keeps_cli_exit_two(
+    command: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    monkeypatch.setattr(
+        runner,
+        "_authorized_execution",
+        lambda _arguments: (SimpleNamespace(), {}, {}),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_focused_pair",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            runtime.FocusedCrashPairRuntimeError("native arm failed")
+        ),
+    )
+    with pytest.raises(SystemExit) as raised:
+        runner.main(
+            [
+                command,
+                "--preflight-receipt",
+                str(tmp_path / "preflight.json"),
+                "--authorization-receipt",
+                str(tmp_path / "authorization.json"),
+                "--output",
+                str(tmp_path / "output"),
+                "--retries",
+                "0",
+            ]
+        )
+    assert raised.value.code == 2
+
+
+class _PairAbortBackend(_RecordingLaunchBackend):
+    def __init__(self, runtime: Any, *, failed_arm: str, cleanup_mode: str = "complete") -> None:
+        super().__init__()
+        self.failure = runtime.FocusedCrashPairRuntimeError("native arm failed")
+        self.failed_arm = failed_arm
+        self.cleanup_mode = cleanup_mode
+
+    def materialize_arm_configuration(
+        self, context: Mapping[str, object], *, pair_ordinal: int, arm: str
+    ) -> Mapping[str, object]:
+        configuration = dict(
+            super().materialize_arm_configuration(
+                context, pair_ordinal=pair_ordinal, arm=arm
+            )
+        )
+        root = Path(context["output_root"]) / str(configuration["pair_id"]) / arm
+        root.mkdir(parents=True, exist_ok=False)
+        configuration["run_directory"] = root
+        return configuration
+
+    def run_arm(
+        self, configuration: Mapping[str, object], _processes: object
+    ) -> Mapping[str, object]:
+        self._record("run", configuration)
+        if configuration["arm"] == self.failed_arm:
+            raise self.failure
+        return {"runtime_graph": "complete"}
+
+    def cleanup(
+        self, configuration: Mapping[str, object], _processes: object
+    ) -> Mapping[str, object]:
+        self._record("cleanup", configuration)
+        if self.cleanup_mode == "raises":
+            raise RuntimeError("cleanup failed")
+        return {"complete": self.cleanup_mode == "complete", "outcomes": []}
+
+    def seal(
+        self,
+        configuration: Mapping[str, object],
+        _outcome: Mapping[str, object],
+        _cleanup: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        self._record("seal", configuration)
+        metadata = _runner().create_evidence_seal(Path(configuration["run_directory"]))
+        return {"tree_sha256": metadata.tree_sha256, "seal_sha256": metadata.seal_sha256}
+
+
+@pytest.mark.parametrize(
+    ("mode", "failed_arm", "completed_arms", "not_started"),
+    (
+        ("smoke", "control", [], ["adaptive"]),
+        ("pair", "control", [], ["adaptive"]),
+        ("pair", "adaptive", ["control"], []),
+    ),
+)
+def test_smoke_pair_runtime_abort_seals_only_quiescent_pair_prefix(
+    mode: str,
+    failed_arm: str,
+    completed_arms: list[str],
+    not_started: list[str],
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / f"{mode}-{failed_arm}"
+    backend = _PairAbortBackend(runtime, failed_arm=failed_arm)
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode=mode), backend=backend
+        )
+    assert raised.value is backend.failure
+    pair_root = output / "pair-01"
+    failed_root = pair_root / failed_arm
+    abort = json.loads((failed_root / "arm-abort.json").read_text())
+    pair_abort = json.loads((pair_root / "pair-abort.json").read_text())
+    assert (failed_root / "cleanup.json").is_file()
+    assert abort["state"] == "INCOMPLETE"
+    assert abort["mode"] == mode
+    assert abort["slot_id"] == ("slot-01" if failed_arm == "control" else "slot-02")
+    assert [row["arm"] for row in pair_abort["completed_prefix"]] == completed_arms
+    assert pair_abort["failed_arm"]["arm"] == failed_arm
+    assert pair_abort["mode"] == mode
+    assert pair_abort["not_started_arms"] == not_started
+    assert (failed_root / "evidence-seal.json").is_file()
+    assert (pair_root / "evidence-seal.json").is_file()
+    failed_seal = runner.verify_evidence_seal(failed_root)
+    pair_seal = runner.verify_evidence_seal(pair_root)
+    assert pair_abort["failed_arm"]["tree_sha256"] == failed_seal.tree_sha256
+    assert pair_abort["failed_arm"]["seal_sha256"] == failed_seal.seal_sha256
+    assert pair_seal.seal_sha256
+    assert not (output / "campaign-ledger.jsonl").exists()
+    assert not (output / "campaign-summary.json").exists()
+    assert [call for call in backend.calls if call[0] == "configuration"] == [
+        ("configuration", "pair-01", arm)
+        for arm in (("control",) if failed_arm == "control" else ("control", "adaptive"))
+    ]
+    with pytest.raises(runner.FocusedCrashPairValidationError):
+        runner.validate_sealed_pair(pair_root, trusted_provenance={})
+
+
+@pytest.mark.parametrize("cleanup_mode", ("raises", "incomplete"))
+def test_smoke_pair_abort_cleanup_failure_is_unsealed(
+    cleanup_mode: str, tmp_path: Path
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / cleanup_mode
+    backend = _PairAbortBackend(
+        runtime, failed_arm="control", cleanup_mode=cleanup_mode
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="smoke"), backend=backend
+        )
+    assert raised.value is backend.failure
+    failed_root = output / "pair-01" / "control"
+    assert (failed_root / "cleanup-failure.json").is_file()
+    assert not (failed_root / "cleanup.json").exists()
+    assert not (failed_root / "arm-abort.json").exists()
+    assert not (failed_root / "evidence-seal.json").exists()
+    assert not (output / "pair-01" / "evidence-seal.json").exists()
+
+
+def test_smoke_pair_abort_keeps_original_error_when_seal_and_stderr_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / "finalizer-failure"
+    backend = _PairAbortBackend(runtime, failed_arm="control")
+    monkeypatch.setattr(
+        runner,
+        "create_evidence_seal",
+        lambda _directory: (_ for _ in ()).throw(RuntimeError("seal failed")),
+    )
+    monkeypatch.setattr(
+        runner.sys,
+        "stderr",
+        SimpleNamespace(
+            write=lambda _message: (_ for _ in ()).throw(OSError("stderr closed"))
+        ),
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="pair"), backend=backend
+        )
+    assert raised.value is backend.failure
+    failed_root = output / "pair-01" / "control"
+    assert (failed_root / "cleanup.json").is_file()
+    assert (failed_root / "arm-abort.json").is_file()
+    assert (output / "pair-01" / "abort-finalization-failure.json").is_file()
+    assert not (failed_root / "evidence-seal.json").exists()
+
+
+def test_smoke_pair_abort_pair_seal_failure_keeps_arm_seal_and_marks_pair_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / "pair-seal-failure"
+    backend = _PairAbortBackend(runtime, failed_arm="control")
+    original_seal = runner.create_evidence_seal
+
+    def seal(directory: Path) -> object:
+        if Path(directory) == output / "pair-01":
+            raise RuntimeError("pair seal failed")
+        return original_seal(directory)
+
+    monkeypatch.setattr(runner, "create_evidence_seal", seal)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="pair"), backend=backend
+        )
+    assert raised.value is backend.failure
+    failed_root = output / "pair-01" / "control"
+    assert runner.verify_evidence_seal(failed_root).seal_sha256
+    failure = json.loads(
+        (output / "pair-01" / "abort-finalization-failure.json").read_text()
+    )
+    assert failure["category"] == "finalization_error"
+    assert not (output / "pair-01" / "evidence-seal.json").exists()
+
+
+def test_smoke_pair_abort_rejects_lexical_arm_symlink(tmp_path: Path) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / "symlink-output"
+    pair_root = output / "pair-01"
+    target = tmp_path / "target"
+    target.mkdir(parents=True)
+    pair_root.mkdir(parents=True)
+    (pair_root / "control").symlink_to(target, target_is_directory=True)
+    slot = {
+        "slot_id": "slot-01",
+        "pair_id": "pair-01",
+        "arm": "control",
+        "pair_seed": 41_720,
+        "execution_ordinal": 1,
+    }
+    with pytest.raises(runner.FocusedCrashPairCliError, match="symlink"):
+        runner._finalize_pair_abort(
+            output_root=output,
+            slot=slot,
+            configuration={
+                **slot,
+                "run_directory": pair_root / "control",
+            },
+            completed_records=(),
+            mode="smoke",
+            runtime_error=runtime.FocusedCrashPairRuntimeError("native arm failed"),
+            cleanup={"complete": True},
+            cleanup_error=None,
+        )
+
+
+def test_smoke_pair_abort_rejects_forged_completed_slot_identity(tmp_path: Path) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / "forged-prefix"
+    pair_root = output / "pair-01"
+    control_root = pair_root / "control"
+    failed_root = pair_root / "adaptive"
+    control_root.mkdir(parents=True)
+    failed_root.mkdir()
+    seal = runner.create_evidence_seal(control_root)
+    slot = {
+        "slot_id": "slot-02",
+        "pair_id": "pair-01",
+        "arm": "adaptive",
+        "pair_seed": 41_720,
+        "execution_ordinal": 2,
+    }
+    forged = {
+        "slot_id": "slot-99",
+        "pair_id": "pair-01",
+        "arm": "control",
+        "pair_seed": 41_720,
+        "execution_ordinal": 1,
+        "configuration": {
+            "slot_id": "slot-99",
+            "pair_id": "pair-01",
+            "arm": "control",
+            "pair_seed": 41_720,
+            "execution_ordinal": 1,
+            "run_directory": control_root,
+        },
+        "seal": {"tree_sha256": seal.tree_sha256, "seal_sha256": seal.seal_sha256},
+    }
+    with pytest.raises(runner.FocusedCrashPairCliError, match="binding drifted"):
+        runner._finalize_pair_abort(
+            output_root=output,
+            slot=slot,
+            configuration={**slot, "run_directory": failed_root},
+            completed_records=(forged,),
+            mode="pair",
+            runtime_error=runtime.FocusedCrashPairRuntimeError("native arm failed"),
+            cleanup={"complete": True},
+            cleanup_error=None,
+        )
+
+
+def test_smoke_pair_abort_symlink_finalization_failure_never_writes_external(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    runtime = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.focused_crash_pair_runtime"
+    )
+    output = tmp_path / "symlink-finalizer"
+    external = tmp_path / "external"
+    external.mkdir()
+
+    class SymlinkBackend(_PairAbortBackend):
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            pair_root = output / "pair-01"
+            shutil.rmtree(pair_root)
+            pair_root.symlink_to(external, target_is_directory=True)
+            raise self.failure
+
+    backend = SymlinkBackend(runtime, failed_arm="control")
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError) as raised:
+        runner._execute_focused(
+            _direct_focused_invocation(output, mode="smoke"), backend=backend
+        )
+    assert raised.value is backend.failure
+    assert (output / "pair-abort-finalization-failure.json").is_file()
+    assert not (external / "abort-finalization-failure.json").exists()
+
+
 @pytest.mark.parametrize(
     ("child_validation", "expected_outcome", "expected_integrity", "expected_claim"),
     (

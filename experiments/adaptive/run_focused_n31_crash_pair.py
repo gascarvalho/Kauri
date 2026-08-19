@@ -37,6 +37,12 @@ from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
 from experiments.adaptive import run_n31_crash_pair_campaign as campaign_contracts
 
 
+_PAIR_ABORT_SLOT_IDENTITIES = {
+    "control": ("slot-01", 1),
+    "adaptive": ("slot-02", 2),
+}
+
+
 class FocusedCrashPairCliError(RuntimeError):
     """The CLI invocation is not exactly authorized for one result root."""
 
@@ -137,6 +143,19 @@ def _sha256_field(value: object, label: str) -> str:
     ):
         raise FocusedCrashPairCliError(f"{label} is not a canonical SHA-256 digest")
     return value
+
+
+def _pair_abort_diagnostic_path(output_root: Path, pair_id: str) -> Path:
+    """Choose a diagnostic location without following a hostile pair symlink."""
+
+    lexical_root = output_root
+    lexical_pair = lexical_root / pair_id
+    if not lexical_pair.is_symlink():
+        root = lexical_root.resolve()
+        pair = lexical_pair.resolve()
+        if pair.parent == root:
+            return lexical_pair / "abort-finalization-failure.json"
+    return lexical_root / "pair-abort-finalization-failure.json"
 
 
 def _finalize_campaign_abort(
@@ -283,6 +302,201 @@ def _finalize_campaign_abort(
     create_evidence_seal(output_root)
 
 
+def _finalize_pair_abort(
+    *,
+    output_root: Path,
+    slot: Mapping[str, object],
+    configuration: Mapping[str, object],
+    completed_records: Sequence[Mapping[str, object]],
+    mode: str,
+    runtime_error: FocusedCrashPairRuntimeError,
+    cleanup: Mapping[str, object] | None,
+    cleanup_error: BaseException | None,
+) -> Path:
+    """Seal one quiescent smoke/pair abort without normal aggregation."""
+
+    if mode not in {"smoke", "pair"}:
+        raise FocusedCrashPairCliError("pair abort mode is invalid")
+    pair_id = str(slot["pair_id"])
+    arm = str(slot["arm"])
+    if arm not in {"control", "adaptive"}:
+        raise FocusedCrashPairCliError("failed focused arm is invalid")
+    expected_slot_id, expected_ordinal = _PAIR_ABORT_SLOT_IDENTITIES[arm]
+    if (
+        slot.get("slot_id") != expected_slot_id
+        or slot.get("execution_ordinal") != expected_ordinal
+        or not isinstance(slot.get("pair_seed"), int)
+        or not pair_id
+    ):
+        raise FocusedCrashPairCliError("failed pair slot identity is not canonical")
+    lexical_root = output_root
+    lexical_pair_root = lexical_root / pair_id
+    lexical_arm_root = lexical_pair_root / arm
+    if lexical_pair_root.is_symlink() or lexical_arm_root.is_symlink():
+        raise FocusedCrashPairCliError("pair abort path is a symlink")
+    root = lexical_root.resolve()
+    pair_root = lexical_pair_root.resolve()
+    arm_root = lexical_arm_root.resolve()
+    if pair_root.parent != root or arm_root.parent != pair_root:
+        raise FocusedCrashPairCliError("failed focused arm path escapes its pair root")
+    configured_root = configuration.get("run_directory")
+    if (
+        not isinstance(configured_root, (str, Path))
+        or Path(configured_root).is_symlink()
+        or Path(configured_root).resolve() != arm_root
+        or any(
+            configuration.get(key) != slot[key]
+            for key in ("slot_id", "pair_id", "arm", "pair_seed", "execution_ordinal")
+        )
+    ):
+        raise FocusedCrashPairCliError("failed arm configuration run directory drifted")
+    if not arm_root.is_dir():
+        raise FocusedCrashPairCliError("failed arm directory is absent")
+    if (
+        cleanup_error is not None
+        or cleanup is None
+        or cleanup.get("complete") is not True
+    ):
+        reason = cleanup_error or FocusedCrashPairRuntimeError(
+            "cleanup did not establish a quiescent process set"
+        )
+        _write_exclusive_json(
+            arm_root / "cleanup-failure.json",
+            {
+                "schema_version": 1,
+                "kind": "kauri-focused-cleanup-failure-v1",
+                "state": "INCOMPLETE",
+                "claim_eligible": False,
+                "complete": False,
+                "category": "cleanup_error",
+                "reason": _bounded_failure_reason(reason),
+            },
+        )
+        return arm_root
+
+    expected_completed = [] if arm == "control" else ["control"]
+    if [str(record.get("arm")) for record in completed_records] != expected_completed:
+        raise FocusedCrashPairCliError("completed pair prefix is not exact")
+    completed: list[dict[str, object]] = []
+    for record in completed_records:
+        completed_arm = str(record["arm"])
+        expected_completed_slot, expected_completed_ordinal = (
+            _PAIR_ABORT_SLOT_IDENTITIES[completed_arm]
+        )
+        lexical_completed_root = lexical_pair_root / completed_arm
+        if lexical_completed_root.is_symlink():
+            raise FocusedCrashPairCliError("completed pair arm path is a symlink")
+        completed_root = lexical_completed_root.resolve()
+        recorded_configuration = record.get("configuration")
+        seal = record.get("seal")
+        if (
+            not isinstance(recorded_configuration, Mapping)
+            or not isinstance(seal, Mapping)
+            or recorded_configuration.get("pair_id") != pair_id
+            or recorded_configuration.get("arm") != completed_arm
+            or record.get("slot_id") != expected_completed_slot
+            or record.get("execution_ordinal") != expected_completed_ordinal
+            or record.get("pair_id") != pair_id
+            or record.get("pair_seed") != slot["pair_seed"]
+            or any(
+                recorded_configuration.get(key) != record.get(key)
+                for key in ("slot_id", "pair_id", "arm", "pair_seed", "execution_ordinal")
+            )
+            or not isinstance(recorded_configuration.get("run_directory"), (str, Path))
+            or Path(recorded_configuration["run_directory"]).is_symlink()
+            or Path(recorded_configuration.get("run_directory", "")).resolve()
+            != completed_root
+        ):
+            raise FocusedCrashPairCliError("completed pair arm binding drifted")
+        verified = verify_evidence_seal(completed_root)
+        tree_sha = _sha256_field(
+            getattr(verified, "tree_sha256", None), "verified completed arm tree"
+        )
+        seal_sha = _sha256_field(
+            getattr(verified, "seal_sha256", None), "verified completed arm seal"
+        )
+        if (
+            _sha256_field(seal.get("tree_sha256"), "completed arm tree") != tree_sha
+            or _sha256_field(seal.get("seal_sha256"), "completed arm seal") != seal_sha
+        ):
+            raise FocusedCrashPairCliError(
+                "completed arm seal differs from its persisted evidence"
+            )
+        completed.append(
+            {
+                "arm": completed_arm,
+                "slot_id": str(record["slot_id"]),
+                "pair_id": pair_id,
+                "pair_seed": int(record["pair_seed"]),
+                "execution_ordinal": int(record["execution_ordinal"]),
+                "tree_sha256": tree_sha,
+                "seal_sha256": seal_sha,
+            }
+        )
+    _write_exclusive_json(arm_root / "cleanup.json", dict(cleanup))
+    _write_exclusive_json(
+        arm_root / "arm-abort.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-focused-arm-abort-v1",
+            "state": "INCOMPLETE",
+            "claim_eligible": False,
+            "mode": mode,
+            "slot_id": str(slot["slot_id"]),
+            "pair_id": pair_id,
+            "arm": arm,
+            "pair_seed": int(slot["pair_seed"]),
+            "execution_ordinal": int(slot["execution_ordinal"]),
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "failure": {
+                "category": "runtime_error",
+                "reason": _bounded_failure_reason(runtime_error),
+            },
+        },
+    )
+    failed_seal = create_evidence_seal(arm_root)
+    failed = {
+        "arm": arm,
+        "slot_id": str(slot["slot_id"]),
+        "pair_id": pair_id,
+        "pair_seed": int(slot["pair_seed"]),
+        "execution_ordinal": int(slot["execution_ordinal"]),
+        "tree_sha256": _sha256_field(
+            getattr(failed_seal, "tree_sha256", None), "failed arm tree"
+        ),
+        "seal_sha256": _sha256_field(
+            getattr(failed_seal, "seal_sha256", None), "failed arm seal"
+        ),
+    }
+    if not pair_root.is_dir():
+        raise FocusedCrashPairCliError("pair root is absent")
+    _write_exclusive_json(
+        pair_root / "pair-abort.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-focused-pair-abort-v1",
+            "state": "ABORTED_INCOMPLETE",
+            "claim_eligible": False,
+            "mode": mode,
+            "pair_id": pair_id,
+            "pair_seed": int(slot["pair_seed"]),
+            "failed_arm": failed,
+            "completed_prefix": completed,
+            "not_started_arms": [
+                candidate
+                for candidate in ("control", "adaptive")
+                if candidate not in {entry["arm"] for entry in completed} | {arm}
+            ],
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "continuation": "prohibited",
+        },
+    )
+    create_evidence_seal(pair_root)
+    return arm_root
+
+
 def _execute_focused(
     invocation: Mapping[str, object], *, backend: object
 ) -> Mapping[str, object]:
@@ -344,6 +558,19 @@ def _execute_focused(
             raise FocusedCrashPairCliError(
                 "backend relabelled the prederived pair or arm identity"
             )
+        identity = {
+            "slot_id": slot_id,
+            "pair_id": pair_id,
+            "arm": arm,
+            "pair_seed": slot["pair_seed"],
+            "execution_ordinal": slot["execution_ordinal"],
+        }
+        if any(
+            configuration.get(key) not in {None, value}
+            for key, value in identity.items()
+        ):
+            raise FocusedCrashPairCliError("backend relabelled focused slot identity")
+        configuration = {**configuration, **identity}
         slot_directory = output_root / "children" / slot_id
         if plan is not None and not slot_directory.exists():
             slot_directory.mkdir(parents=True)
@@ -410,6 +637,44 @@ def _execute_focused(
                         )
                     except BaseException:
                         pass
+            elif (
+                isinstance(execution_error, FocusedCrashPairRuntimeError)
+                and plan is None
+                and invocation.get("mode") in {"smoke", "pair"}
+            ):
+                try:
+                    _finalize_pair_abort(
+                        output_root=output_root,
+                        slot=slot,
+                        configuration=configuration,
+                        completed_records=arm_records.get(pair_id, ()),
+                        mode=str(invocation["mode"]),
+                        runtime_error=execution_error,
+                        cleanup=cleanup,
+                        cleanup_error=cleanup_error,
+                    )
+                except BaseException as finalization_error:
+                    try:
+                        _write_exclusive_json(
+                            _pair_abort_diagnostic_path(output_root, pair_id),
+                            {
+                                "schema_version": 1,
+                                "kind": "kauri-focused-abort-finalization-failure-v1",
+                                "state": "INCOMPLETE",
+                                "claim_eligible": False,
+                                "category": "finalization_error",
+                                "reason": _bounded_failure_reason(finalization_error),
+                            },
+                        )
+                    except BaseException:
+                        pass
+                    try:
+                        sys.stderr.write(
+                            "pair abort finalization failed: "
+                            f"{_bounded_failure_reason(finalization_error)}\n"
+                        )
+                    except BaseException:
+                        pass
             raise execution_error.with_traceback(execution_traceback)
         if cleanup_error is not None:
             raise cleanup_error
@@ -434,6 +699,8 @@ def _execute_focused(
             "slot_id": slot_id,
             "pair_id": pair_id,
             "arm": arm,
+            "pair_seed": slot["pair_seed"],
+            "execution_ordinal": slot["execution_ordinal"],
             "validation": dict(validation),
             "ledger": dict(ledger),
             "seal": dict(seal),
