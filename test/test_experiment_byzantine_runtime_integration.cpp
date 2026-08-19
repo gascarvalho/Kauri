@@ -22,6 +22,10 @@ public:
         std::optional<std::uint64_t> generation;
         bool unavailable{false};
         bool conflicted{false};
+        std::optional<ProposalKey> event_key;
+        std::optional<std::uint64_t> event_generation;
+        bool event_unavailable{false};
+        bool event_conflicted{false};
     };
 
     static bool consume_direct_vote(
@@ -62,6 +66,32 @@ public:
             HotStuffBase::AuthenticatedProposalIngress{
                 generation,
                 authenticated_proposal_source_replica});
+    }
+
+    static bool retain_commit_event_identity(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation)
+    {
+        return runtime.retain_commit_event_identity(key, generation);
+    }
+
+    static void forget_retained_commit_event_identities_before_epoch(
+        HotStuffBase &runtime,
+        std::uint32_t first_live_epoch)
+    {
+        runtime.forget_retained_commit_event_identities_before_epoch(
+            first_live_epoch);
+    }
+
+    static void cancel_all_exact_fallbacks(HotStuffBase &runtime)
+    {
+        runtime.cancel_all_exact_fallbacks();
+    }
+
+    static std::size_t maximum_retained_commit_event_identities()
+    {
+        return HotStuffBase::maximum_proposal_view_generation_observations;
     }
 
     static void seed_view_generation_without_source(
@@ -590,6 +620,14 @@ public:
                 HotStuffBase::CommittedProposalIdentityDisposition::
                     unavailable,
             runtime.pending_adaptive_v2_commit->identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    conflicting,
+            runtime.pending_adaptive_v2_commit->event_committed_key,
+            runtime.pending_adaptive_v2_commit->event_view_generation,
+            runtime.pending_adaptive_v2_commit->event_identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    unavailable,
+            runtime.pending_adaptive_v2_commit->event_identity_disposition ==
                 HotStuffBase::CommittedProposalIdentityDisposition::
                     conflicting};
     }
@@ -1731,6 +1769,359 @@ TEST_CASE(
     CHECK(observed3->block_hash == block3->get_hash());
     CHECK(committed3->block_hash == block3->get_hash());
     runtime.bind_structured_event_emitters(nullptr, nullptr, nullptr);
+}
+
+TEST_CASE(
+    "legal skipped-QC ancestors recover only one retained event identity",
+    "[adaptive-v2][evidence][commit][identity-unavailable][qc-skip][retained][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    SECTION("a closed live context retains its exact event identity")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1,
+            1,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+        const auto block = indirect_commit_block(runtime, "retained-qc-skip");
+        const ProposalKey key{configuration, block->get_hash()};
+        Access::seed_view_generation(runtime, key, 77);
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 77));
+        REQUIRE(Access::admit_exact_context(runtime, key));
+        Access::close_exact_context(runtime, key);
+        CHECK(Access::context_status(runtime, key) ==
+              ProposalContextStatus::terminal_closed);
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK_FALSE(cached.key.has_value());
+        CHECK_FALSE(cached.generation.has_value());
+        CHECK(cached.unavailable);
+        CHECK_FALSE(cached.conflicted);
+        REQUIRE(cached.event_key == key);
+        CHECK(cached.event_generation == 77);
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK_FALSE(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+        const auto *committed =
+            std::get_if<CommitStructuredEvent>(&emitter.events[1]);
+        REQUIRE(committed != nullptr);
+        CHECK(committed->block_hash == block->get_hash());
+        CHECK(committed->decision_proof == key);
+        CHECK(committed->view_generation == 77);
+    }
+
+    SECTION("an absent retained identity remains unavailable")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1,
+            1,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "absent-qc-skip");
+        const ProposalKey key{configuration, block->get_hash()};
+        REQUIRE(Access::admit_exact_context(runtime, key));
+        Access::close_exact_context(runtime, key);
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK_FALSE(cached.key.has_value());
+        CHECK_FALSE(cached.generation.has_value());
+        CHECK(cached.unavailable);
+        CHECK_FALSE(cached.conflicted);
+        CHECK_FALSE(cached.event_key.has_value());
+        CHECK_FALSE(cached.event_generation.has_value());
+        CHECK(cached.event_unavailable);
+        CHECK_FALSE(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+        const auto *unavailable = std::get_if<
+            CommitIdentityUnavailableStructuredEvent>(&emitter.events[1]);
+        REQUIRE(unavailable != nullptr);
+        CHECK(unavailable->block_hash == block->get_hash());
+    }
+
+    SECTION("conflicting retained identities fail closed")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1,
+            1,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "conflicting-qc-skip");
+        const ProposalKey key{configuration, block->get_hash()};
+        const ProposalKey conflict{
+            ConfigurationId{
+                configuration.epoch_number,
+                configuration.tree_id,
+                digest("conflicting-retained-identity")},
+            block->get_hash()};
+        Access::seed_view_generation(runtime, key, 81);
+        Access::seed_view_generation(runtime, conflict, 82);
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 81));
+        CHECK_FALSE(
+            Access::retain_commit_event_identity(runtime, conflict, 82));
+        REQUIRE(Access::admit_exact_context(runtime, key));
+        Access::close_exact_context(runtime, key);
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK_FALSE(cached.key.has_value());
+        CHECK_FALSE(cached.generation.has_value());
+        CHECK(cached.unavailable);
+        CHECK_FALSE(cached.conflicted);
+        CHECK_FALSE(cached.event_key.has_value());
+        CHECK_FALSE(cached.event_generation.has_value());
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+        CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
+    }
+}
+
+TEST_CASE(
+    "retained commit event identities preserve proof authority and fail closed",
+    "[adaptive-v2][evidence][commit][identity-unavailable][retained][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    SECTION("a verified direct certifier remains protocol and event exact")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "direct-retained");
+        const ProposalKey key{configuration, block->get_hash()};
+        Access::seed_view_generation(runtime, key, 19);
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 19));
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, Access::direct_certifier(runtime, key));
+        REQUIRE(cached.key == key);
+        CHECK(cached.generation == 19);
+        CHECK_FALSE(cached.unavailable);
+        CHECK_FALSE(cached.conflicted);
+        REQUIRE(cached.event_key == key);
+        CHECK(cached.event_generation == 19);
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK_FALSE(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+        CHECK(std::get_if<CommitStructuredEvent>(&emitter.events[1]) !=
+              nullptr);
+    }
+
+    SECTION("non-legal provenance cannot recover retained event identity")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "nonlegal-retained");
+        const ProposalKey key{configuration, block->get_hash()};
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 23));
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr);
+        CHECK_FALSE(cached.key.has_value());
+        CHECK_FALSE(cached.generation.has_value());
+        CHECK_FALSE(cached.unavailable);
+        CHECK(cached.conflicted);
+        CHECK_FALSE(cached.event_key.has_value());
+        CHECK_FALSE(cached.event_generation.has_value());
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 1);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+    }
+
+    SECTION("duplicate retention is idempotent and a conflict is permanent")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        const auto block = indirect_commit_block(runtime, "retention-conflict");
+        const ProposalKey key{configuration, block->get_hash()};
+        const ProposalKey conflict{
+            ConfigurationId{configuration.epoch_number, configuration.tree_id,
+                            digest("retention-conflict-digest")},
+            block->get_hash()};
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 29));
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 29));
+        CHECK_FALSE(Access::retain_commit_event_identity(runtime, conflict, 31));
+        CHECK_FALSE(Access::retain_commit_event_identity(runtime, key, 29));
+
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK(cached.unavailable);
+        CHECK_FALSE(cached.conflicted);
+        CHECK_FALSE(cached.event_key.has_value());
+        CHECK_FALSE(cached.event_generation.has_value());
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK(cached.event_conflicted);
+    }
+
+    SECTION("retirement, shutdown, and capacity leave no recoverable event identity")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        const auto block = indirect_commit_block(runtime, "retention-retire");
+        const ProposalKey key{configuration, block->get_hash()};
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 37));
+        Access::forget_retained_commit_event_identities_before_epoch(
+            runtime, configuration.epoch_number + 1);
+        auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK(cached.event_unavailable);
+
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 37));
+        Access::cancel_all_exact_fallbacks(runtime);
+        cached = Access::resolve_and_cache_commit(runtime, block, {}, nullptr, true);
+        CHECK(cached.event_unavailable);
+
+        for (std::size_t index = 0;
+             index < Access::maximum_retained_commit_event_identities();
+             ++index)
+        {
+            const ProposalKey retained{configuration,
+                                       digest("retained-capacity-" +
+                                              std::to_string(index))};
+            REQUIRE(Access::retain_commit_event_identity(
+                runtime, retained, index + 1));
+        }
+        const ProposalKey overflow{configuration, digest("retained-overflow")};
+        CHECK_FALSE(Access::retain_commit_event_identity(runtime, overflow, 1));
+    }
+
+    SECTION("four legal skips retain an authoritative event chain")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v2);
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::reset_reporting_outbox(runtime, 8);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+
+        const auto genesis = runtime.get_genesis();
+        const auto block1 = Access::add_commit_rule_block(
+            runtime, configuration, genesis, genesis, "four-skips-1");
+        const auto block2 = Access::add_commit_rule_block(
+            runtime, configuration, block1, genesis, "four-skips-2");
+        const auto block3 = Access::add_commit_rule_block(
+            runtime, configuration, block2, genesis, "four-skips-3");
+        const auto block4 = Access::add_commit_rule_block(
+            runtime, configuration, block3, genesis, "four-skips-4");
+        const std::vector<block_t> blocks{block1, block2, block3, block4};
+        for (std::size_t index = 0; index < blocks.size(); ++index)
+        {
+            const ProposalKey key{configuration, blocks[index]->get_hash()};
+            REQUIRE(Access::retain_commit_event_identity(
+                runtime, key, 101 + index));
+            const auto cached = Access::resolve_and_cache_commit(
+                runtime, blocks[index], {}, nullptr, true);
+            CHECK(cached.unavailable);
+            REQUIRE(cached.event_key == key);
+            CHECK(cached.event_generation == 101 + index);
+            Access::report_and_post_commit(runtime, blocks[index], index);
+        }
+
+        REQUIRE(emitter.events.size() == blocks.size() * 2);
+        for (std::size_t index = 0; index < blocks.size(); ++index)
+        {
+            const auto *observed = std::get_if<CommitObservedStructuredEvent>(
+                &emitter.events[index * 2]);
+            const auto *committed = std::get_if<CommitStructuredEvent>(
+                &emitter.events[index * 2 + 1]);
+            REQUIRE(observed != nullptr);
+            REQUIRE(committed != nullptr);
+            CHECK(committed->block_height == blocks[index]->get_height());
+            CHECK(committed->block_hash == blocks[index]->get_hash());
+            CHECK(committed->view_generation == 101 + index);
+            if (index != 0)
+            {
+                REQUIRE(committed->parent_hash.has_value());
+                CHECK(*committed->parent_hash == blocks[index - 1]->get_hash());
+            }
+        }
+    }
 }
 
 TEST_CASE(

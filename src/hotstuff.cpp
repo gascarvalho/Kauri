@@ -3214,7 +3214,15 @@ namespace hotstuff
                             owner.relay_once(deferred);
                         }
 
-                        if (owner.on_receive_proposal(parsed))
+                        const bool proposal_accepted =
+                            owner.on_receive_proposal(parsed);
+                        if (owner.epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v2)
+                            static_cast<void>(
+                                owner.retain_commit_event_identity(
+                                    metadata.key,
+                                    deferred.view_generation));
+                        if (proposal_accepted)
                         {
                             owner.pmaker->record_verified_progress(
                                 metadata.key.configuration,
@@ -5968,6 +5976,7 @@ namespace hotstuff
         exact_vote_fallback_jobs.clear();
         exact_root_repair_deliveries.clear();
         authenticated_proposal_ingress.clear();
+        retained_commit_event_identities.clear();
         successful_response_attempt_arm_provenance.clear();
         response_attempt_arm_failure_markers.clear();
         exact_proposal_fallback_jobs.clear();
@@ -10022,6 +10031,8 @@ namespace hotstuff
             {
                 pending_adaptive_v2_commit->identity_disposition =
                     CommittedProposalIdentityDisposition::conflicting;
+                pending_adaptive_v2_commit->event_identity_disposition =
+                    CommittedProposalIdentityDisposition::conflicting;
                 mark_adaptive_v2_convergence_evidence_unhealthy(
                     "authoritative_commit_identity_mismatched_or_conflicted");
                 return;
@@ -10029,6 +10040,8 @@ namespace hotstuff
             if (adaptive_v2_committed_convergence_identity.has_value())
             {
                 pending_adaptive_v2_commit->identity_disposition =
+                    CommittedProposalIdentityDisposition::conflicting;
+                pending_adaptive_v2_commit->event_identity_disposition =
                     CommittedProposalIdentityDisposition::conflicting;
                 mark_adaptive_v2_convergence_evidence_unhealthy(
                     "authoritative_commit_identity_unavailable_while_"
@@ -10045,6 +10058,10 @@ namespace hotstuff
             cached.view_generation.has_value();
         if (!exact_authoritative_identity)
         {
+            pending_adaptive_v2_commit->identity_disposition =
+                CommittedProposalIdentityDisposition::conflicting;
+            pending_adaptive_v2_commit->event_identity_disposition =
+                CommittedProposalIdentityDisposition::conflicting;
             mark_adaptive_v2_convergence_evidence_unhealthy(
                 "authoritative_commit_identity_mismatched_or_conflicted");
             return;
@@ -12311,8 +12328,12 @@ namespace hotstuff
                 static_cast<unsigned long long>(wire_generation),
                 adaptive_payload.size());
             if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            {
                 static_cast<void>(observe_proposal_view_generation(
                     prop.key(), *generation));
+                static_cast<void>(retain_commit_event_identity(
+                    prop.key(), *generation));
+            }
         }
 
         std::size_t send_attempts = 0;
@@ -12607,6 +12628,7 @@ namespace hotstuff
                         std::nullopt,
                         CommittedProposalIdentityDisposition::conflicting,
                         provenance};
+
         }
         catch (...)
         {
@@ -12663,6 +12685,74 @@ namespace hotstuff
             // Observation failure affects evidence completeness only.
             return false;
         }
+    }
+
+    bool HotStuffBase::retain_commit_event_identity(
+        const ProposalKey &key,
+        std::uint64_t generation) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            generation == 0)
+            return false;
+        try
+        {
+            auto found = retained_commit_event_identities.find(
+                key.block_hash);
+            if (found == retained_commit_event_identities.end())
+            {
+                if (retained_commit_event_identities.size() >=
+                    maximum_proposal_view_generation_observations)
+                    return false;
+                retained_commit_event_identities.emplace(
+                    key.block_hash,
+                    RetainedCommitEventIdentity{
+                        key,
+                        generation,
+                        key.configuration.epoch_number});
+                return true;
+            }
+
+            auto &retained = found->second;
+            retained.max_observed_epoch = std::max(
+                retained.max_observed_epoch,
+                key.configuration.epoch_number);
+            if (!retained.key.has_value() ||
+                !retained.view_generation.has_value())
+                return false;
+            if (*retained.key == key &&
+                *retained.view_generation == generation)
+                return true;
+            retained.key.reset();
+            retained.view_generation.reset();
+            return false;
+        }
+        catch (...)
+        {
+            // Retention is evidence-only. Consensus remains live while the
+            // later commit event fails closed as unavailable/conflicting.
+            return false;
+        }
+    }
+
+    void HotStuffBase::
+    forget_retained_commit_event_identities_before_epoch(
+        std::uint32_t first_live_epoch) noexcept
+    {
+        try
+        {
+            for (auto retained =
+                     retained_commit_event_identities.begin();
+                 retained != retained_commit_event_identities.end();)
+            {
+                if (retained->second.max_observed_epoch < first_live_epoch)
+                    retained = retained_commit_event_identities.erase(
+                        retained);
+                else
+                    ++retained;
+            }
+        }
+        catch (...)
+        {}
     }
 
     std::optional<std::uint64_t>
@@ -13046,6 +13136,8 @@ namespace hotstuff
                 first_live_epoch);
             forget_proposal_view_generations_before_epoch(
                 first_live_epoch);
+            forget_retained_commit_event_identities_before_epoch(
+                first_live_epoch);
         }
     }
 
@@ -13180,12 +13272,75 @@ namespace hotstuff
         }
         if (disposition != CommittedProposalIdentityDisposition::exact)
             exact_key.reset();
+
+        auto event_disposition = disposition;
+        auto event_key = exact_key;
+        auto event_generation = generation;
+        try
+        {
+            const auto retained =
+                retained_commit_event_identities.find(blk->get_hash());
+            if (disposition ==
+                    CommittedProposalIdentityDisposition::exact &&
+                exact_key.has_value() && generation.has_value())
+            {
+                if (retained != retained_commit_event_identities.end() &&
+                    (!retained->second.key.has_value() ||
+                     !retained->second.view_generation.has_value() ||
+                     *retained->second.key != *exact_key ||
+                     *retained->second.view_generation != *generation))
+                {
+                    event_disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                    event_key.reset();
+                    event_generation.reset();
+                }
+            }
+            else if (
+                disposition ==
+                    CommittedProposalIdentityDisposition::unavailable &&
+                identity.provenance ==
+                    CommittedProposalIdentityProvenance::
+                        legal_qc_skipped_ancestor &&
+                retained != retained_commit_event_identities.end())
+            {
+                if (retained->second.key.has_value() &&
+                    retained->second.view_generation.has_value() &&
+                    retained->second.key->block_hash == blk->get_hash() &&
+                    *retained->second.view_generation != 0)
+                {
+                    event_disposition =
+                        CommittedProposalIdentityDisposition::exact;
+                    event_key = retained->second.key;
+                    event_generation =
+                        retained->second.view_generation;
+                }
+                else
+                {
+                    event_disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                    event_key.reset();
+                    event_generation.reset();
+                }
+            }
+            retained_commit_event_identities.erase(blk->get_hash());
+        }
+        catch (...)
+        {
+            event_disposition =
+                CommittedProposalIdentityDisposition::conflicting;
+            event_key.reset();
+            event_generation.reset();
+        }
         pending_adaptive_v2_commit.emplace(
             PendingAdaptiveV2Commit{
                 blk->get_hash(),
                 exact_key,
                 generation,
                 disposition,
+                event_key,
+                event_generation,
+                event_disposition,
                 std::nullopt});
     }
 
@@ -13349,36 +13504,44 @@ namespace hotstuff
         emit_commit_observed_event(blk, commit_batch_index);
 
         std::optional<ProposalKey> committed_key;
-        std::optional<std::uint64_t> view_generation;
+        std::optional<ProposalKey> event_committed_key;
+        std::optional<std::uint64_t> event_view_generation;
         std::optional<std::uint64_t>
             reporter_local_commit_monotonic_ns;
-        auto identity_disposition =
+        auto event_identity_disposition =
             CommittedProposalIdentityDisposition::conflicting;
         if (pending_adaptive_v2_commit &&
             pending_adaptive_v2_commit->block_hash == blk->get_hash())
         {
             committed_key = pending_adaptive_v2_commit->committed_key;
-            view_generation =
-                pending_adaptive_v2_commit->view_generation;
+            event_committed_key =
+                pending_adaptive_v2_commit->event_committed_key;
+            event_view_generation =
+                pending_adaptive_v2_commit->event_view_generation;
             reporter_local_commit_monotonic_ns =
                 pending_adaptive_v2_commit
                     ->reporter_local_commit_monotonic_ns;
-            identity_disposition =
-                pending_adaptive_v2_commit->identity_disposition;
+            event_identity_disposition =
+                pending_adaptive_v2_commit
+                    ->event_identity_disposition;
         }
         pending_adaptive_v2_commit.reset();
-        if (identity_disposition ==
+        if (event_identity_disposition ==
             CommittedProposalIdentityDisposition::unavailable)
             emit_commit_identity_unavailable_event(
                 blk, commit_batch_index);
-        else if (identity_disposition ==
+        else if (event_identity_disposition ==
                  CommittedProposalIdentityDisposition::exact)
             emit_committed_block_event(
                 blk,
-                committed_key,
-                view_generation,
+                event_committed_key,
+                event_view_generation,
                 commit_batch_index,
                 reporter_local_commit_monotonic_ns);
+        else if (event_identity_disposition ==
+                 CommittedProposalIdentityDisposition::conflicting)
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "commit_event_identity_mismatched_or_conflicted");
 
         const auto fail_closed = [this](ActivationBlockReason reason) noexcept {
             pending_committed_epoch_change.reset();

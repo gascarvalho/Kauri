@@ -1365,6 +1365,13 @@ namespace hotstuff
             std::optional<std::uint64_t> view_generation;
             CommittedProposalIdentityDisposition identity_disposition{
                 CommittedProposalIdentityDisposition::conflicting};
+            // Structured commit evidence may recover a legal skipped
+            // ancestor from separately retained authenticated proposal
+            // provenance.  It must not become a protocol/cadence identity.
+            std::optional<ProposalKey> event_committed_key;
+            std::optional<std::uint64_t> event_view_generation;
+            CommittedProposalIdentityDisposition event_identity_disposition{
+                CommittedProposalIdentityDisposition::conflicting};
             std::optional<std::uint64_t>
                 reporter_local_commit_monotonic_ns;
         };
@@ -1376,6 +1383,17 @@ namespace hotstuff
         // A disengaged mapped value permanently marks an exact-key conflict.
         std::map<ProposalKey, std::optional<std::uint64_t>>
             proposal_view_generations;
+        struct RetainedCommitEventIdentity
+        {
+            std::optional<ProposalKey> key;
+            std::optional<std::uint64_t> view_generation;
+            std::uint32_t max_observed_epoch{0};
+        };
+        // Evidence-only block-hash projection captured after proposal
+        // authentication. A disengaged key/generation is a permanent
+        // conflict tombstone and is never usable by protocol state.
+        std::map<uint256_t, RetainedCommitEventIdentity>
+            retained_commit_event_identities;
         std::optional<std::size_t> adaptive_v2_tree_switch_period;
         std::unique_ptr<AdaptiveV2RotationCoordinator>
             adaptive_v2_rotation_coordinator;
@@ -1589,6 +1607,11 @@ namespace hotstuff
         bool observe_proposal_view_generation(
             const ProposalKey &key,
             std::uint64_t generation) noexcept;
+        bool retain_commit_event_identity(
+            const ProposalKey &key,
+            std::uint64_t generation) noexcept;
+        void forget_retained_commit_event_identities_before_epoch(
+            std::uint32_t first_live_epoch) noexcept;
         std::optional<std::uint64_t> proposal_view_generation(
             const ProposalKey &key) const noexcept;
         bool adaptive_v2_runtime_initialization_is_referenced(

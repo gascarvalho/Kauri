@@ -2017,6 +2017,14 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         "void HotStuffBase::advance_committed_retirement_floor(");
     const auto forwarding_abort = function_body(
         implementation, "void HotStuffBase::abort_exact_forwarding(");
+    const auto report_commit = function_body(
+        implementation, "void HotStuffBase::report_adaptive_v2_committed(");
+    const auto commit_marker = function_body(
+        implementation, "void HotStuffBase::record_adaptive_commit_marker(");
+    const auto observe_commit = function_body(
+        implementation, "void HotStuffBase::observe_authoritative_commit(");
+    const auto retire_absent = function_body(
+        implementation, "void HotStuffBase::retire_authoritative_absent_context(");
 
     CHECK(contains_all(
         header,
@@ -2024,7 +2032,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "AuditStructuredEventEmitter *audit_emitter",
          "maximum_proposal_view_generation_observations",
          "proposal_view_generations",
-         "std::optional<std::uint64_t> view_generation"}));
+         "std::optional<std::uint64_t> view_generation",
+         "std::optional<ProposalKey> committed_key",
+         "CommittedProposalIdentityDisposition identity_disposition",
+         "std::optional<ProposalKey> event_committed_key",
+         "std::optional<std::uint64_t> event_view_generation",
+         "CommittedProposalIdentityDisposition event_identity_disposition"}));
     CHECK(contains_in_order(
         consensus_header,
         {"do_post_block_commit(",
@@ -2110,17 +2123,39 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     REQUIRE_FALSE(local_proposal.empty());
     CHECK(contains_in_order(
         local_proposal,
-        {"adaptive_epoch_consensus_message(",
+        {"find_exact_runtime_generation(",
+         "if (!generation.has_value())",
+         "adaptive_epoch_consensus_message(",
          "if (adaptive_payload.empty())",
          "observe_proposal_view_generation(",
          "prop.key()",
-         "*generation"}));
+         "*generation",
+         "retain_commit_event_identity(",
+         "prop.key(), *generation"}));
+    CHECK(count_occurrences(
+              local_proposal, "retain_commit_event_identity(") == 1);
     REQUIRE_FALSE(remote_proposal.empty());
     CHECK(contains_in_order(
         remote_proposal,
-        {"proposal.metadata.key()",
-         "observe_proposal_view_generation(",
-         "proposal.view_generation"}));
+        {"authenticated_proposal_source_replica",
+         "MsgPropose message(",
+         "message.postponed_parse(this)",
+         "parsed.metadata().key() != proposal.metadata.key()",
+         "if (!block)",
+         "exact_context_metadata(parsed.key())",
+         "async_deliver_blk(block->get_hash(), source)",
+         "if (delivered == nullptr || !delivered->delivered)",
+         "delivery_hash_mismatch",
+         "proposal_retired",
+         "pre_vote_epoch_change_gate(parsed)",
+         "EpochChangeProposalDisposition::defer",
+         "EpochChangeProposalDisposition::rejected",
+         "admit_exact_context(",
+         "const bool proposal_accepted =\n                            owner.on_receive_proposal(parsed);",
+         "retain_commit_event_identity(",
+         "metadata.key,\n                                    deferred.view_generation"}));
+    CHECK(count_occurrences(
+              remote_proposal, "retain_commit_event_identity(") == 1);
 
     REQUIRE_FALSE(cache_commit.empty());
     CHECK(contains_all(
@@ -2134,10 +2169,14 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "proposal_view_generation(*exact_key)",
          "CommittedProposalIdentityDisposition::unavailable",
          "CommittedProposalIdentityDisposition::conflicting",
+         "auto event_disposition = disposition",
+         "auto event_key = exact_key",
+         "auto event_generation = generation",
+         "retained_commit_event_identities.find(blk->get_hash())",
          "PendingAdaptiveV2Commit"}));
     CHECK(count_occurrences(
               cache_commit,
-              "CommittedProposalIdentityDisposition::unavailable") == 1);
+              "CommittedProposalIdentityDisposition::unavailable") == 2);
     CHECK(contains_in_order(
         cache_commit,
         {"unavailable_resolution",
@@ -2145,6 +2184,16 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "!exact_key.has_value()",
          "identity.provenance",
          "legal_qc_skipped_ancestor"}));
+    CHECK(contains_in_order(
+        cache_commit,
+        {"PendingAdaptiveV2Commit{",
+         "blk->get_hash(),",
+         "exact_key,",
+         "generation,",
+         "disposition,",
+         "event_key,",
+         "event_generation,",
+         "event_disposition,"}));
     REQUIRE_FALSE(do_consensus.empty());
     CHECK(contains_in_order(
         do_consensus,
@@ -2156,6 +2205,27 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "verified_direct_certifier != nullptr",
          "forget_proposal_view_generation(key)",
          "forget_proposal_view_generations_for_block(blk->get_hash())"}));
+    CHECK(contains_in_order(
+        do_consensus,
+        {"const auto &authoritative_key = identity.key",
+         "retire_authoritative_absent_context(",
+         "observe_authoritative_commit(",
+         "cache_adaptive_v2_commit(",
+         "report_adaptive_v2_committed(",
+         "pending_adaptive_v2_commit->committed_key",
+         "record_adaptive_commit_marker(blk, authoritative_key)",
+         "advance_committed_retirement_floor(blk, authoritative_key)"}));
+    CHECK(do_consensus.find("event_") == std::string::npos);
+    REQUIRE_FALSE(report_commit.empty());
+    REQUIRE_FALSE(commit_marker.empty());
+    REQUIRE_FALSE(observe_commit.empty());
+    REQUIRE_FALSE(retire_absent.empty());
+    CHECK(report_commit.find("event_committed_key") == std::string::npos);
+    CHECK(report_commit.find("event_view_generation") == std::string::npos);
+    CHECK(commit_marker.find("event_committed_key") == std::string::npos);
+    CHECK(commit_marker.find("event_view_generation") == std::string::npos);
+    CHECK(observe_commit.find("event_") == std::string::npos);
+    CHECK(retire_absent.find("event_") == std::string::npos);
     REQUIRE_FALSE(retire_before_epoch.empty());
     CHECK(retire_before_epoch.find(
               "forget_proposal_view_generation(key)") !=
@@ -2209,22 +2279,37 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "emit_commit_observed_event(",
          "std::optional<ProposalKey> committed_key",
          "committed_key = pending_adaptive_v2_commit->committed_key",
-         "view_generation =",
-         "pending_adaptive_v2_commit->view_generation",
-         "identity_disposition =",
-         "pending_adaptive_v2_commit->identity_disposition",
+         "event_committed_key =",
+         "->event_committed_key",
+         "event_view_generation =",
+         "->event_view_generation",
+         "event_identity_disposition =",
+         "->event_identity_disposition",
          "pending_adaptive_v2_commit.reset()",
          "CommittedProposalIdentityDisposition::unavailable",
          "emit_commit_identity_unavailable_event(",
          "CommittedProposalIdentityDisposition::exact",
          "emit_committed_block_event(",
-         "commit_batch_index",
-         "record_committed_v2(command, blk->get_height())",
+         "event_committed_key",
+         "event_view_generation",
+         "reporter_local_commit_monotonic_ns"}));
+    CHECK(contains_in_order(
+        post_commit,
+        {"record_committed_v2(command, blk->get_height())",
          "ActivationRecordDisposition::recorded",
          "recorded.record.has_value()",
          "emit_epoch_command_committed_event(",
          "pending_committed_epoch_change.reset()",
          "on_v2_post_block_commit("}));
+    CHECK(post_commit.find(
+              "emit_committed_block_event(\n                blk,\n                committed_key") ==
+          std::string::npos);
+    CHECK(post_commit.find(
+              "on_v2_post_block_commit(\n                blk, event_committed_key") ==
+          std::string::npos);
+    CHECK(post_commit.find(
+              "rotate_adaptive_v2_after_commit(event_committed_key)") ==
+          std::string::npos);
 }
 
 TEST_CASE("every adaptive v2 topology publication emits active configuration",
@@ -2348,6 +2433,9 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
          "exact_key,",
          "generation,",
          "disposition,",
+         "event_key,",
+         "event_generation,",
+         "event_disposition,",
          "std::nullopt"}));
 
     REQUIRE_FALSE(post_commit.empty());
@@ -2356,13 +2444,18 @@ TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
         {"pending_adaptive_v2_commit",
          "block_hash == blk->get_hash()",
          "committed_key =",
-         "view_generation =",
+         "event_committed_key =",
+         "event_view_generation =",
+         "event_identity_disposition =",
          "pending_adaptive_v2_commit.reset()",
          "epoch_live_binding->on_v2_post_block_commit(",
          "finish_adaptive_epoch_commit(blk, activation)",
          "rotate_adaptive_v2_after_commit(committed_key)"}));
     CHECK(post_commit.find(
-              "rotate_adaptive_v2_after_commit(view_generation)") ==
+              "rotate_adaptive_v2_after_commit(event_view_generation)") ==
+          std::string::npos);
+    CHECK(post_commit.find(
+              "rotate_adaptive_v2_after_commit(event_committed_key)") ==
           std::string::npos);
 
     REQUIRE_FALSE(finish_commit.empty());
