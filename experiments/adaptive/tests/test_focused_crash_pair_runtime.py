@@ -456,8 +456,8 @@ def test_v4_pass_terminal_chain_rejects_injected_arm_failure() -> None:
             "payload": {
                 "predecessor_epoch_number": 0,
                 "activation_generation": 1,
-                "baseline_evidence_cutoff": 7,
-                "current_evidence_cutoff": 9,
+                "baseline_cutoff": 7,
+                "current_cutoff": 9,
             },
         },
         {
@@ -481,6 +481,26 @@ def test_v4_pass_terminal_chain_rejects_injected_arm_failure() -> None:
         "activations2": [],
     }
     validation._validate_v4_pass_terminals(events, **kwargs)
+
+    for snapshot_field, terminal_field in (
+        ("baseline_cutoff", "baseline_evidence_cutoff"),
+        ("current_cutoff", "current_evidence_cutoff"),
+    ):
+        for delta in (-1, 1):
+            snapshot_drift = deepcopy(events)
+            snapshot_drift[0]["payload"][snapshot_field] += delta
+            with pytest.raises(
+                validation.FocusedCrashPairValidationError,
+                match="identity drifted",
+            ):
+                validation._validate_v4_pass_terminals(snapshot_drift, **kwargs)
+            terminal_drift = deepcopy(events)
+            terminal_drift[1]["payload"][terminal_field] += delta
+            with pytest.raises(
+                validation.FocusedCrashPairValidationError,
+                match="identity drifted",
+            ):
+                validation._validate_v4_pass_terminals(terminal_drift, **kwargs)
 
     injected = deepcopy(terminal)
     injected.update(

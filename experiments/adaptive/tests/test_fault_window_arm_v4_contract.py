@@ -479,6 +479,62 @@ def test_v4_anchor_replay_requires_exact_prefix_and_replays_outstanding_timeouts
     assert latest_ns == 1_121
 
 
+def test_v4_anchor_replay_ignores_postaudit_epoch1_ingestion_restart(
+    tmp_path: Path,
+) -> None:
+    validation, contract, events, audit = _anchor_replay_fixture(tmp_path)
+    post_epoch = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "evidence.observation_accepted"
+            )
+        )
+    )
+    post_epoch["source_sequence"] = audit["source_sequence"] + 1
+    post_epoch["source_monotonic_ns"] = audit["source_monotonic_ns"] + 1
+    post_epoch["payload"]["ingestion_sequence"] = 1
+    post_epoch["payload"]["observation"]["configuration"] = {
+        "epoch_number": 1,
+        "tree_id": 0,
+        "epoch_digest": "f" * 64,
+    }
+    events.append(post_epoch)
+    rows, drawdowns, latest_ns = validation._v4_replay_fault_window_anchors(
+        contract, events, baseline_cutoff=0, current_cutoff=4, audit=audit
+    )
+    assert {(row["reporter_id"], row["tree_id"]) for row in rows} == {
+        (2, 6),
+        (3, 0),
+    }
+    assert drawdowns == {"1": -2}
+    assert latest_ns == 1_121
+
+
+def test_v4_anchor_replay_rejects_postaudit_pred0_ingestion_restart(
+    tmp_path: Path,
+) -> None:
+    validation, contract, events, audit = _anchor_replay_fixture(tmp_path)
+    post_epoch = json.loads(
+        json.dumps(
+            next(
+                event
+                for event in events
+                if event["event_type"] == "evidence.observation_accepted"
+            )
+        )
+    )
+    post_epoch["source_sequence"] = audit["source_sequence"] + 1
+    post_epoch["source_monotonic_ns"] = audit["source_monotonic_ns"] + 1
+    post_epoch["payload"]["ingestion_sequence"] = 1
+    events.append(post_epoch)
+    with pytest.raises(validation.FocusedCrashPairValidationError, match="audit"):
+        validation._v4_replay_fault_window_anchors(
+            contract, events, baseline_cutoff=0, current_cutoff=4, audit=audit
+        )
+
+
 def test_v4_anchor_replay_does_not_require_an_unreachable_root_anchor(
     tmp_path: Path,
 ) -> None:

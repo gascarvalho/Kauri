@@ -1015,13 +1015,6 @@ def _v4_replay_fault_window_anchors(
         )
         if sequence > current_cutoff:
             continue
-        if (
-            _integer(event["source_monotonic_ns"], "evidence acceptance time")
-            > audit_ns
-            or _integer(event["source_sequence"], "evidence acceptance sequence", 1)
-            >= audit_sequence
-        ):
-            _error("v4 accepted evidence does not precede predecessor-0 audit")
         observation = _mapping(payload.get("observation"), "accepted observation")
         configuration = _mapping(
             observation.get("configuration"), "observation configuration"
@@ -1034,6 +1027,13 @@ def _v4_replay_fault_window_anchors(
             or configuration.get("epoch_digest") != expected_digest
         ):
             continue
+        if (
+            _integer(event["source_monotonic_ns"], "evidence acceptance time")
+            > audit_ns
+            or _integer(event["source_sequence"], "evidence acceptance sequence", 1)
+            >= audit_sequence
+        ):
+            _error("v4 accepted evidence does not precede predecessor-0 audit")
         tree_id = _integer(configuration.get("tree_id"), "observation tree")
         block_hash = _digest(observation.get("block_hash"), "observation block hash")
         key = (0, tree_id, expected_digest, block_hash)
@@ -3464,8 +3464,16 @@ def _validate_v4_pass_terminals(
             "evidence_window_activation_generation": snapshot.get(
                 "activation_generation"
             ),
-            "baseline_evidence_cutoff": snapshot.get("baseline_evidence_cutoff"),
-            "current_evidence_cutoff": snapshot.get("current_evidence_cutoff"),
+            "baseline_evidence_cutoff": _integer(
+                snapshot.get("baseline_cutoff"),
+                "terminal snapshot baseline cutoff",
+                0,
+            ),
+            "current_evidence_cutoff": _integer(
+                snapshot.get("current_cutoff"),
+                "terminal snapshot current cutoff",
+                0,
+            ),
         }
         if dict(payload) != expected:
             _error("v4 PASS manager terminal identity drifted")
