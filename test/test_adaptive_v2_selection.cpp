@@ -959,6 +959,7 @@ TEST_CASE(
         fixture.anchor_timeout_proposal(timeout);
     }
     const auto unanchored = fixture.timeout_in_tree(5, 4);
+    fixture.on_time(0, 5);
 
     AdaptiveV2FaultWindowArm arm;
     arm.predecessor_epoch_number = fixture.epoch.epoch_number;
@@ -1331,6 +1332,59 @@ TEST_CASE(
               result.eligible_roots.end(),
               ReplicaID{6}) == result.eligible_roots.end());
     CHECK(result.snapshot->ranking().size() == 7);
+}
+
+TEST_CASE(
+    "containment remains recoverable when an unguarded member is nonresponsive",
+    "[adaptive-v2][selection][fault-containment][eligibility][n7]")
+{
+    Fixture fixture;
+    fixture.baseline_all();
+    auto config = selection_config();
+    config.required_nonresponsive = 1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger,
+        fixture.members,
+        fixture.epoch,
+        config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    // Replica 0 meets the f+1 reporter guard. Replica 6 is separately
+    // snapshot-nonresponsive, but one reporter cannot place it in the
+    // evidence-driven containment set.
+    fixture.persistent_timeouts(0, {2, 3, 4}, 2);
+    fixture.persistent_timeouts(6, {1}, 2);
+
+    const auto result = selector.select_through(
+        fixture.ledger->high_watermark());
+
+    REQUIRE(result.snapshot != nullptr);
+    CHECK(result.status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(result.selected_replicas.empty());
+    CHECK(result.eligible_roots.empty());
+    CHECK(std::count_if(
+              result.snapshot->ranking().begin(),
+              result.snapshot->ranking().end(),
+              [](const auto &entry) { return entry.eligible; }) == 5);
+    const auto *guarded = candidate(result.eligible_candidates, 0);
+    REQUIRE(guarded != nullptr);
+    CHECK(guarded->guarded_eligible);
+    CHECK(candidate(result.eligible_candidates, 6) == nullptr);
+
+    for (std::size_t attempt = 0; attempt < 4; ++attempt)
+        fixture.on_time(1, 6);
+
+    const auto recovered = selector.select_through(
+        fixture.ledger->high_watermark());
+    REQUIRE(recovered.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(recovered.selected_replicas == std::vector<ReplicaID>{0});
+    CHECK(recovered.eligible_roots.size() == 5);
+    CHECK(std::find(
+              recovered.eligible_roots.begin(),
+              recovered.eligible_roots.end(),
+              ReplicaID{0}) == recovered.eligible_roots.end());
 }
 
 TEST_CASE(

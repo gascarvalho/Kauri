@@ -1495,6 +1495,45 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "controller waits for an unguarded nonresponsive member to recover",
+    "[adaptive-v2][manager-controller][selection][eligibility][n7]")
+{
+    Fixture fixture(5, 4096, 1);
+    fixture.freeze_baseline();
+
+    fixture.persistent_timeouts(0, 3);
+    fixture.persistent_timeouts(6, 1);
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::awaiting_guarded_selection);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    CHECK(fixture.controller->selection_audit()->status ==
+          AdaptiveV2SelectionStatus::insufficient_eligible_roots);
+    CHECK(fixture.controller->selection_audit()->selected_replicas.empty());
+    CHECK(fixture.controller->selection_audit()->eligible_roots.empty());
+    CHECK(fixture.controller->successor_bundle() == nullptr);
+    CHECK(fixture.controller->failure_detail() == nullptr);
+    CHECK(fixture.controller->healthy());
+
+    for (std::size_t attempt = 0; attempt < 6; ++attempt)
+    {
+        fixture.record(
+            6, 0, ResponseOutcome::on_time,
+            "recover-unselected-member");
+    }
+
+    REQUIRE(fixture.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(fixture.controller->selection_audit() != nullptr);
+    CHECK(fixture.controller->selection_audit()->status ==
+          AdaptiveV2SelectionStatus::selected);
+    CHECK(fixture.controller->selection_audit()->selected_replicas ==
+          std::vector<ReplicaID>{0});
+    CHECK(fixture.controller->selection_audit()->eligible_roots.size() == 5);
+    REQUIRE(fixture.controller->successor_bundle() != nullptr);
+    CHECK(fixture.controller->healthy());
+}
+
+TEST_CASE(
     "controller composes raw drawdown with proposal-filtered timeout audit",
     "[adaptive-v2][manager-controller][selection][epoch-factory]"
     "[fault-containment][audit-domain]")

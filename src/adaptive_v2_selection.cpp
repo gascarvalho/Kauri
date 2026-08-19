@@ -983,6 +983,21 @@ struct AdaptiveV2ByzantineSelection::State
             const std::set<ReplicaID> selected(
                 output.selected_replicas.begin(),
                 output.selected_replicas.end());
+            for (const auto &entry : output.snapshot->ranking())
+            {
+                if (selected.count(entry.replica_id) != 0)
+                    continue;
+                if (entry.classification !=
+                        ResponsivenessClass::responsive ||
+                    !entry.eligible)
+                {
+                    output.status =
+                        AdaptiveV2SelectionStatus::insufficient_eligible_roots;
+                    output.selected_replicas.clear();
+                    output.eligible_roots.clear();
+                    return output;
+                }
+            }
             output.eligible_roots.reserve(quorum.quorum);
             for (const auto &entry : output.snapshot->ranking())
             {
