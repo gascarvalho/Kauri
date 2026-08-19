@@ -128,6 +128,19 @@ _FCRASH_H_V9_IDENTITIES = {
 _FCRASH_H_V10_PROFILE_IDS = frozenset(
     {"n7-f2-q5-two-crash-pair-smoke-v10", "n31-f5-q21-three-crash-pair-v10"}
 )
+_FCRASH_H_V11_PROFILE_IDS = frozenset(
+    {"n7-f2-q5-two-crash-pair-smoke-v11", "n31-f5-q21-three-crash-pair-v11"}
+)
+_FCRASH_H_V11_IDENTITIES = {
+    "n7-f2-q5-two-crash-pair-smoke-v11": (
+        "02b3ca67f3caf1e145f80daa700531188d6828bf25d4102d61174e99dd729bbb",
+        "bbe9c4df3f6f5a05e16822abf3f27e91c6e121d0449fd69fc18396c6bb9d6814",
+    ),
+    "n31-f5-q21-three-crash-pair-v11": (
+        "bab7175e31f961af7dcd1197deac332b739fa9c1c21e00da54e481c1f4dc184e",
+        "f5a3d5c343580e71e90de4f4bf9b4e7198c61fe7b258d197e0ab0050c94341ae",
+    ),
+}
 _FCRASH_H_V10_IDENTITIES = {
     "n7-f2-q5-two-crash-pair-smoke-v10": (
         "b57b6406be768305f917d7ad45d022e510733d01932bd75c91aa027e82e0b34c",
@@ -139,7 +152,7 @@ _FCRASH_H_V10_IDENTITIES = {
     ),
 }
 _FCRASH_H_GUARDED_PROFILE_IDS = (
-    _FCRASH_H_V9_PROFILE_IDS | _FCRASH_H_V10_PROFILE_IDS
+    _FCRASH_H_V9_PROFILE_IDS | _FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS
 )
 _REVIEWED_FOCUSED_PROFILE_IDS = frozenset(
     {
@@ -544,7 +557,9 @@ def _is_v9_contract(contract: Mapping[str, object]) -> bool:
 
 
 def _is_v10_contract(contract: Mapping[str, object]) -> bool:
-    return contract.get("profile_id") in _FCRASH_H_V10_PROFILE_IDS
+    return contract.get("profile_id") in (
+        _FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS
+    )
 
 
 def _is_v8_or_v9_contract(contract: Mapping[str, object]) -> bool:
@@ -2477,7 +2492,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
     fault = _mapping(profile.get("fault"), "profile fault")
     transitions = _mapping(profile.get("transitions"), "profile transitions")
     timing = transitions.get("adaptive_timing_contract")
-    if profile_id in _FCRASH_H_V10_PROFILE_IDS:
+    if profile_id in (_FCRASH_H_V10_PROFILE_IDS | _FCRASH_H_V11_PROFILE_IDS):
         expected_timing = {
             "schema_version": 1,
             "domain": "kauri-focused-v10-transition-timing-v1",
@@ -2557,6 +2572,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
         "n31-f5-q21-three-crash-pair-v8",
         "n31-f5-q21-three-crash-pair-v9",
         "n31-f5-q21-three-crash-pair-v10",
+        "n31-f5-q21-three-crash-pair-v11",
     }
     order = [members[(active_tree + offset) % count] for offset in range(count)]
     if (
@@ -2625,7 +2641,8 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
             proof_sha,
         )
         != (
-            _FCRASH_H_V10_IDENTITIES.get(str(profile_id))
+            _FCRASH_H_V11_IDENTITIES.get(str(profile_id))
+            or _FCRASH_H_V10_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V9_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V8_IDENTITIES.get(str(profile_id))
             or _FCRASH_H_V7_IDENTITIES.get(str(profile_id))
@@ -2719,6 +2736,7 @@ def validation_contract_from_profile(root: Path) -> dict[str, object]:
                     "n7-f2-q5-two-crash-pair-smoke-v8",
                     "n7-f2-q5-two-crash-pair-smoke-v9",
                     "n7-f2-q5-two-crash-pair-smoke-v10",
+                    "n7-f2-q5-two-crash-pair-smoke-v11",
                 }
                 else {}
             ),

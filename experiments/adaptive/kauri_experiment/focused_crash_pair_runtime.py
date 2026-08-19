@@ -210,13 +210,13 @@ def _v6_timeout_observation_id(
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9", "-v10")
+        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11")
     )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v5", "-v6", "-v7", "-v8", "-v9", "-v10")
+        ("-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11")
     )
 
 
@@ -235,11 +235,11 @@ def _is_v8_profile(profile: FocusedProfile | object) -> bool:
 def _is_v9_profile(profile: FocusedProfile | object) -> bool:
     """Return whether this is the prospective guarded-cohort contract."""
 
-    return str(getattr(profile, "profile_id", "")).endswith(("-v9", "-v10"))
+    return str(getattr(profile, "profile_id", "")).endswith(("-v9", "-v10", "-v11"))
 
 
 def _is_v10_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith("-v10")
+    return str(getattr(profile, "profile_id", "")).endswith(("-v10", "-v11"))
 
 
 def _is_v8_or_v9_profile(profile: FocusedProfile | object) -> bool:
@@ -1006,11 +1006,14 @@ def _validate_topology_proof(
         "n31-f5-q21-three-crash-pair-v8",
         "n31-f5-q21-three-crash-pair-v9",
         "n31-f5-q21-three-crash-pair-v10",
+        "n31-f5-q21-three-crash-pair-v11",
     }:
         metric = topology.get("target_selection_metric")
         expected_metric = (
             _v8_n31_target_selection_metric()
-            if str(profile.get("profile_id", "")).endswith(("-v8", "-v9", "-v10"))
+            if str(profile.get("profile_id", "")).endswith(
+                ("-v8", "-v9", "-v10", "-v11")
+            )
             else _v7_n31_target_selection_metric()
         )
         if metric != expected_metric:
@@ -1020,7 +1023,7 @@ def _validate_topology_proof(
         "target_selection_metric" in topology or "target_selection_metric" in derivation
     ):
         _error("archived topology contains a prospective target selection metric")
-    if str(profile.get("profile_id", "")).endswith(("-v8", "-v9", "-v10")):
+    if str(profile.get("profile_id", "")).endswith(("-v8", "-v9", "-v10", "-v11")):
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         expected_capacity = _reporter_capacity_document(
             replica_count=replica_count,

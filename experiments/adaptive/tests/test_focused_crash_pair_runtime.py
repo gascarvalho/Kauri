@@ -43,6 +43,8 @@ N7_PROFILE_V9 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v9.json"
 N31_PROFILE_V9 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v9.json"
 N7_PROFILE_V10 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v10.json"
 N31_PROFILE_V10 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v10.json"
+N7_PROFILE_V11 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v11.json"
+N31_PROFILE_V11 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v11.json"
 
 
 def test_v9_inherited_cohort_binds_leaves_without_inventing_suffix_order() -> None:
@@ -538,7 +540,7 @@ def test_v9_uses_six_complete_buckets_while_v8_keeps_archived_window_width() -> 
     assert runtime._phase_measurement_duration_ns(v9, bucket_width_ns) == 30_000_000_000
 
 
-def test_v10_profiles_have_frozen_identities_and_phase_derived_residence() -> None:
+def test_v10_v11_profiles_have_frozen_identities_and_phase_derived_residence() -> None:
     runtime = _runtime()
     expected = {
         N7_PROFILE_V10: (
@@ -549,38 +551,83 @@ def test_v10_profiles_have_frozen_identities_and_phase_derived_residence() -> No
             "066fbd2b1a14d6cec0d86eaafe28e19e4b52ed2a4cefb47d8a2b0079005bdf85",
             "8a4bc9a735cd73a31110ca4641e24a296247d5e17dd32af2e704ecbf76333a3d",
         ),
+        N7_PROFILE_V11: (
+            "02b3ca67f3caf1e145f80daa700531188d6828bf25d4102d61174e99dd729bbb",
+            "bbe9c4df3f6f5a05e16822abf3f27e91c6e121d0449fd69fc18396c6bb9d6814",
+        ),
+        N31_PROFILE_V11: (
+            "bab7175e31f961af7dcd1197deac332b739fa9c1c21e00da54e481c1f4dc184e",
+            "f5a3d5c343580e71e90de4f4bf9b4e7198c61fe7b258d197e0ab0050c94341ae",
+        ),
     }
     for path, identities in expected.items():
         profile = runtime.load_focused_profile(path)
         assert (profile.profile_sha256, profile.topology_proof_sha256) == identities
         assert runtime._v10_transition_timing(profile) == (5_000_000_000, 65_000)
 
+    n7_v10 = json.loads(N7_PROFILE_V10.read_text(encoding="utf-8"))
+    n7_v11 = json.loads(N7_PROFILE_V11.read_text(encoding="utf-8"))
+    assert n7_v11["timers"] == {
+        **n7_v10["timers"],
+        "nonresponse_evidence_deadline_seconds": 180,
+        "containment_activation_deadline_seconds": 270,
+        "arm_hard_deadline_seconds": 480,
+    }
+    n31_v10 = json.loads(N31_PROFILE_V10.read_text(encoding="utf-8"))
+    n31_v11 = json.loads(N31_PROFILE_V11.read_text(encoding="utf-8"))
+    assert n31_v11["timers"] == n31_v10["timers"]
 
-def test_v10_transition_request_uses_65s_while_v9_archive_keeps_40s(
+    def normalized(profile: dict[str, Any]) -> dict[str, Any]:
+        value = deepcopy(profile)
+        value["profile_id"] = "normalized"
+        topology = value["topology"]
+        assert isinstance(topology, dict)
+        topology["proof_path"] = "normalized-proof.json"
+        topology.pop("proof_sha256")
+        return value
+
+    normalized_n7_v11 = normalized(n7_v11)
+    normalized_n7_v11["timers"] = deepcopy(n7_v10["timers"])
+    assert normalized_n7_v11 == normalized(n7_v10)
+    assert normalized(n31_v11) == normalized(n31_v10)
+
+
+def test_v10_v11_transition_request_uses_65s_while_v9_archive_keeps_40s(
     tmp_path: Path,
 ) -> None:
     runtime = _runtime()
     v9 = runtime.load_focused_profile(N7_PROFILE_V9)
     v10 = runtime.load_focused_profile(N7_PROFILE_V10)
+    v11 = runtime.load_focused_profile(N7_PROFILE_V11)
     v9_requests = runtime._focused_transition_requests(tmp_path / "v9", "adaptive", v9)
     v10_requests = runtime._focused_transition_requests(
         tmp_path / "v10", "adaptive", v10
     )
     assert v9_requests[1][0]["minimum_predecessor_residency_ms"] == 40_000
     assert v10_requests[1][0]["minimum_predecessor_residency_ms"] == 65_000
+    v11_requests = runtime._focused_transition_requests(
+        tmp_path / "v11", "adaptive", v11
+    )
+    assert v11_requests[1][0]["minimum_predecessor_residency_ms"] == 65_000
+    assert runtime.derive_reporter_coverage_plan(v11)["deadlines_seconds"] == {
+        "evidence_seconds": 180,
+        "epoch1_activation_seconds": 270,
+        "optimization_activation_seconds": 90,
+        "arm_hard_seconds": 480,
+    }
 
-    adapter = runtime._profiled_adapter(v10, 41_719)
+    adapter = runtime._profiled_adapter(v11, 41_719)
     tls = [{"sec": f"key-{index}", "crt": f"cert-{index}"} for index in range(8)]
     argv = runtime._focused_manager_command(
-        v10,
+        v11,
         adapter,
         arm="adaptive",
         manager_binary=Path("/build/adaptation-manager"),
         tls=tls,
         issuer={"sec": "issuer-key", "pub": native_fixture.ISSUER_PUBLIC_KEY},
         run_directory=tmp_path / "argv",
-        run_id="run-v10",
-        source_instance="manager-v10",
+        run_id="run-v11",
+        source_instance="manager-v11",
         fault_window_arm_path=(tmp_path / "argv" / "fault-window-arm.json").resolve(),
         request_sha256="a" * 64,
     )
@@ -4911,8 +4958,10 @@ def _arm_hooks(runtime: Any, snapshots: Mapping[str, Mapping[str, object]]) -> A
     return hooks, calls
 
 
-def _v10_timing_state_fixture(runtime: Any) -> tuple[Any, dict[str, Any]]:
-    loaded = runtime.load_focused_profile(N7_PROFILE_V10)
+def _v10_timing_state_fixture(
+    runtime: Any, profile_path: Path = N7_PROFILE_V10
+) -> tuple[Any, dict[str, Any]]:
+    loaded = runtime.load_focused_profile(profile_path)
     profile = replace(
         loaded,
         issuer_public_key=native_fixture.ISSUER_PUBLIC_KEY,
@@ -4950,9 +4999,12 @@ def _v10_timing_state_fixture(runtime: Any) -> tuple[Any, dict[str, Any]]:
     return profile, snapshots
 
 
-def test_v10_live_state_rejects_late_common_anchor_and_early_first_e2_command() -> None:
+@pytest.mark.parametrize("profile_path", (N7_PROFILE_V10, N7_PROFILE_V11))
+def test_v10_v11_live_state_rejects_late_common_anchor_and_early_first_e2_command(
+    profile_path: Path,
+) -> None:
     runtime = _runtime()
-    profile, accepted = _v10_timing_state_fixture(runtime)
+    profile, accepted = _v10_timing_state_fixture(runtime, profile_path)
     hooks, _ = _arm_hooks(runtime, accepted)
     runtime._drive_arm_state_machine(profile, "A", "pair-01", hooks)
 
