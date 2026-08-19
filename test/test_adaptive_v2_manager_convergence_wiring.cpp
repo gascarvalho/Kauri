@@ -1077,7 +1077,10 @@ TEST_CASE(
         {"if (!begin_current_cycle())", "fail(", "if (!failed_)"}));
 
     const auto fail = function_body(
-        manager, "void fail(const char *reason) noexcept");
+        manager,
+        "void fail(\n"
+        "        const char *reason,\n"
+        "        AdaptiveV2ManagerCycleTerminalReason terminal_reason");
     REQUIRE_FALSE(fail.empty());
     CHECK(contains_in_order(
         fail, {"failed_ = true", "event_context_.stop()"}));
@@ -1230,7 +1233,10 @@ TEST_CASE(
     const auto cancel = function_body(
         manager, "void cancel_pending_evaluation() noexcept");
     const auto fail = function_body(
-        manager, "void fail(const char *reason) noexcept");
+        manager,
+        "void fail(\n"
+        "        const char *reason,\n"
+        "        AdaptiveV2ManagerCycleTerminalReason terminal_reason");
     const auto stop = function_body(
         manager, "void stop_runtime() noexcept");
     const auto begin_cycle = function_body(
@@ -1637,7 +1643,10 @@ TEST_CASE(
          "evaluate()"}));
 
     const auto fail = function_body(
-        manager, "void fail(const char *reason) noexcept");
+        manager,
+        "void fail(\n"
+        "        const char *reason,\n"
+        "        AdaptiveV2ManagerCycleTerminalReason terminal_reason");
     const auto stop = function_body(manager, "void stop_runtime() noexcept");
     REQUIRE_FALSE(fail.empty());
     REQUIRE_FALSE(stop.empty());
