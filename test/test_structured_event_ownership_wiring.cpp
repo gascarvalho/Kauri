@@ -452,7 +452,8 @@ TEST_CASE(
         REQUIRE(wire_health != std::string::npos);
         CHECK(wire_emit < wire_drain);
         CHECK(wire_drain < wire_health);
-        CHECK(wire_rejected.find("fail()") != std::string::npos);
+        CHECK(wire_rejected.find("fail(\"wire_rejection_") !=
+              std::string::npos);
     }
 
     SECTION("assembled certificate audits bind the exact delivery wire bytes")

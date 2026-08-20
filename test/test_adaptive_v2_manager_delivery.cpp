@@ -246,6 +246,51 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "adaptive v3 fatal paths log bounded controller state",
+    "[adaptive-v3][manager][diagnostic]")
+{
+    const auto source = read_source("examples/adaptation_manager.cpp");
+    const auto v3_begin = source.find("class AdaptiveV3ManagerModeState final");
+    const auto v2_begin = source.find("class AdaptiveV2ManagerModeState final", v3_begin);
+    REQUIRE(v3_begin != std::string::npos);
+    REQUIRE(v2_begin != std::string::npos);
+    const auto manager = source.substr(v3_begin, v2_begin - v3_begin);
+    const auto diagnostic_begin = manager.find("void fail(const char *reason)");
+    const auto diagnostic_end = manager.find("void stop_runtime()", diagnostic_begin);
+    REQUIRE(diagnostic_begin != std::string::npos);
+    REQUIRE(diagnostic_end != std::string::npos);
+    const auto diagnostic = manager.substr(
+        diagnostic_begin, diagnostic_end - diagnostic_begin);
+
+    for (const auto *field : {
+             "KAURI_ADAPTIVE_V3_MANAGER fatal reason=%s",
+             "status=%u", "next_policy=%zu", "ready_members=%zu",
+             "total_members=%zu", "operational_ready=%d",
+             "ledger_high_watermark=%llu", "baseline_frozen=%d",
+             "baseline_cutoff=%llu", "current_cutoff=%llu",
+             "controller_failure_stage=%u", "selection_status=%u",
+             "factory_status=%u", "terminal_count=%zu",
+             "terminal_cycle=%llu", "terminal_reason=%u",
+             "fault_window_armed=%d",
+             "fault_window_arm_timer_pending=%d"})
+    {
+        CAPTURE(field);
+        CHECK(diagnostic.find(field) != std::string::npos);
+    }
+    CHECK(diagnostic.find("private_key") == std::string::npos);
+    CHECK(diagnostic.find("certificate") == std::string::npos);
+    CHECK(diagnostic.find("canonical_bytes") == std::string::npos);
+    CHECK(manager.find("fail(\"fault_window_arm_session_rejected\")") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "fail(\"fault_window_hard_deadline_session_rejected\")") !=
+          std::string::npos);
+    CHECK(manager.find("fail(\"fault_window_arm_acquisition_deadline\")") !=
+          std::string::npos);
+    CHECK(manager.find("fail(\"transport_fatal\")") != std::string::npos);
+}
+
+TEST_CASE(
     "fatal manager ingress logs one bounded diagnostic before shutdown",
     "[adaptive-v2][manager-ingress][diagnostic]")
 {

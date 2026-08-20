@@ -3303,7 +3303,7 @@ public:
                   [this](MsgActivationReadinessAck &&message, ReplicaID source) {
                       handle_ack(std::move(message), source);
                   },
-                  [this] { fail();
+                  [this] { fail("transport_fatal");
                   }})
     {
         retry_timer_ = salticidae::TimerEvent(
@@ -3311,7 +3311,7 @@ public:
                 if (logical_tick_ ==
                     std::numeric_limits<std::uint64_t>::max())
                 {
-                    fail();
+                    fail("logical_tick_overflow");
                     return;
                 }
                 ++logical_tick_;
@@ -3323,7 +3323,7 @@ public:
                 {
                     // A deadline/retry terminal has no successful E2
                     // certificate to report; it is fail-closed.
-                    fail();
+                    fail("session_terminal_on_advance");
                     return;
                 }
                 drive_deliveries();
@@ -3367,7 +3367,7 @@ public:
                     event_sink_.drain();
                     if (!event_sink_.health().healthy)
                     {
-                        fail();
+                        fail("structured_event_drain_unhealthy");
                         return;
                     }
                     timer.add(0.05);
@@ -3434,7 +3434,7 @@ private:
         event_sink_.emit(hotstuff::StructuredEventPayload{
             hotstuff::ProcessLifecycleEvent{state, std::nullopt}});
         if (!event_sink_.health().healthy)
-            fail();
+            fail("process_event_sink_unhealthy");
     }
 
     void emit_new_v3_accepted_observations() noexcept
@@ -3444,7 +3444,7 @@ private:
             const auto &records = facade_.ingress().ledger().accepted();
             if (emitted_accepted_observations_ > records.size())
             {
-                fail();
+                fail("accepted_observation_cursor_regressed");
                 return;
             }
             while (emitted_accepted_observations_ < records.size())
@@ -3456,7 +3456,7 @@ private:
                 event_sink_.drain();
                 if (!event_sink_.health().healthy)
                 {
-                    fail();
+                    fail("accepted_observation_audit_unhealthy");
                     return;
                 }
                 ++emitted_accepted_observations_;
@@ -3464,7 +3464,7 @@ private:
         }
         catch (...)
         {
-            fail();
+            fail("accepted_observation_audit_exception");
         }
     }
 
@@ -3474,7 +3474,7 @@ private:
         event_sink_.emit_audit(
             hotstuff::AuditStructuredEventPayload{std::move(event)});
         if (!event_sink_.health().healthy)
-            fail();
+            fail("readiness_audit_unhealthy");
     }
 
     // A TLS-authenticated peer can still send malformed v3 readiness wire.
@@ -3501,16 +3501,66 @@ private:
             // caller can continue or return.
             event_sink_.drain();
             if (!event_sink_.health().healthy)
-                fail();
+                fail("wire_rejection_audit_unhealthy");
         }
         catch (...)
         {
-            fail();
+            fail("wire_rejection_audit_exception");
         }
     }
 
-    void fail() noexcept
+    void fail(const char *reason) noexcept
     {
+        if (!failed_)
+        {
+            const auto status = facade_.v3_status();
+            const auto readiness = facade_.ingress().readiness_stats();
+            const auto controller = facade_.controller_audit();
+            const auto *terminals = facade_.v3_terminal_records();
+            const auto terminal_count = terminals == nullptr ? 0 : terminals->size();
+            const auto terminal_cycle = terminal_count == 0 ? 0 :
+                terminals->back().cycle_ordinal;
+            const auto terminal_reason = terminal_count == 0 ? 0 :
+                static_cast<unsigned>(terminals->back().reason);
+            const auto failure_stage =
+                controller.has_value() && controller->controller_failure.has_value()
+                ? static_cast<unsigned>(controller->controller_failure->stage) : 0;
+            const auto selection_status =
+                controller.has_value() && controller->controller_failure.has_value() &&
+                    controller->controller_failure->selection_status.has_value()
+                ? static_cast<unsigned>(
+                    *controller->controller_failure->selection_status) : 0;
+            const auto factory_status =
+                controller.has_value() && controller->controller_failure.has_value() &&
+                    controller->controller_failure->epoch_factory_status.has_value()
+                ? static_cast<unsigned>(
+                    *controller->controller_failure->epoch_factory_status) : 0;
+            HOTSTUFF_LOG_WARN(
+                "KAURI_ADAPTIVE_V3_MANAGER fatal reason=%s status=%u "
+                "next_policy=%zu ready_members=%zu total_members=%zu "
+                "operational_ready=%d ledger_high_watermark=%llu "
+                "baseline_frozen=%d baseline_cutoff=%llu current_cutoff=%llu "
+                "controller_failure_stage=%u selection_status=%u "
+                "factory_status=%u terminal_count=%zu terminal_cycle=%llu "
+                "terminal_reason=%u fault_window_armed=%d "
+                "fault_window_arm_timer_pending=%d",
+                reason,
+                status.has_value() ? static_cast<unsigned>(*status) : 0,
+                next_policy_, readiness.ready_members, readiness.total_members,
+                facade_.ingress().operationally_ready() ? 1 : 0,
+                static_cast<unsigned long long>(
+                    facade_.ingress().ledger().high_watermark()),
+                controller.has_value() && controller->baseline_frozen ? 1 : 0,
+                static_cast<unsigned long long>(
+                    controller.has_value() ? controller->baseline_cutoff : 0),
+                static_cast<unsigned long long>(
+                    controller.has_value() ? controller->current_cutoff : 0),
+                failure_stage, selection_status, factory_status,
+                terminal_count,
+                static_cast<unsigned long long>(terminal_cycle), terminal_reason,
+                fault_window_armed_ ? 1 : 0,
+                fault_window_arm_timer_pending_ ? 1 : 0);
+        }
         failed_ = true;
         event_context_.stop();
     }
@@ -3521,7 +3571,7 @@ private:
         retry_timer_.del();
         fault_window_arm_timer_.del();
         if (!transport_.stop())
-            failed_ = true;
+            fail("transport_stop_failed");
     }
 
     void emit_new_session_terminals() noexcept
@@ -3557,7 +3607,7 @@ private:
         const auto *certificate = facade_.v3_certificate();
         if (certificate == nullptr)
         {
-            fail();
+            fail("certificate_assembled_without_certificate");
             return;
         }
         try
@@ -3581,7 +3631,7 @@ private:
             event.required_release_count = options_.required_release_count;
             emit_readiness(std::move(event));
         }
-        catch (...) { fail(); }
+        catch (...) { fail("certificate_assembled_audit_exception"); }
     }
 
     void drive_deliveries() noexcept
@@ -3598,7 +3648,7 @@ private:
             const auto *certificate = facade_.v3_certificate();
             if (certificate == nullptr)
             {
-                fail();
+                fail("delivery_certificate_disappeared");
                 return;
             }
             const auto certificate_identity = certificate->identity;
@@ -3621,7 +3671,7 @@ private:
             }
             catch (...)
             {
-                fail();
+                fail("delivery_audit_preparation_exception");
                 return;
             }
             enqueued = transport_.send_certificate(
@@ -3645,7 +3695,7 @@ private:
                 event.disposition = "deadline_expired";
             else
             {
-                fail();
+                fail("delivery_result_invalid");
                 return;
             }
             emit_readiness(std::move(event));
@@ -3656,7 +3706,7 @@ private:
             if (failed_ || facade_.v3_status() ==
                     hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
             {
-                fail();
+                fail("delivery_session_terminal");
                 return;
             }
             if (disposition ==
@@ -3672,7 +3722,7 @@ private:
                  hotstuff::AdaptiveV3ManagerSessionStatus::terminal))
         {
             emit_new_session_terminals();
-            fail();
+            fail("delivery_retry_exhausted");
         }
     }
 
@@ -3695,7 +3745,7 @@ private:
         if (failed_ || facade_.v3_status() ==
                 hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
         {
-            fail();
+            fail("observation_session_terminal");
             return;
         }
         hotstuff::AdaptiveV3ReadinessStructuredEvent event;
@@ -3739,7 +3789,7 @@ private:
         if (released_conflict && !failed_)
         {
             emit_new_session_terminals();
-            fail();
+            fail("readiness_source_conflict_after_release");
             return;
         }
         if (result.certificate_assembled && !failed_)
@@ -3769,7 +3819,7 @@ private:
                     rejected_ack)
         {
             emit_new_session_terminals();
-            fail();
+            fail("readiness_ack_rejected");
             return;
         }
         if (disposition !=
@@ -3823,13 +3873,13 @@ private:
             event_sink_.drain();
             if (failed_ || !event_sink_.health().healthy)
             {
-                fail();
+                fail("e2_eligibility_audit_unhealthy");
                 return;
             }
             evaluate_transition_cycle();
         }
         else if (!facade_.begin_cycle(transition_policies_[next_policy_++]))
-            fail();
+            fail("containment_cycle_begin_rejected");
         else if (containment_cycle &&
                  options_.manager.fault_window_arm.has_value() &&
                  !fault_window_armed_)
@@ -3862,7 +3912,7 @@ private:
             event.e2_reserve_raw_ns = snapshot.reserve_ticks;
             emit_readiness(std::move(event));
         }
-        catch (...) { fail(); }
+        catch (...) { fail("e2_eligibility_audit_exception"); }
     }
 
     bool try_arm_fault_window() noexcept
@@ -3876,7 +3926,9 @@ private:
         if (read.status != FaultWindowArmReadStatus::consumed ||
             !read.document.has_value())
         {
-            fail();
+            fail(read.status == FaultWindowArmReadStatus::invalid
+                ? "fault_window_arm_invalid"
+                : "fault_window_arm_io_failure");
             return false;
         }
         try
@@ -3894,10 +3946,21 @@ private:
                     std::numeric_limits<std::uint64_t>::max() - duration_ns)
                 throw std::overflow_error("v3 arm hard deadline overflows");
             const auto hard_deadline_ns = fault_anchor_ns + duration_ns;
-            if (manager_tick_ns() >= hard_deadline_ns ||
-                !facade_.arm_fault_window(document.arm) ||
-                !facade_.v3_arm_hard_deadline(hard_deadline_ns))
-                throw std::logic_error("manager session rejected fault-window arm");
+            if (manager_tick_ns() >= hard_deadline_ns)
+            {
+                fail("fault_window_arm_hard_deadline_expired");
+                return false;
+            }
+            if (!facade_.arm_fault_window(document.arm))
+            {
+                fail("fault_window_arm_session_rejected");
+                return false;
+            }
+            if (!facade_.v3_arm_hard_deadline(hard_deadline_ns))
+            {
+                fail("fault_window_hard_deadline_session_rejected");
+                return false;
+            }
             event_sink_.emit_audit(
                 hotstuff::AuditStructuredEventPayload{document.event});
             event_sink_.drain();
@@ -3910,7 +3973,7 @@ private:
         }
         catch (...)
         {
-            fail();
+            fail("fault_window_arm_processing_exception");
             return false;
         }
     }
@@ -3925,7 +3988,7 @@ private:
             fault_window_arm_timer_pending_ = true;
             fault_window_arm_timer_.add(kEvaluationCoalescingSeconds);
         }
-        catch (...) { fail(); }
+        catch (...) { fail("fault_window_arm_timer_schedule_failed"); }
     }
 
     void handle_fault_window_arm_timer() noexcept
@@ -3941,11 +4004,11 @@ private:
             return;
         if (std::chrono::steady_clock::now() >= fault_window_arm_deadline_)
         {
-            fail();
+            fail("fault_window_arm_acquisition_deadline");
             return;
         }
         try { fault_window_arm_timer_.add(kEvaluationCoalescingSeconds); }
-        catch (...) { fail(); }
+        catch (...) { fail("fault_window_arm_timer_reschedule_failed"); }
     }
 
     const TransitionRequest *current_v3_transition_request() const noexcept
@@ -4180,13 +4243,13 @@ private:
         const auto *bundle = facade_.v3_successor_bundle();
         if (bundle == nullptr)
         {
-            fail();
+            fail("successor_ready_without_bundle");
             return;
         }
         const auto *request = current_v3_transition_request();
         if (request == nullptr)
         {
-            fail();
+            fail("successor_ready_without_request");
             return;
         }
         try
@@ -4208,7 +4271,7 @@ private:
         catch (...)
         {
             emit_new_session_terminals();
-            fail();
+            fail("successor_publication_failed");
         }
     }
 
@@ -4225,7 +4288,7 @@ private:
         if (result.status == AdaptiveV2ManagerIngressStatus::evidence_unhealthy ||
             result.status == AdaptiveV2ManagerIngressStatus::stopped)
         {
-            fail();
+            fail("manager_ingress_unhealthy");
             return;
         }
         evaluate_transition_cycle();
