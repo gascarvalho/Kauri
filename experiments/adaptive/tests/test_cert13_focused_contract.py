@@ -69,6 +69,45 @@ def _runner() -> Any:
     return importlib.import_module(RUNNER_MODULE)
 
 
+def test_runtime_bundle_decode_routes_only_exact_v13_profiles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    calls: list[tuple[str, bytes, str]] = []
+
+    def decode_v2(wire: bytes, *, issuer_public_key: str) -> str:
+        calls.append(("v2", wire, issuer_public_key))
+        return "v2"
+
+    def decode_v3(wire: bytes, *, issuer_public_key: str) -> str:
+        calls.append(("v3", wire, issuer_public_key))
+        return "v3"
+
+    monkeypatch.setattr(
+        runtime.factorial_validation, "decode_epoch_change_bundle", decode_v2
+    )
+    monkeypatch.setattr(
+        runtime.factorial_validation,
+        "decode_adaptive_v3_epoch_change_bundle",
+        decode_v3,
+    )
+
+    assert runtime._decode_focused_epoch_change_bundle(
+        b"same-wire",
+        issuer_public_key="issuer",
+        profile={"profile_id": "n7-f2-q5-two-crash-pair-smoke-v13"},
+    ) == "v3"
+    assert runtime._decode_focused_epoch_change_bundle(
+        b"same-wire",
+        issuer_public_key="issuer",
+        profile={"profile_id": "n7-f2-q5-two-crash-pair-smoke-v12"},
+    ) == "v2"
+    assert calls == [
+        ("v3", b"same-wire", "issuer"),
+        ("v2", b"same-wire", "issuer"),
+    ]
+
+
 def _canonical_v13_contract(
     root: Path, profile_path: Path = N7_V13
 ) -> dict[str, Any]:

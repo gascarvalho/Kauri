@@ -360,6 +360,23 @@ def _is_v13_profile(profile: FocusedProfile | Mapping[str, Any] | object) -> boo
         return False
 
 
+def _decode_focused_epoch_change_bundle(
+    wire: bytes,
+    *,
+    issuer_public_key: str,
+    profile: FocusedProfile | Mapping[str, Any] | object,
+) -> Any:
+    """Decode by frozen profile identity without sniffing or fallback."""
+
+    if _is_v13_profile(profile):
+        return factorial_validation.decode_adaptive_v3_epoch_change_bundle(
+            wire, issuer_public_key=issuer_public_key
+        )
+    return factorial_validation.decode_epoch_change_bundle(
+        wire, issuer_public_key=issuer_public_key
+    )
+
+
 def _v13_certified_activation_contract(
     profile: FocusedProfile | Mapping[str, Any] | object,
 ) -> dict[str, object]:
@@ -3751,14 +3768,19 @@ def _timestamp(value: Mapping[str, object], label: str) -> int:
 
 
 def _decoded_bundle(
-    snapshot: Mapping[str, object], issuer_public_key: str, label: str
+    snapshot: Mapping[str, object],
+    issuer_public_key: str,
+    label: str,
+    profile: FocusedProfile | Mapping[str, Any] | object,
 ) -> tuple[bytes, Any]:
     wire = snapshot.get("native_bundle")
     if not isinstance(wire, bytes) or not wire:
         _error(f"{label} native bundle is absent")
     try:
-        decoded = factorial_validation.decode_epoch_change_bundle(
-            wire, issuer_public_key=issuer_public_key
+        decoded = _decode_focused_epoch_change_bundle(
+            wire,
+            issuer_public_key=issuer_public_key,
+            profile=profile,
         )
     except factorial_validation.FactorialValidationError as exc:
         raise FocusedCrashPairRuntimeError(f"{label} native bundle is invalid") from exc
@@ -4072,7 +4094,9 @@ def _drive_arm_state_machine(
         _error("epoch 1 request is causally early")
     if coverage is not None and epoch1_ns != snapshot_audit_ns:
         _error("Epoch 1 request is not bound to its native snapshot audit")
-    epoch1_wire, epoch1 = _decoded_bundle(epoch1_snapshot, issuer, "epoch 1")
+    epoch1_wire, epoch1 = _decoded_bundle(
+        epoch1_snapshot, issuer, "epoch 1", profile
+    )
     if epoch1.epoch_number != 1:
         _error("epoch 1 bundle has the wrong epoch number")
     if (
@@ -4229,7 +4253,9 @@ def _drive_arm_state_machine(
             ) * 1_000_000
             if epoch2_ns <= max(phase_end_ns, residence_end_ns):
                 _error("v13 Epoch-2 request is ineligible before the Epoch-1 window")
-        epoch2_wire, epoch2 = _decoded_bundle(epoch2_snapshot, issuer, "epoch 2")
+        epoch2_wire, epoch2 = _decoded_bundle(
+            epoch2_snapshot, issuer, "epoch 2", profile
+        )
         if (
             epoch2.epoch_number != 2
             or epoch2.previous_epoch_digest != epoch1.epoch_digest
@@ -4844,8 +4870,10 @@ class FocusedRawEvidenceSource:
             _error(f"raw Epoch {epoch} bundle is absent")
         wire = path.read_bytes()
         try:
-            decoded = factorial_validation.decode_epoch_change_bundle(
-                wire, issuer_public_key=str(self._profile.issuer_public_key)
+            decoded = _decode_focused_epoch_change_bundle(
+                wire,
+                issuer_public_key=str(self._profile.issuer_public_key),
+                profile=self._profile,
             )
         except factorial_validation.FactorialValidationError as exc:
             raise FocusedCrashPairRuntimeError(
