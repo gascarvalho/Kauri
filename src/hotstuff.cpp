@@ -2986,10 +2986,13 @@ namespace hotstuff
                     attempt_state->resolve(outcome);
             };
         const auto proposal_key = proposal.metadata.key();
+        const bool certified_adaptive_mode =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3;
         static_cast<void>(observe_proposal_view_generation(
             proposal_key, proposal.view_generation));
         if (proposal.source_peer.is_null() ||
-            (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+            (certified_adaptive_mode &&
              !proposal.authenticated_proposal_source_replica.has_value()))
         {
             erase_deferred_epoch_change(proposal_key);
@@ -3227,23 +3230,25 @@ namespace hotstuff
                                 true);
                             return;
                         }
-                        if (owner.epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v2)
+                        const bool certified_adaptive_mode =
+                            owner.epoch_protocol_mode ==
+                                EpochProtocolMode::adaptive_v2 ||
+                            owner.epoch_protocol_mode ==
+                                EpochProtocolMode::adaptive_v3;
+                        if (certified_adaptive_mode)
                         {
                             owner.attempt_proposal_evidence_before_exposure(
                                 metadata.key,
                                 "response_deadline_arm_failed_before_"
                                 "proposal_exposure");
                         }
-                        if (owner.epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v2)
+                        if (certified_adaptive_mode)
                         {
                             relay_exposure_attempted = true;
                             owner.relay_once(deferred);
                         }
 
-                        if (owner.epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v2)
+                        if (certified_adaptive_mode)
                             static_cast<void>(
                                 owner.
                                     retain_authenticated_proposal_commit_event_identities(
@@ -3277,8 +3282,7 @@ namespace hotstuff
                                     completed_exposed);
                             return;
                         }
-                        if (owner.epoch_protocol_mode !=
-                            EpochProtocolMode::adaptive_v2)
+                        if (!certified_adaptive_mode)
                         {
                             owner.create_expected_vote_state(metadata.key);
                             static_cast<void>(

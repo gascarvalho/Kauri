@@ -1387,6 +1387,14 @@ TEST_CASE(
          "start_latency_deadline(metadata.key)",
          "start_aggregation_timer(metadata.key)",
          "drain_pending_exact_contributions(metadata.key)"}));
+    CHECK(remote.find(
+              "owner.epoch_protocol_mode ==\n"
+              "                                EpochProtocolMode::adaptive_v3") !=
+          std::string::npos);
+    CHECK(remote.find("if (certified_adaptive_mode)") !=
+          std::string::npos);
+    CHECK(remote.find("if (!certified_adaptive_mode)") !=
+          std::string::npos);
     REQUIRE_FALSE(receive.empty());
     CHECK(contains_in_order(
         receive,
