@@ -521,8 +521,8 @@ def _materialize_sealed_v13_arm(
 @pytest.mark.parametrize(
     ("arm", "expected_commit_count", "expected_phase_transactions"),
     [
-        ("control", 5, [1000, 0, 1000, 1000]),
-        ("adaptive", 7, [1000, 0, 1000, 1000]),
+        ("control", 10, [1000, 0, 1000, 1000]),
+        ("adaptive", 17, [1000, 0, 1000, 1000]),
     ],
 )
 def test_v13_native_sealed_arm_passes_exact_certified_validation(
@@ -721,7 +721,7 @@ def test_v13_native_fragment_reconstructs_authoritative_measurements(
         contract,
     )
 
-    assert len(commits) == 7
+    assert len(commits) == 17
     assert [row["phase"] for row in measurements["phases"]] == [
         "baseline",
         "fault",
@@ -1197,6 +1197,15 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
         and event["payload"]["block_hash"]
         == cycle["identity"]["command_block_hash"]
     )
+    authoritative_boundary = next(
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and event["payload"]["block_height"]
+        == cycle["identity"]["activation_height"]
+        and event["payload"]["block_hash"]
+        == cycle["identity"]["activation_boundary_block_hash"]
+    )
 
     if mutation == "missing_command":
         events.remove(command)
@@ -1217,9 +1226,9 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
     elif mutation == "command_not_designated":
         authoritative_command["payload"]["designated_observer"] = False
     elif mutation == "wrong_predecessor_tree":
-        authoritative_command["payload"]["decision_proof"]["tree_id"] += 1
+        authoritative_boundary["payload"]["decision_proof"]["tree_id"] += 1
     elif mutation == "wrong_predecessor_generation":
-        authoritative_command["payload"]["view_generation"] += 1
+        authoritative_boundary["payload"]["view_generation"] += 1
     elif mutation == "wrong_identity_successor":
         cycle["identity"]["successor_configuration"]["epoch_number"] = 2
     elif mutation == "prepared_identity_mismatch":

@@ -184,6 +184,13 @@ public:
         return HotStuffBase::maximum_proposal_view_generation_observations;
     }
 
+    static std::optional<std::uint64_t> exact_runtime_generation(
+        const HotStuffBase &runtime,
+        const ConfigurationId &configuration)
+    {
+        return runtime.find_exact_runtime_generation(configuration);
+    }
+
     static void seed_view_generation_without_source(
         HotStuffBase &runtime,
         const ProposalKey &key,
@@ -3756,6 +3763,150 @@ TEST_CASE(
                 nullptr),
             generation);
     }
+}
+
+TEST_CASE(
+    "adaptive-v3 retains the certified successor bridge without alternate ingress",
+    "[adaptive-v3][evidence][commit][qc-skip][proposal-bridge][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    const auto generation =
+        Access::exact_runtime_generation(runtime, configuration);
+    REQUIRE(generation.has_value());
+
+    const auto genesis = runtime.get_genesis();
+    const auto alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        genesis,
+        genesis,
+        "v3-certified-bridge-alternate");
+    const auto skipped = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        alternate,
+        genesis,
+        "v3-certified-bridge-skipped");
+    const auto certifier = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        skipped,
+        alternate,
+        "v3-certified-bridge-certifier");
+    const ProposalKey alternate_key{
+        configuration, alternate->get_hash()};
+    const ProposalKey skipped_key{
+        configuration, skipped->get_hash()};
+    const ProposalKey certifier_key{
+        configuration, certifier->get_hash()};
+
+    // Only the certifier proposal crossed this replica's authenticated
+    // ingress. The verified QC itself is the exact source for alternate_key.
+    Access::seed_view_generation(
+        runtime, certifier_key, *generation, 3);
+    Access::RetainedIdentityRollback rollback;
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        Proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            certifier,
+            nullptr),
+        *generation,
+        &rollback));
+    CHECK(Access::rollback_owned_mutation_count(rollback) == 3);
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, alternate_key.block_hash));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, skipped_key.block_hash));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, certifier_key.block_hash));
+
+    RecordingProtocolEmitter emitter;
+    runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+    const auto alternate_cached =
+        Access::resolve_and_cache_unproven_commit(runtime, alternate);
+    CHECK(alternate_cached.conflicted);
+    CHECK(alternate_cached.event_key == alternate_key);
+    CHECK(alternate_cached.event_generation == generation);
+    CHECK_FALSE(alternate_cached.event_conflicted);
+    Access::report_and_post_commit(runtime, alternate, 0);
+
+    const auto skipped_cached = Access::resolve_and_cache_commit(
+        runtime, skipped, {}, nullptr, true);
+    CHECK(skipped_cached.unavailable);
+    CHECK(skipped_cached.event_key == skipped_key);
+    CHECK(skipped_cached.event_generation == generation);
+    CHECK_FALSE(skipped_cached.event_unavailable);
+    CHECK_FALSE(skipped_cached.event_conflicted);
+    Access::report_and_post_commit(runtime, skipped, 1);
+
+    REQUIRE(emitter.events.size() == 4);
+    const auto *alternate_event =
+        std::get_if<CommitStructuredEvent>(&emitter.events[1]);
+    const auto *skipped_event =
+        std::get_if<CommitStructuredEvent>(&emitter.events[3]);
+    REQUIRE(alternate_event != nullptr);
+    REQUIRE(skipped_event != nullptr);
+    CHECK(alternate_event->decision_proof == alternate_key);
+    CHECK(alternate_event->view_generation == generation);
+    CHECK(skipped_event->decision_proof == skipped_key);
+    CHECK(skipped_event->view_generation == generation);
+
+    const auto drift_alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        certifier,
+        certifier,
+        "v3-certified-bridge-drift-alternate");
+    const auto drift_skipped = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        drift_alternate,
+        certifier,
+        "v3-certified-bridge-drift-skipped");
+    const auto drift_certifier = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        drift_skipped,
+        drift_alternate,
+        "v3-certified-bridge-drift-certifier");
+    const ProposalKey drift_alternate_key{
+        configuration, drift_alternate->get_hash()};
+    const ProposalKey drift_skipped_key{
+        configuration, drift_skipped->get_hash()};
+    const ProposalKey drift_certifier_key{
+        configuration, drift_certifier->get_hash()};
+    REQUIRE(*generation != std::numeric_limits<std::uint64_t>::max());
+    const auto drifted_generation = *generation + 1;
+    Access::seed_view_generation(
+        runtime, drift_certifier_key, drifted_generation, 3);
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        Proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            drift_certifier,
+            nullptr),
+        drifted_generation));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, drift_alternate_key.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, drift_skipped_key.block_hash));
 }
 
 TEST_CASE(

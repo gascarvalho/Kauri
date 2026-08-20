@@ -4193,7 +4193,7 @@ def _validate_v13_transition(
         "epoch_number", "tree_id", "epoch_digest", "block_hash"
     }:
         _error("v13 command decision proof schema drifted")
-    predecessor_configuration = {
+    command_configuration = {
         "epoch_number": _uint64(
             decision.get("epoch_number"), "v13 predecessor decision epoch"
         ),
@@ -4204,9 +4204,9 @@ def _validate_v13_transition(
             decision.get("epoch_digest"), "v13 predecessor decision digest"
         ),
     }
-    predecessor_generation = _uint64(
+    command_generation = _uint64(
         authoritative.get("view_generation"),
-        "v13 predecessor decision generation",
+        "v13 command decision generation",
         1,
     )
     expected_authoritative_source = contract.get("authoritative_source_id")
@@ -4223,13 +4223,107 @@ def _validate_v13_transition(
         ) != command_hash
         or _digest(decision.get("block_hash"), "v13 command decision block hash")
         != command_hash
+        or command_configuration["epoch_number"] != decoded.epoch_number - 1
+        or command_configuration["epoch_digest"]
+        != decoded.previous_epoch_digest
+    ):
+        _error("v13 certified command decision drifted")
+
+    activation_height = _uint64(
+        identity.get("activation_height"), "v13 certified activation height", 1
+    )
+    activation_boundary_hash = _digest(
+        identity.get("activation_boundary_block_hash"),
+        "v13 certified activation boundary hash",
+    )
+    boundary_candidates: list[Mapping[str, object]] = []
+    for event in events:
+        if event.get("event_type") != "block.committed":
+            continue
+        payload = _mapping(event.get("payload"), "v13 activation boundary decision")
+        if (
+            payload.get("block_height") == activation_height
+            or payload.get("block_hash") == activation_boundary_hash
+        ):
+            boundary_candidates.append(event)
+    if len(boundary_candidates) != 1:
+        _error("v13 certified activation lacks one authoritative boundary")
+    boundary_event = boundary_candidates[0]
+    boundary = _mapping(
+        boundary_event.get("payload"), "v13 activation boundary decision"
+    )
+    boundary_decision = _mapping(
+        boundary.get("decision_proof"), "v13 activation boundary decision proof"
+    )
+    if set(boundary_decision) != {
+        "epoch_number", "tree_id", "epoch_digest", "block_hash"
+    }:
+        _error("v13 activation boundary decision proof schema drifted")
+    predecessor_configuration = {
+        "epoch_number": _uint64(
+            boundary_decision.get("epoch_number"),
+            "v13 activation boundary epoch",
+        ),
+        "tree_id": _integer(
+            boundary_decision.get("tree_id"), "v13 activation boundary tree"
+        ),
+        "epoch_digest": _digest(
+            boundary_decision.get("epoch_digest"),
+            "v13 activation boundary epoch digest",
+        ),
+    }
+    predecessor_generation = _uint64(
+        boundary.get("view_generation"),
+        "v13 activation boundary generation",
+        1,
+    )
+    if (
+        boundary_event.get("source_id") != expected_authoritative_source
+        or replica_source(boundary_event, "v13 activation boundary") not in sources
+        or boundary.get("designated_observer") is not True
+        or _uint64(
+            boundary.get("block_height"), "v13 authoritative activation height", 1
+        )
+        != activation_height
+        or _digest(
+            boundary.get("block_hash"), "v13 authoritative activation hash"
+        )
+        != activation_boundary_hash
+        or _digest(
+            boundary_decision.get("block_hash"),
+            "v13 activation boundary decision block hash",
+        )
+        != activation_boundary_hash
         or predecessor_configuration["epoch_number"] != decoded.epoch_number - 1
         or predecessor_configuration["epoch_digest"]
         != decoded.previous_epoch_digest
+        or identity.get("predecessor_boundary_configuration")
+        != predecessor_configuration
         or identity.get("predecessor_boundary_generation")
         != predecessor_generation
+        or activation_height <= command_height
+        or _integer(
+            boundary_event.get("source_sequence"),
+            "v13 activation boundary source sequence",
+            1,
+        )
+        <= _integer(
+            authoritative_event.get("source_sequence"),
+            "v13 command decision source sequence",
+            1,
+        )
+        or _uint64(
+            boundary_event.get("source_monotonic_ns"),
+            "v13 activation boundary time",
+            1,
+        )
+        < _uint64(
+            authoritative_event.get("source_monotonic_ns"),
+            "v13 command decision time",
+            1,
+        )
     ):
-        _error("v13 certified command decision drifted")
+        _error("v13 certified activation boundary drifted")
 
     successor_configuration = {
         "epoch_number": decoded.epoch_number,

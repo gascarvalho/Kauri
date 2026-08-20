@@ -14149,22 +14149,48 @@ namespace hotstuff
                 authenticated_proposal_ingress.find(alternate_key);
             const auto certifier_ingress =
                 authenticated_proposal_ingress.find(certifier_key);
-            if (alternate_ingress == authenticated_proposal_ingress.end() ||
-                certifier_ingress == authenticated_proposal_ingress.end() ||
+            if (certifier_ingress == authenticated_proposal_ingress.end() ||
                 alternate_key.configuration !=
                     certifier_key.configuration ||
-                alternate_ingress->second.view_generation != generation ||
                 certifier_ingress->second.view_generation != generation)
+                return true;
+
+            if (alternate_ingress == authenticated_proposal_ingress.end())
+            {
+                if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
+                    return true;
+                const auto runtime_generation =
+                    find_exact_runtime_generation(
+                        certifier_key.configuration);
+                if (!runtime_generation.has_value() ||
+                    *runtime_generation != generation)
+                    return true;
+
+                // The quorum certificate has already been verified by
+                // has_verified_legal_qc_skip and carries alternate_key.  V3
+                // may activate while predecessor blocks are still draining,
+                // so the designated observer can first see the certified
+                // successor chain at this authenticated certifier.  Retain
+                // both the QC-authenticated alternate and its single
+                // adjacent physical successor under the same exact active
+                // configuration/generation.  This is evidence-only and does
+                // not enter proposal admission, voting, rotation, or cadence.
+                if (!retain_owned(alternate_key))
+                    return false;
+            }
+            else if (
+                alternate_ingress->second.view_generation != generation)
                 return true;
 
             const ProposalKey skipped_key{
                 certifier_key.configuration,
                 skipped->get_hash()};
             // This bridge is deliberately evidence-only. The verified QC
-            // carries the alternate's exact key, while both endpoints still
-            // have authenticated ingress for the same configuration and
-            // generation. The recovered key never enters proposal admission,
-            // cadence, rotation, or consensus identity state.
+            // carries the alternate's exact key, while the authenticated
+            // certifier and exact runtime bind its configuration and
+            // generation. V2 additionally requires alternate ingress. The
+            // recovered key never enters proposal admission, cadence,
+            // rotation, or consensus identity state.
             return retain_owned(skipped_key);
         }
         catch (...)

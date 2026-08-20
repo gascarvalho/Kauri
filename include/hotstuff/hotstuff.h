@@ -1459,7 +1459,7 @@ namespace hotstuff
         };
         struct RetainedCommitEventIdentityRollback
         {
-            std::array<RetainedCommitEventIdentityOwnedMutation, 2>
+            std::array<RetainedCommitEventIdentityOwnedMutation, 3>
                 owned_mutations{};
             std::size_t owned_mutation_count{0};
         };
