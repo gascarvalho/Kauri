@@ -8697,6 +8697,7 @@ namespace hotstuff
     void HotStuffBase::schedule_adaptive_v3_observation_retry() noexcept
     {
         if (!adaptive_v3_config || adaptive_v3_observation_terminal ||
+            adaptive_v3_observation_retry_exhausted ||
             adaptive_v3_pending_observation == std::nullopt ||
             adaptive_v3_observation_retry_cancellation)
             return;
@@ -8726,6 +8727,7 @@ namespace hotstuff
     {
         if (!adaptive_v3_config || !adaptive_v3_pending_observation ||
             adaptive_v3_observation_terminal ||
+            adaptive_v3_observation_retry_exhausted ||
             !epoch_manager_peer.has_value())
             return;
         if (!adaptive_v3_signed_observation)
@@ -8738,9 +8740,23 @@ namespace hotstuff
         if (adaptive_v3_observation_attempts >=
             adaptive_v3_config->maximum_observation_attempts)
         {
-            emit_adaptive_v3_observation_terminal(
-                adaptive_v3_signed_observation->identity,
-                "observation_retry_exhausted");
+            adaptive_v3_observation_retry_exhausted = true;
+            AdaptiveV3ReadinessStructuredEvent event;
+            event.transition = AdaptiveV3ReadinessTransition::
+                observation_retry_exhausted;
+            event.identity = adaptive_v3_signed_observation->identity;
+            event.replica_id = get_id();
+            event.signer_source_sequence =
+                adaptive_v3_signed_observation->signer_source_sequence;
+            event.signer_monotonic_raw_ns =
+                adaptive_v3_signed_observation->signer_monotonic_raw_ns;
+            event.observation_digest =
+                activation_ready_observation_digest(
+                    *adaptive_v3_signed_observation);
+            event.canonical_wire_payload =
+                *adaptive_v3_pending_observation;
+            event.disposition = "retry_exhausted";
+            emit_adaptive_v3_readiness_event(std::move(event));
             HOTSTUFF_LOG_WARN(
                 "[EPOCH] Adaptive-v3 readiness observation retry exhausted");
             return;
@@ -8940,6 +8956,7 @@ namespace hotstuff
         adaptive_v3_latest_committed_block = nullptr;
         adaptive_v3_runtime_prepared = false;
         adaptive_v3_observation_attempts = 0;
+        adaptive_v3_observation_retry_exhausted = false;
         adaptive_v3_observation_terminal = false;
         adaptive_v3_certificate_ack_sent = false;
         adaptive_v3_command_evidence.reset();
@@ -9253,6 +9270,7 @@ namespace hotstuff
                         fixed_quorum);
                 adaptive_v3_committed_command = command;
                 adaptive_v3_observation_attempts = 0;
+                adaptive_v3_observation_retry_exhausted = false;
                 adaptive_v3_observation_terminal = false;
                 adaptive_v3_certificate_ack_sent = false;
                 const auto *successor = exact_epochs->find_epoch_by_digest(

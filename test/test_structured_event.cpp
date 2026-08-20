@@ -5638,7 +5638,7 @@ TEST_CASE("CERT13 M1 registers and strictly serializes readiness evidence",
     using Transition = hotstuff::AdaptiveV3ReadinessTransition;
     using Event = hotstuff::AdaptiveV3ReadinessStructuredEvent;
 
-    const std::array<std::pair<StructuredEventType, const char *>, 14> names{{
+    const std::array<std::pair<StructuredEventType, const char *>, 15> names{{
         {StructuredEventType::adaptive_v3_activation_prepared,
          "epoch.activation_prepared"},
         {StructuredEventType::adaptive_v3_activation_ready_signed,
@@ -5667,6 +5667,8 @@ TEST_CASE("CERT13 M1 registers and strictly serializes readiness evidence",
          "adaptive_v3.readiness_wire_rejected"},
         {StructuredEventType::adaptive_v3_command_terminal,
          "adaptive_v3.command_terminal"},
+        {StructuredEventType::adaptive_v3_observation_retry_exhausted,
+         "adaptive_v3.readiness_observation_retry_exhausted"},
     }};
     for (const auto &entry : names)
         CHECK(std::string(structured_event_type_name(entry.first)) ==
@@ -5836,6 +5838,23 @@ TEST_CASE("CERT13 M1 registers and strictly serializes readiness evidence",
     REQUIRE(signed_result.first.healthy);
     REQUIRE(hotstuff::parse_structured_event_prefix(signed_result.second).status ==
             StructuredEventPrefixStatus::complete);
+
+    auto retry_exhausted_event = signed_event;
+    retry_exhausted_event.transition =
+        Transition::observation_retry_exhausted;
+    retry_exhausted_event.disposition = "retry_exhausted";
+    REQUIRE(emits(replica_config, retry_exhausted_event).first.healthy);
+    retry_exhausted_event.disposition.clear();
+    CHECK_FALSE(
+        emits(replica_config, std::move(retry_exhausted_event)).first.healthy);
+
+    Event legacy_retry_terminal;
+    legacy_retry_terminal.transition = Transition::terminal;
+    legacy_retry_terminal.identity = identity;
+    legacy_retry_terminal.replica_id = 2;
+    legacy_retry_terminal.disposition = "observation_retry_exhausted";
+    CHECK_FALSE(
+        emits(replica_config, std::move(legacy_retry_terminal)).first.healthy);
 
     auto accepted_event = signed_event;
     accepted_event.transition = Transition::observation_accepted;

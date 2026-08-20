@@ -381,6 +381,7 @@ enum class AdaptiveV3ReadinessTransition : std::uint8_t
     e2_eligibility,
     terminal,
     wire_rejected,
+    observation_retry_exhausted,
 };
 
 /**
@@ -591,6 +592,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v3_terminal,
     adaptive_v3_wire_rejected,
     adaptive_v3_command_terminal,
+    adaptive_v3_observation_retry_exhausted,
 };
 
 StructuredEventType structured_event_type(

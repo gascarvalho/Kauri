@@ -444,6 +444,10 @@ bool adaptive_v3_readiness_payload_type(
         case AdaptiveV3ReadinessTransition::wire_rejected:
             type = StructuredEventType::adaptive_v3_wire_rejected;
             return true;
+        case AdaptiveV3ReadinessTransition::observation_retry_exhausted:
+            type = StructuredEventType::
+                adaptive_v3_observation_retry_exhausted;
+            return true;
     }
     return false;
 }
@@ -1638,11 +1642,14 @@ bool valid_adaptive_v3_readiness_payload(
                 event.disposition.empty();
 
         case AdaptiveV3ReadinessTransition::activation_ready_signed:
+        case AdaptiveV3ReadinessTransition::observation_retry_exhausted:
         case AdaptiveV3ReadinessTransition::observation_accepted:
         case AdaptiveV3ReadinessTransition::source_quarantined:
         {
             const bool replica_event = event.transition ==
-                AdaptiveV3ReadinessTransition::activation_ready_signed;
+                    AdaptiveV3ReadinessTransition::activation_ready_signed ||
+                event.transition == AdaptiveV3ReadinessTransition::
+                    observation_retry_exhausted;
             if (config.source.kind !=
                     (replica_event
                          ? StructuredEventSourceKind::replica
@@ -1674,7 +1681,10 @@ bool valid_adaptive_v3_readiness_payload(
                 return false;
             }
             if (replica_event)
-                return event.disposition.empty();
+                return event.transition == AdaptiveV3ReadinessTransition::
+                        activation_ready_signed
+                    ? event.disposition.empty()
+                    : event.disposition == "retry_exhausted";
             if (event.transition ==
                 AdaptiveV3ReadinessTransition::source_quarantined)
                 return event.disposition == "rejected_conflict";
@@ -1889,8 +1899,6 @@ bool valid_adaptive_v3_readiness_payload(
                     event.delivery_attempt == 0 &&
                     !event.canonical_wire_payload.has_value() &&
                     (event.disposition ==
-                         "observation_retry_exhausted" ||
-                     event.disposition ==
                          "observation_schedule_failed" ||
                      event.disposition ==
                          "observation_encoding_failed" ||
@@ -3852,6 +3860,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v3.readiness_wire_rejected";
         case StructuredEventType::adaptive_v3_command_terminal:
             return "adaptive_v3.command_terminal";
+        case StructuredEventType::adaptive_v3_observation_retry_exhausted:
+            return "adaptive_v3.readiness_observation_retry_exhausted";
         default:
             break;
     }

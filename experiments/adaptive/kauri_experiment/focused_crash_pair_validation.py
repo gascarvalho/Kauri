@@ -3391,6 +3391,7 @@ _V13_READINESS_EVENT_KEYS = {
 _V13_READINESS_SUCCESS_EVENTS = {
     "epoch.activation_prepared",
     "epoch.activation_ready_signed",
+    "adaptive_v3.readiness_observation_retry_exhausted",
     "adaptive_v3.readiness_observation_accepted",
     "adaptive_v3.readiness_certificate_assembled",
     "adaptive_v3.readiness_certificate_delivery",
@@ -3510,11 +3511,19 @@ def _validate_v13_readiness_event_payload(
 
     if name in {
         "epoch.activation_ready_signed",
+        "adaptive_v3.readiness_observation_retry_exhausted",
         "adaptive_v3.readiness_observation_accepted",
     }:
-        if name == "epoch.activation_ready_signed":
+        if name in {
+            "epoch.activation_ready_signed",
+            "adaptive_v3.readiness_observation_retry_exhausted",
+        }:
             source = _v13_readiness_replica_source(event, payload)
-            allowed_dispositions = {None}
+            allowed_dispositions = (
+                {None}
+                if name == "epoch.activation_ready_signed"
+                else {"retry_exhausted"}
+            )
         else:
             if event.get("source_kind") != "adaptation_manager" or event.get(
                 "source_id"
@@ -3736,6 +3745,7 @@ def _validate_v13_sources(root: Path, contract: Mapping[str, object]) -> tuple[l
     if replicas != expected_replicas or len(managers) != 1:
         _error("v13 source inventory lacks exact replica or manager envelopes")
     readiness_names = {"epoch.activation_prepared", "epoch.activation_ready_signed",
+        "adaptive_v3.readiness_observation_retry_exhausted",
         "adaptive_v3.readiness_observation_accepted", "adaptive_v3.readiness_observation_rejected",
         "adaptive_v3.readiness_source_quarantined", "adaptive_v3.readiness_certificate_assembled", "adaptive_v3.readiness_certificate_delivery",
         "adaptive_v3.readiness_certificate_accepted", "adaptive_v3.readiness_certificate_rejected", "adaptive_v3.readiness_certificate_acknowledged",
@@ -3868,6 +3878,41 @@ def _reconstruct_v13_certified_readiness(
         if any(set(rows) != expected_signers for rows in
                (prepared, signed, accepted, acknowledgements)):
             _error("v13 readiness per-replica barrier differs from certificate R")
+
+        retry_exhausted = replica_map(
+            "adaptive_v3.readiness_observation_retry_exhausted"
+        ) if "adaptive_v3.readiness_observation_retry_exhausted" in by_type else {}
+        if not set(retry_exhausted).issubset(expected_signers):
+            _error("v13 retry exhaustion source differs from certificate R")
+        for replica, row in retry_exhausted.items():
+            retry_payload = _mapping(
+                row.get("payload"), "v13 retry exhaustion payload"
+            )
+            signed_payload = _mapping(
+                signed[replica].get("payload"),
+                "v13 signed observation payload",
+            )
+            signed_sequence = _integer(
+                signed[replica].get("source_sequence"),
+                "v13 signed observation source sequence", 1,
+            )
+            retry_sequence = _integer(
+                row.get("source_sequence"),
+                "v13 retry exhaustion source sequence", 1,
+            )
+            accepted_sequence = _integer(
+                accepted[replica].get("source_sequence"),
+                "v13 certificate acceptance source sequence", 1,
+            )
+            if not signed_sequence < retry_sequence < accepted_sequence:
+                _error("v13 retry exhaustion is outside its certificate interval")
+            if (
+                retry_payload.get("canonical_wire_payload_hex")
+                != signed_payload.get("canonical_wire_payload_hex")
+                or retry_payload.get("observation_digest")
+                != signed_payload.get("observation_digest")
+            ):
+                _error("v13 retry exhaustion changed the signed observation")
 
         observations: dict[int, list[Mapping[str, object]]] = {}
         for row in by_type["adaptive_v3.readiness_observation_accepted"]:

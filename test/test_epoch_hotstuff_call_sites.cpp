@@ -458,9 +458,17 @@ TEST_CASE("adaptive v3 live path fences before observation and activates only fr
         retry,
         {"adaptive_v3_observation_attempts >=",
          "maximum_observation_attempts",
-         "emit_adaptive_v3_observation_terminal(",
+         "adaptive_v3_observation_retry_exhausted = true",
+         "AdaptiveV3ReadinessTransition::",
+         "observation_retry_exhausted",
+         "retry_exhausted",
          "pn.get_peer_conn(*epoch_manager_peer)",
          "schedule_adaptive_v3_observation_retry()"}));
+    CHECK(retry.find("emit_adaptive_v3_observation_terminal(") ==
+          std::string::npos);
+    CHECK(certificate.find(
+              "adaptive_v3_observation_retry_exhausted") ==
+          std::string::npos);
 }
 
 TEST_CASE("adaptive v3 app and client expose isolated canonical flags",
@@ -563,6 +571,7 @@ TEST_CASE(
          "adaptive_v3_latest_committed_block = nullptr",
          "adaptive_v3_runtime_prepared = false",
          "adaptive_v3_observation_attempts = 0",
+         "adaptive_v3_observation_retry_exhausted = false",
          "adaptive_v3_observation_terminal = false"}));
     CHECK(post_commit.find(
               "adaptive_v3_retired_activation_receipt") !=

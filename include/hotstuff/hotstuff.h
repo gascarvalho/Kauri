@@ -1097,6 +1097,10 @@ namespace hotstuff
             adaptive_v3_observation_retry_cancellation;
         std::size_t adaptive_v3_observation_attempts{0};
         std::uint64_t adaptive_v3_readiness_source_sequence{0};
+        // Exhausting transport retries stops retransmission only.  The
+        // already-signed observation remains eligible for a matching
+        // manager certificate until the cycle reaches a real terminal state.
+        bool adaptive_v3_observation_retry_exhausted{false};
         bool adaptive_v3_observation_terminal{false};
         bool adaptive_v3_certificate_ack_sent{false};
         std::optional<EpochCommandCommittedStructuredEvent>

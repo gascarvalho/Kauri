@@ -825,6 +825,7 @@ def test_v13_native_exported_readiness_rows_are_admitted_when_available() -> Non
     validation._validate_v13_sources(Path(root) / "control", contract)
     validation._validate_v13_sources(Path(root) / "adaptive", contract)
     names = {"epoch.activation_prepared", "epoch.activation_ready_signed",
+             "adaptive_v3.readiness_observation_retry_exhausted",
              "adaptive_v3.readiness_observation_accepted", "adaptive_v3.readiness_certificate_assembled",
              "adaptive_v3.readiness_certificate_delivery", "adaptive_v3.readiness_certificate_accepted",
              "adaptive_v3.readiness_certificate_acknowledged", "adaptive_v3.e2_eligibility",
@@ -843,6 +844,22 @@ def test_v13_native_exported_readiness_rows_are_admitted_when_available() -> Non
                         validation._validate_v13_readiness_event_payload(
                             bad, contract
                         )
+                    if event["event_type"] == "epoch.activation_ready_signed":
+                        retry = deepcopy(event)
+                        retry["event_type"] = (
+                            "adaptive_v3.readiness_observation_retry_exhausted"
+                        )
+                        retry["payload"]["disposition"] = "retry_exhausted"
+                        validation._validate_v13_readiness_event_payload(
+                            retry, contract
+                        )
+                        retry["payload"]["disposition"] = "garbage"
+                        with pytest.raises(
+                            validation.FocusedCrashPairValidationError
+                        ):
+                            validation._validate_v13_readiness_event_payload(
+                                retry, contract
+                            )
 
 
 def test_v13_native_exported_readiness_chain_reconstructs_when_available() -> None:

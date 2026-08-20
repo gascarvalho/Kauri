@@ -1048,6 +1048,43 @@ public:
         return runtime.epoch_live_binding->rotate_to_tree(tree_id);
     }
 
+    static void seed_adaptive_v3_observation_retry(
+        HotStuffBase &runtime,
+        const AdaptiveV3ActivationReadyObservation &observation,
+        const bytearray_t &canonical_payload,
+        std::size_t attempts)
+    {
+        runtime.adaptive_v3_signed_observation = observation;
+        runtime.adaptive_v3_pending_observation = canonical_payload;
+        runtime.adaptive_v3_observation_attempts = attempts;
+        runtime.adaptive_v3_observation_retry_exhausted = false;
+        runtime.adaptive_v3_observation_terminal = false;
+    }
+
+    static void transmit_adaptive_v3_observation(HotStuffBase &runtime)
+    {
+        runtime.transmit_adaptive_v3_observation();
+    }
+
+    static bool adaptive_v3_observation_retry_exhausted(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v3_observation_retry_exhausted;
+    }
+
+    static bool adaptive_v3_observation_terminal(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v3_observation_terminal;
+    }
+
+    static bool has_adaptive_v3_pending_observation(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v3_pending_observation.has_value() &&
+            runtime.adaptive_v3_signed_observation.has_value();
+    }
+
 };
 
 } // namespace hotstuff
@@ -1220,6 +1257,27 @@ public:
     }
 
     std::vector<AdaptiveAggregationStructuredEvent> events;
+};
+
+class RecordingReadinessAuditEmitter final
+    : public AuditStructuredEventEmitter
+{
+public:
+    void emit_audit(
+        const AuditStructuredEventPayload &payload) noexcept override
+    {
+        try
+        {
+            const auto *event = std::get_if<
+                AdaptiveV3ReadinessStructuredEvent>(&payload);
+            if (event != nullptr)
+                events.push_back(*event);
+        }
+        catch (...)
+        {}
+    }
+
+    std::vector<AdaptiveV3ReadinessStructuredEvent> events;
 };
 
 class ScopedSigpipeIgnore final
@@ -2528,6 +2586,80 @@ TEST_CASE(
     CHECK(decoded.notice->active_configuration == configuration);
     CHECK(decoded.notice->activation_generation == 1);
     CHECK(decoded.notice->committed_height == 0);
+}
+
+TEST_CASE(
+    "adaptive-v3 retry exhaustion preserves matching certificate eligibility",
+    "[adaptive-v3][readiness][retry][runtime-integration][regression]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+    EventContext event_context;
+    auto config = adaptive_v3_runtime_config(1);
+    config.maximum_observation_attempts = 1;
+    const auto local_key = config.local_readiness_private_key;
+    std::vector<std::pair<ReplicaID, PubKeyBLS>> membership;
+    membership.reserve(config.readiness_membership.size());
+    for (const auto &member : config.readiness_membership)
+        membership.emplace_back(member.replica_id, member.public_key);
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v3, config);
+    const auto active = Access::initialize_active_runtime(runtime);
+    RecordingReadinessAuditEmitter emitter;
+    runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+
+    ActivationReadyIdentityV1 identity;
+    identity.membership_digest =
+        canonical_activation_readiness_membership_digest(membership);
+    identity.predecessor_boundary_configuration = active;
+    identity.predecessor_boundary_generation =
+        *checked_activation_generation(active.epoch_number, 0);
+    identity.successor_configuration = {
+        static_cast<std::uint32_t>(active.epoch_number + 1),
+        0,
+        digest("retry-exhausted-successor")};
+    identity.successor_activation_generation =
+        *checked_activation_generation(
+            identity.successor_configuration.epoch_number, 0);
+    identity.command_payload_digest = digest("retry-exhausted-command");
+    identity.command_block_height = 10;
+    identity.command_block_hash = digest("retry-exhausted-command-block");
+    identity.activation_delay_blocks = 1;
+    identity.activation_height = 11;
+    identity.activation_boundary_block_hash =
+        digest("retry-exhausted-boundary");
+    REQUIRE(local_key != nullptr);
+    const auto observation = sign_activation_ready_observation(
+        identity, 1, 1, 10'000, *local_key);
+    const auto payload = encode_activation_ready_observation(
+        observation, config.readiness_wire_limits);
+    Access::seed_adaptive_v3_observation_retry(
+        runtime, observation, payload, config.maximum_observation_attempts);
+
+    Access::transmit_adaptive_v3_observation(runtime);
+
+    CHECK(Access::adaptive_v3_observation_retry_exhausted(runtime));
+    CHECK_FALSE(Access::adaptive_v3_observation_terminal(runtime));
+    CHECK(Access::has_adaptive_v3_pending_observation(runtime));
+    REQUIRE(emitter.events.size() == 1);
+    const auto &event = emitter.events.front();
+    CHECK(event.transition ==
+          AdaptiveV3ReadinessTransition::observation_retry_exhausted);
+    CHECK(event.identity == identity);
+    CHECK(event.replica_id == 1);
+    CHECK(event.signer_source_sequence == 1);
+    CHECK(event.signer_monotonic_raw_ns == 10'000);
+    CHECK(event.canonical_wire_payload == payload);
+    CHECK(event.disposition == "retry_exhausted");
+
+    // Exhaustion is latched and produces no repeated audit or retransmit.
+    Access::transmit_adaptive_v3_observation(runtime);
+    CHECK(emitter.events.size() == 1);
+    CHECK_FALSE(Access::adaptive_v3_observation_terminal(runtime));
+    CHECK(Access::has_adaptive_v3_pending_observation(runtime));
 }
 
 TEST_CASE(
