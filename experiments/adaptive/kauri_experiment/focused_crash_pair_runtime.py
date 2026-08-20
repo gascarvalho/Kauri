@@ -5863,6 +5863,11 @@ class FocusedRawEvidenceSource:
                 "activation_height",
             }
         )
+        if activation and _is_v13_profile(self._profile):
+            expected_payload_keys |= {
+                "certificate_apply_committed_height",
+                "activation_readiness_certificate_digest",
+            }
         selected: list[Mapping[str, Any]] = []
         for event in events:
             if event["event_type"] != event_type:
@@ -5914,6 +5919,22 @@ class FocusedRawEvidenceSource:
                     != decoded.epoch_digest
                 ):
                     _error(f"raw Epoch {epoch} transition payload drifted")
+                if _is_v13_profile(self._profile) and (
+                    _integer(
+                        payload.get("certificate_apply_committed_height"),
+                        "transition certificate apply height",
+                        1,
+                    )
+                    != activation_height
+                    or _digest(
+                        payload.get("activation_readiness_certificate_digest"),
+                        "transition readiness certificate digest",
+                    )
+                    == "0" * 64
+                ):
+                    _error(
+                        f"raw Epoch {epoch} transition readiness binding drifted"
+                    )
             else:
                 command_height = _integer(
                     payload.get("command_block_height"),

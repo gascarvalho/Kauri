@@ -47,6 +47,7 @@ N7_PROFILE_V11 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v11.json"
 N31_PROFILE_V11 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v11.json"
 N7_PROFILE_V12 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v12.json"
 N31_PROFILE_V12 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v12.json"
+N7_PROFILE_V13 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v13.json"
 
 
 def _synthetic_v13_profile() -> SimpleNamespace:
@@ -3453,9 +3454,10 @@ def _n31_transition_exit_fixture(
     missing: tuple[int, ...],
     manager_returncode: int = 0,
     terminal_outcome: str = "advanced",
+    profile_path: Path = N31_PROFILE_V12,
 ) -> tuple[Any, object, list[dict[str, object]]]:
     runtime = _runtime()
-    profile = _fcrash_h_profile(N31_PROFILE_V12)
+    profile = _fcrash_h_profile(profile_path)
     root = tmp_path / "transition-exit"
     (root / "raw").mkdir(parents=True)
     (root / "runtime").mkdir()
@@ -3487,6 +3489,14 @@ def _n31_transition_exit_fixture(
                 "tree_id": 0,
                 "epoch_digest": epoch_digest,
                 "activation_height": 15,
+                **(
+                    {
+                        "certificate_apply_committed_height": 15,
+                        "activation_readiness_certificate_digest": "d" * 64,
+                    }
+                    if runtime._is_v13_profile(profile)
+                    else {}
+                ),
             },
         }
         for replica in survivors
@@ -3622,6 +3632,29 @@ def test_n31_transition_barrier_accepts_all_28_survivors(tmp_path: Path) -> None
         for replica in source._profile.replica_ids
         if replica not in source._profile.target_replica_ids
     ]
+
+
+def test_v13_transition_barrier_accepts_exact_readiness_activation_fields(
+    tmp_path: Path,
+) -> None:
+    _runtime_module, source, events = _n31_transition_exit_fixture(
+        tmp_path, missing=(), profile_path=N7_PROFILE_V13
+    )
+    snapshot = source._transition(events, 1, activation=True)
+    assert snapshot is not None
+    assert snapshot["witness_count"] == 5
+
+    payload = next(
+        event["payload"] for event in events
+        if event["event_type"] == "epoch.activated"
+    )
+    assert isinstance(payload, dict)
+    payload.pop("activation_readiness_certificate_digest")
+    with pytest.raises(
+        _runtime_module.FocusedCrashPairRuntimeError,
+        match="transition payload schema drifted",
+    ):
+        source._transition(events, 1, activation=True)
 
 
 @pytest.mark.parametrize(
