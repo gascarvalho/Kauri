@@ -1350,7 +1350,9 @@ namespace hotstuff
                 armed_topology = nullptr;
                 armed_replacement = false;
                 if (owner.epoch_protocol_mode ==
-                    EpochProtocolMode::adaptive_v2)
+                        EpochProtocolMode::adaptive_v2 ||
+                    owner.epoch_protocol_mode ==
+                        EpochProtocolMode::adaptive_v3)
                     owner.emit_active_configuration_event(
                         update.activation.configuration);
             }

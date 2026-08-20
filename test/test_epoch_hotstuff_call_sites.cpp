@@ -2726,8 +2726,8 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
           std::string::npos);
 }
 
-TEST_CASE("every adaptive v2 topology publication emits active configuration",
-          "[adaptive-v2][structured-event][topology][runtime]")
+TEST_CASE("every adaptive topology publication emits active configuration",
+          "[adaptive-v2][adaptive-v3][structured-event][topology][runtime]")
 {
     const auto implementation = source("src/hotstuff.cpp");
     const auto runtime = source("src/epoch_runtime.cpp");
@@ -2759,6 +2759,7 @@ TEST_CASE("every adaptive v2 topology publication emits active configuration",
          "owner.config.fanout",
          "armed_topology = nullptr",
          "EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
          "owner.emit_active_configuration_event(",
          "update.activation.configuration"}));
     CHECK(count_occurrences(

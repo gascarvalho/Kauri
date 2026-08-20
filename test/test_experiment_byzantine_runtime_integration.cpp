@@ -1165,6 +1165,24 @@ private:
     bool designated_{true};
 };
 
+class RecordingAdaptiveEmitter final : public AdaptiveStructuredEventEmitter
+{
+public:
+    void emit_adaptive(
+        const AdaptiveAggregationStructuredEvent &event) noexcept override
+    {
+        try
+        {
+            events.push_back(event);
+        }
+        catch (...)
+        {
+        }
+    }
+
+    std::vector<AdaptiveAggregationStructuredEvent> events;
+};
+
 class ScopedSigpipeIgnore final
 {
 public:
@@ -4109,6 +4127,43 @@ TEST_CASE(
         runtime, missing_block, {}, missing_proof);
     CHECK_FALSE(missing.key.has_value());
     CHECK_FALSE(missing.generation.has_value());
+}
+
+TEST_CASE(
+    "adaptive v3 tree rotation publishes the exact active configuration",
+    "[adaptive-v3][rotation][structured-event][runtime-integration]")
+{
+    ScopedSigpipeIgnore ignore_sigpipe;
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    static_cast<void>(Access::initialize_active_runtime(runtime));
+    RecordingAdaptiveEmitter emitter;
+    runtime.bind_structured_event_emitters(nullptr, &emitter, nullptr);
+
+    const auto rotation = Access::rotate_to_tree(runtime, 1);
+    REQUIRE(rotation.error == EpochIngressError::none);
+    REQUIRE(rotation.update.has_value());
+    REQUIRE(emitter.events.size() == 1);
+    const auto &event = emitter.events.front();
+    CHECK(
+        event.transition ==
+        AdaptiveAggregationTransition::configuration_active);
+    CHECK(event.configuration == rotation.update->activation.configuration);
+    CHECK(event.configuration.tree_id == 1);
+    CHECK(event.observer_replica == 1);
 }
 
 TEST_CASE(
