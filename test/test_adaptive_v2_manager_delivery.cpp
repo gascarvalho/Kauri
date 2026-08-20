@@ -283,6 +283,14 @@ TEST_CASE(
     CHECK(manager.find("fail(\"fault_window_arm_session_rejected\")") !=
           std::string::npos);
     CHECK(manager.find(
+              "KAURI_ADAPTIVE_V3_MANAGER state=%s cutoff=%llu") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "status == AdaptiveV2ManagerControllerStatus::unhealthy") !=
+          std::string::npos);
+    CHECK(manager.find("fail(\"controller_unhealthy\")") !=
+          std::string::npos);
+    CHECK(manager.find(
               "fail(\"fault_window_hard_deadline_session_rejected\")") !=
           std::string::npos);
     CHECK(manager.find("fail(\"fault_window_arm_acquisition_deadline\")") !=

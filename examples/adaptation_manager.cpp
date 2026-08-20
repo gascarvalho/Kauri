@@ -4237,6 +4237,26 @@ private:
             return;
         const auto status = facade_.evaluate();
         emit_new_session_terminals();
+        if (!last_controller_status_.has_value() ||
+            *last_controller_status_ != status)
+        {
+            const auto audit = facade_.controller_audit();
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_MANAGER state=%s cutoff=%llu "
+                "baseline_cutoff=%llu baseline_frozen=%d",
+                controller_status_name(status),
+                static_cast<unsigned long long>(
+                    audit.has_value() ? audit->current_cutoff : 0),
+                static_cast<unsigned long long>(
+                    audit.has_value() ? audit->baseline_cutoff : 0),
+                audit.has_value() && audit->baseline_frozen ? 1 : 0);
+            last_controller_status_ = status;
+        }
+        if (status == AdaptiveV2ManagerControllerStatus::unhealthy)
+        {
+            fail("controller_unhealthy");
+            return;
+        }
         if (status != AdaptiveV2ManagerControllerStatus::successor_ready &&
             status != AdaptiveV2ManagerControllerStatus::already_ready)
             return;
@@ -4318,6 +4338,8 @@ private:
     std::uint64_t logical_tick_{0};
     std::size_t emitted_accepted_observations_{0};
     std::size_t emitted_session_terminals_{0};
+    std::optional<AdaptiveV2ManagerControllerStatus>
+        last_controller_status_;
     bool fault_window_arm_timer_pending_{false};
     bool fault_window_armed_{false};
     bool failed_{false};
