@@ -1848,7 +1848,7 @@ hotstuff::StructuredEventConfig manager_structured_event_config(
     return {
         options.structured_event_run_id,
         {hotstuff::StructuredEventSourceKind::adaptation_manager,
-         "adaptation-manager",
+         "adaptive-manager",
          options.structured_event_source_instance},
         std::nullopt,
         hotstuff::StructuredEventLimits{}};

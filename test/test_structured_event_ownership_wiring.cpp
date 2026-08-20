@@ -309,6 +309,20 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "adaptive v3 manager retains the canonical structured source identity",
+    "[cert13][adaptive-v3][manager][structured-event][source-identity]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto config = function_body(
+        manager,
+        "hotstuff::StructuredEventConfig manager_structured_event_config(\n"
+        "    const AdaptiveV3ManagerOptions &options)");
+    REQUIRE_FALSE(config.empty());
+    CHECK(config.find("\"adaptive-manager\"") != std::string::npos);
+    CHECK(config.find("\"adaptation-manager\"") == std::string::npos);
+}
+
+TEST_CASE(
     "adaptive-v3 manager owns authenticated delivery through durable stop",
     "[cert13][m1][adaptive-v3][manager][ownership][transport][wiring]")
 {
