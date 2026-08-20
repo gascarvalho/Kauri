@@ -13662,8 +13662,13 @@ namespace hotstuff
                 prop.key().block_hash.to_hex().c_str(),
                 static_cast<unsigned long long>(wire_generation),
                 adaptive_payload.size());
-            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            if (is_adaptive_epoch_mode(epoch_protocol_mode))
             {
+                // A locally proposed block does not traverse the
+                // authenticated remote-proposal callback. Retain the same
+                // evidence-only identity that callback owns so a designated
+                // adaptive-v3 observer can emit a gap-free authoritative
+                // commit chain when its own proposal later commits.
                 static_cast<void>(observe_proposal_view_generation(
                     prop.key(), *generation));
                 static_cast<void>(retain_commit_event_identity(
