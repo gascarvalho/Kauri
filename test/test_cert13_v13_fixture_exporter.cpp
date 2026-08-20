@@ -592,13 +592,18 @@ void emit_commit_plan(StructuredEventSink &sink, const CommitPlan &plan,
     sink.emit(StructuredEventPayload{std::move(commit)});
 }
 
-void emit_replica_cycle(StructuredEventSink &sink, ReplicaID replica,
-                        const CompletedReadinessArtifacts &artifacts)
+void emit_replica_cycle(
+    StructuredEventSink &sink,
+    ReplicaID replica,
+    const CompletedReadinessArtifacts &artifacts,
+    const std::optional<CommitPlan> &authoritative_command = std::nullopt)
 {
     const ActivationReadinessWireLimits limits{64 * 1024, 7};
     const auto identity = decode_activation_ready_identity_v1(artifacts.identity_bytes, limits);
     const auto certificate = decode_activation_readiness_certificate(artifacts.certificate_bytes, limits);
     REQUIRE(identity); REQUIRE(certificate);
+    if (authoritative_command)
+        emit_commit_plan(sink, *authoritative_command, true);
     EpochCommandCommittedStructuredEvent command;
     command.command_block_height = identity.value->command_block_height;
     command.command_block_hash = identity.value->command_block_hash;
@@ -657,7 +662,7 @@ bytearray_t emit_replica_stream(
     if (!cycles.empty() && replica == designated_replica) {
         REQUIRE(active_configurations.size() ==
                 cycles.size() + predecessor_configuration_count);
-        REQUIRE(commit_plans.size() == (cycles.size() == 1 ? 4 : 5));
+        REQUIRE(commit_plans.size() == (cycles.size() == 1 ? 5 : 7));
         ticks.push_back(9'000'000'000ULL);
         ticks.push_back(commit_plans.front().tick);
         for (std::size_t tree = 1; tree < 7; ++tree)
@@ -671,6 +676,8 @@ bytearray_t emit_replica_stream(
             [replica](const auto &value) { return value.signer_replica_id == replica; });
         REQUIRE(observation != cycle->observations.end());
         const auto delivery_tick = delivery_tick_for(*cycle, replica);
+        if (replica == designated_replica)
+            ticks.push_back(commit_plans.at(cycle_index == 0 ? 1U : 4U).tick);
         ticks.insert(ticks.end(), {cycle->readiness_tick, cycle->readiness_tick,
                                    observation->signer_monotonic_raw_ns,
                                    delivery_tick, delivery_tick});
@@ -679,18 +686,18 @@ bytearray_t emit_replica_stream(
                                 ? 71'500'000'000ULL
                                 : 137'500'000'000ULL);
         }
-        const auto common_index = cycle_index == 0 ? 1U : 3U;
+        const auto common_index = cycle_index == 0 ? 2U : 5U;
         REQUIRE(common_index < commit_plans.size());
         ticks.push_back(commit_plans.at(common_index).tick);
         if (replica == designated_replica) {
             ticks.push_back(commit_plans.at(common_index).tick);
-            const auto measurement_index = cycle_index == 0 ? 2U : 4U;
+            const auto measurement_index = cycle_index == 0 ? 3U : 6U;
             REQUIRE(measurement_index < commit_plans.size());
             ticks.push_back(commit_plans.at(measurement_index).tick);
         }
     }
     if (cycles.size() == 1 && replica == designated_replica)
-        ticks.push_back(commit_plans.at(3).tick);
+        ticks.push_back(commit_plans.at(4).tick);
     DeterministicRawClock clock(std::move(ticks));
     auto config = event_config(StructuredEventSourceKind::replica,
         "replica-" + std::to_string(replica));
@@ -712,20 +719,25 @@ bytearray_t emit_replica_stream(
                     sink, active_configurations.at(index), replica);
         }
         for (std::size_t index = 0; index < cycles.size(); ++index) {
-            emit_replica_cycle(sink, replica, *cycles.at(index));
+            const auto command_index = index == 0 ? 1U : 4U;
+            emit_replica_cycle(
+                sink, replica, *cycles.at(index),
+                designated
+                    ? std::optional<CommitPlan>{commit_plans.at(command_index)}
+                    : std::nullopt);
             if (designated)
                 emit_configuration_active(
                     sink,
                     active_configurations.at(
                         predecessor_configuration_count + index),
                     replica);
-            const auto common_index = index == 0 ? 1U : 3U;
+            const auto common_index = index == 0 ? 2U : 5U;
             emit_commit_plan(sink, commit_plans.at(common_index), designated);
-            const auto measurement_index = index == 0 ? 2U : 4U;
+            const auto measurement_index = index == 0 ? 3U : 6U;
             emit_commit_plan(sink, commit_plans.at(measurement_index), designated);
         }
         if (cycles.size() == 1)
-            emit_commit_plan(sink, commit_plans.at(3), designated);
+            emit_commit_plan(sink, commit_plans.at(4), designated);
     }
     sink.shutdown();
     INFO("manager sink failure=" << static_cast<unsigned>(sink.health().first_failure));
@@ -922,7 +934,7 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
         adaptive, 1, TreePolicyKind::performance_optimization,
         "e1-to-e2-optimization", std::nullopt);
     const auto adaptive_e2 = complete_readiness_capture(
-        adaptive, survivors, 137'000 * raw_ns, 2000, "fixture-adaptive-e2", 2,
+        adaptive, survivors, 137'000 * raw_ns, 1003, "fixture-adaptive-e2", 2,
         137'000 * raw_ns);
     REQUIRE(adaptive.session.status() == AdaptiveV3ManagerSessionStatus::terminal);
 
@@ -969,11 +981,16 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
     const auto control_epoch1_hash = digest("fixture-control-epoch1-measurement");
     const auto control_late_hash = digest("fixture-control-late");
     const std::vector<CommitPlan> control_commits{
-        {10'000 * raw_ns, 1000, control_baseline_hash,
+        {10'000 * raw_ns, 999, control_baseline_hash,
          digest("fixture-control-genesis-parent"), 1000,
          ProposalKey{control_epoch0, control_baseline_hash}, 1, false},
+        {71'000 * raw_ns, control_e1_identity.value->command_block_height,
+         control_e1_identity.value->command_block_hash, control_baseline_hash, 0,
+         ProposalKey{control_e1_identity.value->predecessor_boundary_configuration,
+                     control_e1_identity.value->command_block_hash},
+         control_e1_identity.value->predecessor_boundary_generation, false},
         {72'000 * raw_ns, 1001, control_common_hash,
-         control_baseline_hash, 0,
+         control_e1_identity.value->command_block_hash, 0,
          ProposalKey{control_epoch1, control_common_hash},
          (1ULL << 32U) + 1U, true},
         {110'000 * raw_ns, 1002, control_epoch1_hash,
@@ -991,21 +1008,32 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
     const auto adaptive_common_e2_hash = digest("fixture-adaptive-common-e2");
     const auto adaptive_late_hash = digest("fixture-adaptive-late");
     const std::vector<CommitPlan> adaptive_commits{
-        {10'000 * raw_ns, 1000, adaptive_baseline_hash,
+        {10'000 * raw_ns, 999, adaptive_baseline_hash,
          digest("fixture-adaptive-genesis-parent"), 1000,
          ProposalKey{adaptive_epoch0, adaptive_baseline_hash}, 1, false},
+        {71'000 * raw_ns, adaptive_e1_identity.value->command_block_height,
+         adaptive_e1_identity.value->command_block_hash, adaptive_baseline_hash, 0,
+         ProposalKey{adaptive_e1_identity.value->predecessor_boundary_configuration,
+                     adaptive_e1_identity.value->command_block_hash},
+         adaptive_e1_identity.value->predecessor_boundary_generation, false},
         {72'000 * raw_ns, 1001, e2_audit->common_commit.block_hash,
-         adaptive_baseline_hash, 0, e2_audit->common_commit,
+         adaptive_e1_identity.value->command_block_hash, 0,
+         e2_audit->common_commit,
          (1ULL << 32U) + 1U, true},
         {110'000 * raw_ns, 1002, adaptive_epoch1_hash,
          e2_audit->common_commit.block_hash, 1000,
          ProposalKey{adaptive_epoch1, adaptive_epoch1_hash},
          (1ULL << 32U) + 1U, false},
-        {138'000 * raw_ns, 1003, adaptive_common_e2_hash,
-         adaptive_epoch1_hash, 0,
+        {137'000 * raw_ns, adaptive_e2_identity.value->command_block_height,
+         adaptive_e2_identity.value->command_block_hash, adaptive_epoch1_hash, 0,
+         ProposalKey{adaptive_e2_identity.value->predecessor_boundary_configuration,
+                     adaptive_e2_identity.value->command_block_hash},
+         adaptive_e2_identity.value->predecessor_boundary_generation, false},
+        {138'000 * raw_ns, 1004, adaptive_common_e2_hash,
+         adaptive_e2_identity.value->command_block_hash, 0,
          ProposalKey{adaptive_epoch2, adaptive_common_e2_hash},
          (2ULL << 32U) + 1U, true},
-        {175'000 * raw_ns, 1004, adaptive_late_hash,
+        {175'000 * raw_ns, 1005, adaptive_late_hash,
          adaptive_common_e2_hash, 1000,
          ProposalKey{adaptive_epoch2, adaptive_late_hash},
          (2ULL << 32U) + 1U, false},
@@ -1096,9 +1124,9 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
         adaptive.session.terminal_records(), e2_audit);
     write_bytes(control_client, {});
     write_bytes(adaptive_client, {});
-    REQUIRE(control_replica_count == 61);
+    REQUIRE(control_replica_count == 62);
     REQUIRE(control_manager_count > survivors.size());
-    REQUIRE(adaptive_replica_count == 93);
+    REQUIRE(adaptive_replica_count == 95);
     REQUIRE(adaptive_manager_count > control_manager_count);
     const auto control_replica_text = std::string(control_replica_bytes.begin(),
                                                    control_replica_bytes.end());
@@ -1115,9 +1143,9 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
     REQUIRE(event_count(adaptive_replica_text, "process.started") == 7);
     REQUIRE(event_count(control_replica_text, "process.ready") == 7);
     REQUIRE(event_count(adaptive_replica_text, "process.ready") == 7);
-    REQUIRE(event_count(control_replica_text, "block.committed") == 4);
+    REQUIRE(event_count(control_replica_text, "block.committed") == 5);
     REQUIRE(event_count(control_replica_text, "block.commit_observed") == survivors.size());
-    REQUIRE(event_count(adaptive_replica_text, "block.committed") == 5);
+    REQUIRE(event_count(adaptive_replica_text, "block.committed") == 7);
     REQUIRE(event_count(adaptive_replica_text, "block.commit_observed") == survivors.size() * 2);
     const auto designated_part = root.path / "adaptive/raw/replica-2.jsonl";
     const auto designated_bytes = read_bytes(designated_part);

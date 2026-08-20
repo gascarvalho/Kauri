@@ -4084,24 +4084,6 @@ def _validate_v13_transition(
     certificate_digest = _digest(
         certificate.get("certificate_digest"), "v13 transition certificate digest"
     )
-    predecessor_configuration = {
-        "epoch_number": decoded.epoch_number - 1,
-        "tree_id": 0,
-        "epoch_digest": decoded.previous_epoch_digest,
-    }
-    successor_configuration = {
-        "epoch_number": decoded.epoch_number,
-        "tree_id": 0,
-        "epoch_digest": decoded.epoch_digest,
-    }
-    if (
-        identity.get("predecessor_boundary_configuration")
-        != predecessor_configuration
-        or identity.get("successor_configuration") != successor_configuration
-        or identity.get("command_payload_digest") != decoded.command.payload_digest
-    ):
-        _error("v13 certified identity differs from the decoded bundle")
-
     def replica_source(event: Mapping[str, object], label: str) -> int:
         source_id = event.get("source_id")
         if event.get("source_kind") != "replica" or not isinstance(source_id, str):
@@ -4118,6 +4100,86 @@ def _validate_v13_transition(
         if source_id != f"replica-{source}":
             _error(f"{label} source ID is not canonical")
         return source
+
+    command_height = _uint64(
+        identity.get("command_block_height"), "v13 certified command height", 1
+    )
+    command_hash = _digest(
+        identity.get("command_block_hash"), "v13 certified command hash"
+    )
+    authoritative_candidates: list[Mapping[str, object]] = []
+    for event in events:
+        if event.get("event_type") != "block.committed":
+            continue
+        payload = _mapping(event.get("payload"), "v13 command decision")
+        if (
+            payload.get("block_height") == command_height
+            or payload.get("block_hash") == command_hash
+        ):
+            authoritative_candidates.append(event)
+    if len(authoritative_candidates) != 1:
+        _error("v13 certified command lacks one authoritative decision")
+    authoritative_event = authoritative_candidates[0]
+    authoritative = _mapping(
+        authoritative_event.get("payload"), "v13 command decision"
+    )
+    decision = _mapping(
+        authoritative.get("decision_proof"), "v13 command decision proof"
+    )
+    if set(decision) != {
+        "epoch_number", "tree_id", "epoch_digest", "block_hash"
+    }:
+        _error("v13 command decision proof schema drifted")
+    predecessor_configuration = {
+        "epoch_number": _uint64(
+            decision.get("epoch_number"), "v13 predecessor decision epoch"
+        ),
+        "tree_id": _integer(
+            decision.get("tree_id"), "v13 predecessor decision tree"
+        ),
+        "epoch_digest": _digest(
+            decision.get("epoch_digest"), "v13 predecessor decision digest"
+        ),
+    }
+    predecessor_generation = _uint64(
+        authoritative.get("view_generation"),
+        "v13 predecessor decision generation",
+        1,
+    )
+    expected_authoritative_source = contract.get("authoritative_source_id")
+    if (
+        not isinstance(expected_authoritative_source, str)
+        or authoritative_event.get("source_id") != expected_authoritative_source
+        or replica_source(authoritative_event, "v13 command decision") not in sources
+        or authoritative.get("designated_observer") is not True
+        or _uint64(
+            authoritative.get("block_height"), "v13 authoritative command height", 1
+        ) != command_height
+        or _digest(
+            authoritative.get("block_hash"), "v13 authoritative command hash"
+        ) != command_hash
+        or _digest(decision.get("block_hash"), "v13 command decision block hash")
+        != command_hash
+        or predecessor_configuration["epoch_number"] != decoded.epoch_number - 1
+        or predecessor_configuration["epoch_digest"]
+        != decoded.previous_epoch_digest
+        or identity.get("predecessor_boundary_generation")
+        != predecessor_generation
+    ):
+        _error("v13 certified command decision drifted")
+
+    successor_configuration = {
+        "epoch_number": decoded.epoch_number,
+        "tree_id": 0,
+        "epoch_digest": decoded.epoch_digest,
+    }
+    if (
+        identity.get("predecessor_boundary_configuration")
+        != predecessor_configuration
+        or identity.get("successor_configuration") != successor_configuration
+        or identity.get("command_payload_digest") != decoded.command.payload_digest
+    ):
+        _error("v13 certified identity differs from the decoded bundle")
 
     commands = [
         event
@@ -4227,6 +4289,7 @@ def _validate_v13_transition(
 
     return {
         "sources": sources,
+        "authoritative_command": authoritative_event,
         "commands": tuple(commands_by_source[source] for source in sources),
         "activations": tuple(
             activations_by_source[source] for source in sources

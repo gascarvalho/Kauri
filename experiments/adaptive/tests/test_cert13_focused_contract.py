@@ -521,8 +521,8 @@ def _materialize_sealed_v13_arm(
 @pytest.mark.parametrize(
     ("arm", "expected_commit_count", "expected_phase_transactions"),
     [
-        ("control", 4, [1000, 0, 1000, 1000]),
-        ("adaptive", 5, [1000, 0, 1000, 1000]),
+        ("control", 5, [1000, 0, 1000, 1000]),
+        ("adaptive", 7, [1000, 0, 1000, 1000]),
     ],
 )
 def test_v13_native_sealed_arm_passes_exact_certified_validation(
@@ -721,7 +721,7 @@ def test_v13_native_fragment_reconstructs_authoritative_measurements(
         contract,
     )
 
-    assert len(commits) == 5
+    assert len(commits) == 7
     assert [row["phase"] for row in measurements["phases"]] == [
         "baseline",
         "fault",
@@ -1100,6 +1100,12 @@ def test_v13_native_transitions_bind_bundles_commands_and_certified_activation_w
         "non_r_command",
         "wrong_command_hash",
         "command_after_prepared",
+        "missing_authoritative_command",
+        "duplicate_authoritative_command",
+        "wrong_authoritative_command_source",
+        "command_not_designated",
+        "wrong_predecessor_tree",
+        "wrong_predecessor_generation",
         "wrong_identity_successor",
         "prepared_identity_mismatch",
         "missing_activation",
@@ -1165,6 +1171,15 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
         and event["source_id"] == "replica-2"
         and event["payload"]["epoch_number"] == 1
     )
+    authoritative_command = next(
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and event["payload"]["block_height"]
+        == cycle["identity"]["command_block_height"]
+        and event["payload"]["block_hash"]
+        == cycle["identity"]["command_block_hash"]
+    )
 
     if mutation == "missing_command":
         events.remove(command)
@@ -1176,6 +1191,18 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
         command["payload"]["command_block_hash"] = "00" * 32
     elif mutation == "command_after_prepared":
         command["source_sequence"] = prepared["source_sequence"]
+    elif mutation == "missing_authoritative_command":
+        events.remove(authoritative_command)
+    elif mutation == "duplicate_authoritative_command":
+        events.append(deepcopy(authoritative_command))
+    elif mutation == "wrong_authoritative_command_source":
+        authoritative_command["source_id"] = "replica-3"
+    elif mutation == "command_not_designated":
+        authoritative_command["payload"]["designated_observer"] = False
+    elif mutation == "wrong_predecessor_tree":
+        authoritative_command["payload"]["decision_proof"]["tree_id"] += 1
+    elif mutation == "wrong_predecessor_generation":
+        authoritative_command["payload"]["view_generation"] += 1
     elif mutation == "wrong_identity_successor":
         cycle["identity"]["successor_configuration"]["epoch_number"] = 2
     elif mutation == "prepared_identity_mismatch":
