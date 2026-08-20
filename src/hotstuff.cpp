@@ -10674,10 +10674,10 @@ namespace hotstuff
         }
         else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         {
-            // V3 reuses the bounded reporting FIFO for exact lifecycle and
-            // schema-v3 response-evidence notices only. V2 readiness,
-            // convergence, durable initialization, and commit state remain
-            // absent on this branch.
+            // V3 reuses the bounded reporting FIFO for the common initial
+            // operational-readiness notice, exact lifecycle, and schema-v3
+            // response-evidence notices only. V2 convergence, durable
+            // initialization, and durable commit state remain absent here.
             AdaptiveV2ReportingOutboxConfig reporting_config;
             reporting_config.source_replica_id = get_id();
             reporting_config.limits.maximum_delivery_attempts =
@@ -11067,7 +11067,7 @@ namespace hotstuff
 
     void HotStuffBase::enqueue_initial_adaptive_v2_readiness() noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             adaptive_v2_readiness_enqueued ||
             adaptive_v2_reporting_outbox == nullptr ||
             adaptive_epoch_runtime == nullptr)
@@ -11752,6 +11752,7 @@ namespace hotstuff
         const AdaptiveV2PendingReport &report) noexcept
     {
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            report.stream != AdaptiveV2ReportingStream::readiness &&
             report.stream != AdaptiveV2ReportingStream::lifecycle &&
             report.stream != AdaptiveV2ReportingStream::evidence)
             return AdaptiveV2ReportingDeliveryResult::permanent_failure;

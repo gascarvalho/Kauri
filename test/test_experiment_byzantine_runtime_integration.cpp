@@ -340,6 +340,14 @@ public:
         return *runtime.adaptive_v2_reporting_outbox;
     }
 
+    static const AdaptiveV2PendingReport *reporting_front(
+        const HotStuffBase &runtime)
+    {
+        return runtime.adaptive_v2_reporting_outbox == nullptr
+            ? nullptr
+            : runtime.adaptive_v2_reporting_outbox->front();
+    }
+
     static void poison_reporting(HotStuffBase &runtime)
     {
         runtime.poison_adaptive_v2_reporting("test_terminal_front");
@@ -2460,6 +2468,35 @@ TEST_CASE(
     CHECK(observation.outcome == ResponseOutcome::timeout);
     CHECK(observation.attempt_start_monotonic_ns == start_ns);
     CHECK(observation.deadline_duration_us == deadline_us);
+}
+
+TEST_CASE(
+    "adaptive-v3 publishes initial operational readiness to the unified manager",
+    "[adaptive-v3][manager][readiness][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    const auto *report = Access::reporting_front(runtime);
+    REQUIRE(report != nullptr);
+    CHECK(report->stream == AdaptiveV2ReportingStream::readiness);
+    CHECK(report->opcode == MsgAdaptiveV2ReadinessNotice::opcode);
+    const auto decoded = decode_adaptive_v2_readiness_notice(
+        report->canonical_payload, AdaptiveV2ReadinessWireLimits{});
+    REQUIRE(decoded);
+    CHECK(decoded.notice->claimed_source_replica_id == 1);
+    CHECK(decoded.notice->source_sequence == 1);
+    CHECK(decoded.notice->active_configuration == configuration);
+    CHECK(decoded.notice->activation_generation == 1);
+    CHECK(decoded.notice->committed_height == 0);
 }
 
 TEST_CASE(

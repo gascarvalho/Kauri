@@ -847,7 +847,8 @@ TEST_CASE(
     REQUIRE_FALSE(readiness.empty());
     CHECK(contains_all(
         readiness,
-        {"adaptive_v2_readiness_enqueued",
+        {"is_adaptive_epoch_mode(epoch_protocol_mode)",
+         "adaptive_v2_readiness_enqueued",
          "configuration.epoch_number != 0",
          "configuration.tree_id != 0",
          "generation.has_value()",
@@ -855,6 +856,12 @@ TEST_CASE(
          "enqueue_readiness(",
          "configuration, *generation, 0",
          "schedule_adaptive_v2_reporting_flush"}));
+    CHECK(contains_in_order(
+        transmit,
+        {"EpochProtocolMode::adaptive_v3",
+         "AdaptiveV2ReportingStream::readiness",
+         "AdaptiveV2ReportingStream::lifecycle",
+         "AdaptiveV2ReportingStream::evidence"}));
 
     REQUIRE_FALSE(admit.empty());
     CHECK(contains_in_order(
