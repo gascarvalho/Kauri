@@ -14,11 +14,13 @@
 namespace hotstuff {
 
 /** Immutable, non-dynamic portion of a v3 readiness identity.  Command
- * commit/boundary facts are deliberately absent: only signed observations
- * can establish those values. */
+ * commit/boundary facts, including the active predecessor tree/generation,
+ * are deliberately absent: only matching signed observations can establish
+ * those values. */
 struct AdaptiveV3TransitionProjection {
-    ConfigurationId predecessor_configuration;
-    std::uint64_t predecessor_generation{0};
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::vector<std::uint32_t> predecessor_tree_ids;
     ConfigurationId successor_configuration;
     std::uint64_t successor_generation{0};
     uint256_t membership_digest;
@@ -33,8 +35,7 @@ struct AdaptiveV3TransitionProjection {
 std::optional<AdaptiveV3TransitionProjection>
 make_adaptive_v3_transition_projection(
     const AdaptiveV3EpochChangeBundle &bundle,
-    const ConfigurationId &current_predecessor_configuration,
-    std::uint64_t current_predecessor_generation,
+    const EpochDefinition &current_predecessor,
     std::uint64_t cycle_ordinal,
     const std::vector<std::pair<ReplicaID, PubKeyBLS>> &readiness_membership) noexcept;
 

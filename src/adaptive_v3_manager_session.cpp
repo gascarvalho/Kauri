@@ -213,7 +213,7 @@ AdaptiveV2ManagerControllerStatus AdaptiveV3ManagerSession::evaluate() noexcept 
     const auto *bundle=s.controller->successor_bundle_v3();
     if (!bundle) return AdaptiveV2ManagerControllerStatus::unhealthy;
     s.projection=make_adaptive_v3_transition_projection(*bundle,
-        s.ingress.current_configuration(), s.ingress.activation_generation(), s.cycle_ordinal,
+        s.ingress.current_epoch(), s.cycle_ordinal,
         s.config.readiness_membership);
     if (!s.projection) return AdaptiveV2ManagerControllerStatus::unhealthy;
     s.phase=AdaptiveV3ManagerSessionStatus::successor_available; return result;

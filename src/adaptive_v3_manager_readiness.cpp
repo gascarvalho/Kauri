@@ -10,10 +10,25 @@ namespace hotstuff
 bool AdaptiveV3TransitionProjection::matches_static(
     const ActivationReadyIdentityV1 &identity) const noexcept
 {
+    if (identity.predecessor_boundary_generation == 0)
+        return false;
+    const auto predecessor_ordinal = static_cast<std::uint32_t>(
+        identity.predecessor_boundary_generation - 1);
+    const auto canonical_predecessor_generation =
+        checked_activation_generation(
+            predecessor_epoch_number, predecessor_ordinal);
     return identity.schema_version == kActivationReadinessSchemaVersionV1 &&
            identity.membership_digest == membership_digest &&
-           identity.predecessor_boundary_configuration == predecessor_configuration &&
-           identity.predecessor_boundary_generation == predecessor_generation &&
+           identity.predecessor_boundary_configuration.epoch_number ==
+               predecessor_epoch_number &&
+           identity.predecessor_boundary_configuration.epoch_digest ==
+               predecessor_epoch_digest &&
+           std::binary_search(
+               predecessor_tree_ids.begin(), predecessor_tree_ids.end(),
+               identity.predecessor_boundary_configuration.tree_id) &&
+           canonical_predecessor_generation.has_value() &&
+           *canonical_predecessor_generation ==
+               identity.predecessor_boundary_generation &&
            identity.successor_configuration == successor_configuration &&
            identity.successor_activation_generation == successor_generation &&
            identity.command_payload_digest == command_payload_digest &&
@@ -23,8 +38,7 @@ bool AdaptiveV3TransitionProjection::matches_static(
 std::optional<AdaptiveV3TransitionProjection>
 make_adaptive_v3_transition_projection(
     const AdaptiveV3EpochChangeBundle &bundle,
-    const ConfigurationId &current,
-    std::uint64_t current_generation,
+    const EpochDefinition &current,
     std::uint64_t cycle_ordinal,
     const std::vector<std::pair<ReplicaID, PubKeyBLS>> &readiness_membership) noexcept
 {
@@ -36,18 +50,30 @@ make_adaptive_v3_transition_projection(
             command.payload.successor_epoch_number, 0);
         if (bundle.protocol_mode() != EpochProtocolMode::adaptive_v3 ||
             command.protocol_mode != EpochProtocolMode::adaptive_v3 ||
-            !successor_generation || current.epoch_number !=
+            !successor_generation || current.epoch_number() !=
                 command.payload.successor_epoch_number - 1 ||
-            current.epoch_digest != command.payload.predecessor_epoch_digest ||
+            current.epoch_digest() != command.payload.predecessor_epoch_digest ||
             definition.epoch_number != command.payload.successor_epoch_number ||
             !definition.epoch_digest || *definition.epoch_digest !=
                 command.payload.successor_epoch_digest ||
-            current_generation == 0 || readiness_membership.empty())
+            readiness_membership.empty() || current.trees().empty())
             return std::nullopt;
         for (std::size_t i = 1; i < readiness_membership.size(); ++i)
             if (readiness_membership[i - 1].first >= readiness_membership[i].first)
                 return std::nullopt;
-        return AdaptiveV3TransitionProjection{current, current_generation,
+        std::vector<std::uint32_t> predecessor_tree_ids;
+        predecessor_tree_ids.reserve(current.trees().size());
+        for (const auto &tree : current.trees())
+            predecessor_tree_ids.push_back(tree.tree_id);
+        std::sort(
+            predecessor_tree_ids.begin(), predecessor_tree_ids.end());
+        if (std::adjacent_find(
+                predecessor_tree_ids.begin(),
+                predecessor_tree_ids.end()) != predecessor_tree_ids.end())
+            return std::nullopt;
+        return AdaptiveV3TransitionProjection{
+            current.epoch_number(), current.epoch_digest(),
+            std::move(predecessor_tree_ids),
             {definition.epoch_number, 0, *definition.epoch_digest},
             *successor_generation,
             canonical_activation_readiness_membership_digest(readiness_membership),

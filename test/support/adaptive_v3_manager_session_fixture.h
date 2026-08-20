@@ -320,8 +320,7 @@ struct Fixture {
         CHECK(bundle->definition().epoch_number ==
               bundle->command().payload.successor_epoch_number);
         CHECK(make_adaptive_v3_transition_projection(
-                  *bundle, session.ingress().current_configuration(),
-                  session.ingress().activation_generation(), 0,
+                  *bundle, session.ingress().current_epoch(), 0,
                   config.readiness_membership).has_value());
         REQUIRE(selected == AdaptiveV2ManagerControllerStatus::successor_ready);
     }

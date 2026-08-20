@@ -185,8 +185,9 @@ TEST_CASE("M1 projection binds dynamic readiness identity only at Q")
 {
     Fixture fixture(7);
     const AdaptiveV3TransitionProjection projection{
-        fixture.identity.predecessor_boundary_configuration,
-        fixture.identity.predecessor_boundary_generation,
+        fixture.identity.predecessor_boundary_configuration.epoch_number,
+        fixture.identity.predecessor_boundary_configuration.epoch_digest,
+        {0, 1},
         fixture.identity.successor_configuration,
         fixture.identity.successor_activation_generation,
         fixture.identity.membership_digest,
@@ -198,6 +199,9 @@ TEST_CASE("M1 projection binds dynamic readiness identity only at Q")
 
     // A static-compatible alternative cannot pin the session below Q.
     auto alternate = fixture.identity;
+    alternate.predecessor_boundary_configuration.tree_id = 1;
+    alternate.predecessor_boundary_generation =
+        *checked_activation_generation(7, 17);
     alternate.command_block_height = 101;
     alternate.command_block_hash = digest("other-command");
     alternate.activation_height = 103;
@@ -225,6 +229,15 @@ TEST_CASE("M1 projection binds dynamic readiness identity only at Q")
         AdaptiveV3ManagerReadinessDisposition::released);
     REQUIRE(releaser.certificate() != nullptr);
     REQUIRE_FALSE(releaser.certificate()->identity != fixture.identity);
+
+    auto unknown_tree = fixture.identity;
+    unknown_tree.predecessor_boundary_configuration.tree_id = 2;
+    AdaptiveV3ManagerReadinessCollector tree_guard(
+        projection, {fixture.members, 6});
+    REQUIRE(tree_guard.ingest(
+                0, fixture.observation_for(unknown_tree, 0, 0)) ==
+            AdaptiveV3ManagerReadinessDisposition::rejected_wrong_identity);
+    REQUIRE(tree_guard.accepted_count() == 0);
 }
 
 TEST_CASE("M1 validates release cardinality and canonical membership ownership")
