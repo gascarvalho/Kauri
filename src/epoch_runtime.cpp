@@ -474,7 +474,8 @@ bytearray_t encode_epoch_consensus_envelope(
     if (!valid_limits(limits))
         throw std::invalid_argument("epoch consensus wire limits are invalid");
     if (envelope.protocol_mode != EpochProtocolMode::adaptive_v1 &&
-        envelope.protocol_mode != EpochProtocolMode::adaptive_v2)
+        envelope.protocol_mode != EpochProtocolMode::adaptive_v2 &&
+        envelope.protocol_mode != EpochProtocolMode::adaptive_v3)
         throw std::invalid_argument(
             "epoch consensus wire requires an adaptive protocol mode");
     if (envelope.body.size() >
@@ -531,7 +532,8 @@ EpochConsensusWireDecodeResult decode_epoch_consensus_envelope(
                 std::nullopt};
         stream >> mode;
         if ((expected_mode != EpochProtocolMode::adaptive_v1 &&
-             expected_mode != EpochProtocolMode::adaptive_v2) ||
+             expected_mode != EpochProtocolMode::adaptive_v2 &&
+             expected_mode != EpochProtocolMode::adaptive_v3) ||
             mode != static_cast<std::uint8_t>(expected_mode))
             return {EpochConsensusWireError::mode_mismatch, std::nullopt};
         stream >> kind;

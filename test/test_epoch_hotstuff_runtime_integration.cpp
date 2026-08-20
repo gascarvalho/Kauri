@@ -2918,7 +2918,7 @@ TEST_CASE("adaptive outbound helper binds the active configuration and generatio
 }
 
 TEST_CASE("consensus envelopes bind the exact adaptive protocol mode",
-          "[c08][adaptive-v2][consensus][wire][mode][intentional-red]")
+          "[c08][cert13][adaptive-v2][adaptive-v3][consensus][wire][mode][intentional-red]")
 {
     const ConfigurationId configuration{
         0, 0, digest("adaptive-mode-epoch")};
@@ -2934,11 +2934,15 @@ TEST_CASE("consensus envelopes bind the exact adaptive protocol mode",
         EpochConsensusWireKind::proposal};
     auto adaptive_v2 = adaptive_v1;
     adaptive_v2.protocol_mode = EpochProtocolMode::adaptive_v2;
+    auto adaptive_v3 = adaptive_v1;
+    adaptive_v3.protocol_mode = EpochProtocolMode::adaptive_v3;
 
     const auto v1_wire = encode_epoch_consensus_envelope(
         adaptive_v1, limits());
     const auto v2_wire = encode_epoch_consensus_envelope(
         adaptive_v2, limits());
+    const auto v3_wire = encode_epoch_consensus_envelope(
+        adaptive_v3, limits());
 
     const auto decoded_v1 = decode_epoch_consensus_envelope(
         v1_wire,
@@ -2959,10 +2963,31 @@ TEST_CASE("consensus envelopes bind the exact adaptive protocol mode",
         CHECK(decoded_v2.value->protocol_mode ==
               EpochProtocolMode::adaptive_v2);
 
+    const auto decoded_v3 = decode_epoch_consensus_envelope(
+        v3_wire,
+        EpochConsensusWireKind::proposal,
+        EpochProtocolMode::adaptive_v3,
+        limits());
+    REQUIRE(decoded_v3);
+    CHECK(decoded_v3.value->protocol_mode ==
+          EpochProtocolMode::adaptive_v3);
+
     CHECK(decode_epoch_consensus_envelope(
               v1_wire,
               EpochConsensusWireKind::proposal,
               EpochProtocolMode::adaptive_v2,
+              limits())
+              .error == EpochConsensusWireError::mode_mismatch);
+    CHECK(decode_epoch_consensus_envelope(
+              v3_wire,
+              EpochConsensusWireKind::proposal,
+              EpochProtocolMode::adaptive_v2,
+              limits())
+              .error == EpochConsensusWireError::mode_mismatch);
+    CHECK(decode_epoch_consensus_envelope(
+              v2_wire,
+              EpochConsensusWireKind::proposal,
+              EpochProtocolMode::adaptive_v3,
               limits())
               .error == EpochConsensusWireError::mode_mismatch);
     CHECK(decode_epoch_consensus_envelope(
