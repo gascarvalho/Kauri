@@ -3331,9 +3331,10 @@ public:
                 if (facade_.v3_status() ==
                         hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
                 {
-                    // A deadline/retry terminal has no successful E2
-                    // certificate to report; it is fail-closed.
-                    fail("session_terminal_on_advance");
+                    if (session_completed_successfully())
+                        event_context_.stop();
+                    else
+                        fail("session_terminal_on_advance");
                     return;
                 }
                 drive_deliveries();
@@ -3413,10 +3414,7 @@ public:
             stop_runtime();
             emit_process(hotstuff::ProcessLifecycleState::stopped);
             event_sink_.drain();
-            return failed_ || emitted_session_terminals_ !=
-                    transition_policies_.size() ||
-                    facade_.v3_status() !=
-                        hotstuff::AdaptiveV3ManagerSessionStatus::terminal ||
+            return failed_ || !session_completed_successfully() ||
                     !event_sink_.health().healthy
                 ? 1
                 : 0;
@@ -3582,6 +3580,28 @@ private:
         fault_window_arm_timer_.del();
         if (!transport_.stop())
             fail("transport_stop_failed");
+    }
+
+    bool session_completed_successfully() const noexcept
+    {
+        if (facade_.v3_status() !=
+                hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+            return false;
+        const auto *records = facade_.v3_terminal_records();
+        if (records == nullptr ||
+            records->size() != transition_policies_.size() ||
+            emitted_session_terminals_ != transition_policies_.size())
+            return false;
+        for (std::size_t cycle = 0; cycle < records->size(); ++cycle)
+        {
+            const auto &record = (*records)[cycle];
+            if (record.cycle_ordinal != cycle ||
+                record.reason != hotstuff::
+                    AdaptiveV3ManagerSessionTerminalReason::
+                        acknowledgements_complete)
+                return false;
+        }
+        return true;
     }
 
     void emit_new_session_terminals() noexcept
@@ -3853,8 +3873,10 @@ private:
                 hotstuff::AdaptiveV3ManagerSessionStatus::terminal &&
             !failed_)
         {
-            if (!failed_)
+            if (session_completed_successfully())
                 event_context_.stop();
+            else
+                fail("readiness_ack_terminal_invalid");
         }
     }
 

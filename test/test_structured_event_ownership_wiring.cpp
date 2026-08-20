@@ -336,6 +336,8 @@ TEST_CASE(
     const auto v3 = manager.substr(v3_begin, v2_begin - v3_begin);
     const auto run = function_body(v3, "int run_adaptive_v3()");
     const auto stop_runtime = function_body(v3, "void stop_runtime()");
+    const auto completed = function_body(
+        v3, "bool session_completed_successfully() const noexcept");
     const auto transport_begin = manager.find(
         "class AdaptiveV3ManagerTransport final");
     REQUIRE(transport_begin != std::string::npos);
@@ -365,6 +367,7 @@ TEST_CASE(
     const auto common_ingest = function_body(v3, "void ingest_common(");
     REQUIRE_FALSE(run.empty());
     REQUIRE_FALSE(stop_runtime.empty());
+    REQUIRE_FALSE(completed.empty());
     REQUIRE_FALSE(handlers.empty());
     REQUIRE_FALSE(observation.empty());
     REQUIRE_FALSE(acknowledgement.empty());
@@ -553,6 +556,26 @@ TEST_CASE(
         REQUIRE(emit != std::string::npos);
         REQUIRE(drain != std::string::npos);
         CHECK(emit < drain);
+    }
+
+    SECTION("v3 distinguishes exact successful completion from failure terminals")
+    {
+        CHECK(completed.find("records->size() != transition_policies_.size()") !=
+              std::string::npos);
+        CHECK(completed.find(
+                  "AdaptiveV3ManagerSessionTerminalReason::\n"
+                  "                        acknowledgements_complete") !=
+              std::string::npos);
+        CHECK(run.find("!session_completed_successfully()") !=
+              std::string::npos);
+        CHECK(acknowledgement.find("session_completed_successfully()") !=
+              std::string::npos);
+        CHECK(v3.find(
+                  "if (session_completed_successfully())\n"
+                  "                        event_context_.stop();\n"
+                  "                    else\n"
+                  "                        fail(\"session_terminal_on_advance\")") !=
+              std::string::npos);
     }
 
     CHECK(v3.find("fault_receipt") == std::string::npos);
