@@ -99,7 +99,8 @@ HotStuffEpochRuntimeTransaction::prepare(const EpochRuntimePlan &plan)
 {
     if (plan.trees.empty() || plan.canonical_stage.empty() ||
         (plan.protocol_mode != EpochProtocolMode::adaptive_v1 &&
-         plan.protocol_mode != EpochProtocolMode::adaptive_v2) ||
+         plan.protocol_mode != EpochProtocolMode::adaptive_v2 &&
+         plan.protocol_mode != EpochProtocolMode::adaptive_v3) ||
         plan.epoch_digest == uint256_t{} ||
         plan.canonical_digest == uint256_t{} ||
         DataStream(plan.canonical_stage).get_hash() != plan.canonical_digest)
@@ -109,7 +110,8 @@ HotStuffEpochRuntimeTransaction::prepare(const EpochRuntimePlan &plan)
          plan.stage.activation.successor_epoch_number != plan.epoch_number ||
          plan.stage.activation.successor_epoch_digest != plan.epoch_digest))
         return std::nullopt;
-    if (plan.protocol_mode == EpochProtocolMode::adaptive_v2 &&
+    if ((plan.protocol_mode == EpochProtocolMode::adaptive_v2 ||
+         plan.protocol_mode == EpochProtocolMode::adaptive_v3) &&
         plan.canonical_digest != plan.epoch_digest)
         return std::nullopt;
 

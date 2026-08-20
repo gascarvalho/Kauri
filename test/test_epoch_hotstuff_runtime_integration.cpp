@@ -2055,6 +2055,47 @@ TEST_CASE("v2 runtime preparation is schedule-free and never arms",
     CHECK(harness.live_effects.prepare_count == 1);
 }
 
+TEST_CASE("v3 runtime preparation reaches the concrete live topology",
+          "[cert13][epoch-live-binding][adaptive-v3][prepare]")
+{
+    V2Harness harness(
+        epoch_v2_input(0),
+        {2, 3},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+
+    REQUIRE(harness.adapter.prepare_committed_v3(harness.epoch1) ==
+            EpochIngressError::none);
+    CHECK(harness.live_effects.prepare_count == 1);
+    CHECK(harness.live_effects.arm_count == 0);
+    CHECK(harness.live_effects.apply_count == 0);
+    CHECK(harness.manager_egress.acknowledgements.empty());
+    CHECK(harness.manager_egress.statuses.empty());
+
+    REQUIRE(harness.live_effects.prepared_plan.has_value());
+    const auto &plan = *harness.live_effects.prepared_plan;
+    CHECK(plan.protocol_mode == EpochProtocolMode::adaptive_v3);
+    CHECK(plan.epoch_number == harness.epoch1.epoch_number());
+    CHECK(plan.epoch_digest == harness.epoch1.epoch_digest());
+    CHECK(plan.canonical_stage ==
+          harness.epoch1.canonical_serialization());
+    CHECK(plan.canonical_digest == harness.epoch1.epoch_digest());
+    REQUIRE(plan.trees.size() == harness.epoch1.trees().size());
+    for (const auto &tree : plan.trees)
+    {
+        CHECK(tree.configuration.epoch_number ==
+              harness.epoch1.epoch_number());
+        CHECK(tree.configuration.epoch_digest ==
+              harness.epoch1.epoch_digest());
+    }
+
+    CHECK(harness.adapter.prepare_committed_v3(harness.epoch1) ==
+          EpochIngressError::none);
+    CHECK(harness.live_effects.prepare_count == 1);
+}
+
 TEST_CASE("failed v2 preparation has no activation side effects",
           "[c08][epoch-live-binding][adaptive-v2][prepare][failure]")
 {
