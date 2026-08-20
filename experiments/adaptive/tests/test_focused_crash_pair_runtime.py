@@ -499,6 +499,42 @@ def test_v13_unified_manager_argv_uses_native_public_readiness_contract(
     assert command[command.index("--fault-window-arm-schema-version") + 1] == "4"
     assert command[command.index("--fault-window-arm-clock-domain") + 1] == "same_host_clock_monotonic_raw"
     assert "--activation-readiness-identity" not in command
+    manager_input = {
+        "input_source": "normalized_manager_launch_boundary_v1",
+        "requested_argv": list(command),
+        "observed_argv": list(command),
+        "stdin": "closed",
+    }
+    assert runtime._validate_manager_launch_boundary(
+        command,
+        command,
+        manager_input=manager_input,
+        forbidden_values=(),
+    )["blinded"] is True
+    mutations: list[tuple[int, str]] = [
+        (command.index("--protocol-mode") + 1, "adaptive_v2"),
+        (command.index("--activation-readiness-release-count") + 1, "0"),
+    ]
+    member_indices = [
+        index + 1
+        for index, value in enumerate(command[:-1])
+        if value == "--activation-readiness-member"
+    ]
+    mutations.append((member_indices[1], command[member_indices[0]]))
+    for index, value in mutations:
+        mutated = list(command)
+        mutated[index] = value
+        with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+            runtime._validate_manager_launch_boundary(
+                mutated,
+                mutated,
+                manager_input={
+                    **manager_input,
+                    "requested_argv": mutated,
+                    "observed_argv": mutated,
+                },
+                forbidden_values=(),
+            )
 
 
 @pytest.mark.parametrize(

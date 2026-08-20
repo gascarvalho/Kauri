@@ -8149,6 +8149,11 @@ def _validate_manager_launch_boundary(
         "--responsiveness-maximum-timeout-rate-ppm",
         "--responsiveness-trailing-timeout-streak",
         "--responsiveness-latency-percentile-basis-points",
+        "--protocol-mode",
+        "--activation-readiness-release-count",
+        "--activation-readiness-maximum-delivery-attempts",
+        "--activation-readiness-retry-interval-ticks",
+        "--activation-readiness-member",
         "--transition-request",
         "--bundle-output",
         "--structured-event-run-id",
@@ -8179,6 +8184,53 @@ def _validate_manager_launch_boundary(
     pairs = tuple(zip(requested[1::2], requested[2::2], strict=True))
     if any(option not in allowed for option, _value in pairs):
         _error("manager argv contains an unreviewed option")
+    v3_options = {
+        "--protocol-mode",
+        "--activation-readiness-release-count",
+        "--activation-readiness-maximum-delivery-attempts",
+        "--activation-readiness-retry-interval-ticks",
+        "--activation-readiness-member",
+    }
+    if any(option in v3_options for option, _value in pairs):
+        values = {
+            option: [value for current, value in pairs if current == option]
+            for option in v3_options
+        }
+        if (
+            values["--protocol-mode"] != ["adaptive_v3"]
+            or len(values["--activation-readiness-release-count"]) != 1
+            or values["--activation-readiness-maximum-delivery-attempts"]
+            != [str(_V13_MAXIMUM_OBSERVATION_ATTEMPTS)]
+            or values["--activation-readiness-retry-interval-ticks"]
+            != [str(_V13_OBSERVATION_RETRY_INTERVAL_MS * 1_000_000)]
+            or not values["--activation-readiness-member"]
+        ):
+            _error("manager adaptive-v3 launch boundary is incomplete")
+        readiness_members: list[tuple[int, str]] = []
+        for value in values["--activation-readiness-member"]:
+            raw_replica, separator, public_key = value.partition(",")
+            if (
+                separator != ","
+                or not raw_replica.isascii()
+                or not raw_replica.isdecimal()
+                or str(int(raw_replica)) != raw_replica
+                or len(public_key) != 96
+                or any(character not in "0123456789abcdef" for character in public_key)
+            ):
+                _error("manager adaptive-v3 readiness member is not canonical")
+            readiness_members.append((int(raw_replica), public_key))
+        release_raw = values["--activation-readiness-release-count"][0]
+        if (
+            not release_raw.isascii()
+            or not release_raw.isdecimal()
+            or str(int(release_raw)) != release_raw
+            or [replica for replica, _public in readiness_members]
+            != list(range(len(readiness_members)))
+            or len({public for _replica, public in readiness_members})
+            != len(readiness_members)
+            or not 0 < int(release_raw) <= len(readiness_members)
+        ):
+            _error("manager adaptive-v3 readiness boundary is invalid")
     transitions = [value for option, value in pairs if option == "--transition-request"]
     outputs = [value for option, value in pairs if option == "--bundle-output"]
     replicas = [value for option, value in pairs if option == "--replica"]
