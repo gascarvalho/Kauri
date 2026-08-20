@@ -3305,7 +3305,7 @@ TEST_CASE(
     REQUIRE_FALSE(enable.empty());
     CHECK(contains_in_order(
         enable,
-        {"epoch_protocol_mode != EpochProtocolMode::adaptive_v2",
+        {"!is_adaptive_epoch_mode(epoch_protocol_mode)",
          "proposal_contexts->active_configuration().has_value()",
          "adaptive_v2_response_evidence == nullptr",
          "enable_exact_timeout_attempt_evidence_v3()",
@@ -3323,7 +3323,25 @@ TEST_CASE(
           std::string::npos);
     CHECK(count_occurrences(
               implementation,
-              "experiment_exact_timeout_attempt_evidence_v3") == 2);
+              "experiment_exact_timeout_attempt_evidence_v3") == 3);
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+    const auto enqueue = function_body(
+        implementation,
+        "EvidenceTransportResult HotStuffBase::enqueue_adaptive_v2_evidence_report(");
+    REQUIRE_FALSE(constructor.empty());
+    REQUIRE_FALSE(enqueue.empty());
+    CHECK(contains_in_order(
+        constructor,
+        {"epoch_protocol_mode == EpochProtocolMode::adaptive_v3",
+         "std::make_unique<AdaptiveV2ResponseEvidenceBridge>",
+         "bind_transport",
+         "enqueue_adaptive_v2_evidence_report"}));
+    CHECK(contains_in_order(
+        enqueue,
+        {"epoch_protocol_mode == EpochProtocolMode::adaptive_v3",
+         "enqueue_evidence",
+         "EvidenceTransportResult::accepted"}));
     for (const auto *forbidden : {
              "do_consensus",
              "do_vote",

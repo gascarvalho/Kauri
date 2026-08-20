@@ -2553,14 +2553,14 @@ TEST_CASE(
         "void HotStuffBase::record_optional_aggregation_absence");
     const auto exact_fact = timeout.find(
         "adaptive_v2_response_evidence->record_timeouts");
-    const auto v2_guard = timeout.find(
-        "epoch_protocol_mode == EpochProtocolMode::adaptive_v2");
+    const auto adaptive_guard = timeout.find(
+        "is_adaptive_epoch_mode(epoch_protocol_mode)");
     const auto legacy_send = timeout.find("MsgTimeoutReport");
     REQUIRE(exact_fact != std::string::npos);
-    REQUIRE(v2_guard != std::string::npos);
+    REQUIRE(adaptive_guard != std::string::npos);
     REQUIRE(legacy_send != std::string::npos);
-    CHECK(exact_fact < v2_guard);
-    CHECK(v2_guard < legacy_send);
+    CHECK(exact_fact < adaptive_guard);
+    CHECK(adaptive_guard < legacy_send);
     CHECK(timeout.find("const auto recorded") != std::string::npos);
     CHECK(timeout.find("diagnostics()") != std::string::npos);
     CHECK(timeout.find("[EVIDENCE] Timeout bridge") !=

@@ -556,6 +556,16 @@ public:
                    key, tree, start_ns, duration_us);
     }
 
+    static ProposalTreeSnapshot context_tree(
+        HotStuffBase &runtime,
+        const ProposalKey &key)
+    {
+        const auto lease = runtime.proposal_contexts->acquire_open_context(key);
+        if (!lease.has_value())
+            throw std::invalid_argument("exact context is unavailable");
+        return lease->tree();
+    }
+
     static std::size_t record_response_timeout(
         HotStuffBase &runtime,
         const ProposalKey &key,
@@ -2382,6 +2392,56 @@ TEST_CASE(
         CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
         CHECK(Access::convergence_evidence_healthy(runtime));
     }
+}
+
+TEST_CASE(
+    "adaptive-v3 exact timeout evidence reaches the shared authenticated outbox",
+    "[adaptive-v3][evidence][schema-v3][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+    REQUIRE_NOTHROW(
+        runtime.enable_experiment_exact_timeout_attempt_evidence_v3());
+    const auto configuration = Access::initialize_active_runtime(runtime);
+    auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+    const ProposalKey key{
+        configuration, digest("v3-exact-timeout-evidence")};
+    REQUIRE(Access::admit_exact_context(runtime, key));
+    const auto exact_tree = Access::context_tree(runtime, key);
+    REQUIRE_FALSE(exact_tree.direct_children.empty());
+    const auto child = *exact_tree.direct_children.begin();
+    constexpr std::uint64_t start_ns = 1'000'000;
+    constexpr std::uint64_t deadline_us = 1'000;
+    REQUIRE(Access::arm_response_attempt(
+        runtime, key, exact_tree, start_ns, deadline_us));
+    REQUIRE(Access::record_response_timeout(
+                runtime,
+                key,
+                child,
+                start_ns + deadline_us * 1'000) == 1);
+
+    REQUIRE(outbox.front() != nullptr);
+    CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::evidence);
+    CHECK(outbox.front()->opcode == MsgEvidenceReport::opcode);
+    const auto decoded = decode_evidence_batch(
+        outbox.front()->canonical_payload, EvidenceWireLimits{});
+    REQUIRE(decoded);
+    REQUIRE(decoded.batch->observations.size() == 1);
+    const auto &observation = decoded.batch->observations.front();
+    CHECK(observation.schema_version == kResponseObservationSchemaVersionV3);
+    CHECK(observation.reporter_id == 1);
+    CHECK(observation.observed_replica_id == child);
+    CHECK(observation.proposal_key() == key);
+    CHECK(observation.outcome == ResponseOutcome::timeout);
+    CHECK(observation.attempt_start_monotonic_ns == start_ns);
+    CHECK(observation.deadline_duration_us == deadline_us);
 }
 
 TEST_CASE(

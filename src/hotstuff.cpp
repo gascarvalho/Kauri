@@ -6097,9 +6097,9 @@ namespace hotstuff
                 diagnostics.healthy ? 1U : 0U);
         }
 
-        // Adaptive-v2 emits only exact, locally derived response facts. The
+        // Adaptive modes emit only exact, locally derived response facts. The
         // legacy timeout message has no authenticated manager-ingress seam.
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        if (is_adaptive_epoch_mode(epoch_protocol_mode))
             return;
 
         std::vector<TimeoutMeasure> timeouts;
@@ -7292,10 +7292,14 @@ namespace hotstuff
     bool HotStuffBase::start_latency_deadline(const ProposalKey &key)
     {
         bool normal_evidence_armed = false;
+        const bool response_evidence_enabled =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+            (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+             experiment_exact_timeout_attempt_evidence_v3);
         const auto lease = proposal_contexts->acquire_open_context(key);
         if (!lease.has_value())
         {
-            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            if (response_evidence_enabled)
                 poison_response_attempt_arm_once(
                     key, "proposal_context_unavailable");
             return false;
@@ -7307,7 +7311,7 @@ namespace hotstuff
 
             arm_experiment_post_qc_audit(*lease);
 
-            if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            if (!response_evidence_enabled ||
                 lease->tree().direct_children.empty())
                 return true;
             if (adaptive_v2_response_evidence == nullptr)
@@ -10665,9 +10669,10 @@ namespace hotstuff
         }
         else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         {
-            // V3 uses the shared bounded lifecycle FIFO only for exact
-            // ProposalCommitted notices; v2 evidence and convergence state
-            // stays absent on this branch.
+            // V3 reuses the bounded reporting FIFO for exact lifecycle and
+            // schema-v3 response-evidence notices only. V2 readiness,
+            // convergence, durable initialization, and commit state remain
+            // absent on this branch.
             AdaptiveV2ReportingOutboxConfig reporting_config;
             reporting_config.source_replica_id = get_id();
             reporting_config.limits.maximum_delivery_attempts =
@@ -10683,6 +10688,66 @@ namespace hotstuff
             adaptive_v2_reporting_outbox =
                 std::make_unique<AdaptiveV2ReportingOutbox>(
                     std::move(reporting_config));
+            adaptive_v2_response_evidence =
+                std::make_unique<AdaptiveV2ResponseEvidenceBridge>(
+                    get_id());
+            adaptive_v2_response_evidence->bind_deadline_scheduler(
+                [this](
+                    const ProposalKey &,
+                    std::uint64_t deadline_duration_us,
+                    EvidenceDeadlineCallback deadline,
+                    EvidenceDeadlineFailureCallback failure) {
+                    constexpr std::uint64_t nanoseconds_per_microsecond =
+                        1000;
+                    const auto maximum_delay = static_cast<std::uint64_t>(
+                        AggregationScheduler::Duration::max().count());
+                    if (deadline_duration_us == 0 ||
+                        deadline_duration_us >
+                            maximum_delay / nanoseconds_per_microsecond)
+                        return EvidenceDeadlineCancellation{};
+                    const auto delay = AggregationScheduler::Duration(
+                        static_cast<AggregationScheduler::Duration::rep>(
+                            deadline_duration_us *
+                            nanoseconds_per_microsecond));
+                    const auto now = aggregation_scheduler->monotonic_now();
+                    if (delay <= AggregationScheduler::Duration::zero() ||
+                        now > AggregationScheduler::Duration::max() - delay)
+                        return EvidenceDeadlineCancellation{};
+                    const auto access = exact_runtime_access;
+                    return schedule_at_or_after_deadline(
+                        *aggregation_scheduler,
+                        now + delay,
+                        [access,
+                         deadline = std::move(deadline)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            deadline(adaptive_evidence_monotonic_now_ns());
+                        },
+                        [access,
+                         failure = std::move(failure)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            failure();
+                        });
+                });
+            adaptive_v2_response_evidence->bind_retry_scheduler(
+                [this](EvidenceRetryCallback retry) {
+                    const auto access = exact_runtime_access;
+                    return aggregation_scheduler->schedule_after(
+                        adaptive_v2_evidence_retry_delay,
+                        [access, retry = std::move(retry)]() mutable {
+                            auto runtime = access->acquire();
+                            if (!runtime.has_value())
+                                return;
+                            retry();
+                        });
+                });
+            adaptive_v2_response_evidence->bind_transport(
+                [this](const EvidenceReportEnvelope &report) {
+                    return enqueue_adaptive_v2_evidence_report(report);
+                });
         }
         rebuild_aggregation_timeout_coordinator();
 
@@ -10931,9 +10996,28 @@ namespace hotstuff
     EvidenceTransportResult HotStuffBase::enqueue_adaptive_v2_evidence_report(
         const EvidenceReportEnvelope &report) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            adaptive_v2_reporting_outbox == nullptr ||
+        if (adaptive_v2_reporting_outbox == nullptr ||
             adaptive_v2_lifecycle_reporting_suppressed)
+            return EvidenceTransportResult::permanent_failure;
+
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            const auto status =
+                adaptive_v2_reporting_outbox->enqueue_evidence(
+                    report.canonical_payload);
+            if (status == AdaptiveV2ReportingEnqueueStatus::queued)
+            {
+                schedule_adaptive_v2_reporting_flush(
+                    adaptive_v2_evidence_retry_delay);
+                return EvidenceTransportResult::accepted;
+            }
+            if (status ==
+                AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+                return EvidenceTransportResult::temporary_failure;
+            poison_adaptive_v2_reporting("v3_evidence_enqueue_failed");
+            return EvidenceTransportResult::permanent_failure;
+        }
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return EvidenceTransportResult::permanent_failure;
 
         const ProposalKey key{
@@ -11662,6 +11746,10 @@ namespace hotstuff
     HotStuffBase::transmit_adaptive_v2_report(
         const AdaptiveV2PendingReport &report) noexcept
     {
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            report.stream != AdaptiveV2ReportingStream::lifecycle &&
+            report.stream != AdaptiveV2ReportingStream::evidence)
+            return AdaptiveV2ReportingDeliveryResult::permanent_failure;
         if (!epoch_manager_peer.has_value() ||
             !authorize_manager_peer(*epoch_manager_peer))
             return AdaptiveV2ReportingDeliveryResult::permanent_failure;
@@ -12411,7 +12499,7 @@ namespace hotstuff
 
     void HotStuffBase::enable_experiment_exact_timeout_attempt_evidence_v3()
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             proposal_contexts->active_configuration().has_value() ||
             adaptive_v2_response_evidence == nullptr ||
             !adaptive_v2_response_evidence
