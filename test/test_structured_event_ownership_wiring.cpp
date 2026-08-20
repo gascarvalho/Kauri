@@ -571,10 +571,13 @@ TEST_CASE(
         CHECK(acknowledgement.find("session_completed_successfully()") !=
               std::string::npos);
         CHECK(v3.find(
-                  "if (session_completed_successfully())\n"
-                  "                        event_context_.stop();\n"
-                  "                    else\n"
+                  "if (!session_completed_successfully())\n"
                   "                        fail(\"session_terminal_on_advance\")") !=
+              std::string::npos);
+        CHECK(acknowledgement.find(
+                  "Keep the process observable as healthy until the experiment") !=
+              std::string::npos);
+        CHECK(acknowledgement.find("event_context_.stop()") ==
               std::string::npos);
     }
 

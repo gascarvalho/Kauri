@@ -3331,10 +3331,12 @@ public:
                 if (facade_.v3_status() ==
                         hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
                 {
-                    if (session_completed_successfully())
-                        event_context_.stop();
-                    else
+                    if (!session_completed_successfully())
                         fail("session_terminal_on_advance");
+                    // A successful manager remains alive until the runner's
+                    // coordinated shutdown signal.  Returning here leaves the
+                    // structured-event drain timer active but does not
+                    // reschedule protocol work.
                     return;
                 }
                 drive_deliveries();
@@ -3873,10 +3875,11 @@ private:
                 hotstuff::AdaptiveV3ManagerSessionStatus::terminal &&
             !failed_)
         {
-            if (session_completed_successfully())
-                event_context_.stop();
-            else
+            if (!session_completed_successfully())
                 fail("readiness_ack_terminal_invalid");
+            // Keep the process observable as healthy until the experiment
+            // runner performs coordinated teardown.  The next retry callback
+            // observes the successful terminal and stops rescheduling itself.
         }
     }
 
