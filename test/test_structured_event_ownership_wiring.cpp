@@ -588,6 +588,23 @@ TEST_CASE(
         CHECK(acknowledgement.find(
                   "failed_ || session_completed_successfully()") !=
               std::string::npos);
+        const auto acknowledge_call = acknowledgement.find(
+            "facade_.v3_acknowledge(");
+        const auto completed_cycle = acknowledgement.find(
+            "AdaptiveV3ManagerSessionTerminalReason::\n"
+            "                    acknowledgements_complete",
+            acknowledge_call);
+        const auto reset_cycle_cursor = acknowledgement.find(
+            "emitted_accepted_observations_ = 0", completed_cycle);
+        const auto emit_ack = acknowledgement.find(
+            "emit_readiness(std::move(event))", reset_cycle_cursor);
+        REQUIRE(acknowledge_call != std::string::npos);
+        REQUIRE(completed_cycle != std::string::npos);
+        REQUIRE(reset_cycle_cursor != std::string::npos);
+        REQUIRE(emit_ack != std::string::npos);
+        CHECK(acknowledge_call < completed_cycle);
+        CHECK(completed_cycle < reset_cycle_cursor);
+        CHECK(reset_cycle_cursor < emit_ack);
     }
 
     CHECK(v3.find("fault_receipt") == std::string::npos);
@@ -1112,7 +1129,7 @@ TEST_CASE(
               std::string::npos);
         CHECK(count_occurrences(
                   manager,
-                  "emitted_accepted_observations_ = 0;") == 1);
+                  "emitted_accepted_observations_ = 0;") == 2);
         const auto publish = rotate.find(
             "session_.consume_ready_and_rotate()");
         const auto failed_rotation_return = rotate.find(

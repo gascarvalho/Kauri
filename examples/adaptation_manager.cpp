@@ -3838,6 +3838,10 @@ private:
     {
         if (failed_ || session_completed_successfully())
             return;
+        const auto *terminal_records_before = facade_.v3_terminal_records();
+        const auto terminal_count_before = terminal_records_before == nullptr
+            ? std::size_t{0}
+            : terminal_records_before->size();
         const auto payload = static_cast<bytearray_t>(message.serialized);
         const auto decoded = hotstuff::decode_activation_readiness_ack(
             payload, options_.wire_limits);
@@ -3850,6 +3854,19 @@ private:
         }
         const auto disposition = facade_.v3_acknowledge(
             source, manager_tick_ns(), payload);
+        const auto *terminal_records_after = facade_.v3_terminal_records();
+        if (terminal_records_after != nullptr &&
+            terminal_records_after->size() > terminal_count_before &&
+            terminal_records_after->back().reason == hotstuff::
+                AdaptiveV3ManagerSessionTerminalReason::
+                    acknowledgements_complete)
+        {
+            // Publishing the successor rotates the ingress ledger.  The
+            // structured-event cursor belongs to that ledger, so begin the
+            // new cycle at its first record while residency lifecycle facts
+            // remain authoritative for the E2 gate.
+            emitted_accepted_observations_ = 0;
+        }
         if (decoded && disposition ==
                 hotstuff::AdaptiveV3CertificateDeliveryDisposition::
                     rejected_ack)
