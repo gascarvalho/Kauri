@@ -11142,7 +11142,14 @@ namespace hotstuff
     void HotStuffBase::report_adaptive_v2_runtime_initialized(
         const ProposalKey &key) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        // V3 timeout evidence is proposal-lifecycle bound just like V2
+        // evidence.  A proposal that cannot commit after the injected fault
+        // still needs its authenticated initialization notice to reach the
+        // manager; otherwise the exact timeout stays quarantined forever.
+        // Reusing the bounded reporting retention here is observational only:
+        // it does not enable V2 convergence or durable consensus state in V3.
+        if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+             epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
             adaptive_v2_reporting_outbox == nullptr ||
             adaptive_v2_lifecycle_reporting_suppressed)
             return;

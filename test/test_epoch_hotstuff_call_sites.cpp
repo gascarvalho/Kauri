@@ -880,7 +880,9 @@ TEST_CASE(
     REQUIRE_FALSE(initialized.empty());
     CHECK(contains_in_order(
         initialized,
-        {"adaptive_v2_durable_initialization_reports.size()",
+        {"epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&",
+         "epoch_protocol_mode != EpochProtocolMode::adaptive_v3",
+         "adaptive_v2_durable_initialization_reports.size()",
          "maximum_proposal_view_generation_observations",
          "adaptive_v2_durable_initialization_reports.emplace",
          "AdaptiveV2DurableInitializationPhase::",
