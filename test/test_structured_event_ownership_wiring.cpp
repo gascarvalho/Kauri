@@ -579,6 +579,15 @@ TEST_CASE(
               std::string::npos);
         CHECK(acknowledgement.find("event_context_.stop()") ==
               std::string::npos);
+        CHECK(common_ingest.find(
+                  "failed_ || session_completed_successfully()") !=
+              std::string::npos);
+        CHECK(observation.find(
+                  "failed_ || session_completed_successfully()") !=
+              std::string::npos);
+        CHECK(acknowledgement.find(
+                  "failed_ || session_completed_successfully()") !=
+              std::string::npos);
     }
 
     CHECK(v3.find("fault_receipt") == std::string::npos);

@@ -3761,6 +3761,8 @@ private:
     void handle_observation(
         MsgActivationReadyObservation &&message, ReplicaID source) noexcept
     {
+        if (failed_ || session_completed_successfully())
+            return;
         const auto payload = static_cast<bytearray_t>(message.serialized);
         const auto decoded = hotstuff::decode_activation_ready_observation(
             payload, options_.wire_limits);
@@ -3834,6 +3836,8 @@ private:
     void handle_ack(
         MsgActivationReadinessAck &&message, ReplicaID source) noexcept
     {
+        if (failed_ || session_completed_successfully())
+            return;
         const auto payload = static_cast<bytearray_t>(message.serialized);
         const auto decoded = hotstuff::decode_activation_readiness_ack(
             payload, options_.wire_limits);
@@ -4422,7 +4426,11 @@ private:
     void ingest_common(const AuthenticatedReporter &source,
                        const Message &message, Ingest &&operation)
     {
-        if (failed_)
+        // The selected transport stays alive after the final successful ACK
+        // so the runner can coordinate process teardown.  Authenticated
+        // messages already in flight must be inert after that append-only
+        // terminal; the session has rotated/cleared its live ingress window.
+        if (failed_ || session_completed_successfully())
             return;
         const auto result = operation(source, message);
         emit_new_v3_accepted_observations();
