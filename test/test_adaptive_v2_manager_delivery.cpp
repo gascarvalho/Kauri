@@ -177,6 +177,12 @@ TEST_CASE(
     CHECK(transport.find("register_handlers") != std::string::npos);
     CHECK(transport.find("send_certificate") != std::string::npos);
     CHECK(transport.find("send_bundle") != std::string::npos);
+    CHECK(transport.find("std::size_t send_bundle") != std::string::npos);
+    CHECK(transport.find("++delivered") != std::string::npos);
+    CHECK(v3_manager.find(
+              "transport_.send_bundle(*bundle) <\n"
+              "                options_.required_release_count") !=
+          std::string::npos);
     CHECK(transport.find("AdaptiveManagerSessionFacade") == std::string::npos);
     CHECK(transport.find("AdaptiveV2TransitionPolicy") == std::string::npos);
     CHECK(transport.find("StructuredEventSink") == std::string::npos);

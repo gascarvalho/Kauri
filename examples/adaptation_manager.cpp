@@ -3137,23 +3137,33 @@ public:
         catch (...) { return false; }
     }
 
-    bool send_bundle(const hotstuff::AdaptiveV3EpochChangeBundle &bundle) noexcept
+    std::size_t send_bundle(
+        const hotstuff::AdaptiveV3EpochChangeBundle &bundle) noexcept
     {
-        try
+        std::size_t delivered = 0;
+        for (const auto &replica : replicas_)
         {
-            for (const auto &replica : replicas_)
+            try
             {
                 const auto connection = network_.get_peer_conn(replica.peer_id);
                 if (connection == nullptr || connection->is_terminated() ||
                     authenticated_source(connection) !=
-                        std::optional<ReplicaID>{replica.replica_id} ||
-                    !network_.send_msg(
-                        hotstuff::MsgAdaptiveV3EpochChangeBundle(bundle), connection))
-                    return false;
+                        std::optional<ReplicaID>{replica.replica_id})
+                    continue;
+                if (network_.send_msg(
+                        hotstuff::MsgAdaptiveV3EpochChangeBundle(bundle),
+                        connection))
+                    ++delivered;
             }
-            return true;
+            catch (...)
+            {
+                // A disconnected or failed recipient remains absent from the
+                // signed readiness barrier.  Continue attempting every other
+                // authenticated replica; the owner enforces the frozen R
+                // release count before it accepts publication.
+            }
         }
-        catch (...) { return false; }
+        return delivered;
     }
 
 private:
@@ -4372,7 +4382,8 @@ private:
                 throw std::runtime_error(
                     "v3 manager session rejected readiness start");
             }
-            if (!transport_.send_bundle(*bundle))
+            if (transport_.send_bundle(*bundle) <
+                options_.required_release_count)
                 throw std::runtime_error("v3 successor bundle send failed");
         }
         catch (...)
