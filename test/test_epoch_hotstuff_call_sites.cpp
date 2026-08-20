@@ -2791,6 +2791,114 @@ TEST_CASE("every adaptive v2 topology publication emits active configuration",
           std::string::npos);
 }
 
+TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
+          "[cert13][adaptive-v3][rotation][runtime]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto application = source("examples/hotstuff_app.cpp");
+    const auto runtime = source("src/epoch_runtime.cpp");
+    const auto initialize = function_body(
+        implementation,
+        "void HotStuffBase::initialize_adaptive_epoch_runtime()");
+    const auto configure = function_body(
+        implementation, "void HotStuffBase::set_tree_period(size_t nblocks)");
+    const auto start = function_body(
+        implementation, "void HotStuffBase::start(");
+    const auto post_commit = function_body(
+        implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto periodic = function_body(
+        implementation,
+        "void HotStuffBase::rotate_adaptive_v2_after_commit(");
+    const auto timeout = function_body(
+        implementation,
+        "HotStuffBase::rotate_tree_on_leader_timeout(");
+    const auto publish = function_body(
+        implementation,
+        "void HotStuffBase::publish_adaptive_v3_activation(");
+    const auto finish_v3 = function_body(
+        runtime, "std::optional<EpochRuntimeUpdate> finish_v3_activation(");
+    const auto rotate_runtime = function_body(
+        runtime, "HotStuffEpochRuntimeAdapter::rotate_to_tree(");
+
+    REQUIRE_FALSE(initialize.empty());
+    CHECK(contains_in_order(
+        application,
+        {"opt_epoch_protocol_mode->get() == \"adaptive_v2\"",
+         "opt_epoch_protocol_mode->get() == \"adaptive_v3\"",
+         "adaptive tree switch period must be a finite positive integer"}));
+    CHECK(contains_in_order(
+        application,
+        {"epoch_protocol_mode == EpochProtocolMode::adaptive_v2",
+         "epoch_protocol_mode == EpochProtocolMode::adaptive_v3",
+         "static_cast<std::size_t>(tree_switch_period)"}));
+    CHECK(contains_in_order(
+        initialize,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "adaptive_v2_tree_switch_period",
+         "AdaptiveV2RotationCoordinator"}));
+
+    REQUIRE_FALSE(configure.empty());
+    CHECK(contains_in_order(
+        configure,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "adaptive_v2_tree_switch_period = nblocks"}));
+
+    REQUIRE_FALSE(start.empty());
+    CHECK(contains_in_order(
+        start,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "adaptive_v2_tree_switch_period.has_value()"}));
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(contains_in_order(
+        post_commit,
+        {"EpochProtocolMode::adaptive_v3",
+         "committed_key =",
+         "process_adaptive_v3_post_block_commit(blk)",
+         "rotate_adaptive_v2_after_commit(committed_key)"}));
+
+    REQUIRE_FALSE(periodic.empty());
+    CHECK(contains_in_order(
+        periodic,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "adaptive_v3_activation_gate",
+         "adaptive_v2_rotation_coordinator->on_commit("}));
+
+    REQUIRE_FALSE(timeout.empty());
+    CHECK(contains_in_order(
+        timeout,
+        {"EpochProtocolMode::adaptive_v1",
+         "EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "adaptive_v3_activation_gate",
+         "adaptive_v2_rotation_coordinator->on_timeout("}));
+
+    REQUIRE_FALSE(publish.empty());
+    CHECK(contains_in_order(
+        publish,
+        {"adaptive_v2_rotation_coordinator->reset_for_activation()",
+         "adaptive_v3_activation_gate.reset()"}));
+
+    REQUIRE_FALSE(finish_v3.empty());
+    CHECK(contains_in_order(
+        finish_v3,
+        {"state.future_drain_configuration = update.activation.configuration",
+         "state.v3_gate = nullptr",
+         "return update"}));
+
+    REQUIRE_FALSE(rotate_runtime.empty());
+    CHECK(contains_in_order(
+        rotate_runtime,
+        {"state_->mode == EpochProtocolMode::adaptive_v2",
+         "state_->mode == EpochProtocolMode::adaptive_v3",
+         "state_->future_drain_configuration =",
+         "update.activation.configuration"}));
+}
+
 TEST_CASE("adaptive v2 rotates only after exact post-commit cadence",
           "[c08][adaptive-v2][commit-cadence][post-block]")
 {
@@ -3508,7 +3616,7 @@ TEST_CASE("adaptive v2 executable rejects a zero commit rotation period",
         {"--tree-switch-period", "0"});
     const auto rejected = run_hotstuff_app(adaptive_v2.values);
     CHECK(rejected.status != 0);
-    CHECK(rejected.output.find("adaptive-v2 tree switch period") !=
+    CHECK(rejected.output.find("adaptive tree switch period") !=
           std::string::npos);
     CHECK(rejected.output.find("replica idx out of range") ==
           std::string::npos);
@@ -3519,7 +3627,7 @@ TEST_CASE("adaptive v2 executable rejects a zero commit rotation period",
     CHECK(adaptive_v1.status != 0);
     CHECK(adaptive_v1.output.find("replica idx out of range") !=
           std::string::npos);
-    CHECK(adaptive_v1.output.find("adaptive-v2 tree switch period") ==
+    CHECK(adaptive_v1.output.find("adaptive tree switch period") ==
           std::string::npos);
 }
 
@@ -3538,7 +3646,7 @@ TEST_CASE("adaptive v2 executable accepts only finite integral rotation periods"
         CAPTURE(invalid);
         CAPTURE(rejected.output);
         CHECK(rejected.status != 0);
-        CHECK(rejected.output.find("adaptive-v2 tree switch period") !=
+        CHECK(rejected.output.find("adaptive tree switch period") !=
               std::string::npos);
         CHECK(rejected.output.find("replica idx out of range") ==
               std::string::npos);
@@ -3553,7 +3661,7 @@ TEST_CASE("adaptive v2 executable accepts only finite integral rotation periods"
         CHECK(compatible.status != 0);
         CHECK(compatible.output.find("replica idx out of range") !=
               std::string::npos);
-        CHECK(compatible.output.find("adaptive-v2 tree switch period") ==
+        CHECK(compatible.output.find("adaptive tree switch period") ==
               std::string::npos);
     }
 }

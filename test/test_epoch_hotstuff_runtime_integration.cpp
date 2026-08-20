@@ -676,7 +676,8 @@ struct V2Harness
         std::vector<ReplicaID> successor_roots = {2, 3},
         std::uint32_t successor_fanout = 2,
         std::uint32_t successor_pipeline_stretch = 2,
-        std::vector<ReplicaID> successor_wait_exempt = {})
+        std::vector<ReplicaID> successor_wait_exempt = {},
+        EpochProtocolMode protocol_mode = EpochProtocolMode::adaptive_v2)
         : epoch0(store.stage(std::move(initial), validation_context(0))),
           epoch1(stage_successor(
               store,
@@ -702,7 +703,7 @@ struct V2Harness
               admission,
               retryable_future,
               validator,
-              EpochProtocolMode::adaptive_v2,
+              protocol_mode,
               limits(),
               transaction),
           binding(
@@ -1071,6 +1072,44 @@ TEST_CASE("adaptive v2 timeout reset rejects a stale expected view",
     CHECK_FALSE(stale.update.has_value());
     CHECK(active_root(harness.activation.active_effect()) == 1);
     CHECK(coordinator.observed_commits() == 0);
+}
+
+TEST_CASE("adaptive v3 shares exact periodic and timeout rotation",
+          "[cert13][adaptive-v3][rotation-coordinator][runtime]")
+{
+    V2Harness harness(
+        rooted_epoch_v2_input(0, {0, 1, 2}),
+        {2, 3},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+    AdaptiveV2RotationCoordinator coordinator(2, harness.binding);
+
+    const auto initial = harness.activation.active_effect();
+    CHECK(active_root(initial) == 0);
+    CHECK(coordinator.on_commit(
+              ProposalKey{initial.configuration, digest("v3-first")},
+              initial.configuration,
+              initial.generation)
+              .disposition == AdaptiveV2RotationDisposition::not_due);
+
+    const auto periodic = coordinator.on_commit(
+        ProposalKey{initial.configuration, digest("v3-second")},
+        initial.configuration,
+        initial.generation);
+    REQUIRE(periodic.disposition ==
+            AdaptiveV2RotationDisposition::rotated);
+    REQUIRE(periodic.update.has_value());
+    CHECK(active_root(harness.activation.active_effect()) == 1);
+
+    const auto after_periodic = harness.activation.active_effect();
+    const auto timeout = coordinator.on_timeout(
+        after_periodic.configuration, after_periodic.generation);
+    REQUIRE(timeout.disposition ==
+            AdaptiveV2RotationDisposition::rotated);
+    REQUIRE(timeout.update.has_value());
+    CHECK(active_root(harness.activation.active_effect()) == 2);
 }
 
 TEST_CASE("adaptive v2 activation resets cadence and excludes its predecessor key",

@@ -1396,7 +1396,8 @@ int main(int argc, char **argv)
             opt_structured_event_commit_observer_id->get(),
             opt_structured_event_commit_observer_instance->get());
     const auto tree_switch_period = opt_tree_switch_period->get();
-    if (opt_epoch_protocol_mode->get() == "adaptive_v2" &&
+    if ((opt_epoch_protocol_mode->get() == "adaptive_v2" ||
+         opt_epoch_protocol_mode->get() == "adaptive_v3") &&
         (!std::isfinite(tree_switch_period) ||
          tree_switch_period < 1.0 ||
          std::trunc(tree_switch_period) != tree_switch_period ||
@@ -1404,7 +1405,7 @@ int main(int argc, char **argv)
              1.0,
              std::numeric_limits<std::size_t>::digits)))
         throw HotStuffError(
-            "adaptive-v2 tree switch period must be a finite positive integer within size_t range");
+            "adaptive tree switch period must be a finite positive integer within size_t range");
     auto idx = opt_idx->get();
     auto client_port = opt_client_port->get();
     std::vector<std::tuple<std::string, std::string, std::string>> replicas;
@@ -1694,7 +1695,8 @@ int main(int argc, char **argv)
     papp->set_fanout(opt_fanout->get());
     papp->set_piped_latency(opt_piped_latency->get(), opt_async_blocks->get());
     papp->set_tree_generation(opt_tree_generation->get(), opt_tree_generation_fpath->get());
-    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+        epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         papp->set_tree_period(
             static_cast<std::size_t>(tree_switch_period));
     else

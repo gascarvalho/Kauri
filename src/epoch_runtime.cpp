@@ -1208,6 +1208,11 @@ std::optional<EpochRuntimeUpdate> finish_v3_activation(
         state.future_drain_configuration = update.activation.configuration;
         state.completed_drain_configuration.reset();
         state.remaining_hint.reset();
+        // The caller retires the gate immediately after publishing this
+        // update.  Drop the non-owning pointer in the same serialized state
+        // transition so later proposal admission and tree rotation cannot
+        // observe a retired gate.
+        state.v3_gate = nullptr;
         return update;
     }
     catch (...)
@@ -1451,7 +1456,8 @@ EpochRotationResult HotStuffEpochRuntimeAdapter::rotate_to_tree(
             update.activation, update.leader_view});
         state_->retire_staged_epoch(update.activation.configuration);
         state_->draining_effect.emplace(previous);
-        if (state_->mode == EpochProtocolMode::adaptive_v2)
+        if (state_->mode == EpochProtocolMode::adaptive_v2 ||
+            state_->mode == EpochProtocolMode::adaptive_v3)
         {
             if (state_->future_drain_configuration &&
                 *state_->future_drain_configuration !=

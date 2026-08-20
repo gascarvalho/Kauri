@@ -2060,11 +2060,12 @@ namespace hotstuff
         auto runtime =
             std::make_unique<AdaptiveEpochRuntime>(*this, *active);
         std::unique_ptr<AdaptiveV2RotationCoordinator> coordinator;
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         {
             if (!adaptive_v2_tree_switch_period.has_value())
                 throw std::logic_error(
-                    "adaptive-v2 tree switch period is not configured");
+                    "adaptive tree switch period is not configured");
             coordinator =
                 std::make_unique<AdaptiveV2RotationCoordinator>(
                     *adaptive_v2_tree_switch_period,
@@ -8919,6 +8920,8 @@ namespace hotstuff
             ->certificate_apply_committed_height();
         const auto certificate_digest =
             adaptive_v3_retired_activation_receipt->certificate_digest;
+        if (adaptive_v2_rotation_coordinator != nullptr)
+            adaptive_v2_rotation_coordinator->reset_for_activation();
         adaptive_v3_activation_gate.reset();
         adaptive_v3_committed_command.reset();
         adaptive_v3_pending_observation.reset();
@@ -13155,17 +13158,18 @@ namespace hotstuff
 
     void HotStuffBase::set_tree_period(size_t nblocks)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
         {
             HotStuffCore::set_tree_period(nblocks);
             return;
         }
         if (nblocks == 0)
             throw std::invalid_argument(
-                "adaptive-v2 tree switch period must be positive");
+                "adaptive tree switch period must be positive");
         if (adaptive_epoch_runtime != nullptr)
             throw std::logic_error(
-                "adaptive-v2 tree switch period must be configured before startup");
+                "adaptive tree switch period must be configured before startup");
 
         HotStuffCore::set_tree_period(nblocks);
         adaptive_v2_tree_switch_period = nblocks;
@@ -14932,8 +14936,14 @@ namespace hotstuff
                     emit_commit_identity_unavailable_event(
                         blk, commit_batch_index);
             }
+            const auto committed_key =
+                pending_adaptive_v2_commit &&
+                    pending_adaptive_v2_commit->block_hash == blk->get_hash()
+                ? pending_adaptive_v2_commit->committed_key
+                : std::optional<ProposalKey>{};
             pending_adaptive_v2_commit.reset();
             process_adaptive_v3_post_block_commit(blk);
+            rotate_adaptive_v2_after_commit(committed_key);
             return;
         }
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
@@ -15223,9 +15233,17 @@ namespace hotstuff
     void HotStuffBase::rotate_adaptive_v2_after_commit(
         const std::optional<ProposalKey> &committed_key) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        // A committed v3 transition pins one exact predecessor
+        // configuration/generation until its readiness certificate is
+        // applied.  Intra-epoch rotation is therefore paused only for that
+        // bounded gate lifetime and resumes from successor tree zero after
+        // publication resets the cadence.
+        if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+             epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
             adaptive_epoch_runtime == nullptr ||
-            adaptive_v2_rotation_coordinator == nullptr)
+            adaptive_v2_rotation_coordinator == nullptr ||
+            (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+             adaptive_v3_activation_gate != nullptr))
             return;
 
         const auto active =
@@ -15310,15 +15328,22 @@ namespace hotstuff
         const LeaderViewId &expired_view) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v1 &&
-            epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return LeaderTimeoutRotationDisposition::legacy_fallback;
         if (adaptive_epoch_runtime == nullptr ||
             epoch_live_binding == nullptr)
             return LeaderTimeoutRotationDisposition::rejected;
 
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         {
-            if (adaptive_v2_rotation_coordinator == nullptr)
+            // See rotate_adaptive_v2_after_commit: changing the predecessor
+            // view after v3 has latched it would invalidate the certified
+            // activation identity.
+            if (adaptive_v2_rotation_coordinator == nullptr ||
+                (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+                 adaptive_v3_activation_gate != nullptr))
                 return LeaderTimeoutRotationDisposition::rejected;
             const auto rotation =
                 adaptive_v2_rotation_coordinator->on_timeout(
@@ -15977,11 +16002,12 @@ namespace hotstuff
     void HotStuffBase::start(std::vector<std::tuple<NetAddr, pubkey_bt, uint256_t>> &&replicas, bool ec_loop)
     {
 
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+             epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
             !adaptive_v2_tree_switch_period.has_value())
         {
             throw HotStuffError(
-                "adaptive-v2 startup requires a positive tree switch period");
+                "adaptive startup requires a positive tree switch period");
         }
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
         {
