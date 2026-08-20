@@ -11014,6 +11014,26 @@ namespace hotstuff
             const auto status =
                 adaptive_v2_reporting_outbox->enqueue_evidence(
                     report.canonical_payload);
+            if (report.observation.outcome == ResponseOutcome::timeout)
+            {
+                const auto diagnostics =
+                    adaptive_v2_reporting_outbox->diagnostics();
+                HOTSTUFF_LOG_INFO(
+                    "[EVIDENCE] V3 timeout report enqueue "
+                    "reporter=%u target=%u sequence=%llu status=%u "
+                    "pending=%zu pending_bytes=%zu last_sequence=%llu "
+                    "healthy=%u",
+                    get_id(),
+                    report.observation.observed_replica_id,
+                    static_cast<unsigned long long>(
+                        report.observation.reporter_sequence),
+                    static_cast<unsigned>(status),
+                    diagnostics.pending_reports,
+                    diagnostics.pending_payload_bytes,
+                    static_cast<unsigned long long>(
+                        diagnostics.last_evidence_sequence),
+                    diagnostics.healthy ? 1U : 0U);
+            }
             if (status == AdaptiveV2ReportingEnqueueStatus::queued)
             {
                 schedule_adaptive_v2_reporting_flush(
