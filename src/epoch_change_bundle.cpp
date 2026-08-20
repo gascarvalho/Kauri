@@ -13,6 +13,8 @@ namespace
 
 const std::string kBundleDomain =
     "kauri-adaptive-v2-epoch-change-bundle-v1";
+const std::string kAdaptiveV3BundleDomain =
+    "kauri-adaptive-v3-epoch-change-bundle-v2";
 
 struct BundleFailure
 {
@@ -80,14 +82,17 @@ struct NormalizedComponents
 NormalizedComponents normalize_components(
     AuthorizedEpochChange command,
     EpochDefinitionInput definition,
-    const EpochChangeBundleLimits &limits)
+    const EpochChangeBundleLimits &limits,
+    std::uint32_t command_schema,
+    EpochProtocolMode protocol_mode,
+    std::uint32_t wire_schema)
 {
     require_limits(limits);
-    if (command.schema_version != kEpochChangeSchemaVersionV1 ||
-        command.protocol_mode != EpochProtocolMode::adaptive_v2)
+    if (command.schema_version != command_schema ||
+        command.protocol_mode != protocol_mode)
     {
         throw std::invalid_argument(
-            "epoch-change bundle requires an adaptive-v2 command");
+            "epoch-change bundle command contract mismatch");
     }
     if (definition.schema_version != kEpochDefinitionSchemaVersionV2 ||
         definition.activation_height != 0)
@@ -112,8 +117,12 @@ NormalizedComponents normalize_components(
     if (command_bytes.size() > limits.maximum_command_bytes)
         throw std::length_error(
             "epoch-change bundle command exceeds limit");
-    const auto canonical_command = extract_epoch_change_block_extra(
-        command_bytes, limits.maximum_command_bytes);
+    const auto canonical_command =
+        protocol_mode == EpochProtocolMode::adaptive_v2
+            ? extract_epoch_change_block_extra(
+                  command_bytes, limits.maximum_command_bytes)
+            : extract_epoch_change_block_extra_v3(
+                  command_bytes, limits.maximum_command_bytes);
     if (canonical_command.disposition !=
             EpochChangeExtraDisposition::present ||
         !canonical_command.command)
@@ -125,14 +134,14 @@ NormalizedComponents normalize_components(
 
     auto definition_bytes = encode_epoch_wire(
         EpochDefinitionReply{
-            kEpochWireSchemaVersionV2,
-            EpochProtocolMode::adaptive_v2,
+            wire_schema,
+            protocol_mode,
             computed_digest,
             std::move(definition)},
         limits.definition_limits);
     const auto decoded_definition = decode_epoch_definition_reply(
         definition_bytes,
-        EpochProtocolMode::adaptive_v2,
+        protocol_mode,
         limits.definition_limits);
     if (!decoded_definition)
         throw std::logic_error(
@@ -148,15 +157,17 @@ NormalizedComponents normalize_components(
 bytearray_t encode_bundle(
     const bytearray_t &command,
     const bytearray_t &definition,
-    const EpochChangeBundleLimits &limits)
+    const EpochChangeBundleLimits &limits,
+    const std::string &domain,
+    std::uint32_t schema,
+    EpochProtocolMode protocol_mode)
 {
     Writer writer(
         limits.maximum_payload_bytes,
         "epoch-change bundle payload exceeds limit");
-    writer.domain(kBundleDomain);
-    writer.integer(kEpochChangeBundleSchemaVersionV1);
-    writer.integer(
-        static_cast<std::uint8_t>(EpochProtocolMode::adaptive_v2));
+    writer.domain(domain);
+    writer.integer(schema);
+    writer.integer(static_cast<std::uint8_t>(protocol_mode));
     append_component(writer, command);
     append_component(writer, definition);
     return std::move(writer).finish();
@@ -177,17 +188,32 @@ const std::string &epoch_change_bundle_domain() noexcept
     return kBundleDomain;
 }
 
+const std::string &adaptive_v3_epoch_change_bundle_domain() noexcept
+{
+    return kAdaptiveV3BundleDomain;
+}
+
 AdaptiveV2EpochChangeBundle::AdaptiveV2EpochChangeBundle(
     AuthorizedEpochChange command,
     EpochDefinitionInput definition,
     const EpochChangeBundleLimits &limits)
 {
     auto normalized = normalize_components(
-        std::move(command), std::move(definition), limits);
+        std::move(command),
+        std::move(definition),
+        limits,
+        kEpochChangeSchemaVersionV1,
+        EpochProtocolMode::adaptive_v2,
+        kEpochWireSchemaVersionV2);
     command_ = std::move(normalized.command);
     definition_ = std::move(normalized.definition);
     canonical_bytes_ = encode_bundle(
-        normalized.command_bytes, normalized.definition_bytes, limits);
+        normalized.command_bytes,
+        normalized.definition_bytes,
+        limits,
+        kBundleDomain,
+        kEpochChangeBundleSchemaVersionV1,
+        EpochProtocolMode::adaptive_v2);
 }
 
 EpochChangeBundleDecodeResult decode_adaptive_v2_epoch_change_bundle(
@@ -280,6 +306,134 @@ EpochChangeBundleDecodeResult decode_adaptive_v2_epoch_change_bundle(
     }
 }
 
+AdaptiveV3EpochChangeBundle::AdaptiveV3EpochChangeBundle(
+    AuthorizedEpochChange command,
+    EpochDefinitionInput definition,
+    const EpochChangeBundleLimits &limits)
+{
+    auto normalized = normalize_components(
+        std::move(command),
+        std::move(definition),
+        limits,
+        kEpochChangeSchemaVersionV2,
+        EpochProtocolMode::adaptive_v3,
+        kEpochWireSchemaVersionV3);
+    command_ = std::move(normalized.command);
+    definition_ = std::move(normalized.definition);
+    canonical_bytes_ = encode_bundle(
+        normalized.command_bytes,
+        normalized.definition_bytes,
+        limits,
+        kAdaptiveV3BundleDomain,
+        kEpochChangeBundleSchemaVersionV2,
+        EpochProtocolMode::adaptive_v3);
+}
+
+AdaptiveV3EpochChangeBundleDecodeResult
+decode_adaptive_v3_epoch_change_bundle(
+    const bytearray_t &payload,
+    const EpochChangeBundleLimits &limits) noexcept
+{
+    const auto rejected_v3 = [](
+        EpochChangeBundleWireError error,
+        EpochChangeWireError command_error = EpochChangeWireError::none,
+        EpochWireError definition_error = EpochWireError::none) noexcept {
+        return AdaptiveV3EpochChangeBundleDecodeResult{
+            error,
+            command_error,
+            definition_error,
+            std::nullopt};
+    };
+
+    if (!valid_limits(limits))
+        return rejected_v3(EpochChangeBundleWireError::invalid_limits);
+    if (payload.size() > limits.maximum_payload_bytes)
+        return rejected_v3(EpochChangeBundleWireError::payload_too_large);
+
+    try
+    {
+        Reader reader(payload, EpochChangeBundleWireError::truncated);
+        reader.domain(
+            kAdaptiveV3BundleDomain,
+            EpochChangeBundleWireError::invalid_domain);
+        const auto schema = reader.integer<std::uint32_t>();
+        if (schema != kEpochChangeBundleSchemaVersionV2)
+            return rejected_v3(
+                EpochChangeBundleWireError::unsupported_schema);
+        const auto mode = static_cast<EpochProtocolMode>(
+            reader.integer<std::uint8_t>());
+        if (mode != EpochProtocolMode::adaptive_v3)
+            return rejected_v3(EpochChangeBundleWireError::mode_mismatch);
+
+        auto command_bytes = read_component(
+            reader, limits.maximum_command_bytes);
+        auto definition_bytes = read_component(
+            reader,
+            limits.definition_limits.maximum_payload_bytes);
+        if (!reader.empty())
+            return rejected_v3(EpochChangeBundleWireError::trailing_bytes);
+
+        auto command = extract_epoch_change_block_extra_v3(
+            command_bytes, limits.maximum_command_bytes);
+        if (command.disposition != EpochChangeExtraDisposition::present ||
+            !command.command)
+        {
+            return rejected_v3(
+                EpochChangeBundleWireError::invalid_command,
+                command.wire_error == EpochChangeWireError::none
+                    ? EpochChangeWireError::internal_failure
+                    : command.wire_error);
+        }
+
+        auto definition = decode_epoch_definition_reply(
+            definition_bytes,
+            EpochProtocolMode::adaptive_v3,
+            limits.definition_limits);
+        if (!definition)
+        {
+            return rejected_v3(
+                EpochChangeBundleWireError::invalid_definition,
+                EpochChangeWireError::none,
+                definition.error);
+        }
+
+        AdaptiveV3EpochChangeBundle bundle(
+            std::move(*command.command),
+            std::move(definition.value->definition),
+            limits);
+        if (bundle.canonical_bytes() != payload)
+        {
+            return rejected_v3(
+                EpochChangeBundleWireError::noncanonical_encoding);
+        }
+        return {
+            EpochChangeBundleWireError::none,
+            EpochChangeWireError::none,
+            EpochWireError::none,
+            std::move(bundle)};
+    }
+    catch (const BundleFailure &failure)
+    {
+        return rejected_v3(failure.error);
+    }
+    catch (const std::invalid_argument &)
+    {
+        return rejected_v3(EpochChangeBundleWireError::identity_mismatch);
+    }
+    catch (const std::length_error &)
+    {
+        return rejected_v3(EpochChangeBundleWireError::component_too_large);
+    }
+    catch (const std::bad_alloc &)
+    {
+        return rejected_v3(EpochChangeBundleWireError::allocation_failure);
+    }
+    catch (...)
+    {
+        return rejected_v3(EpochChangeBundleWireError::internal_failure);
+    }
+}
+
 const opcode_t MsgAdaptiveV2EpochChangeBundle::opcode;
 
 MsgAdaptiveV2EpochChangeBundle::MsgAdaptiveV2EpochChangeBundle(
@@ -289,6 +443,20 @@ MsgAdaptiveV2EpochChangeBundle::MsgAdaptiveV2EpochChangeBundle(
 }
 
 MsgAdaptiveV2EpochChangeBundle::MsgAdaptiveV2EpochChangeBundle(
+    DataStream &&serialized_payload)
+    : serialized(std::move(serialized_payload))
+{
+}
+
+const opcode_t MsgAdaptiveV3EpochChangeBundle::opcode;
+
+MsgAdaptiveV3EpochChangeBundle::MsgAdaptiveV3EpochChangeBundle(
+    const AdaptiveV3EpochChangeBundle &value)
+    : serialized(value.canonical_bytes())
+{
+}
+
+MsgAdaptiveV3EpochChangeBundle::MsgAdaptiveV3EpochChangeBundle(
     DataStream &&serialized_payload)
     : serialized(std::move(serialized_payload))
 {

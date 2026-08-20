@@ -213,6 +213,23 @@ public:
         std::uint64_t height,
         const uint256_t &predecessor_digest);
 
+    /**
+     * Adaptive-v3 applies only after the separate certified-activation gate
+     * has authenticated the exact readiness certificate.  These methods do
+     * not inspect evidence; they atomically validate and publish the exact
+     * predecessor-to-successor runtime identity selected by that gate.
+     */
+    EpochActivationResult preview_v3_certified_activation(
+        const ConfigurationId &predecessor_configuration,
+        std::uint64_t predecessor_generation,
+        const ConfigurationId &successor_configuration,
+        std::uint64_t successor_generation) const;
+    EpochActivationResult apply_v3_certified_activation(
+        const ConfigurationId &predecessor_configuration,
+        std::uint64_t predecessor_generation,
+        const ConfigurationId &successor_configuration,
+        std::uint64_t successor_generation);
+
     EpochActivationResult on_predecessor_commit(
         std::uint64_t height,
         const uint256_t &digest);

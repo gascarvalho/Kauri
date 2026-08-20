@@ -480,16 +480,29 @@ struct AdaptiveV2ManagerController::State
                     std::move(decision));
         }
 
+        if (config.successor_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            auto v3 = build_adaptive_v3_successor_bundle(
+                ingress.current_epoch(), *latest_selection,
+                config.transition_policy, placement,
+                config.activation_delay_blocks, config.issuer_id,
+                config.issuer_private_key, config.bundle_limits);
+            if (!v3 || v3.bundle == nullptr)
+                return fail_closed(AdaptiveV2ManagerControllerFailureDetail{
+                    AdaptiveV2ManagerControllerFailureStage::successor_factory,
+                    AdaptiveV2SelectionStatus::selected, v3.status});
+            successor_v3 = std::move(v3.bundle);
+            return AdaptiveV2ManagerControllerStatus::successor_ready;
+        }
+        if (config.successor_protocol_mode != EpochProtocolMode::adaptive_v2)
+            return fail_closed();
         auto built = build_adaptive_v2_successor_bundle(
-            ingress.current_epoch(),
-            *latest_selection,
-            config.transition_policy,
-            placement,
-            config.activation_delay_blocks,
-            config.issuer_id,
-            config.issuer_private_key,
-            config.bundle_limits);
-        if (!built || built.bundle == nullptr)
+            ingress.current_epoch(), *latest_selection,
+            config.transition_policy, placement,
+            config.activation_delay_blocks, config.issuer_id,
+            config.issuer_private_key, config.bundle_limits);
+        if (
+            !built || built.bundle == nullptr)
         {
             const auto factory_status =
                 built.status == AdaptiveV2EpochFactoryStatus::success
@@ -590,6 +603,7 @@ struct AdaptiveV2ManagerController::State
     std::unique_ptr<AdaptationSnapshot> baseline_snapshot;
     std::unique_ptr<AdaptiveV2SelectionResult> latest_selection;
     std::unique_ptr<const AdaptiveV2EpochChangeBundle> successor;
+    std::unique_ptr<const AdaptiveV3EpochChangeBundle> successor_v3;
     std::unique_ptr<ShapeDecisionRecord> shape_decision;
     std::vector<ReplicaID> inherited_wait_exempt;
     bool inherit_consensus_wait_exempt{false};
@@ -617,7 +631,7 @@ AdaptiveV2ManagerController::evaluate() noexcept
     {
         if (!state.operational())
             return state.fail_operational();
-        if (state.successor != nullptr)
+        if (state.successor != nullptr || state.successor_v3 != nullptr)
             return AdaptiveV2ManagerControllerStatus::already_ready;
         if (!state.ingress.operationally_ready())
             return AdaptiveV2ManagerControllerStatus::awaiting_readiness;
@@ -679,6 +693,12 @@ const AdaptiveV2EpochChangeBundle *
 AdaptiveV2ManagerController::successor_bundle() const noexcept
 {
     return state_->successor.get();
+}
+
+const AdaptiveV3EpochChangeBundle *
+AdaptiveV2ManagerController::successor_bundle_v3() const noexcept
+{
+    return state_->successor_v3.get();
 }
 
 const ShapeDecisionRecord *

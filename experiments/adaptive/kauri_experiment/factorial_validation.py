@@ -870,6 +870,10 @@ _DIRECT_VOTE_RESPONSIVENESS_POLICY_VERSION = (
 )
 _BUNDLE_DOMAIN = b"kauri-adaptive-v2-epoch-change-bundle-v1"
 _AUTHORIZED_COMMAND_DOMAIN = b"kauri-authorized-epoch-change-v1"
+_ADAPTIVE_V3_BUNDLE_DOMAIN = b"kauri-adaptive-v3-epoch-change-bundle-v2"
+_ADAPTIVE_V3_AUTHORIZED_COMMAND_DOMAIN = (
+    b"kauri-adaptive-v3-authorized-epoch-change-v2"
+)
 _EPOCH_CHANGE_PAYLOAD_DOMAIN = b"kauri-epoch-change-payload-v1"
 _EPOCH_DEFINITION_DOMAIN = b"kauri-epoch-definition-v2"
 _MEMBERSHIP_DOMAIN = b"kauri-membership-v1"
@@ -3663,28 +3667,39 @@ def _verify_secp256k1_signature(
         _fail("epoch command signature does not verify under the archived issuer key")
 
 
-def decode_epoch_change_bundle(
+def _decode_epoch_change_bundle_for_protocol(
     payload: bytes,
     *,
     issuer_public_key: str,
+    bundle_domain: bytes,
+    bundle_schema: int,
+    bundle_mode: int,
+    command_domain: bytes,
+    command_schema: int,
+    command_mode: int,
+    definition_reply_schema: int,
+    definition_reply_mode: int,
 ) -> DecodedBundle:
-    """Decode and re-canonicalize a native adaptive-v2 bundle."""
+    """Decode and re-canonicalize one exact native adaptive bundle wire."""
 
     if not payload or len(payload) > _MAX_JSON_BYTES:
         _fail("epoch-change bundle is empty or exceeds the validation bound")
     outer = _WireReader(payload, "epoch-change bundle")
-    if outer.take(len(_BUNDLE_DOMAIN)) != _BUNDLE_DOMAIN:
+    if outer.take(len(bundle_domain)) != bundle_domain:
         _fail("epoch-change bundle domain is invalid")
-    if outer.integer(4) != 1 or outer.integer(1) != 2:
+    if outer.integer(4) != bundle_schema or outer.integer(1) != bundle_mode:
         _fail("epoch-change bundle schema/mode is invalid")
     command_bytes = outer.take(outer.integer(4))
     definition_bytes = outer.take(outer.integer(4))
     outer.finish()
 
     command_reader = _WireReader(command_bytes, "authorized epoch-change command")
-    if command_reader.take(len(_AUTHORIZED_COMMAND_DOMAIN)) != _AUTHORIZED_COMMAND_DOMAIN:
+    if command_reader.take(len(command_domain)) != command_domain:
         _fail("authorized epoch-change command domain is invalid")
-    if command_reader.integer(4) != 1 or command_reader.integer(1) != 2:
+    if (
+        command_reader.integer(4) != command_schema
+        or command_reader.integer(1) != command_mode
+    ):
         _fail("authorized epoch-change command schema/mode is invalid")
     issuer_id = command_reader.integer(4)
     successor_epoch_number = command_reader.integer(4)
@@ -3712,8 +3727,8 @@ def decode_epoch_change_bundle(
 
     definition_reader = _WireReader(definition_bytes, "epoch definition reply")
     if (
-        definition_reader.integer(4) != 2
-        or definition_reader.integer(1) != 2
+        definition_reader.integer(4) != definition_reply_schema
+        or definition_reader.integer(1) != definition_reply_mode
         or definition_reader.integer(1) != 6
     ):
         _fail("epoch definition reply schema/mode/kind is invalid")
@@ -3797,6 +3812,48 @@ def decode_epoch_change_bundle(
         evidence_snapshot_id=evidence_snapshot_id,
         evidence_cutoff=evidence_cutoff,
         trees=tuple(trees),
+    )
+
+
+def decode_epoch_change_bundle(
+    payload: bytes,
+    *,
+    issuer_public_key: str,
+) -> DecodedBundle:
+    """Decode and re-canonicalize a native adaptive-v2 bundle."""
+
+    return _decode_epoch_change_bundle_for_protocol(
+        payload,
+        issuer_public_key=issuer_public_key,
+        bundle_domain=_BUNDLE_DOMAIN,
+        bundle_schema=1,
+        bundle_mode=2,
+        command_domain=_AUTHORIZED_COMMAND_DOMAIN,
+        command_schema=1,
+        command_mode=2,
+        definition_reply_schema=2,
+        definition_reply_mode=2,
+    )
+
+
+def decode_adaptive_v3_epoch_change_bundle(
+    payload: bytes,
+    *,
+    issuer_public_key: str,
+) -> DecodedBundle:
+    """Independently decode the canonical adaptive-v3 schema-2 bundle."""
+
+    return _decode_epoch_change_bundle_for_protocol(
+        payload,
+        issuer_public_key=issuer_public_key,
+        bundle_domain=_ADAPTIVE_V3_BUNDLE_DOMAIN,
+        bundle_schema=2,
+        bundle_mode=3,
+        command_domain=_ADAPTIVE_V3_AUTHORIZED_COMMAND_DOMAIN,
+        command_schema=2,
+        command_mode=3,
+        definition_reply_schema=3,
+        definition_reply_mode=3,
     )
 
 
@@ -20878,6 +20935,7 @@ __all__ = (
     "SecondaryPlacementVerdict",
     "SlotValidationResult",
     "Tree",
+    "decode_adaptive_v3_epoch_change_bundle",
     "decode_epoch_change_bundle",
     "derive_actor_ids",
     "fnv1a_rotating_actor",

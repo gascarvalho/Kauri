@@ -107,6 +107,145 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "checkpoint4 v3 uses the unified facade route with timed ingress",
+    "[.][intentional-red][adaptive-v3][manager-route][checkpoint4]")
+{
+    const auto source = read_source("examples/adaptation_manager.cpp");
+    const auto v3_config_begin = source.find(
+        "AdaptiveV3ManagerSessionConfig adaptive_v3_session_config(");
+    const auto v3_config_end = source.find(
+        "AdaptiveManagerSessionFacadeConfig", v3_config_begin);
+    REQUIRE(v3_config_begin != std::string::npos);
+    REQUIRE(v3_config_end != std::string::npos);
+    const auto v3_config = source.substr(
+        v3_config_begin, v3_config_end - v3_config_begin);
+    const auto transport_begin = source.find(
+        "class AdaptiveV3ManagerTransport final");
+    const auto v3_manager_begin = source.find(
+        "class AdaptiveV3ManagerModeState final", transport_begin);
+    const auto v2_manager_begin = source.find(
+        "class AdaptiveV2ManagerModeState final", v3_manager_begin);
+    REQUIRE(transport_begin != std::string::npos);
+    REQUIRE(v3_manager_begin != std::string::npos);
+    REQUIRE(v2_manager_begin != std::string::npos);
+    const auto transport = source.substr(
+        transport_begin, v3_manager_begin - transport_begin);
+    const auto v3_manager = source.substr(
+        v3_manager_begin, v2_manager_begin - v3_manager_begin);
+    // A caller cannot precompute an identity: the certified v3 successor is
+    // selected and emitted by the existing AdaptationManager route.
+    CHECK(source.find("activation-readiness-identity") == std::string::npos);
+    // The retired side manager must disappear once v3 is held by the existing
+    // manager through the explicit mode facade.
+    CHECK(source.find("class AdaptiveV3AdaptationManager final") == std::string::npos);
+    CHECK(source.find("class AdaptationManager final") != std::string::npos);
+    CHECK(source.find("std::make_unique<AdaptationManager>") !=
+          std::string::npos);
+    CHECK(source.find("AdaptiveManagerSessionFacade") != std::string::npos);
+    // Live E2 gating must retain raw-nanosecond precision.  A raw clock
+    // divided to milliseconds would admit a sub-millisecond early boundary.
+    CHECK(source.find("CLOCK_MONOTONIC_RAW") != std::string::npos);
+    CHECK(source.find("manager_tick_ns") != std::string::npos);
+    CHECK(source.find("1000000000ULL") != std::string::npos);
+    CHECK(source.find("now.tv_nsec") != std::string::npos);
+    CHECK(source.find("/ 1000000ULL") == std::string::npos);
+    CHECK(source.find("100'000'000ULL") != std::string::npos);
+    CHECK(source.find("5'000'000'000ULL") != std::string::npos);
+    CHECK(source.find("60'000'000'000ULL") != std::string::npos);
+    CHECK(source.find("65'000'000'000ULL") != std::string::npos);
+    CHECK(source.find("90'000'000'000ULL") != std::string::npos);
+    // CLI retry interval is milliseconds, unlike direct session fixture
+    // defaults.  The live path must check then convert it to raw ns.
+    CHECK(v3_config.find(
+              "std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL") !=
+          std::string::npos);
+    CHECK(v3_config.find("options.retry_interval_ticks * 1'000'000ULL") !=
+          std::string::npos);
+    CHECK(source.find("v3_ingest_timed_lifecycle") != std::string::npos);
+    CHECK(source.find("v3_arm_hard_deadline") != std::string::npos);
+    CHECK(source.find("v3_e2_eligible") != std::string::npos);
+    // The one existing arm-deadline binding is the profile-provided hard
+    // bound.  It is consumed as raw ns from the verified fault anchor, with
+    // overflow and half-open equality rejected before the session is armed.
+    CHECK(v3_manager.find("bindings.deadline_seconds") != std::string::npos);
+    CHECK(v3_manager.find("fault_anchor_ns") != std::string::npos);
+    CHECK(v3_manager.find("kNanosecondsPerSecond") != std::string::npos);
+    CHECK(v3_manager.find("max() - duration_ns") != std::string::npos);
+    CHECK(v3_manager.find("manager_tick_ns() >= hard_deadline_ns") !=
+          std::string::npos);
+    CHECK(source.find("read_fault_window_arm") != std::string::npos);
+    CHECK(transport.find("register_handlers") != std::string::npos);
+    CHECK(transport.find("send_certificate") != std::string::npos);
+    CHECK(transport.find("send_bundle") != std::string::npos);
+    CHECK(transport.find("AdaptiveManagerSessionFacade") == std::string::npos);
+    CHECK(transport.find("AdaptiveV2TransitionPolicy") == std::string::npos);
+    CHECK(transport.find("StructuredEventSink") == std::string::npos);
+    CHECK(transport.find("TimerEvent") == std::string::npos);
+    CHECK(v3_manager.find("AdaptiveV3ManagerTransport transport_") !=
+          std::string::npos);
+    // Manager-side terminal publication follows the append-only session audit,
+    // so E1 and E2 each publish once and a pre-certificate deadline never
+    // fabricates a readiness certificate.
+    CHECK(v3_manager.find("emit_new_session_terminals") != std::string::npos);
+    CHECK(v3_manager.find("emitted_session_terminals_") != std::string::npos);
+    CHECK(v3_manager.find("v3_terminal_records") != std::string::npos);
+    CHECK(v3_manager.find("terminal_identity = record.identity") !=
+          std::string::npos);
+    CHECK(v3_manager.find("terminal_bundle_digest = record.bundle_digest") !=
+          std::string::npos);
+    const auto acknowledged = v3_manager.find("certificate_acknowledged");
+    REQUIRE(acknowledged != std::string::npos);
+    CHECK(v3_manager.find("emit_new_session_terminals();", acknowledged) !=
+          std::string::npos);
+    // Terminal-producing callback boundaries mirror before failure or any
+    // post-terminal payload dereference/audit.
+    CHECK(v3_manager.find("!facade_.v3_begin_readiness(manager_tick_ns())") !=
+          std::string::npos);
+    CHECK(v3_manager.find("const auto certificate_identity") !=
+          std::string::npos);
+    CHECK(v3_manager.find("certificate_digest = certificate_digest") !=
+          std::string::npos);
+    CHECK(v3_manager.find("facade_.v3_status() ==\n                    hotstuff::AdaptiveV3ManagerSessionStatus::terminal") !=
+          std::string::npos);
+    const auto delivery_result = v3_manager.find(
+        "const auto disposition = facade_.v3_record_delivery_result");
+    REQUIRE(delivery_result != std::string::npos);
+    const auto delivery_audit = v3_manager.find(
+        "emit_readiness(std::move(event));", delivery_result);
+    const auto delivery_terminal = v3_manager.find(
+        "emit_new_session_terminals();", delivery_result);
+    REQUIRE(delivery_audit != std::string::npos);
+    REQUIRE(delivery_terminal != std::string::npos);
+    CHECK(delivery_audit < delivery_terminal);
+    const auto delivery_payload_copy = v3_manager.find(
+        "event.canonical_wire_payload = *delivery->bytes", delivery_result - 2048);
+    REQUIRE(delivery_payload_copy != std::string::npos);
+    CHECK(delivery_payload_copy < delivery_result);
+    CHECK(v3_manager.find("disposition ==\n                hotstuff::AdaptiveV3CertificateDeliveryDisposition::queued") !=
+          std::string::npos);
+    CHECK(v3_manager.find("event.disposition = \"deadline_expired\"") !=
+          std::string::npos);
+    CHECK(v3_manager.find("event.delivery_enqueued = enqueued") !=
+          std::string::npos);
+    CHECK(v3_manager.find("ManagerNetwork network_") == std::string::npos);
+    const auto facade_member = v3_manager.find(
+        "hotstuff::AdaptiveManagerSessionFacade facade_");
+    const auto transport_member = v3_manager.find(
+        "AdaptiveV3ManagerTransport transport_");
+    REQUIRE(facade_member != std::string::npos);
+    REQUIRE(transport_member != std::string::npos);
+    CHECK(facade_member < transport_member);
+    const auto transport_stop = transport.find("bool stop() noexcept");
+    REQUIRE(transport_stop != std::string::npos);
+    const auto callbacks_quiesced = transport.find("callbacks_ = {}", transport_stop);
+    const auto network_stop = transport.find("network_.stop()", transport_stop);
+    REQUIRE(callbacks_quiesced != std::string::npos);
+    REQUIRE(network_stop != std::string::npos);
+    CHECK(callbacks_quiesced < network_stop);
+    CHECK(transport.find("~AdaptiveV3ManagerTransport") != std::string::npos);
+}
+
+TEST_CASE(
     "fatal manager ingress logs one bounded diagnostic before shutdown",
     "[adaptive-v2][manager-ingress][diagnostic]")
 {

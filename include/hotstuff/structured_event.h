@@ -15,6 +15,7 @@
 
 #include "hotstuff/adaptive_v2_convergence_wire.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
+#include "hotstuff/activation_readiness_wire.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/evidence_reputation.h"
 #include "hotstuff/experiment_byzantine_adapter.h"
@@ -70,6 +71,9 @@ struct EpochLifecycleEvent
     EpochLifecycleTransition transition{EpochLifecycleTransition::generated};
     ConfigurationId configuration;
     std::uint64_t activation_height{0};
+    /** Adaptive-v3 only. Both values are absent for every legacy event. */
+    std::optional<std::uint64_t> certificate_apply_committed_height;
+    std::optional<uint256_t> activation_readiness_certificate_digest;
 };
 
 struct CommitStructuredEvent
@@ -362,6 +366,91 @@ struct AdaptiveV2ManagerSessionTerminalStructuredEvent
     std::uint64_t current_evidence_cutoff{0};
 };
 
+enum class AdaptiveV3ReadinessTransition : std::uint8_t
+{
+    activation_prepared = 1,
+    activation_ready_signed,
+    observation_accepted,
+    observation_rejected,
+    source_quarantined,
+    certificate_assembled,
+    certificate_delivery,
+    certificate_accepted,
+    certificate_rejected,
+    certificate_acknowledged,
+    e2_eligibility,
+    terminal,
+    wire_rejected,
+};
+
+/**
+ * Canonical adaptive-v3 readiness audit. Binary wire payloads are retained
+ * exactly where independent signature/certificate reconstruction needs them.
+ * This evidence grants no vote, QC, commit, or activation authority.
+ */
+struct AdaptiveV3ReadinessStructuredEvent
+{
+    AdaptiveV3ReadinessTransition transition{
+        AdaptiveV3ReadinessTransition::activation_prepared};
+    ActivationReadyIdentityV1 identity;
+    std::optional<ReplicaID> replica_id;
+    std::optional<std::uint64_t> signer_source_sequence;
+    std::optional<std::uint64_t> signer_monotonic_raw_ns;
+    std::optional<uint256_t> observation_digest;
+    std::optional<uint256_t> certificate_digest;
+    std::optional<uint256_t> payload_digest;
+    std::vector<ReplicaID> observed_signers;
+    std::size_t required_release_count{0};
+    std::uint32_t delivery_attempt{0};
+    bool delivery_enqueued{false};
+    std::optional<bytearray_t> canonical_wire_payload;
+    // Identity-free audit for authenticated but malformed v3 readiness wire.
+    // The raw digest is over canonical_wire_payload exactly (DataStream hash).
+    std::optional<opcode_t> wire_opcode;
+    std::optional<std::uint64_t> wire_payload_size;
+    std::string disposition;
+    // Manager terminal records may precede certificate assembly.  These
+    // terminal-only fields preserve the session audit without inventing an
+    // activation identity or certificate.
+    std::optional<std::uint64_t> terminal_cycle_ordinal;
+    std::optional<std::uint8_t> terminal_reason;
+    std::optional<ActivationReadyIdentityV1> terminal_identity;
+    std::optional<uint256_t> terminal_bundle_digest;
+    // E2 opening is an independent, manager-originated audit of the frozen
+    // all-R common commit and strict hard-deadline reserve.
+    std::optional<std::uint64_t> e2_cycle_ordinal;
+    std::optional<uint256_t> e1_bundle_digest;
+    std::optional<std::uint64_t> e2_final_ack_raw_ns;
+    std::optional<ProposalKey> e2_common_commit;
+    std::vector<ReplicaID> e2_common_commit_sources;
+    std::optional<std::uint64_t> e2_common_commit_raw_ns;
+    std::optional<std::uint64_t> e2_earliest_raw_ns;
+    std::optional<std::uint64_t> e2_actual_begin_raw_ns;
+    std::optional<std::uint64_t> e2_hard_deadline_raw_ns;
+    std::optional<std::uint64_t> e2_reserve_raw_ns;
+};
+
+enum class AdaptiveV3CommandTerminalReason : std::uint8_t
+{
+    invalid_committed_command = 1,
+    wrong_active_predecessor,
+    invalid_successor_generation,
+    successor_runtime_preparation_failed,
+    committed_definition_recovery_failed,
+    committed_definition_retry_schedule_failed,
+    readiness_source_sequence_exhausted,
+    readiness_boundary_rejected,
+    readiness_internal_failure,
+};
+
+/** Replica-local terminal evidence before a readiness identity exists. */
+struct AdaptiveV3CommandTerminalStructuredEvent
+{
+    EpochCommandCommittedStructuredEvent command;
+    AdaptiveV3CommandTerminalReason reason{
+        AdaptiveV3CommandTerminalReason::invalid_committed_command};
+};
+
 using StructuredEventPayload = std::variant<
     ProcessLifecycleEvent,
     EpochLifecycleEvent,
@@ -381,7 +470,9 @@ using AuditStructuredEventPayload = std::variant<
     RootQcQueueBlockedStructuredEvent,
     AdaptiveV2FaultContainmentCoverageReadyStructuredEvent,
     AdaptiveV2CrossCommitRetentionReadyStructuredEvent,
-    FaultWindowArmedStructuredEvent>;
+    FaultWindowArmedStructuredEvent,
+    AdaptiveV3ReadinessStructuredEvent,
+    AdaptiveV3CommandTerminalStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -486,6 +577,20 @@ enum class StructuredEventType : std::uint8_t
     block_commit_identity_unavailable,
     adaptive_v2_cross_commit_retention_ready,
     fault_window_armed,
+    adaptive_v3_activation_prepared,
+    adaptive_v3_activation_ready_signed,
+    adaptive_v3_observation_accepted,
+    adaptive_v3_observation_rejected,
+    adaptive_v3_source_quarantined,
+    adaptive_v3_certificate_assembled,
+    adaptive_v3_certificate_delivery,
+    adaptive_v3_certificate_accepted,
+    adaptive_v3_certificate_rejected,
+    adaptive_v3_certificate_acknowledged,
+    adaptive_v3_e2_eligibility,
+    adaptive_v3_terminal,
+    adaptive_v3_wire_rejected,
+    adaptive_v3_command_terminal,
 };
 
 StructuredEventType structured_event_type(
@@ -658,6 +763,7 @@ class StructuredEventEmitter
 public:
     virtual ~StructuredEventEmitter() = default;
     virtual void emit(const StructuredEventPayload &payload) noexcept = 0;
+    virtual bool is_designated_commit_observer() const noexcept = 0;
 };
 
 /**
@@ -716,6 +822,7 @@ public:
     StructuredEventSink &operator=(StructuredEventSink &&) = delete;
 
     void emit(const StructuredEventPayload &payload) noexcept override;
+    bool is_designated_commit_observer() const noexcept override;
     void emit_adaptive(
         const AdaptiveAggregationStructuredEvent &event) noexcept override;
     void emit_audit(

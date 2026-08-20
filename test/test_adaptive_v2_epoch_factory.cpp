@@ -830,6 +830,20 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "v2 factory rejects undersized bundle limits before signing",
+    "[adaptive-v2][epoch-factory][failure-boundary]")
+{
+    Fixture fixture;
+    auto impossible_bundle_limits = fixture.limits;
+    impossible_bundle_limits.definition_limits.maximum_members_per_tree = 4;
+    const auto oversized_result = hotstuff::build_adaptive_v2_successor_bundle(
+        *fixture.current, fixture.selection, fixture.placement, 5, kIssuerId,
+        fixture.key, impossible_bundle_limits);
+    CHECK(oversized_result.status == AdaptiveV2EpochFactoryStatus::capacity_exceeded);
+    CHECK(oversized_result.bundle == nullptr);
+}
+
+TEST_CASE(
     "factory keeps quorum fixed while a smaller fault set leaves root choice",
     "[adaptive-v2][epoch-factory][minority][roots]")
 {

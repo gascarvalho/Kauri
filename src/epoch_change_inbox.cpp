@@ -63,24 +63,26 @@ const ExactTreeView *tree_for_generation(
 
 bool exact_defer(
     const EpochChangeValidationResult &validation,
-    const AuthorizedEpochChange &command) noexcept
+    const AuthorizedEpochChange &command,
+    EpochProtocolMode protocol_mode) noexcept
 {
     return validation.disposition ==
                EpochChangeDisposition::defer_missing_definition &&
            validation.recovery_request.has_value() &&
            validation.recovery_request->protocol_mode ==
-               EpochProtocolMode::adaptive_v2 &&
+               protocol_mode &&
            validation.recovery_request->successor_epoch_digest ==
                command.payload.successor_epoch_digest;
 }
 
 bool may_stage(
     const EpochChangeValidationResult &validation,
-    const AuthorizedEpochChange &command) noexcept
+    const AuthorizedEpochChange &command,
+    EpochProtocolMode protocol_mode) noexcept
 {
     return validation.disposition == EpochChangeDisposition::accepted ||
            validation.disposition == EpochChangeDisposition::duplicate ||
-           exact_defer(validation, command);
+           exact_defer(validation, command, protocol_mode);
 }
 
 bool exact_predecessor_configuration(
@@ -133,22 +135,28 @@ struct AdaptiveV2CommandInbox::State
         }
     };
 
-    explicit State(AdaptiveV2CommandInboxLimits configured_limits)
-        : limits(std::move(configured_limits))
+    explicit State(
+        AdaptiveV2CommandInboxLimits configured_limits,
+        EpochProtocolMode configured_mode)
+        : limits(std::move(configured_limits)), mode(configured_mode)
     {}
 
     AdaptiveV2CommandInboxLimits limits;
+    EpochProtocolMode mode{EpochProtocolMode::adaptive_v2};
     std::unique_ptr<Record> record;
     std::uint64_t next_reservation_token{1};
 };
 
 AdaptiveV2CommandInbox::AdaptiveV2CommandInbox(
-    AdaptiveV2CommandInboxLimits limits)
-    : state_(std::make_unique<State>(std::move(limits)))
+    AdaptiveV2CommandInboxLimits limits,
+    EpochProtocolMode protocol_mode)
+    : state_(std::make_unique<State>(std::move(limits), protocol_mode))
 {
     if (state_->limits.maximum_bundle_bytes == 0 ||
         state_->limits.maximum_block_extra_bytes == 0 ||
-        state_->limits.maximum_reservation_token == 0)
+        state_->limits.maximum_reservation_token == 0 ||
+        (protocol_mode != EpochProtocolMode::adaptive_v2 &&
+         protocol_mode != EpochProtocolMode::adaptive_v3))
     {
         throw std::invalid_argument(
             "adaptive-v2 inbox limits must be nonzero");
@@ -163,10 +171,38 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
     const EpochChangeVerifier &verifier,
     EpochStore &store) noexcept
 {
+    if (state_->mode != EpochProtocolMode::adaptive_v2)
+        return {};
+    return ingest_components(
+        bundle.command(), bundle.definition(), bundle.canonical_bytes(),
+        active_epoch, verifier, store);
+}
+
+AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
+    const AdaptiveV3EpochChangeBundle &bundle,
+    const EpochDefinition &active_epoch,
+    const EpochChangeVerifier &verifier,
+    EpochStore &store) noexcept
+{
+    if (state_->mode != EpochProtocolMode::adaptive_v3)
+        return {};
+    return ingest_components(
+        bundle.command(), bundle.definition(), bundle.canonical_bytes(),
+        active_epoch, verifier, store);
+}
+
+AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest_components(
+    const AuthorizedEpochChange &command,
+    const EpochDefinitionInput &definition,
+    const bytearray_t &canonical_bundle,
+    const EpochDefinition &active_epoch,
+    const EpochChangeVerifier &verifier,
+    EpochStore &store) noexcept
+{
     AdaptiveV2CommandIngestResult result;
     try
     {
-        if (bundle.canonical_bytes().size() >
+        if (canonical_bundle.size() >
             state_->limits.maximum_bundle_bytes)
         {
             result.disposition =
@@ -175,15 +211,15 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
         }
 
         const auto initial = verifier.validate(
-            bundle.command(), active_epoch, store, EpochChangeHistoryView{});
+            command, active_epoch, store, EpochChangeHistoryView{});
         result.initial_validation = initial.disposition;
-        if (!may_stage(initial, bundle.command()))
+        if (!may_stage(initial, command, state_->mode))
             return result;
 
         const auto payload_digest =
-            epoch_change_payload_digest(bundle.command().payload);
+            epoch_change_payload_digest(command.payload);
         const auto envelope_digest =
-            epoch_change_envelope_digest(bundle.command());
+            epoch_change_envelope_digest(command);
         if (initial.payload_digest != payload_digest ||
             initial.envelope_digest != envelope_digest)
         {
@@ -193,7 +229,7 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
         if (state_->record != nullptr)
         {
             if (state_->record->material->canonical_bundle ==
-                bundle.canonical_bytes())
+                canonical_bundle)
             {
                 result.disposition =
                     AdaptiveV2CommandIngestDisposition::duplicate;
@@ -203,7 +239,9 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
         }
 
         auto block_extra =
-            encode_epoch_change_block_extra(bundle.command());
+            state_->mode == EpochProtocolMode::adaptive_v3
+                ? encode_epoch_change_block_extra_v3(command)
+                : encode_epoch_change_block_extra(command);
         if (block_extra.size() >
             state_->limits.maximum_block_extra_bytes)
         {
@@ -216,22 +254,22 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
         prepared->predecessor_epoch_number = active_epoch.epoch_number();
         prepared->predecessor_trees = exact_tree_views(active_epoch.trees());
         prepared->successor_trees =
-            exact_tree_views(bundle.definition().trees);
+            exact_tree_views(definition.trees);
         prepared->material =
             std::make_shared<const AdaptiveV2CommandMaterial>(
                 AdaptiveV2CommandMaterial{
-                    bundle.command(),
-                    bundle.canonical_bytes(),
+                    command,
+                    canonical_bundle,
                     std::move(block_extra),
                     payload_digest,
                     envelope_digest,
                     AdaptiveV2SuccessorIdentity{
-                        bundle.command().payload.successor_epoch_number,
-                        bundle.command().payload.predecessor_epoch_digest,
-                        bundle.command().payload.successor_epoch_digest}});
+                        command.payload.successor_epoch_number,
+                        command.payload.predecessor_epoch_digest,
+                        command.payload.successor_epoch_digest}});
 
         const auto staged = store.stage_available_v2(
-            bundle.definition(), active_epoch);
+            definition, active_epoch);
         result.definition_staging = staged.disposition;
         if ((staged.disposition !=
                  DefinitionAvailabilityDisposition::staged &&
@@ -243,7 +281,7 @@ AdaptiveV2CommandIngestResult AdaptiveV2CommandInbox::ingest(
         }
 
         const auto final_validation = verifier.validate(
-            bundle.command(), active_epoch, store, EpochChangeHistoryView{});
+            command, active_epoch, store, EpochChangeHistoryView{});
         result.final_validation = final_validation.disposition;
         if (final_validation.disposition !=
                 EpochChangeDisposition::accepted ||

@@ -21,6 +21,12 @@ AdaptiveV2EpochFactoryResult rejected(
     return {status, nullptr};
 }
 
+AdaptiveSuccessorMaterialResult rejected_material(
+    AdaptiveV2EpochFactoryStatus status) noexcept
+{
+    return {status, std::nullopt};
+}
+
 bool supported_current_schema(const EpochDefinition &current) noexcept
 {
     return current.schema_version() == kEpochDefinitionSchemaVersionV1 ||
@@ -756,14 +762,12 @@ bool exact_containment_placement(
     return true;
 }
 
-AdaptiveV2EpochFactoryResult build_validated(
+AdaptiveSuccessorMaterialResult build_validated_material(
     const EpochDefinition &current,
     const AdaptiveV2SelectionResult &selection,
     const AdaptiveV2TransitionPolicy &transition_policy,
     const TreePlacementInput &placement_input,
     std::uint64_t activation_delay_blocks,
-    EpochChangeIssuerId issuer_id,
-    const PrivKeySecp256k1 &issuer_private_key,
     const EpochChangeBundleLimits &bundle_limits)
 {
     const auto current_members = current_membership(current);
@@ -962,53 +966,42 @@ AdaptiveV2EpochFactoryResult build_validated(
     const auto successor_digest = compute_epoch_digest(successor);
     successor.epoch_digest = successor_digest;
 
-    std::optional<AuthorizedEpochChange> command;
-    try
-    {
-        command.emplace(authorize_epoch_change(
-            EpochChangePayload{
-                successor.epoch_number,
-                successor.previous_epoch_digest,
-                successor_digest,
-                activation_delay_blocks},
-            issuer_id,
-            issuer_private_key));
-    }
-    catch (...)
-    {
-        return rejected(
-            AdaptiveV2EpochFactoryStatus::authorization_failed);
-    }
-
-    try
-    {
-        auto bundle =
-            std::make_unique<const AdaptiveV2EpochChangeBundle>(
-                std::move(*command),
-                std::move(successor),
-                bundle_limits);
-        return {
-            AdaptiveV2EpochFactoryStatus::success,
-            std::move(bundle)};
-    }
-    catch (const std::length_error &)
-    {
-        return rejected(
-            AdaptiveV2EpochFactoryStatus::capacity_exceeded);
-    }
-    catch (const std::bad_alloc &)
-    {
-        return rejected(
-            AdaptiveV2EpochFactoryStatus::capacity_exceeded);
-    }
-    catch (...)
-    {
-        return rejected(
-            AdaptiveV2EpochFactoryStatus::bundle_failed);
-    }
+    return {AdaptiveV2EpochFactoryStatus::success,
+            AdaptiveSuccessorMaterial{std::move(successor),
+                EpochChangePayload{*successor_epoch,
+                    current.epoch_digest(), successor_digest,
+                    activation_delay_blocks}}};
 }
 
 } // namespace
+
+AdaptiveSuccessorMaterialResult build_adaptive_successor_material(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    const EpochChangeBundleLimits &bundle_limits) noexcept
+{
+    try
+    {
+        return build_validated_material(current_epoch, selection,
+            transition_policy, placement_input, activation_delay_blocks,
+            bundle_limits);
+    }
+    catch (const std::length_error &)
+    {
+        return rejected_material(AdaptiveV2EpochFactoryStatus::capacity_exceeded);
+    }
+    catch (const std::bad_alloc &)
+    {
+        return rejected_material(AdaptiveV2EpochFactoryStatus::capacity_exceeded);
+    }
+    catch (...)
+    {
+        return rejected_material(AdaptiveV2EpochFactoryStatus::internal_failure);
+    }
+}
 
 AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     const EpochDefinition &current_epoch,
@@ -1020,16 +1013,15 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     const PrivKeySecp256k1 &issuer_private_key,
     const EpochChangeBundleLimits &bundle_limits) noexcept
 {
+    AdaptiveSuccessorMaterialResult material;
     try
     {
-        return build_validated(
+        material = build_validated_material(
             current_epoch,
             selection,
             transition_policy,
             placement_input,
             activation_delay_blocks,
-            issuer_id,
-            issuer_private_key,
             bundle_limits);
     }
     catch (const std::length_error &)
@@ -1047,6 +1039,66 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
         return rejected(
             AdaptiveV2EpochFactoryStatus::internal_failure);
     }
+    if (!material)
+        return rejected(material.status);
+
+    AuthorizedEpochChange command;
+    try
+    {
+        command = authorize_epoch_change(material.material->payload,
+                                         issuer_id, issuer_private_key);
+    }
+    catch (...)
+    {
+        return rejected(AdaptiveV2EpochFactoryStatus::authorization_failed);
+    }
+    try
+    {
+        auto bundle = std::make_unique<const AdaptiveV2EpochChangeBundle>(
+            std::move(command), material.material->definition, bundle_limits);
+        return {AdaptiveV2EpochFactoryStatus::success, std::move(bundle)};
+    }
+    catch (const std::length_error &)
+    {
+        return rejected(AdaptiveV2EpochFactoryStatus::capacity_exceeded);
+    }
+    catch (const std::bad_alloc &)
+    {
+        return rejected(AdaptiveV2EpochFactoryStatus::capacity_exceeded);
+    }
+    catch (...)
+    {
+        return rejected(AdaptiveV2EpochFactoryStatus::bundle_failed);
+    }
+}
+
+AdaptiveV3EpochFactoryResult build_adaptive_v3_successor_bundle(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept
+{
+    const auto material = build_adaptive_successor_material(current_epoch,
+        selection, transition_policy, placement_input,
+        activation_delay_blocks, bundle_limits);
+    if (!material) return {material.status, nullptr};
+    AuthorizedEpochChange command;
+    try { command = authorize_epoch_change_v3(material.material->payload,
+                                                issuer_id, issuer_private_key); }
+    catch (...) { return {AdaptiveV2EpochFactoryStatus::authorization_failed, nullptr}; }
+    try {
+        return {AdaptiveV2EpochFactoryStatus::success,
+            std::make_unique<const AdaptiveV3EpochChangeBundle>(
+                std::move(command), material.material->definition, bundle_limits)};
+    } catch (const std::length_error &) {
+        return {AdaptiveV2EpochFactoryStatus::capacity_exceeded, nullptr};
+    } catch (const std::bad_alloc &) {
+        return {AdaptiveV2EpochFactoryStatus::capacity_exceeded, nullptr};
+    } catch (...) { return {AdaptiveV2EpochFactoryStatus::bundle_failed, nullptr}; }
 }
 
 AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(

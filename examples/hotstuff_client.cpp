@@ -639,7 +639,7 @@ int main(int argc, char **argv)
         opt_epoch_protocol_mode,
         Config::SET_VAL,
         -1,
-        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)");
+        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2, adaptive_v3)");
 
     config.parse(argc, argv);
 
@@ -650,6 +650,8 @@ int main(int argc, char **argv)
         epoch_protocol_mode = EpochProtocolMode::adaptive_v1;
     else if (opt_epoch_protocol_mode->get() == "adaptive_v2")
         epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v3")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v3;
     else
         throw HotStuffError("invalid epoch protocol mode");
 
@@ -697,7 +699,8 @@ int main(int argc, char **argv)
     }
 
     HOTSTUFF_LOG_INFO("client sees replica num = %zu", replicas.size());
-    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+        epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
     {
         const auto byzantine =
             hotstuff::derive_byzantine_quorum(replicas.size());

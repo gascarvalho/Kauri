@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import platform
 import shutil
+import stat
 import struct
 import subprocess
 import time
@@ -73,6 +74,15 @@ _FCRASH_H_V3_PROFILE_IDS = frozenset(
         "n31-f5-q21-three-crash-pair-v3",
     }
 )
+_FCRASH_H_V13_PROFILE_IDS = frozenset(
+    {
+        "n7-f2-q5-two-crash-pair-smoke-v13",
+        "n31-f5-q21-three-crash-pair-v13",
+    }
+)
+_V13_MAXIMUM_OBSERVATION_ATTEMPTS = 5
+_V13_OBSERVATION_RETRY_INTERVAL_MS = 1_000
+_V13_MANAGER_CHECKPOINT = "adaptive_v3_unified_manager_checkpoint4"
 _AUTHORIZATION_KEYS = (
     "schema_version",
     "mode",
@@ -84,6 +94,7 @@ _AUTHORIZATION_KEYS = (
     "replacement_policy",
     "authorization_nonce",
 )
+_V13_AUTHORIZATION_READINESS_KEY = "pair_readiness_manifests"
 _MAX_ARGV_BYTES = 1 << 20
 _CTL_KERN = 1
 _KERN_PROCARGS2 = 49
@@ -283,13 +294,13 @@ def _v6_timeout_observation_id(
 
 def _is_v4_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11", "-v12")
+        ("-v4", "-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11", "-v12", "-v13")
     )
 
 
 def _is_v5_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11", "-v12")
+        ("-v5", "-v6", "-v7", "-v8", "-v9", "-v10", "-v11", "-v12", "-v13")
     )
 
 
@@ -309,18 +320,291 @@ def _is_v9_profile(profile: FocusedProfile | object) -> bool:
     """Return whether this is the prospective guarded-cohort contract."""
 
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v9", "-v10", "-v11", "-v12")
+        ("-v9", "-v10", "-v11", "-v12", "-v13")
     )
 
 
 def _is_v10_profile(profile: FocusedProfile | object) -> bool:
     return str(getattr(profile, "profile_id", "")).endswith(
-        ("-v10", "-v11", "-v12")
+        ("-v10", "-v11", "-v12", "-v13")
     )
 
 
 def _is_v12_profile(profile: FocusedProfile | object) -> bool:
-    return str(getattr(profile, "profile_id", "")).endswith("-v12")
+    return str(getattr(profile, "profile_id", "")).endswith(("-v12", "-v13"))
+
+
+def _profile_document_value(profile: FocusedProfile | Mapping[str, Any] | object) -> Mapping[str, Any]:
+    if isinstance(profile, Mapping):
+        return profile
+    raw = getattr(profile, "raw", None)
+    if not isinstance(raw, Mapping):
+        _error("profile document is unavailable")
+    return raw
+
+
+def _profile_id_value(profile: FocusedProfile | Mapping[str, Any] | object) -> str:
+    raw = _profile_document_value(profile)
+    value = raw.get("profile_id", getattr(profile, "profile_id", None))
+    if not isinstance(value, str):
+        _error("profile id is unavailable")
+    return value
+
+
+def _is_v13_profile(profile: FocusedProfile | Mapping[str, Any] | object) -> bool:
+    """Recognize only the two frozen CERT13 execution identities."""
+
+    try:
+        return _profile_id_value(profile) in _FCRASH_H_V13_PROFILE_IDS
+    except FocusedCrashPairRuntimeError:
+        return False
+
+
+def _v13_certified_activation_contract(
+    profile: FocusedProfile | Mapping[str, Any] | object,
+) -> dict[str, object]:
+    """Validate and return the exact CERT13 certified-activation contract."""
+
+    raw = _profile_document_value(profile)
+    profile_id = _profile_id_value(profile)
+    if profile_id not in _FCRASH_H_V13_PROFILE_IDS or raw.get("schema_version") != 2:
+        _error("v13 certified activation requires an exact v13 profile identity")
+    protocol = _document(raw.get("protocol"), "v13 protocol")
+    transitions = _document(raw.get("transitions"), "v13 transitions")
+    timers = _document(raw.get("timers"), "v13 timers")
+    expected_shape = {
+        "n7-f2-q5-two-crash-pair-smoke-v13": (7, 2, 5, 5, 480),
+        "n31-f5-q21-three-crash-pair-v13": (31, 10, 21, 28, 780),
+    }[profile_id]
+    replica_count, fault_bound, quorum, reporters, hard_seconds = expected_shape
+    if (
+        protocol.get("N"),
+        protocol.get("f"),
+        protocol.get("Q"),
+        protocol.get("epoch_protocol_mode"),
+    ) != (replica_count, fault_bound, quorum, "adaptive_v3"):
+        _error("v13 protocol identity or quorum drifted")
+    if transitions.get("survivor_barrier_count") != reporters:
+        _error("v13 survivor barrier count drifted")
+    if transitions.get("common_commit_quorum") != quorum:
+        _error("v13 common commit quorum drifted")
+    expected = {
+        "schema_version": 1,
+        "domain": "kauri-focused-v13-certified-activation-v1",
+        "certificate_quorum": quorum,
+        "required_reporter_count": reporters,
+        "epoch1_common_commit_anchor_deadline_seconds": 5,
+        "containment_stabilization_seconds": 30,
+        "containment_measurement_seconds": 30,
+        "minimum_predecessor_residency_ms": 65_000,
+        "optimization_activation_budget_seconds": 90,
+        "deadline_semantics": "half_open_monotonic_v1",
+        "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
+    }
+    contract = _document(
+        transitions.get("activation_readiness_contract"),
+        "v13 activation readiness contract",
+    )
+    if contract != expected:
+        _error("v13 activation readiness contract drifted")
+    if (
+        timers.get("optimization_activation_deadline_seconds") != 90
+        or timers.get("arm_hard_deadline_seconds") != hard_seconds
+        or timers.get("stable_phase_seconds") != 30
+    ):
+        _error("v13 activation timers drifted")
+    return dict(contract)
+
+
+def _v13_e2_activation_is_timely(
+    *,
+    final_common_command_ns: int,
+    activation_ns: int,
+    hard_deadline_ns: int,
+    budget_seconds: int,
+) -> bool:
+    """Apply the frozen, half-open E2 activation interval."""
+
+    anchor = _uint64(final_common_command_ns, "v13 final common E2 command")
+    activation = _uint64(activation_ns, "v13 E2 activation")
+    hard = _uint64(hard_deadline_ns, "v13 hard deadline")
+    budget = _integer(budget_seconds, "v13 E2 activation budget", 1)
+    if budget != 90:
+        _error("v13 E2 activation budget drifted")
+    budget_ns = budget * 1_000_000_000
+    return anchor < activation < anchor + budget_ns and activation < hard
+
+
+def _v13_readiness_ledger_document(
+    *,
+    profile: FocusedProfile | Mapping[str, Any] | object,
+    events: Sequence[Mapping[str, Any]],
+) -> dict[str, object]:
+    """Reconstruct the two CERT13 readiness barriers from raw events only."""
+
+    contract = _v13_certified_activation_contract(profile)
+    raw = _profile_document_value(profile)
+    protocol = _document(raw.get("protocol"), "v13 protocol")
+    expected_reporters = _integer(
+        contract["required_reporter_count"], "v13 required reporter count", 1
+    )
+    expected_quorum = _integer(
+        contract["certificate_quorum"], "v13 certificate quorum", 1
+    )
+    relevant_types = {
+        "epoch.activation_prepared",
+        "epoch.activation_ready_signed",
+        "manager.activation_readiness_accepted",
+        "manager.activation_readiness_certificate_assembled",
+        "epoch.activated",
+    }
+    relevant: list[Mapping[str, Any]] = []
+    last_sequences: dict[tuple[str, str], int] = {}
+    for event in events:
+        if not isinstance(event, Mapping) or event.get("event_type") not in relevant_types:
+            continue
+        source_kind = event.get("source_kind")
+        source_instance = event.get("source_instance")
+        if not isinstance(source_kind, str) or not isinstance(source_instance, str):
+            _error("v13 readiness event source identity is malformed")
+        sequence = _integer(event.get("source_sequence"), "v13 source sequence", 1)
+        source_key = (source_kind, source_instance)
+        previous = last_sequences.get(source_key, 0)
+        if sequence <= previous:
+            _error("v13 readiness source sequence is not strictly increasing")
+        last_sequences[source_key] = sequence
+        _uint64(event.get("source_monotonic_ns"), "v13 source monotonic time")
+        _document(event.get("payload"), "v13 readiness payload")
+        relevant.append(event)
+
+    rows: list[dict[str, object]] = []
+    for successor in (1, 2):
+        epoch_events = []
+        identities: list[Mapping[str, Any]] = []
+        for event in relevant:
+            payload = _document(event.get("payload"), "v13 readiness payload")
+            identity = _document(payload.get("identity"), "v13 readiness identity")
+            successor_configuration = _document(
+                identity.get("successor_configuration"),
+                "v13 readiness successor configuration",
+            )
+            if successor_configuration.get("epoch_number") == successor:
+                epoch_events.append(event)
+                identities.append(identity)
+        if not epoch_events:
+            _error(f"v13 readiness evidence is missing Epoch {successor}")
+        canonical_identity = _canonical_json(identities[0])
+        if any(_canonical_json(identity) != canonical_identity for identity in identities):
+            _error("v13 readiness identity drifted within one transition")
+
+        prepared: set[int] = set()
+        signed: set[int] = set()
+        accepted: set[int] = set()
+        activated: set[int] = set()
+        certificates: list[Mapping[str, Any]] = []
+        certificate_digest: str | None = None
+        for event in epoch_events:
+            event_type = str(event["event_type"])
+            payload = _document(event["payload"], "v13 readiness payload")
+            if event_type.startswith("epoch."):
+                replica = _integer(
+                    event.get("source_replica_id"), "v13 source replica id"
+                )
+                if replica >= protocol["N"]:
+                    _error("v13 source replica id is out of range")
+                if event_type == "epoch.activation_prepared":
+                    if payload.get("vote_fence_engaged") is not True:
+                        _error("v13 activation preparation did not engage vote fence")
+                    prepared.add(replica)
+                elif event_type == "epoch.activation_ready_signed":
+                    if (
+                        payload.get("vote_fence_engaged") is not True
+                        or payload.get("signer_replica_id") != replica
+                        or payload.get("signer_source_sequence")
+                        != event.get("source_sequence")
+                        or payload.get("signer_monotonic_raw_ns")
+                        != event.get("source_monotonic_ns")
+                    ):
+                        _error("v13 signed readiness observation is not source-bound")
+                    signature = payload.get("signature")
+                    if not isinstance(signature, str) or not signature:
+                        _error("v13 readiness signature is absent")
+                    signed.add(replica)
+                elif event_type == "epoch.activated":
+                    digest = _digest(
+                        payload.get("certificate_digest"),
+                        "v13 applied readiness certificate digest",
+                    )
+                    if certificate_digest is not None and digest != certificate_digest:
+                        _error("v13 applied readiness certificate digest drifted")
+                    activated.add(replica)
+            elif event_type == "manager.activation_readiness_accepted":
+                authenticated = _integer(
+                    payload.get("authenticated_replica_id"),
+                    "v13 authenticated replica id",
+                )
+                if payload.get("signer_replica_id") != authenticated:
+                    _error("v13 manager accepted mismatched signer identity")
+                accepted.add(authenticated)
+            else:
+                certificates.append(payload)
+
+        if len(certificates) != 1:
+            _error("v13 transition must assemble exactly one readiness certificate")
+        certificate = certificates[0]
+        certificate_digest = _digest(
+            certificate.get("certificate_digest"),
+            "v13 readiness certificate digest",
+        )
+        signer_ids_value = certificate.get("signer_replica_ids")
+        if not isinstance(signer_ids_value, list) or any(
+            type(value) is not int for value in signer_ids_value
+        ):
+            _error("v13 readiness certificate signer ids are malformed")
+        signer_ids = set(signer_ids_value)
+        if (
+            len(signer_ids_value) != len(signer_ids)
+            or certificate.get("certificate_quorum") != expected_quorum
+            or certificate.get("required_reporter_count") != expected_reporters
+        ):
+            _error("v13 readiness certificate cardinality drifted")
+        if not (
+            prepared
+            == signed
+            == accepted
+            == signer_ids
+            == activated
+            and len(signed) == expected_reporters
+        ):
+            _error("v13 readiness barrier is not the exact complete survivor set")
+        for event in epoch_events:
+            if event["event_type"] == "epoch.activated":
+                payload = _document(event["payload"], "v13 activation payload")
+                if payload.get("certificate_digest") != certificate_digest:
+                    _error("v13 activation used a different readiness certificate")
+        rows.append(
+            {
+                "successor_epoch_number": successor,
+                "identity": json.loads(canonical_identity),
+                "certificate_digest": certificate_digest,
+                "observed_reporter_ids": sorted(signed),
+                "activated_replica_ids": sorted(activated),
+            }
+        )
+
+    ledger: dict[str, object] = {
+        "schema_version": 1,
+        "domain": "kauri-focused-readiness-ledger-v1",
+        "profile_id": _profile_id_value(profile),
+        "protocol_mode": "adaptive_v3",
+        "replica_count": protocol["N"],
+        "fault_bound": protocol["f"],
+        "certificate_quorum": expected_quorum,
+        "required_reporter_count": expected_reporters,
+        "transitions": rows,
+    }
+    ledger["reconstruction_digest"] = _sha256(_canonical_json(ledger))
+    return ledger
 
 
 def _is_v8_or_v9_profile(profile: FocusedProfile | object) -> bool:
@@ -978,6 +1262,221 @@ class FocusedPairIssuerAllocator:
         }
 
 
+def _v13_membership_digest(members: Sequence[Mapping[str, object]]) -> str:
+    encoded = bytearray(b"kauri-adaptive-v3-activation-readiness-membership-v1")
+    encoded.extend(len(members).to_bytes(4, "big"))
+    seen: set[int] = set()
+    public_keys: set[str] = set()
+    for expected_replica, member in enumerate(members):
+        replica = _integer(member.get("replica_id"), "v13 manifest replica id")
+        public = member.get("public_key_hex")
+        if replica != expected_replica or replica in seen:
+            _error("v13 public manifest membership is not canonical")
+        if (
+            not isinstance(public, str)
+            or len(public) != 96
+            or any(character not in "0123456789abcdef" for character in public)
+            or public in public_keys
+        ):
+            _error("v13 readiness public key is not canonical BLS hex")
+        seen.add(replica)
+        public_keys.add(public)
+        encoded.extend(replica.to_bytes(2, "big"))
+        encoded.extend(bytes.fromhex(public))
+    return _sha256(bytes(encoded))
+
+
+def _v13_public_manifest_bytes(
+    profile: FocusedProfile | Mapping[str, Any] | object,
+    members: Sequence[Mapping[str, object]],
+) -> bytes:
+    _v13_certified_activation_contract(profile)
+    raw = _profile_document_value(profile)
+    replica_count = _integer(
+        _document(raw.get("protocol"), "v13 protocol").get("N"),
+        "v13 replica count",
+        1,
+    )
+    if len(members) != replica_count:
+        _error("v13 public manifest cardinality drifted")
+    profile_sha = getattr(profile, "profile_sha256", raw.get("profile_sha256"))
+    profile_sha = _digest(profile_sha, "v13 profile digest")
+    document = {
+        "algorithm": "bls-pop",
+        "domain": "kauri-adaptive-v3-readiness-public-key-manifest-v1",
+        "membership_digest": _v13_membership_digest(members),
+        "members": [dict(member) for member in members],
+        "profile_id": _profile_id_value(profile),
+        "profile_sha256": profile_sha,
+        "protocol_mode": "adaptive_v3",
+        "schema_version": 1,
+    }
+    return _canonical_json(document)
+
+
+def _read_exact_private_scalar(path: Path, *, label: str) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise FocusedCrashPairRuntimeError(f"{label} cannot be opened safely") from exc
+    try:
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode) or status.st_mode & 0o777 != 0o600:
+            _error(f"{label} must be one regular 0600 file")
+        if status.st_size != 65:
+            _error(f"{label} has invalid size")
+        chunks: list[bytes] = []
+        remaining = 65
+        while remaining:
+            try:
+                chunk = os.read(descriptor, remaining)
+            except InterruptedError:
+                continue
+            if not chunk:
+                _error(f"{label} ended early")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            _error(f"{label} contains trailing bytes")
+        value = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if value[-1:] != b"\n" or any(
+        byte not in b"0123456789abcdef" for byte in value[:-1]
+    ):
+        _error(f"{label} is not canonical lowercase scalar hex")
+    return value
+
+
+def _sha256_regular_file_no_follow(path: Path, *, label: str) -> str:
+    """Hash one authorized executable without following a replacement link."""
+
+    descriptor: int | None = None
+    try:
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        status = os.fstat(descriptor)
+        if not stat.S_ISREG(status.st_mode):
+            _error(f"{label} is not a regular file")
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 65_536)
+            if not chunk:
+                break
+            digest.update(chunk)
+        return digest.hexdigest()
+    except FocusedCrashPairRuntimeError:
+        raise
+    except OSError as exc:
+        raise FocusedCrashPairRuntimeError(f"cannot read {label}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+@dataclass(slots=True)
+class FocusedV13ReadinessAllocator:
+    """Preallocate pair-bound BLS readiness keys before authorization."""
+
+    allocation_root: Path
+    pair_count: int
+    keygen_binary: Path
+    profile: FocusedProfile | Mapping[str, Any] | object
+    run_command: Callable[..., Any] = subprocess.run
+
+    def allocate(self) -> dict[str, object]:
+        _v13_certified_activation_contract(self.profile)
+        raw = _profile_document_value(self.profile)
+        count = _integer(
+            _document(raw.get("protocol"), "v13 protocol").get("N"),
+            "v13 replica count",
+            1,
+        )
+        pair_count = _integer(self.pair_count, "v13 readiness pair count", 1)
+        root = Path(self.allocation_root).absolute()
+        if root.exists() or root.is_symlink():
+            _error("v13 readiness allocation root already exists")
+        root.mkdir(mode=0o700)
+        pairs: dict[str, object] = {}
+        manifest_digests: set[str] = set()
+        # Each pair becomes an independently authorized live run, but its
+        # readiness identities share this allocation authority.  A key that
+        # appears in just one row of another pair is therefore as unsafe as a
+        # duplicate manifest: both would create ambiguous BLS ownership.
+        allocation_public_keys: set[str] = set()
+        allocation_private_scalars: set[str] = set()
+        for ordinal in range(1, pair_count + 1):
+            pair_id = f"pair-{ordinal:02d}"
+            pair_root = root / pair_id
+            pair_root.mkdir(mode=0o700)
+            result = self.run_command(
+                (
+                    str(Path(self.keygen_binary).resolve()),
+                    "--secure-bls-preallocation",
+                    "--algo",
+                    "bls",
+                    "--num",
+                    str(count),
+                ),
+                cwd=pair_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode != 0 or result.stderr:
+                _error(f"v13 readiness key preallocation failed for {pair_id}")
+            identities = profiled_fault_runtime._parse_identity_output(
+                result.stdout,
+                expected_count=count,
+                expected_fields=frozenset({"pub", "sec"}),
+                label=f"{pair_id} readiness keygen",
+            )
+            members: list[dict[str, object]] = []
+            private_records: list[dict[str, object]] = []
+            for replica, identity in enumerate(identities):
+                public = str(identity["pub"])
+                secret = str(identity["sec"])
+                if (
+                    len(public) != 96
+                    or len(secret) != 64
+                    or any(c not in "0123456789abcdef" for c in public + secret)
+                    or public in allocation_public_keys
+                    or secret in allocation_private_scalars
+                ):
+                    _error("v13 readiness keygen output is malformed or duplicate")
+                allocation_public_keys.add(public)
+                allocation_private_scalars.add(secret)
+                private_path = pair_root / f"replica-{replica}.sec"
+                private_bytes = f"{secret}\n".encode("ascii")
+                profiled_fault_runtime.write_exclusive(
+                    private_path, private_bytes, mode=0o600
+                )
+                members.append({"public_key_hex": public, "replica_id": replica})
+                private_records.append(
+                    {
+                        "private_key_path": str(private_path),
+                        "private_key_sha256": _sha256(private_bytes),
+                        "public_key_hex": public,
+                        "replica_id": replica,
+                    }
+                )
+            manifest = _v13_public_manifest_bytes(self.profile, members)
+            manifest_path = pair_root / "readiness-public-manifest.json"
+            profiled_fault_runtime.write_exclusive(manifest_path, manifest, mode=0o600)
+            manifest_sha = _sha256(manifest)
+            if manifest_sha in manifest_digests:
+                _error("v13 readiness preallocation duplicated a pair manifest")
+            manifest_digests.add(manifest_sha)
+            pairs[pair_id] = {
+                "manifest_path": str(manifest_path),
+                "manifest_sha256": manifest_sha,
+                "membership_digest": json.loads(manifest)["membership_digest"],
+                "members": members,
+                "private_allocations": private_records,
+            }
+        return {"pair_readiness_allocations": pairs}
+
+
 def _profile_identity(raw: Mapping[str, Any]) -> dict[str, Any]:
     identity = json.loads(json.dumps(dict(raw)))
     topology = identity.get("topology")
@@ -1253,11 +1752,12 @@ def _validate_topology_proof(
         "n31-f5-q21-three-crash-pair-v10",
         "n31-f5-q21-three-crash-pair-v11",
         "n31-f5-q21-three-crash-pair-v12",
+        "n31-f5-q21-three-crash-pair-v13",
     }:
         metric = topology.get("target_selection_metric")
         expected_metric = (
             _v12_n31_target_selection_metric()
-            if str(profile.get("profile_id", "")).endswith("-v12")
+            if str(profile.get("profile_id", "")).endswith(("-v12", "-v13"))
             else (
                 _v8_n31_target_selection_metric()
                 if str(profile.get("profile_id", "")).endswith(
@@ -1274,7 +1774,7 @@ def _validate_topology_proof(
     ):
         _error("archived topology contains a prospective target selection metric")
     if str(profile.get("profile_id", "")).endswith(
-        ("-v8", "-v9", "-v10", "-v11", "-v12")
+        ("-v8", "-v9", "-v10", "-v11", "-v12", "-v13")
     ):
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         expected_capacity = _reporter_capacity_document(
@@ -1289,7 +1789,10 @@ def _validate_topology_proof(
         ):
             _error("v8 topology reporter capacity differs from topology derivation")
         expected_derivation["reporter_coverage_capacity"] = expected_capacity
-    if str(profile.get("profile_id", "")) == "n31-f5-q21-three-crash-pair-v12":
+    if str(profile.get("profile_id", "")) in {
+        "n31-f5-q21-three-crash-pair-v12",
+        "n31-f5-q21-three-crash-pair-v13",
+    }:
         arm = _document(profile.get("fault_window_arm"), "fault-window arm metadata")
         expected_all = _all_candidate_reporter_capacity_document(
             replica_count=replica_count,
@@ -2161,6 +2664,88 @@ def _authorization_request(
     }
 
 
+def _v13_authorization_readiness_projection(
+    profile: FocusedProfile,
+    allocations: Mapping[str, object],
+    *,
+    pair_count: int,
+) -> dict[str, dict[str, object]]:
+    """Public, canonical pre-authorization commitment to v13 BLS members."""
+    expected_pairs = {f"pair-{ordinal:02d}" for ordinal in range(1, pair_count + 1)}
+    if set(allocations) != expected_pairs:
+        _error("v13 pair readiness allocation cardinality drifted")
+    expected_members = _integer(
+        _document(profile.raw.get("protocol"), "v13 protocol").get("N"),
+        "v13 profile member count", 1,
+    )
+    manifests: dict[str, dict[str, object]] = {}
+    manifest_digests: set[str] = set()
+    membership_digests: set[str] = set()
+    for pair_id in sorted(expected_pairs):
+        allocation = _document(allocations[pair_id], f"{pair_id} readiness allocation")
+        manifest_sha = _digest(allocation.get("manifest_sha256"), f"{pair_id} manifest digest")
+        membership = _digest(allocation.get("membership_digest"), f"{pair_id} membership digest")
+        members = allocation.get("members")
+        if not isinstance(members, list) or len(members) != expected_members:
+            _error("v13 readiness allocation member count drifted")
+        if manifest_sha in manifest_digests or membership in membership_digests:
+            _error("v13 readiness allocation has duplicate public commitments")
+        manifest_digests.add(manifest_sha)
+        membership_digests.add(membership)
+        manifests[pair_id] = {
+            "manifest_sha256": manifest_sha,
+            "membership_digest": membership,
+            "member_count": expected_members,
+        }
+    return manifests
+
+
+def _validate_v13_authorization_readiness_projection(
+    value: object, *, pair_count: int
+) -> dict[str, dict[str, object]]:
+    projection = _document(value, "v13 authorization readiness projection")
+    expected = {f"pair-{ordinal:02d}" for ordinal in range(1, pair_count + 1)}
+    if set(projection) != expected:
+        _error("v13 authorization readiness projection pair keys drifted")
+    result: dict[str, dict[str, object]] = {}
+    manifests: set[str] = set()
+    memberships: set[str] = set()
+    for pair_id in sorted(expected):
+        row = _document(projection[pair_id], f"{pair_id} readiness projection")
+        if set(row) != {"manifest_sha256", "membership_digest", "member_count"}:
+            _error("v13 authorization readiness projection schema drifted")
+        manifest = _digest(row.get("manifest_sha256"), f"{pair_id} manifest digest")
+        membership = _digest(row.get("membership_digest"), f"{pair_id} membership digest")
+        members = _integer(row.get("member_count"), f"{pair_id} member count", 1)
+        if manifest in manifests or membership in memberships:
+            _error("v13 authorization readiness projection duplicates a public digest")
+        manifests.add(manifest)
+        memberships.add(membership)
+        result[pair_id] = {
+            "manifest_sha256": manifest,
+            "membership_digest": membership,
+            "member_count": members,
+        }
+    return result
+
+
+def _authorization_request_keys(
+    document: Mapping[str, object], *, strict: bool = True
+) -> tuple[str, ...]:
+    schema = document.get("schema_version")
+    if schema == 1:
+        keys = _AUTHORIZATION_KEYS
+        if "execution_context_sha256" in document:
+            keys = (*keys, "execution_context_sha256")
+    elif schema == 2:
+        keys = (*_AUTHORIZATION_KEYS, "execution_context_sha256", _V13_AUTHORIZATION_READINESS_KEY)
+    else:
+        _error("authorization request schema drifted")
+    if strict and set(document) != set(keys):
+        _error("authorization request schema drifted")
+    return keys
+
+
 @dataclass(slots=True)
 class FocusedLivePreflightChecks:
     """Read-only live checks used by the CLI before authorization.
@@ -2174,6 +2759,7 @@ class FocusedLivePreflightChecks:
     build_provenance_path: Path
     run_command: Callable[..., Any] = subprocess.run
     issuer_allocator: object | None = None
+    readiness_allocator: object | None = None
     _build_record: Mapping[str, object] | None = field(default=None, init=False)
     _binaries: Mapping[str, Path] | None = field(default=None, init=False)
 
@@ -2200,6 +2786,16 @@ class FocusedLivePreflightChecks:
                     allocation_root=allocation_root,
                     pair_count=pair_count,
                     keygen_binary=build_directory / "hotstuff-keygen",
+                )
+            ),
+            readiness_allocator=(
+                None
+                if allocation_root is None or not _is_v13_profile(profile)
+                else FocusedV13ReadinessAllocator(
+                    allocation_root=allocation_root.parent / "readiness-allocation",
+                    pair_count=pair_count,
+                    keygen_binary=build_directory / "hotstuff-keygen",
+                    profile=profile,
                 )
             ),
         )
@@ -2307,6 +2903,14 @@ class FocusedLivePreflightChecks:
             _error("issuer_public_key check requires a pair-bound issuer context")
         return {"issuer_public_key": configured}
 
+    def activation_readiness(self, profile: object) -> Mapping[str, object]:
+        if not _is_v13_profile(profile):
+            _error("activation readiness preallocation is v13-only")
+        allocate = getattr(self.readiness_allocator, "allocate", None)
+        if not callable(allocate):
+            _error("v13 readiness allocator is unavailable")
+        return dict(_document(allocate(), "v13 readiness allocation"))
+
 
 def _focused_ports(profile: FocusedProfile) -> tuple[int, ...]:
     ports = _document(profile.raw.get("ports"), "profile ports")
@@ -2334,6 +2938,8 @@ def prepare_focused_preflight(
     request = _authorization_request(
         profile, mode=mode, pair_count=pair_count, output_root=output_root
     )
+    if _is_v13_profile(profile) and checks is None:
+        _error("v13 preflight requires readiness allocation before authorization")
     preflight_root = Path(output_root).resolve().parent / (
         f".{Path(output_root).name}-{request['authorization_nonce'][:16]}-preflight"
     )
@@ -2346,7 +2952,7 @@ def prepare_focused_preflight(
         )
     check_results: dict[str, Mapping[str, object]] = {}
     if checks is not None:
-        for name in (
+        check_names = [
             "repository",
             "build",
             "binaries",
@@ -2354,7 +2960,10 @@ def prepare_focused_preflight(
             "clock",
             "native_topology",
             "issuer_public_key",
-        ):
+        ]
+        if _is_v13_profile(profile):
+            check_names.append("activation_readiness")
+        for name in check_names:
             method = getattr(checks, name, None)
             if not callable(method):
                 _error(f"{name} check is unavailable")
@@ -2385,7 +2994,7 @@ def prepare_focused_preflight(
             **{
                 name: dict(result)
                 for name, result in check_results.items()
-                if name != "issuer_public_key"
+                if name not in {"issuer_public_key", "activation_readiness"}
             },
             "issuer_public_key": check_results["issuer_public_key"][
                 "issuer_public_key"
@@ -2417,6 +3026,36 @@ def prepare_focused_preflight(
                 if any(value is None for value in normalized[pair_id].values()):
                     _error("pair issuer allocation schema drifted")
             execution_context["pair_issuers"] = normalized
+        if _is_v13_profile(profile):
+            readiness = _document(
+                check_results["activation_readiness"],
+                "v13 readiness allocation",
+            )
+            allocations = _document(
+                readiness.get("pair_readiness_allocations"),
+                "v13 pair readiness allocations",
+            )
+            expected_pairs = {
+                f"pair-{ordinal:02d}" for ordinal in range(1, pair_count + 1)
+            }
+            if set(allocations) != expected_pairs:
+                _error("v13 pair readiness allocation cardinality drifted")
+            execution_context["pair_readiness_allocations"] = {
+                pair_id: dict(
+                    _document(allocations[pair_id], f"{pair_id} readiness allocation")
+                )
+                for pair_id in sorted(expected_pairs)
+            }
+            request = {
+                **request,
+                "schema_version": 2,
+                _V13_AUTHORIZATION_READINESS_KEY:
+                    _v13_authorization_readiness_projection(
+                        profile,
+                        execution_context["pair_readiness_allocations"],
+                        pair_count=pair_count,
+                    ),
+            }
         if profile.raw.get("schema_version") == 2:
             execution_context["reporter_coverage"] = derive_reporter_coverage_plan(
                 profile
@@ -2449,23 +3088,46 @@ def prepare_focused_preflight(
 
 def build_focused_authorization_request(preflight: object) -> bytes:
     document = _document(preflight, "focused preflight")
-    request_keys = list(_AUTHORIZATION_KEYS)
+    request_keys = _authorization_request_keys(document, strict=False)
     execution_context = document.get("execution_context")
-    if document.get("execution_context_sha256") is not None:
+    if "execution_context_sha256" in request_keys:
         context_digest = _sha256(
             _canonical_json(_document(execution_context, "execution context"))
         )
         if document.get("execution_context_sha256") != context_digest:
             _error("preflight execution context digest drifted")
-        request_keys.append("execution_context_sha256")
     request = {key: document.get(key) for key in request_keys}
     if any(request[key] is None for key in request_keys):
         _error("preflight does not contain the complete authorization request")
+    if request["schema_version"] == 2:
+        projection = _validate_v13_authorization_readiness_projection(
+            request[_V13_AUTHORIZATION_READINESS_KEY],
+            pair_count=_integer(request["pair_count"], "authorized pair count", 1),
+        )
+        allocations = _document(
+            _document(execution_context, "execution context").get(
+                "pair_readiness_allocations"
+            ),
+            "v13 readiness allocations",
+        )
+        actual: dict[str, dict[str, object]] = {}
+        for pair_id in sorted(projection):
+            allocation = _document(allocations.get(pair_id), f"{pair_id} readiness allocation")
+            members = allocation.get("members")
+            if not isinstance(members, list):
+                _error("v13 readiness allocation members are malformed")
+            actual[pair_id] = {
+                "manifest_sha256": _digest(allocation.get("manifest_sha256"), f"{pair_id} manifest digest"),
+                "membership_digest": _digest(allocation.get("membership_digest"), f"{pair_id} membership digest"),
+                "member_count": len(members),
+            }
+        if projection != actual:
+            _error("preflight readiness projection drifted")
     payload = _canonical_json(request)
     expected_sha = document.get("request_sha256")
     if expected_sha is not None and expected_sha != _sha256(payload):
         base_request = {key: document.get(key) for key in _AUTHORIZATION_KEYS}
-        if "execution_context_sha256" not in request or expected_sha != _sha256(
+        if request["schema_version"] != 1 or "execution_context_sha256" not in request or expected_sha != _sha256(
             _canonical_json(base_request)
         ):
             _error("preflight request digest drifted")
@@ -2489,12 +3151,12 @@ def verify_focused_authorization_receipt(
         raise FocusedCrashPairRuntimeError("authorization request is invalid") from exc
     if _canonical_json(request_document) != request:
         _error("authorization request is not exact canonical JSON")
-    request_keys = set(request_document)
-    if frozenset(request_keys) not in {
-        frozenset(_AUTHORIZATION_KEYS),
-        frozenset((*_AUTHORIZATION_KEYS, "execution_context_sha256")),
-    }:
-        _error("authorization request schema drifted")
+    request_keys = set(_authorization_request_keys(request_document))
+    if request_document["schema_version"] == 2:
+        _validate_v13_authorization_readiness_projection(
+            request_document[_V13_AUTHORIZATION_READINESS_KEY],
+            pair_count=_integer(request_document.get("pair_count"), "authorized pair count", 1),
+        )
     expected_keys = {
         *request_keys,
         "request_sha256",
@@ -2633,6 +3295,320 @@ def reload_pair_issuer_allocations(
     if context.get("issuer_public_key") != loaded["pair-01"]["public_key"]:
         _error("execution context primary issuer key drifted")
     return loaded
+
+
+def reload_v13_readiness_allocations(
+    *,
+    preflight: Mapping[str, Any],
+    authorization: Mapping[str, Any],
+    keygen_record: Mapping[str, object],
+    run_command: Callable[..., Any] = subprocess.run,
+) -> dict[str, dict[str, object]]:
+    """Reload authorized readiness scalars and rederive every public key natively."""
+
+    request = build_focused_authorization_request(preflight)
+    verified = verify_focused_authorization_receipt(request, authorization)
+    context = _document(preflight.get("execution_context"), "execution context")
+    if verified.get("execution_context_sha256") != _sha256(_canonical_json(context)):
+        _error("authorization does not bind v13 readiness allocation")
+    authorized_keygen = _document(keygen_record, "authorized keygen binary")
+    keygen_path_value = authorized_keygen.get("path")
+    if not isinstance(keygen_path_value, str) or not Path(keygen_path_value).is_absolute():
+        _error("authorized keygen path is not absolute")
+    keygen_binary = Path(keygen_path_value)
+    if keygen_binary.is_symlink() or not keygen_binary.is_file():
+        _error("authorized keygen binary is absent or unsafe")
+    resolved_keygen = keygen_binary.resolve()
+    if (
+        str(resolved_keygen) != keygen_path_value
+        or _sha256_regular_file_no_follow(resolved_keygen, label="authorized keygen binary")
+        != _digest(authorized_keygen.get("sha256"), "authorized keygen digest")
+    ):
+        _error("authorized keygen binary identity drifted")
+    allocations = _document(
+        context.get("pair_readiness_allocations"), "v13 readiness allocations"
+    )
+    expected_pairs = {
+        f"pair-{ordinal:02d}"
+        for ordinal in range(
+            1, _integer(verified.get("pair_count"), "authorized pair count", 1) + 1
+        )
+    }
+    if set(allocations) != expected_pairs:
+        _error("v13 readiness allocation cardinality drifted")
+    projection = _validate_v13_authorization_readiness_projection(
+        verified.get(_V13_AUTHORIZATION_READINESS_KEY),
+        pair_count=len(expected_pairs),
+    )
+    expected_projection: dict[str, dict[str, object]] = {}
+    for pair_id in sorted(expected_pairs):
+        allocation = _document(allocations[pair_id], f"{pair_id} readiness allocation")
+        members = allocation.get("members")
+        if not isinstance(members, list):
+            _error("v13 readiness allocation members are malformed")
+        expected_projection[pair_id] = {
+            "manifest_sha256": _digest(allocation.get("manifest_sha256"), f"{pair_id} manifest digest"),
+            "membership_digest": _digest(allocation.get("membership_digest"), f"{pair_id} membership digest"),
+            "member_count": len(members),
+        }
+    if projection != expected_projection:
+        _error("authorization readiness projection does not match allocation")
+    loaded: dict[str, dict[str, object]] = {}
+    allocation_public_keys: set[str] = set()
+    allocation_private_scalars: set[bytes] = set()
+    for pair_id in sorted(expected_pairs):
+        allocation = _document(allocations[pair_id], f"{pair_id} readiness allocation")
+        manifest_path_value = allocation.get("manifest_path")
+        if not isinstance(manifest_path_value, str) or not Path(manifest_path_value).is_absolute():
+            _error("v13 readiness manifest path is not absolute")
+        manifest_path = Path(manifest_path_value)
+        if manifest_path.is_symlink() or not manifest_path.is_file():
+            _error("v13 readiness manifest is absent or unsafe")
+        manifest = manifest_path.read_bytes()
+        if _sha256(manifest) != _digest(
+            allocation.get("manifest_sha256"), "v13 readiness manifest digest"
+        ):
+            _error("v13 readiness public manifest drifted")
+        try:
+            manifest_document = _document(json.loads(manifest), "v13 readiness manifest")
+        except (json.JSONDecodeError, UnicodeError) as exc:
+            raise FocusedCrashPairRuntimeError(
+                "v13 readiness public manifest is malformed"
+            ) from exc
+        if _canonical_json(manifest_document) != manifest:
+            _error("v13 readiness public manifest is not canonical JSON")
+        members_value = manifest_document.get("members")
+        private_value = allocation.get("private_allocations")
+        if not isinstance(members_value, list) or not isinstance(private_value, list):
+            _error("v13 readiness allocation members are malformed")
+        if allocation.get("members") != members_value or len(private_value) != len(members_value):
+            _error("v13 readiness public/private cardinality drifted")
+        if manifest_document.get("membership_digest") != _v13_membership_digest(
+            [_document(member, "v13 readiness member") for member in members_value]
+        ) or allocation.get("membership_digest") != manifest_document.get(
+            "membership_digest"
+        ):
+            _error("v13 readiness membership digest drifted")
+        private_rows: list[dict[str, object]] = []
+        for expected_replica, raw_private in enumerate(private_value):
+            private = _document(raw_private, "v13 readiness private allocation")
+            member = _document(members_value[expected_replica], "v13 readiness member")
+            if (
+                private.get("replica_id") != expected_replica
+                or member.get("replica_id") != expected_replica
+                or private.get("public_key_hex") != member.get("public_key_hex")
+            ):
+                _error("v13 readiness private allocation identity drifted")
+            raw_path = private.get("private_key_path")
+            if not isinstance(raw_path, str) or not Path(raw_path).is_absolute():
+                _error("v13 readiness private path is not absolute")
+            private_path = Path(raw_path)
+            if private_path.parent != manifest_path.parent or private_path.name != f"replica-{expected_replica}.sec":
+                _error("v13 readiness private allocation escaped its pair directory")
+            scalar = _read_exact_private_scalar(
+                private_path, label=f"{pair_id} replica {expected_replica} readiness scalar"
+            )
+            if _sha256(scalar) != _digest(
+                private.get("private_key_sha256"), "v13 readiness private digest"
+            ):
+                _error("v13 readiness private scalar drifted")
+            public = member.get("public_key_hex")
+            if (
+                not isinstance(public, str)
+                or public in allocation_public_keys
+                or scalar in allocation_private_scalars
+            ):
+                _error("v13 readiness allocation has cross-pair key overlap")
+            allocation_public_keys.add(public)
+            allocation_private_scalars.add(scalar)
+            result = run_command(
+                (
+                    str(resolved_keygen),
+                    "--derive-bls-public",
+                ),
+                input=scalar.decode("ascii"),
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            expected_output = f"pub:{member['public_key_hex']}\n"
+            if result.returncode != 0 or result.stderr or result.stdout != expected_output:
+                _error("v13 readiness private/public derivation drifted")
+            private_rows.append(
+                {
+                    **dict(private),
+                    "private_key": scalar[:-1].decode("ascii"),
+                }
+            )
+        loaded[pair_id] = {
+            **dict(allocation),
+            "private_allocations": private_rows,
+            "manifest_bytes": manifest,
+        }
+    return loaded
+
+
+def _v13_launch_readiness_allocation(
+    profile: FocusedProfile,
+    *,
+    pair_id: str,
+    allocations: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the authorized public/private split before constructing argv."""
+
+    _v13_certified_activation_contract(profile)
+    if set(allocations) == {pair_id}:
+        raw_allocation = allocations[pair_id]
+    elif pair_id in allocations:
+        raw_allocation = allocations[pair_id]
+    else:
+        _error("v13 launch readiness allocation is missing its pair")
+    allocation = _document(raw_allocation, f"{pair_id} readiness allocation")
+    if set(allocation) != {
+        "manifest_path",
+        "manifest_sha256",
+        "membership_digest",
+        "members",
+        "private_allocations",
+        "manifest_bytes",
+    }:
+        _error("v13 launch readiness allocation schema drifted")
+    manifest_bytes = allocation.get("manifest_bytes")
+    if not isinstance(manifest_bytes, bytes):
+        _error("v13 launch public manifest bytes are absent")
+    if _sha256(manifest_bytes) != _digest(
+        allocation.get("manifest_sha256"), "v13 launch manifest digest"
+    ):
+        _error("v13 launch public manifest digest drifted")
+    try:
+        manifest = _document(
+            json.loads(manifest_bytes), "v13 launch public manifest"
+        )
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise FocusedCrashPairRuntimeError(
+            "v13 launch public manifest is malformed"
+        ) from exc
+    if _canonical_json(manifest) != manifest_bytes:
+        _error("v13 launch public manifest is not canonical JSON")
+    members_value = manifest.get("members")
+    if not isinstance(members_value, list):
+        _error("v13 launch public manifest members are malformed")
+    members = [
+        dict(_document(member, "v13 launch readiness member"))
+        for member in members_value
+    ]
+    if (
+        set(manifest)
+        != {
+            "algorithm",
+            "domain",
+            "membership_digest",
+            "members",
+            "profile_id",
+            "profile_sha256",
+            "protocol_mode",
+            "schema_version",
+        }
+        or len(members) != len(profile.replica_ids)
+        or manifest.get("schema_version") != 1
+        or manifest.get("domain")
+        != "kauri-adaptive-v3-readiness-public-key-manifest-v1"
+        or manifest.get("algorithm") != "bls-pop"
+        or manifest.get("protocol_mode") != "adaptive_v3"
+        or manifest.get("profile_id") != profile.profile_id
+        or manifest.get("profile_sha256") != profile.profile_sha256
+        or allocation.get("members") != members
+        or manifest.get("membership_digest") != _v13_membership_digest(members)
+        or allocation.get("membership_digest")
+        != manifest.get("membership_digest")
+    ):
+        _error("v13 launch public manifest identity drifted")
+    private_value = allocation.get("private_allocations")
+    if not isinstance(private_value, list) or len(private_value) != len(members):
+        _error("v13 launch private allocation cardinality drifted")
+    private_rows: list[dict[str, object]] = []
+    private_values: set[str] = set()
+    for expected_replica, raw_private in enumerate(private_value):
+        private = _document(raw_private, "v13 launch private allocation")
+        if set(private) != {
+            "private_key_path",
+            "private_key_sha256",
+            "public_key_hex",
+            "replica_id",
+            "private_key",
+        }:
+            _error("v13 launch private allocation schema drifted")
+        member = members[expected_replica]
+        scalar = private.get("private_key")
+        private_path = private.get("private_key_path")
+        if (
+            private.get("replica_id") != expected_replica
+            or member.get("replica_id") != expected_replica
+            or private.get("public_key_hex") != member.get("public_key_hex")
+            or not isinstance(private_path, str)
+            or not Path(private_path).is_absolute()
+            or not isinstance(scalar, str)
+            or len(scalar) != 64
+            or any(character not in "0123456789abcdef" for character in scalar)
+            or scalar in private_values
+            or _sha256(f"{scalar}\n".encode("ascii"))
+            != _digest(
+                private.get("private_key_sha256"),
+                "v13 launch private allocation digest",
+            )
+        ):
+            _error("v13 launch private allocation identity drifted")
+        private_values.add(scalar)
+        private_rows.append(dict(private))
+    if any(value.encode("ascii") in manifest_bytes for value in private_values):
+        _error("v13 readiness private material contaminated the public manifest")
+    return {
+        "manifest_bytes": manifest_bytes,
+        "manifest_sha256": allocation["manifest_sha256"],
+        "membership_digest": allocation["membership_digest"],
+        "members": members,
+        "private_allocations": private_rows,
+        "private_values": private_values,
+    }
+
+
+def _v13_redacted_launch_projection(
+    argv: Sequence[str], *, private_values: Collection[str]
+) -> tuple[str, ...]:
+    """Return a launch projection that cannot contain readiness private material."""
+
+    secrets = {value for value in private_values if isinstance(value, str) and value}
+    projected: list[str] = []
+    for value in argv:
+        if not isinstance(value, str):
+            _error("v13 launch argument is not text")
+        redacted = value
+        for secret in secrets:
+            if secret in redacted:
+                redacted = redacted.replace(secret, "<redacted>")
+        projected.append(redacted)
+    encoded = _canonical_json(projected)
+    if any(secret.encode("utf-8") in encoded for secret in secrets):
+        _error("v13 private material survived launch redaction")
+    return tuple(projected)
+
+
+def _v13_assert_private_material_excluded(
+    root: Path, *, private_values: Collection[str]
+) -> None:
+    secrets = tuple(
+        value.encode("ascii")
+        for value in private_values
+        if isinstance(value, str) and value
+    )
+    for path in root.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        payload = path.read_bytes()
+        if any(secret in payload for secret in secrets):
+            _error(
+                "v13 readiness private material entered a materialized launch artifact"
+            )
 
 
 def derive_focused_child_authorization(
@@ -3147,7 +4123,28 @@ def _drive_arm_state_machine(
         quorum=quorum,
         after_ns=activation1_ns,
     )
-    if isinstance(profile, FocusedProfile) and _is_v10_profile(profile):
+    v13_contract = (
+        _v13_certified_activation_contract(profile)
+        if _is_v13_profile(profile)
+        else None
+    )
+    if v13_contract is not None:
+        first_common1_ns = _integer(
+            commit1.get("first_common_commit_anchor_monotonic_ns"),
+            "first Epoch-1 common commit anchor",
+        )
+        margin_ns = _integer(
+            v13_contract["epoch1_common_commit_anchor_deadline_seconds"],
+            "v13 Epoch-1 anchor deadline",
+            1,
+        ) * 1_000_000_000
+        if (
+            first_common1_ns <= activation1_ns
+            or first_common1_ns > commit1_ns
+            or first_common1_ns >= activation1_ns + margin_ns
+        ):
+            _error("v13 Epoch-1 common commit missed its half-open anchor bound")
+    elif isinstance(profile, FocusedProfile) and _is_v10_profile(profile):
         anchor_margin_ns, _residency_ms = _v10_transition_timing(profile)
         first_common1_ns = _integer(
             commit1.get("first_common_commit_anchor_monotonic_ns"),
@@ -3212,6 +4209,26 @@ def _drive_arm_state_machine(
         epoch2_ns = _timestamp(epoch2_snapshot, "epoch 2 request")
         if epoch2_ns <= ranking_ns:
             _error("epoch 2 request precedes its ranking")
+        if v13_contract is not None:
+            phase_end_ns = commit1_ns + (
+                _integer(
+                    v13_contract["containment_stabilization_seconds"],
+                    "v13 containment stabilization",
+                    1,
+                )
+                + _integer(
+                    v13_contract["containment_measurement_seconds"],
+                    "v13 containment measurement",
+                    1,
+                )
+            ) * 1_000_000_000
+            residence_end_ns = activation1_ns + _integer(
+                v13_contract["minimum_predecessor_residency_ms"],
+                "v13 predecessor residency",
+                1,
+            ) * 1_000_000
+            if epoch2_ns <= max(phase_end_ns, residence_end_ns):
+                _error("v13 Epoch-2 request is ineligible before the Epoch-1 window")
         epoch2_wire, epoch2 = _decoded_bundle(epoch2_snapshot, issuer, "epoch 2")
         if (
             epoch2.epoch_number != 2
@@ -3254,7 +4271,26 @@ def _drive_arm_state_machine(
         )
         if activation2.get("activation_height") != command2.get("activation_height"):
             _error("epoch 2 activation does not match its command")
-        if coverage is not None and not is_before_fcrash_h_deadline(
+        if v13_contract is not None:
+            hard_deadline_ns = fault_ns + _integer(
+                _document(_profile_document_value(profile).get("timers"), "v13 timers").get(
+                    "arm_hard_deadline_seconds"
+                ),
+                "v13 hard deadline",
+                1,
+            ) * 1_000_000_000
+            if not _v13_e2_activation_is_timely(
+                final_common_command_ns=command2_ns,
+                activation_ns=activation2_ns,
+                hard_deadline_ns=hard_deadline_ns,
+                budget_seconds=_integer(
+                    v13_contract["optimization_activation_budget_seconds"],
+                    "v13 optimization activation budget",
+                    1,
+                ),
+            ):
+                _error("v13 Epoch-2 activation missed its command-anchored window")
+        elif coverage is not None and not is_before_fcrash_h_deadline(
             activation1_ns,
             activation2_ns,
             _integer(
@@ -7344,6 +8380,40 @@ def _generate_arm_identities(
     )
 
 
+def _generate_v13_arm_tls_identities(
+    profile: FrozenProfile,
+    *,
+    keygen_binary: Path,
+    tls_keygen_binary: Path,
+    config_directory: Path,
+) -> list[dict[str, str]]:
+    """Generate only TLS material; v13 BLS identities are preauthorized."""
+
+    command = profiled_fault_runtime.identity_generation_commands(
+        profile,
+        keygen_binary=keygen_binary,
+        tls_keygen_binary=tls_keygen_binary,
+    )["tls"]
+    result = subprocess.run(
+        command,
+        cwd=config_directory,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0 or result.stderr:
+        _error("v13 TLS arm identity generation failed")
+    profiled_fault_runtime.write_exclusive(
+        config_directory / "tls-identities.txt", result.stdout.encode("ascii")
+    )
+    return profiled_fault_runtime._parse_identity_output(
+        result.stdout,
+        expected_count=len(profile.replica_ids) + 1,
+        expected_fields=frozenset({"crt", "sec", "cid"}),
+        label="v13 TLS keygen",
+    )
+
+
 def _focused_transition_requests(
     run_directory: Path, arm: str, profile: FocusedProfile
 ) -> tuple[tuple[dict[str, object], Path], ...]:
@@ -7418,6 +8488,109 @@ def _focused_client_default_epoch(
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
+def _v13_replica_argvs(
+    profile: FocusedProfile,
+    adapter: FrozenProfile,
+    *,
+    base_commands: Sequence[Sequence[str]],
+    readiness: Mapping[str, object],
+    tls: Sequence[Mapping[str, str]],
+    issuer: Mapping[str, str],
+    run_directory: Path,
+    run_id: str,
+    source_instances: Mapping[str, str],
+) -> tuple[tuple[str, ...], ...]:
+    """Construct the exact P3 replica argv without persisting readiness secrets."""
+
+    _v13_certified_activation_contract(profile)
+    members = readiness.get("members")
+    private_rows = readiness.get("private_allocations")
+    if (
+        not isinstance(members, list)
+        or not isinstance(private_rows, list)
+        or len(base_commands) != len(profile.replica_ids)
+        or len(members) != len(profile.replica_ids)
+        or len(private_rows) != len(profile.replica_ids)
+        or len(tls) != len(profile.replica_ids) + 1
+    ):
+        _error("v13 replica launch cardinality drifted")
+    membership_argv = tuple(
+        argument
+        for member in members
+        for argument in (
+            "--activation-readiness-member",
+            f"{member['replica_id']},{member['public_key_hex']}",
+        )
+    )
+    commands: list[tuple[str, ...]] = []
+    observer_id = f"replica-{_integer(profile.raw['measurement']['authoritative_replica_id'], 'v13 observer id')}"
+    for position, replica in enumerate(profile.replica_ids):
+        private = _document(private_rows[position], "v13 replica private allocation")
+        source_id = f"replica-{replica}"
+        commands.append(
+            (
+                *tuple(base_commands[position]),
+                "--privkey",
+                str(private["private_key"]),
+                "--epoch-protocol-mode",
+                "adaptive_v3",
+                "--epoch-change-issuer-id",
+                str(profiled_fault_runtime.ISSUER_ID),
+                "--epoch-change-issuer-public-key",
+                str(issuer["pub"]),
+                "--epoch-change-minimum-activation-delay",
+                str(adapter.activation_delay_blocks),
+                "--epoch-change-maximum-activation-delay",
+                str(adapter.activation_delay_blocks),
+                "--epoch-change-maximum-block-extra-bytes",
+                str(profiled_fault_runtime.MAX_COMMAND_BYTES),
+                "--epoch-change-maximum-ancestry-blocks",
+                str(profiled_fault_runtime.MAX_ANCESTRY_BLOCKS),
+                "--epoch-manager-address",
+                f"127.0.0.1:{adapter.manager_port}",
+                "--epoch-manager-tls-cert",
+                str(tls[len(profile.replica_ids)]["crt"]),
+                *membership_argv,
+                "--activation-readiness-maximum-observation-attempts",
+                str(_V13_MAXIMUM_OBSERVATION_ATTEMPTS),
+                "--activation-readiness-observation-retry-interval-ms",
+                str(_V13_OBSERVATION_RETRY_INTERVAL_MS),
+                "--structured-event-run-id",
+                run_id,
+                "--structured-event-source-instance",
+                str(source_instances[source_id]),
+                "--structured-event-output",
+                str(run_directory / "raw" / f"{source_id}.jsonl"),
+                "--structured-event-commit-observer-id",
+                observer_id,
+                "--structured-event-commit-observer-instance",
+                str(source_instances[observer_id]),
+            )
+        )
+    return tuple(commands)
+
+
+def _v13_client_argv(
+    *,
+    client_binary: Path,
+    run_directory: Path,
+    maximum_async: int,
+) -> tuple[str, ...]:
+    return (
+        str(client_binary),
+        "--conf",
+        str(run_directory / "config" / "main.conf"),
+        "--idx",
+        "0",
+        "--iter",
+        "-1",
+        "--max-async",
+        str(maximum_async),
+        "--epoch-protocol-mode",
+        "adaptive_v3",
+    )
+
+
 def _focused_manager_command(
     profile: FocusedProfile,
     adapter: FrozenProfile,
@@ -7431,7 +8604,11 @@ def _focused_manager_command(
     source_instance: str,
     fault_window_arm_path: Path | None = None,
     request_sha256: str | None = None,
+    readiness_members: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[str, ...]:
+    v13 = _is_v13_profile(profile)
+    if v13:
+        _v13_certified_activation_contract(profile)
     count = len(profile.replica_ids)
     policy = _NATIVE_RESPONSIVENESS_POLICY
     command = [
@@ -7475,6 +8652,39 @@ def _focused_manager_command(
         "--responsiveness-latency-percentile-basis-points",
         str(policy["latency_percentile_basis_points"]),
     ]
+    if v13:
+        # The unified manager still owns the common v2 selection/arm parser;
+        # only its public readiness policy is v3-specific.  Identity is
+        # deliberately absent: it is derived from the committed bundle.
+        retry_ns = _V13_OBSERVATION_RETRY_INTERVAL_MS * 1_000_000
+        command.extend(
+            (
+                "--protocol-mode",
+                "adaptive_v3",
+                "--activation-readiness-release-count",
+                str(profile.raw["transitions"]["survivor_barrier_count"]),
+                "--activation-readiness-maximum-delivery-attempts",
+                str(_V13_MAXIMUM_OBSERVATION_ATTEMPTS),
+                "--activation-readiness-retry-interval-ticks",
+                str(retry_ns),
+            )
+        )
+        if (
+            readiness_members is None
+            or len(readiness_members) != len(profile.replica_ids)
+        ):
+            _error("v13 manager readiness members are absent or malformed")
+        for replica, member in zip(profile.replica_ids, readiness_members, strict=True):
+            member_id = member.get("replica_id")
+            public_key = member.get("public_key_hex")
+            if member_id != replica or not isinstance(public_key, str):
+                _error("v13 manager readiness member identity drifted")
+            command.extend(
+                (
+                    "--activation-readiness-member",
+                    f"{replica},{public_key}",
+                )
+            )
     if _is_v4_profile(profile):
         if (
             fault_window_arm_path is None
@@ -7732,6 +8942,54 @@ class FocusedLaunchBackend:
                     )
                 ):
                     _error(f"authorized {pair_id} issuer identity drifted")
+        loaded_readiness = invocation.get("pair_readiness_allocations")
+        authorized_readiness = execution.get("pair_readiness_allocations")
+        if _is_v13_profile(profile):
+            loaded = _document(loaded_readiness, "loaded v13 readiness allocations")
+            authorized = _document(
+                authorized_readiness, "authorized v13 readiness allocations"
+            )
+            if set(loaded) != set(authorized):
+                _error("authorized v13 readiness allocation cardinality drifted")
+            for pair_id in authorized:
+                loaded_pair = _document(
+                    loaded[pair_id], f"loaded {pair_id} readiness allocation"
+                )
+                authorized_pair = _document(
+                    authorized[pair_id], f"authorized {pair_id} readiness allocation"
+                )
+                if any(
+                    loaded_pair.get(key) != authorized_pair.get(key)
+                    for key in (
+                        "manifest_path",
+                        "manifest_sha256",
+                        "membership_digest",
+                        "members",
+                    )
+                ):
+                    _error(f"authorized {pair_id} readiness identity drifted")
+                loaded_private = loaded_pair.get("private_allocations")
+                authorized_private = authorized_pair.get("private_allocations")
+                if (
+                    not isinstance(loaded_private, list)
+                    or not isinstance(authorized_private, list)
+                    or len(loaded_private) != len(authorized_private)
+                    or any(
+                        any(loaded_row.get(key) != authorized_row.get(key) for key in authorized_row)
+                        for loaded_row, authorized_row in zip(
+                            loaded_private, authorized_private, strict=True
+                        )
+                        if isinstance(loaded_row, Mapping)
+                        and isinstance(authorized_row, Mapping)
+                    )
+                    or any(
+                        not isinstance(row, Mapping)
+                        for row in (*loaded_private, *authorized_private)
+                    )
+                ):
+                    _error(f"authorized {pair_id} readiness private identity drifted")
+        elif loaded_readiness is not None or authorized_readiness is not None:
+            _error("v13 readiness allocations cannot enter an archived launch")
         return {
             **dict(invocation),
             "execution_context": dict(execution),
@@ -7753,6 +9011,18 @@ class FocusedLaunchBackend:
         if not isinstance(source_profile, FocusedProfile):
             _error("focused context lost its profile")
         pair_id = f"pair-{_integer(pair_ordinal, 'pair ordinal', 1):02d}"
+        readiness = (
+            _v13_launch_readiness_allocation(
+                source_profile,
+                pair_id=pair_id,
+                allocations=_document(
+                    context.get("pair_readiness_allocations"),
+                    "v13 pair readiness allocations",
+                ),
+            )
+            if _is_v13_profile(source_profile)
+            else None
+        )
         pair_seed = _integer(
             context.get("pair_seed", 41_719 + pair_ordinal), "pair seed"
         )
@@ -7806,12 +9076,34 @@ class FocusedLaunchBackend:
             issuer_public_key=issuer["pub"],
             raw=source_profile.raw,
         )
-        bls, tls = _generate_arm_identities(
-            adapter,
-            keygen_binary=Path(binaries["keygen"]),
-            tls_keygen_binary=Path(binaries["tls_keygen"]),
-            config_directory=run_directory / "config",
-        )
+        if readiness is None:
+            bls, tls = _generate_arm_identities(
+                adapter,
+                keygen_binary=Path(binaries["keygen"]),
+                tls_keygen_binary=Path(binaries["tls_keygen"]),
+                config_directory=run_directory / "config",
+            )
+        else:
+            tls = _generate_v13_arm_tls_identities(
+                adapter,
+                keygen_binary=Path(binaries["keygen"]),
+                tls_keygen_binary=Path(binaries["tls_keygen"]),
+                config_directory=run_directory / "config",
+            )
+            members = readiness["members"]
+            assert isinstance(members, list)
+            placeholder = "v13-private-key-is-supplied-only-in-process-argv"
+            bls = [
+                {"pub": str(member["public_key_hex"]), "sec": placeholder}
+                for member in members
+            ]
+            profiled_fault_runtime.write_exclusive(
+                run_directory / "config" / "bls-identities.txt",
+                b"".join(
+                    f"pub:{member['public_key_hex']}\n".encode("ascii")
+                    for member in members
+                ),
+            )
         run_id = f"{pair_id}-{arm}-{uuid.uuid4().hex}"
         instances = {
             f"replica-{replica}": f"{run_id}-replica-{replica}-{uuid.uuid4().hex}"
@@ -7832,8 +9124,53 @@ class FocusedLaunchBackend:
                 run_id=run_id,
                 source_instances=instances,
                 include_issuer_identity_artifact=False,
+                epoch_protocol_mode=("adaptive_v3" if _is_v13_profile(profile) else "adaptive_v2"),
             )
         )
+        if readiness is not None:
+            placeholder_line = (
+                "privkey = v13-private-key-is-supplied-only-in-process-argv\n"
+            ).encode("ascii")
+            for replica in profile.replica_ids:
+                config_path = run_directory / "config" / f"replica-{replica}.conf"
+                payload = config_path.read_bytes()
+                if payload.count(placeholder_line) != 1:
+                    _error("v13 replica private-key placeholder drifted")
+                config_path.write_bytes(payload.replace(placeholder_line, b""))
+            replicas = _v13_replica_argvs(
+                profile,
+                adapter,
+                base_commands=replicas,
+                readiness=readiness,
+                tls=tls,
+                issuer=issuer,
+                run_directory=run_directory,
+                run_id=run_id,
+                source_instances=instances,
+            )
+            public_manifest_path = (
+                run_directory / "runtime" / "activation-readiness-public-manifest.json"
+            )
+            profiled_fault_runtime.write_exclusive(
+                public_manifest_path, readiness["manifest_bytes"]
+            )
+            artifacts = [
+                {
+                    **artifact,
+                    "sha256": profiled_fault_runtime.sha256_file(
+                        run_directory / str(artifact["path"])
+                    ),
+                }
+                for artifact in artifacts
+            ]
+            artifacts.append(
+                {
+                    "kind": "activation_readiness_public_manifest",
+                    "replica_id": None,
+                    "path": str(public_manifest_path.relative_to(run_directory)),
+                    "sha256": str(readiness["manifest_sha256"]),
+                }
+            )
         if (
             _is_v6_profile(profile)
             or _is_v7_profile(profile)
@@ -7902,6 +9239,9 @@ class FocusedLaunchBackend:
             source_instance=instances[profiled_fault_runtime.MANAGER_SOURCE_ID],
             fault_window_arm_path=arm_path,
             request_sha256=parent_request_sha,
+            readiness_members=(
+                readiness["members"] if readiness is not None else None
+            ),
         )
         build_record_path = (
             Path(context["build_directory"])
@@ -7948,7 +9288,25 @@ class FocusedLaunchBackend:
                 "pair_seed": pair_seed,
             },
             "runtime/launch-arguments.json": {
-                "manager_argv": profiled_fault_runtime.normalized_manager_argv(manager)
+                "manager_argv": profiled_fault_runtime.normalized_manager_argv(
+                    manager
+                ),
+                **(
+                    {
+                        "manager_checkpoint": _V13_MANAGER_CHECKPOINT,
+                        "replica_argv": [
+                            list(
+                                _v13_redacted_launch_projection(
+                                    command,
+                                    private_values=readiness["private_values"],
+                                )
+                            )
+                            for command in replicas
+                        ],
+                    }
+                    if readiness is not None
+                    else {}
+                ),
             },
             "derived/phase-windows.json": {"phases": []},
             "derived/throughput.json": {"rows": []},
@@ -7971,16 +9329,44 @@ class FocusedLaunchBackend:
         )
         (run_directory / "raw" / "client-events.jsonl").write_bytes(b"")
         client = (
-            str(binaries["client"]),
-            "--conf",
-            str(run_directory / "config" / "main.conf"),
-            "--idx",
-            "0",
-            "--iter",
-            "-1",
-            "--max-async",
-            str(max(1, adapter.pipeline_depth * adapter.block_size)),
+            _v13_client_argv(
+                client_binary=Path(binaries["client"]),
+                run_directory=run_directory,
+                maximum_async=max(1, adapter.pipeline_depth * adapter.block_size),
+            )
+            if readiness is not None
+            else (
+                str(binaries["client"]),
+                "--conf",
+                str(run_directory / "config" / "main.conf"),
+                "--idx",
+                "0",
+                "--iter",
+                "-1",
+                "--max-async",
+                str(max(1, adapter.pipeline_depth * adapter.block_size)),
+            )
         )
+        if readiness is not None:
+            launch_path = run_directory / "runtime" / "launch-arguments.json"
+            launch = _document(json.loads(launch_path.read_bytes()), "v13 launch argv")
+            launch["client_argv"] = list(client)
+            launch_path.write_bytes(_canonical_json(launch))
+            artifacts = [
+                {
+                    **artifact,
+                    "sha256": profiled_fault_runtime.sha256_file(
+                        run_directory / str(artifact["path"])
+                    ),
+                }
+                if artifact["kind"] == "launch_arguments"
+                else artifact
+                for artifact in artifacts
+            ]
+            _v13_assert_private_material_excluded(
+                run_directory,
+                private_values=readiness["private_values"],
+            )
         plan = FaultPlan(
             ScenarioContext(
                 profile.replica_ids,
@@ -8014,9 +9400,17 @@ class FocusedLaunchBackend:
             "fault_window_arm_path": arm_path,
             "child_request_sha256": child_request_sha,
             "parent_request_sha256": parent_request_sha,
+            "manager_launch_checkpoint": (
+                _V13_MANAGER_CHECKPOINT if readiness is not None else None
+            ),
         }
 
     def spawn_processes(self, configuration: Mapping[str, object]) -> _FocusedProcesses:
+        manager_command = configuration.get("manager_command")
+        if isinstance(manager_command, (str, bytes)) or not isinstance(
+            manager_command, Sequence
+        ):
+            _error("focused manager command is unavailable")
         root = Path(configuration["run_directory"])
         registry = ProcessRegistry(monotonic_ns=profiled_fault_runtime.monotonic_raw_ns)
         evidence = FaultEvidence(
@@ -8028,7 +9422,7 @@ class FocusedLaunchBackend:
         records: list[ProcessRecord] = []
         logs: list[Any] = []
         commands = [
-            ("adaptive-manager", -1, configuration["manager_command"]),
+            ("adaptive-manager", -1, manager_command),
             *(
                 (f"replica-{replica}", replica, command)
                 for replica, command in zip(

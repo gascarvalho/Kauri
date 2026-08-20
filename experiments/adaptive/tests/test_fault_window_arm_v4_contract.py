@@ -83,7 +83,7 @@ def _arm_fixture(
                 **parent_request,
                 "request_sha256": request_sha,
                 "approval_reference": "test approval",
-                "approved_utc": "2026-08-18T00:00:00Z",
+                "approved_utc": "2026-08-18T00:00:00+00:00",
             }
         )
     )
@@ -741,7 +741,7 @@ def test_v4_child_receipts_keep_their_canonical_digest_while_arm_binds_parent(
         **parent_request,
         "request_sha256": parent_sha,
         "approval_reference": "test",
-        "approved_utc": "2026-08-18T00:00:00Z",
+        "approved_utc": "2026-08-18T00:00:00+00:00",
     }
     configuration = runtime.FocusedLaunchBackend().materialize_arm_configuration(
         {

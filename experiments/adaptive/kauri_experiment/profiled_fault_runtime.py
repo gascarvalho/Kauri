@@ -932,7 +932,10 @@ def main_config_payload(
     bls: Sequence[Mapping[str, str]],
     tls: Sequence[Mapping[str, str]],
     issuer: Mapping[str, str],
+    epoch_protocol_mode: str = "adaptive_v2",
 ) -> bytes:
+    if epoch_protocol_mode not in {"adaptive_v2", "adaptive_v3"}:
+        raise ProfiledFaultRuntimeError("epoch protocol mode drift")
     count = len(profile.replica_ids)
     if len(bls) != count or len(tls) != count + 1:
         raise ProfiledFaultRuntimeError("identity cardinality drift")
@@ -954,7 +957,7 @@ def main_config_payload(
         "client-ip = 127.0.0.1",
         "tree-generation = default",
         f"tree-switch-period = {profile.tree_switch_period_blocks}",
-        "epoch-protocol-mode = adaptive_v2",
+        f"epoch-protocol-mode = {epoch_protocol_mode}",
         f"epoch-change-issuer-id = {ISSUER_ID}",
         f"epoch-change-issuer-public-key = {issuer['pub']}",
         (
@@ -1135,12 +1138,14 @@ def write_runtime_inputs(
     source_instances: Mapping[str, str],
     replica_overlays: Mapping[int, Sequence[str]] | None = None,
     include_issuer_identity_artifact: bool = True,
+    epoch_protocol_mode: str = "adaptive_v2",
 ) -> tuple[tuple[str, ...], tuple[tuple[str, ...], ...], list[dict[str, object]]]:
     config_directory = run_directory / "config"
     main_config = config_directory / "main.conf"
     write_exclusive(
         main_config,
-        main_config_payload(profile, bls=bls, tls=tls, issuer=issuer),
+        main_config_payload(profile, bls=bls, tls=tls, issuer=issuer,
+                            epoch_protocol_mode=epoch_protocol_mode),
     )
     replica_configs: list[Path] = []
     for replica in profile.replica_ids:

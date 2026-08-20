@@ -42,6 +42,21 @@ set_tests_properties(
     test_client_opcodes PROPERTIES
     LABELS "unit;adaptive;client;opcode")
 add_kauri_catch_test(test_crypto_aggregation test_crypto_aggregation.cpp)
+add_kauri_catch_test(
+    test_cert13_native_tools
+    test_cert13_native_tools.cpp)
+target_compile_definitions(
+    test_cert13_native_tools PRIVATE
+    KAURI_HOTSTUFF_KEYGEN_PATH="$<TARGET_FILE:hotstuff-keygen>"
+    KAURI_EPOCH_PROFILE_DIGEST_PATH="$<TARGET_FILE:epoch-profile-digest>")
+add_dependencies(
+    test_cert13_native_tools
+    hotstuff-keygen
+    epoch-profile-digest)
+set_tests_properties(
+    test_cert13_native_tools PROPERTIES
+    LABELS "unit;adaptive;cert13;native-tools"
+    TIMEOUT 20)
 add_kauri_catch_test(test_vote_validation test_vote_validation.cpp)
 add_kauri_catch_test(
     test_crypto_aggregation_remediation
@@ -131,6 +146,41 @@ add_kauri_catch_test(
 set_tests_properties(
     test_epoch_change_bundle PROPERTIES
     LABELS "unit;adaptive;epoch-change;bundle;c09"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_activation_readiness_wire
+    test_activation_readiness_wire.cpp)
+add_kauri_catch_test(
+    test_adaptive_v3_manager_readiness
+    test_adaptive_v3_manager_readiness.cpp)
+add_kauri_catch_test(
+    test_adaptive_v3_manager_activation
+    test_adaptive_v3_manager_activation.cpp)
+add_kauri_catch_test(
+    test_adaptive_v3_manager_session
+    test_adaptive_v3_manager_session.cpp)
+add_kauri_catch_test(
+    test_cert13_v13_fixture_exporter
+    test_cert13_v13_fixture_exporter.cpp)
+target_compile_definitions(
+    test_cert13_v13_fixture_exporter PRIVATE
+    KAURI_EPOCH_PROFILE_DIGEST_PATH="$<TARGET_FILE:epoch-profile-digest>")
+add_dependencies(
+    test_cert13_v13_fixture_exporter
+    epoch-profile-digest)
+set_tests_properties(
+    test_cert13_v13_fixture_exporter PROPERTIES
+    LABELS "unit;adaptive;cert13;fixture-exporter"
+    TIMEOUT 20)
+add_kauri_catch_test(
+    test_adaptive_v3_reporting_outbox
+    test_adaptive_v3_reporting_outbox.cpp)
+add_kauri_catch_test(
+    test_adaptive_manager_session_facade
+    test_adaptive_manager_session_facade.cpp)
+set_tests_properties(
+    test_activation_readiness_wire PROPERTIES
+    LABELS "unit;adaptive;activation-readiness;w1"
     TIMEOUT 10)
 add_kauri_catch_test(
     test_epoch_change_inbox

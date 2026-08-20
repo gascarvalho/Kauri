@@ -2630,7 +2630,11 @@ TEST_CASE(
     REQUIRE(committed_enqueue != std::string::npos);
     CHECK(defer_check < durable_commit);
     CHECK(durable_commit < committed_enqueue);
-    CHECK(commit_report.find("enqueue_lifecycle") ==
+    const auto v2_only_commit_report = commit_report.find(
+        "if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2");
+    REQUIRE(v2_only_commit_report != std::string::npos);
+    CHECK(commit_report.find(
+              "enqueue_lifecycle", v2_only_commit_report) ==
           std::string::npos);
 
     const auto deadline_result = function_slice(

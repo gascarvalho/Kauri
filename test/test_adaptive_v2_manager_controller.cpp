@@ -36,6 +36,7 @@ using hotstuff::DataStream;
 using hotstuff::EpochChangeBundleLimits;
 using hotstuff::EpochChangeIssuer;
 using hotstuff::EpochDefinitionInput;
+using hotstuff::EpochProtocolMode;
 using hotstuff::EpochTreeDefinition;
 using hotstuff::EpochWireLimits;
 using hotstuff::ExpectedMessageType;
@@ -1243,6 +1244,48 @@ void check_controller_bundle_authority(
                       position)) >= leaf_start);
         }
     }
+}
+
+TEST_CASE("successor factory keeps v2 canonical bytes and isolates v3 bundle mode",
+          "[cert13][checkpoint1][epoch-factory][controller]")
+{
+    Fixture v2;
+    v2.freeze_baseline();
+    v2.persistent_timeouts(0);
+    v2.persistent_timeouts(1);
+    REQUIRE(v2.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(v2.controller->successor_bundle() != nullptr);
+    REQUIRE(v2.controller->successor_bundle_v3() == nullptr);
+    const auto v2_bytes = v2.controller->successor_bundle()->canonical_bytes();
+    const auto v2_digest = DataStream(v2_bytes).get_hash().to_hex();
+    INFO(v2_digest);
+    CHECK(v2_digest ==
+          "5ea1776f860f99c0f712d17587f0d92628e11a77f0268bcb339f1bf6c5222b55");
+
+    Fixture v3;
+    v3.controller.reset();
+    v3.config.successor_protocol_mode = EpochProtocolMode::adaptive_v3;
+    v3.controller = std::make_unique<AdaptiveV2ManagerController>(
+        v3.ingress, v3.config);
+    v3.freeze_baseline();
+    v3.persistent_timeouts(0);
+    v3.persistent_timeouts(1);
+    REQUIRE(v3.controller->evaluate() ==
+            AdaptiveV2ManagerControllerStatus::successor_ready);
+    REQUIRE(v3.controller->successor_bundle() == nullptr);
+    REQUIRE(v3.controller->successor_bundle_v3() != nullptr);
+    const auto *bundle = v3.controller->successor_bundle_v3();
+    CHECK(bundle->protocol_mode() == EpochProtocolMode::adaptive_v3);
+    CHECK(bundle->command().protocol_mode == EpochProtocolMode::adaptive_v3);
+    CHECK(bundle->definition().epoch_digest ==
+          v2.controller->successor_bundle()->definition().epoch_digest);
+    CHECK(bundle->canonical_bytes() != v2_bytes);
+    CHECK_FALSE(hotstuff::decode_adaptive_v2_epoch_change_bundle(
+        bundle->canonical_bytes(), bundle_limits()));
+    CHECK(hotstuff::decode_adaptive_v3_epoch_change_bundle(
+        bundle->canonical_bytes(), bundle_limits()));
+
 }
 
 template<typename Config>

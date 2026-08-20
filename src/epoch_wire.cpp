@@ -12,6 +12,23 @@
 
 namespace hotstuff
 {
+std::optional<std::uint32_t> epoch_wire_schema_for_mode(
+    EpochProtocolMode mode) noexcept
+{
+    switch (mode)
+    {
+    case EpochProtocolMode::adaptive_v1:
+        return kEpochWireSchemaVersionV1;
+    case EpochProtocolMode::adaptive_v2:
+        return kEpochWireSchemaVersionV2;
+    case EpochProtocolMode::adaptive_v3:
+        return kEpochWireSchemaVersionV3;
+    case EpochProtocolMode::legacy_static:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 namespace
 {
 
@@ -85,21 +102,6 @@ void append_header(
     writer.integer(static_cast<std::uint8_t>(kind));
 }
 
-std::optional<std::uint32_t> wire_schema_for_mode(
-    EpochProtocolMode mode) noexcept
-{
-    switch (mode)
-    {
-    case EpochProtocolMode::adaptive_v1:
-        return kEpochWireSchemaVersionV1;
-    case EpochProtocolMode::adaptive_v2:
-        return kEpochWireSchemaVersionV2;
-    case EpochProtocolMode::legacy_static:
-        return std::nullopt;
-    }
-    return std::nullopt;
-}
-
 std::optional<std::uint32_t> definition_schema_for_mode(
     EpochProtocolMode mode) noexcept
 {
@@ -108,6 +110,7 @@ std::optional<std::uint32_t> definition_schema_for_mode(
     case EpochProtocolMode::adaptive_v1:
         return kEpochDefinitionSchemaVersionV1;
     case EpochProtocolMode::adaptive_v2:
+    case EpochProtocolMode::adaptive_v3:
         return kEpochDefinitionSchemaVersionV2;
     case EpochProtocolMode::legacy_static:
         return std::nullopt;
@@ -126,10 +129,11 @@ bool mode_supports_kind(
                kind == EpochWireKind::arm_activation ||
                kind == EpochWireKind::activation_status;
     }
-    if (mode == EpochProtocolMode::adaptive_v2)
+    if (mode == EpochProtocolMode::adaptive_v2 ||
+        mode == EpochProtocolMode::adaptive_v3)
     {
-        // Adaptive-v2 activation is consensus ordered. The v1 Arm and its
-        // recovery status are deliberately unavailable in this mode.
+        // Consensus-ordered adaptive activation does not use the v1 Arm or
+        // its recovery status. Adaptive-v3 adds its certificate separately.
         return kind == EpochWireKind::stage_epoch_definition ||
                kind == EpochWireKind::stage_ack ||
                kind == EpochWireKind::definition_request ||
@@ -143,7 +147,7 @@ void require_encode_header_contract(
     EpochProtocolMode mode,
     EpochWireKind kind)
 {
-    const auto expected_schema = wire_schema_for_mode(mode);
+    const auto expected_schema = epoch_wire_schema_for_mode(mode);
     if (!expected_schema.has_value())
     {
         throw std::invalid_argument(
@@ -169,7 +173,7 @@ void read_header(
     const auto schema = reader.integer<std::uint32_t>();
     const auto mode = static_cast<EpochProtocolMode>(
         reader.integer<std::uint8_t>());
-    const auto expected_schema = wire_schema_for_mode(expected_mode);
+    const auto expected_schema = epoch_wire_schema_for_mode(expected_mode);
     if (!expected_schema.has_value() || mode != expected_mode)
     {
         fail(EpochWireError::mode_mismatch);
@@ -323,12 +327,13 @@ EpochDefinitionInput normalized_definition_reply(
     const EpochDefinitionReply &value,
     const EpochWireLimits &limits)
 {
-    if (value.protocol_mode != EpochProtocolMode::adaptive_v2 ||
+    if ((value.protocol_mode != EpochProtocolMode::adaptive_v2 &&
+         value.protocol_mode != EpochProtocolMode::adaptive_v3) ||
         value.definition.schema_version != kEpochDefinitionSchemaVersionV2 ||
         value.definition.activation_height != 0)
     {
         throw std::invalid_argument(
-            "definition availability requires schedule-free adaptive-v2 bytes");
+            "definition availability requires schedule-free adaptive bytes");
     }
 
     EpochActivationIdentity identity;
@@ -356,7 +361,7 @@ void append_definition(
     writer.integer(definition.epoch_number);
     append_digest(writer, definition.previous_epoch_digest);
     append_digest(writer, definition.membership_digest);
-    if (mode != EpochProtocolMode::adaptive_v2)
+    if (mode == EpochProtocolMode::adaptive_v1)
         writer.integer(definition.activation_height);
     writer.integer(definition.generation_seed);
     append_string(
@@ -380,7 +385,8 @@ void append_definition(
         {
             writer.integer(member);
         }
-        if (mode == EpochProtocolMode::adaptive_v2)
+        if (mode == EpochProtocolMode::adaptive_v2 ||
+            mode == EpochProtocolMode::adaptive_v3)
         {
             writer.integer(static_cast<std::uint32_t>(
                 tree.wait_exempt_leaves.size()));
@@ -463,7 +469,8 @@ EpochDefinitionInput read_definition(
             tree.members_breadth_first.push_back(
                 reader.integer<ReplicaID>());
         }
-        if (mode == EpochProtocolMode::adaptive_v2)
+        if (mode == EpochProtocolMode::adaptive_v2 ||
+            mode == EpochProtocolMode::adaptive_v3)
         {
             const auto wait_exempt_count = reader.integer<std::uint32_t>();
             if (wait_exempt_count >
@@ -718,7 +725,7 @@ EpochWireDecodeResult<StageEpochDefinition> decode_stage_epoch_definition(
                 fail(EpochWireError::invalid_definition_digest);
             }
             return StageEpochDefinition{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 std::move(activation),
                 std::move(definition)};
@@ -736,7 +743,7 @@ EpochWireDecodeResult<StageAck> decode_stage_ack(
             read_header(reader, expected_mode, EpochWireKind::stage_ack);
             const auto replica = reader.integer<ReplicaID>();
             return StageAck{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 replica,
                 read_identity(reader)};
@@ -753,7 +760,7 @@ EpochWireDecodeResult<ArmActivation> decode_arm_activation(
         [&](Reader &reader) {
             read_header(reader, expected_mode, EpochWireKind::arm_activation);
             return ArmActivation{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 read_identity(reader)};
         });
@@ -780,7 +787,7 @@ EpochWireDecodeResult<ActivationStatus> decode_activation_status(
                 fail(EpochWireError::invalid_definition_digest);
             }
             return ActivationStatus{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 replica,
                 std::move(activation),
@@ -801,7 +808,7 @@ EpochWireDecodeResult<EpochDefinitionRequest> decode_epoch_definition_request(
                 expected_mode,
                 EpochWireKind::definition_request);
             return EpochDefinitionRequest{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 reader.digest()};
         });
@@ -825,13 +832,13 @@ EpochWireDecodeResult<EpochDefinitionReply> decode_epoch_definition_reply(
             definition.epoch_digest = digest;
             auto normalized = normalized_definition_reply(
                 EpochDefinitionReply{
-                    *wire_schema_for_mode(expected_mode),
+                    *epoch_wire_schema_for_mode(expected_mode),
                     expected_mode,
                     digest,
                     std::move(definition)},
                 limits);
             return EpochDefinitionReply{
-                *wire_schema_for_mode(expected_mode),
+                *epoch_wire_schema_for_mode(expected_mode),
                 expected_mode,
                 digest,
                 std::move(normalized)};

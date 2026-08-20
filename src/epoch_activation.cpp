@@ -1,10 +1,14 @@
 #include "hotstuff/epoch_activation.h"
 
+#include "hotstuff/adaptive_v3_activation_readiness.h"
+
 #include <algorithm>
 #include <limits>
 #include <set>
 #include <stdexcept>
 #include <utility>
+
+#include "hotstuff/configuration.h"
 
 namespace hotstuff
 {
@@ -840,6 +844,112 @@ EpochActivationResult ReplicaEpochActivation::on_v2_post_block_commit(
     return state_->apply_v2_post_block(height, predecessor_digest);
 }
 
+EpochActivationResult
+ReplicaEpochActivation::preview_v3_certified_activation(
+    const ConfigurationId &predecessor_configuration,
+    std::uint64_t predecessor_generation,
+    const ConfigurationId &successor_configuration,
+    std::uint64_t successor_generation) const
+{
+    const auto current = state_->effect();
+    if (current.configuration == successor_configuration &&
+        current.generation == successor_generation)
+        return state_->active_result(ActivationTransition::already_active);
+    const auto predecessor_packed = predecessor_generation == 0
+        ? std::optional<std::uint64_t>{}
+        : checked_activation_generation(
+              predecessor_configuration.epoch_number,
+              static_cast<std::uint32_t>(predecessor_generation - 1));
+    if (state_->permanent_block || !predecessor_packed ||
+        *predecessor_packed != predecessor_generation ||
+        current.configuration != predecessor_configuration ||
+        current.generation != predecessor_generation ||
+        predecessor_configuration.epoch_number ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        successor_configuration.epoch_number !=
+            predecessor_configuration.epoch_number + 1 ||
+        successor_configuration.tree_id != 0 ||
+        successor_configuration.epoch_digest ==
+            predecessor_configuration.epoch_digest)
+        return {
+            ActivationTransition::blocked,
+            ActivationBlockReason::conflicting_activation_record,
+            std::nullopt};
+
+    const auto canonical_successor_generation =
+        checked_activation_generation(
+            successor_configuration.epoch_number, 0);
+    if (!canonical_successor_generation ||
+        *canonical_successor_generation != successor_generation)
+        return {
+            ActivationTransition::blocked,
+            ActivationBlockReason::invalid_activation_record,
+            std::nullopt};
+
+    const auto *const successor = state_->store.find_epoch_by_digest(
+        successor_configuration.epoch_digest);
+    if (successor == nullptr)
+        return {
+            ActivationTransition::blocked,
+            ActivationBlockReason::missing_definition,
+            std::nullopt};
+    if (successor->schema_version() !=
+            kEpochDefinitionSchemaVersionV2 ||
+        successor->activation_height() != 0 ||
+        successor->epoch_number() != successor_configuration.epoch_number ||
+        successor->previous_epoch_digest() !=
+            predecessor_configuration.epoch_digest ||
+        successor->membership_digest() !=
+            current.definition->membership_digest() ||
+        state_->store.find_epoch(successor->epoch_number()) != successor ||
+        state_->store.find_tree(successor->epoch_number(), 0) == nullptr)
+        return {
+            ActivationTransition::blocked,
+            ActivationBlockReason::invalid_activation_record,
+            std::nullopt};
+    return state_->prospective_active_result(*successor);
+}
+
+EpochActivationResult ReplicaEpochActivation::apply_v3_certified_activation(
+    const ConfigurationId &predecessor_configuration,
+    std::uint64_t predecessor_generation,
+    const ConfigurationId &successor_configuration,
+    std::uint64_t successor_generation)
+{
+    const auto preview = preview_v3_certified_activation(
+        predecessor_configuration,
+        predecessor_generation,
+        successor_configuration,
+        successor_generation);
+    if (preview.transition != ActivationTransition::activated)
+    {
+        if (preview.transition == ActivationTransition::blocked)
+        {
+            state_->block_reason = preview.blocked_reason;
+            state_->permanent_block =
+                preview.blocked_reason !=
+                ActivationBlockReason::missing_definition;
+        }
+        return preview;
+    }
+
+    const auto *const successor = state_->store.find_epoch_by_digest(
+        successor_configuration.epoch_digest);
+    if (successor == nullptr)
+    {
+        state_->block_reason = ActivationBlockReason::missing_definition;
+        state_->permanent_block = false;
+        return state_->blocked_result();
+    }
+    state_->draining_configuration = state_->active_configuration();
+    state_->active_definition = successor;
+    state_->active_tree_id = 0;
+    state_->rotation_ordinal = 0;
+    state_->block_reason = ActivationBlockReason::none;
+    state_->permanent_block = false;
+    return state_->active_result(ActivationTransition::activated);
+}
+
 ReplicaStageResult ReplicaEpochActivation::stage(
     const StageEpochDefinition &message,
     const EpochValidationContext &validation_context)
@@ -1160,6 +1270,576 @@ bool ReplicaEpochActivation::may_drain_exact_context(
     return configuration == state_->active_configuration() ||
            (state_->draining_configuration &&
             configuration == *state_->draining_configuration);
+}
+
+namespace
+{
+
+AdaptiveV3ActivationReadinessWireError adaptive_v3_wire_error(
+    ActivationReadinessWireError error) noexcept
+{
+    switch (error)
+    {
+    case ActivationReadinessWireError::none:
+        return AdaptiveV3ActivationReadinessWireError::none;
+    case ActivationReadinessWireError::invalid_limits:
+        return AdaptiveV3ActivationReadinessWireError::invalid_limits;
+    case ActivationReadinessWireError::payload_too_large:
+        return AdaptiveV3ActivationReadinessWireError::payload_too_large;
+    case ActivationReadinessWireError::truncated:
+        return AdaptiveV3ActivationReadinessWireError::truncated;
+    case ActivationReadinessWireError::trailing_bytes:
+        return AdaptiveV3ActivationReadinessWireError::trailing_bytes;
+    case ActivationReadinessWireError::invalid_domain:
+        return AdaptiveV3ActivationReadinessWireError::invalid_domain;
+    case ActivationReadinessWireError::unsupported_schema:
+        return AdaptiveV3ActivationReadinessWireError::unsupported_schema;
+    case ActivationReadinessWireError::noncanonical_encoding:
+        return AdaptiveV3ActivationReadinessWireError::noncanonical_encoding;
+    case ActivationReadinessWireError::invalid_identity:
+        return AdaptiveV3ActivationReadinessWireError::invalid_identity;
+    case ActivationReadinessWireError::too_many_observations:
+        return AdaptiveV3ActivationReadinessWireError::too_many_members;
+    case ActivationReadinessWireError::invalid_observation:
+    case ActivationReadinessWireError::invalid_certificate:
+    case ActivationReadinessWireError::invalid_acknowledgement:
+        return AdaptiveV3ActivationReadinessWireError::noncanonical_encoding;
+    case ActivationReadinessWireError::allocation_failure:
+        return AdaptiveV3ActivationReadinessWireError::allocation_failure;
+    case ActivationReadinessWireError::internal_failure:
+        return AdaptiveV3ActivationReadinessWireError::internal_failure;
+    }
+    return AdaptiveV3ActivationReadinessWireError::internal_failure;
+}
+
+bool zero_digest(const uint256_t &digest) noexcept
+{
+    return digest == uint256_t{};
+}
+
+} // namespace
+
+const std::string &
+adaptive_v3_activation_ready_observation_domain() noexcept
+{
+    return activation_ready_observation_domain();
+}
+
+const std::string &
+adaptive_v3_activation_readiness_certificate_domain() noexcept
+{
+    return activation_readiness_certificate_domain();
+}
+
+bytearray_t encode_adaptive_v3_activation_ready_observation(
+    const AdaptiveV3ActivationReadyObservation &observation,
+    const AdaptiveV3ActivationReadinessLimits &limits)
+{
+    return encode_activation_ready_observation(observation, limits);
+}
+
+AdaptiveV3ActivationReadyObservationDecodeResult
+decode_adaptive_v3_activation_ready_observation(
+    const bytearray_t &payload,
+    const AdaptiveV3ActivationReadinessLimits &limits) noexcept
+{
+    auto decoded = decode_activation_ready_observation(payload, limits);
+    return {
+        adaptive_v3_wire_error(decoded.error),
+        std::move(decoded.value)};
+}
+
+bytearray_t encode_adaptive_v3_activation_readiness_certificate(
+    const AdaptiveV3ActivationReadinessCertificate &certificate,
+    const AdaptiveV3ActivationReadinessLimits &limits)
+{
+    return encode_activation_readiness_certificate(certificate, limits);
+}
+
+AdaptiveV3ActivationReadinessCertificateDecodeResult
+decode_adaptive_v3_activation_readiness_certificate(
+    const bytearray_t &payload,
+    const AdaptiveV3ActivationReadinessLimits &limits) noexcept
+{
+    auto decoded = decode_activation_readiness_certificate(payload, limits);
+    return {
+        adaptive_v3_wire_error(decoded.error),
+        std::move(decoded.value)};
+}
+
+AdaptiveV3ActivationReadinessCertificate
+make_adaptive_v3_activation_readiness_certificate(
+    const AdaptiveV3ActivationReadyIdentity &identity,
+    std::vector<AdaptiveV3ActivationReadyObservation> observations,
+    const AdaptiveV3ActivationReadinessLimits &limits)
+{
+    if (limits.maximum_payload_bytes == 0 || limits.maximum_members == 0 ||
+        observations.size() > limits.maximum_members)
+        throw std::invalid_argument(
+            "adaptive-v3 readiness certificate exceeds fixed limits");
+    auto certificate = make_activation_readiness_certificate(
+        identity, std::move(observations));
+    static_cast<void>(
+        encode_activation_readiness_certificate(certificate, limits));
+    return certificate;
+}
+
+struct AdaptiveV3CertifiedActivationGate::State
+{
+    State(
+        AdaptiveV3ActivationSchedule schedule_value,
+        ReplicaID replica,
+        std::shared_ptr<const PrivKeyBLS> private_key,
+        std::vector<AdaptiveV3ReadinessMember> membership,
+        std::size_t supplied_quorum)
+        : schedule(std::move(schedule_value)),
+          local_replica(replica),
+          local_private_key(std::move(private_key)),
+          active_configuration_value{
+              schedule.predecessor_epoch_number,
+              0,
+              schedule.predecessor_epoch_digest},
+          scheduled_height(schedule.activation_height)
+    {
+        if (local_private_key == nullptr || membership.empty() ||
+            zero_digest(schedule.membership_digest) ||
+            zero_digest(schedule.predecessor_epoch_digest) ||
+            zero_digest(schedule.successor_epoch_digest) ||
+            zero_digest(schedule.command_payload_digest) ||
+            zero_digest(schedule.command_block_hash) ||
+            schedule.predecessor_epoch_number ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            schedule.successor_epoch_number !=
+                schedule.predecessor_epoch_number + 1 ||
+            schedule.predecessor_epoch_digest ==
+                schedule.successor_epoch_digest ||
+            schedule.command_block_height == 0 ||
+            schedule.activation_delay_blocks == 0 ||
+            schedule.command_block_height >
+                std::numeric_limits<std::uint64_t>::max() -
+                    schedule.activation_delay_blocks ||
+            schedule.activation_height !=
+                schedule.command_block_height +
+                    schedule.activation_delay_blocks)
+            throw std::invalid_argument(
+                "adaptive-v3 activation schedule is invalid");
+
+        const auto successor_generation = checked_activation_generation(
+            schedule.successor_epoch_number, 0);
+        if (!successor_generation ||
+            *successor_generation !=
+                schedule.successor_activation_generation)
+            throw std::invalid_argument(
+                "adaptive-v3 successor generation is not canonical");
+
+        const auto member_count = membership.size();
+        if (member_count < 4 || (member_count - 1) % 3 != 0)
+            throw std::invalid_argument(
+                "adaptive-v3 membership is not an exact 3f+1 set");
+        const auto derived_quorum = 2 * ((member_count - 1) / 3) + 1;
+        if (supplied_quorum != derived_quorum)
+            throw std::invalid_argument(
+                "adaptive-v3 supplied quorum differs from fixed quorum");
+        quorum = derived_quorum;
+
+        std::vector<ReplicaID> replica_ids;
+        replica_ids.reserve(member_count);
+        public_members.reserve(member_count);
+        for (const auto &member : membership)
+        {
+            if (!replica_ids.empty() &&
+                replica_ids.back() >= member.replica_id)
+                throw std::invalid_argument(
+                    "adaptive-v3 membership is not canonical");
+            replica_ids.push_back(member.replica_id);
+            public_members.emplace_back(
+                member.replica_id, member.public_key);
+        }
+        if (canonical_membership_digest(replica_ids) !=
+            schedule.membership_digest)
+            throw std::invalid_argument(
+                "adaptive-v3 schedule membership digest mismatch");
+        readiness_membership_digest =
+            canonical_activation_readiness_membership_digest(
+                public_members);
+
+        const auto local = std::lower_bound(
+            public_members.begin(), public_members.end(), local_replica,
+            [](const auto &member, ReplicaID id) {
+                return member.first < id;
+            });
+        if (local == public_members.end() ||
+            local->first != local_replica ||
+            local->second.to_bytes() !=
+                PubKeyBLS(*local_private_key).to_bytes())
+            throw std::invalid_argument(
+                "adaptive-v3 local signing key is not in membership");
+
+        const auto predecessor_generation = checked_activation_generation(
+            schedule.predecessor_epoch_number, 0);
+        if (!predecessor_generation)
+            throw std::overflow_error(
+                "adaptive-v3 predecessor generation overflows");
+        active_generation_value = *predecessor_generation;
+    }
+
+    bool identity_matches_schedule(
+        const AdaptiveV3ActivationReadyIdentity &identity) const noexcept
+    {
+        if (identity.schema_version !=
+                kAdaptiveV3ActivationReadinessSchemaVersionV1 ||
+            identity.membership_digest != readiness_membership_digest ||
+            identity.predecessor_boundary_configuration.epoch_number !=
+                schedule.predecessor_epoch_number ||
+            identity.predecessor_boundary_configuration.epoch_digest !=
+                schedule.predecessor_epoch_digest ||
+            identity.successor_configuration != ConfigurationId{
+                schedule.successor_epoch_number,
+                0,
+                schedule.successor_epoch_digest} ||
+            identity.successor_activation_generation !=
+                schedule.successor_activation_generation ||
+            identity.command_payload_digest !=
+                schedule.command_payload_digest ||
+            identity.command_block_height != schedule.command_block_height ||
+            identity.command_block_hash != schedule.command_block_hash ||
+            identity.activation_delay_blocks !=
+                schedule.activation_delay_blocks ||
+            identity.activation_height != schedule.activation_height ||
+            zero_digest(identity.activation_boundary_block_hash))
+            return false;
+
+        if (identity.predecessor_boundary_generation == 0)
+            return false;
+        const auto packed = identity.predecessor_boundary_generation - 1;
+        return static_cast<std::uint32_t>(packed >> 32) ==
+                   schedule.predecessor_epoch_number;
+    }
+
+    bool matches_latched_predecessor(
+        const ConfigurationId &configuration,
+        std::uint64_t generation) const noexcept
+    {
+        return !predecessor_latched ||
+               (latched_predecessor_configuration.has_value() &&
+                configuration ==
+                    *latched_predecessor_configuration &&
+                latched_predecessor_generation.has_value() &&
+                generation == *latched_predecessor_generation);
+    }
+
+    void latch_predecessor(
+        const ConfigurationId &configuration,
+        std::uint64_t generation) noexcept
+    {
+        active_configuration_value = configuration;
+        active_generation_value = generation;
+        latched_predecessor_configuration = configuration;
+        latched_predecessor_generation = generation;
+        predecessor_latched = true;
+    }
+
+    void activate(std::uint64_t committed_height) noexcept
+    {
+        active_configuration_value = {
+            schedule.successor_epoch_number,
+            0,
+            schedule.successor_epoch_digest};
+        active_generation_value = schedule.successor_activation_generation;
+        activation_state = AdaptiveV3CertifiedActivationState::active;
+        applied_height = committed_height;
+    }
+
+    AdaptiveV3ActivationSchedule schedule;
+    ReplicaID local_replica;
+    std::shared_ptr<const PrivKeyBLS> local_private_key;
+    std::vector<std::pair<ReplicaID, PubKeyBLS>> public_members;
+    uint256_t readiness_membership_digest;
+    std::size_t quorum{0};
+    AdaptiveV3CertifiedActivationState activation_state{
+        AdaptiveV3CertifiedActivationState::awaiting_boundary};
+    ConfigurationId active_configuration_value;
+    std::uint64_t active_generation_value{0};
+    bool predecessor_latched{false};
+    std::optional<ConfigurationId> latched_predecessor_configuration;
+    std::optional<std::uint64_t> latched_predecessor_generation;
+    bool fence_engaged{false};
+    std::optional<std::uint64_t> scheduled_height;
+    std::optional<std::uint64_t> latest_predecessor_commit_height;
+    std::optional<std::uint64_t> applied_height;
+    std::optional<AdaptiveV3ActivationReadyIdentity> prepared_identity;
+    std::optional<AdaptiveV3ActivationReadinessCertificate>
+        buffered_certificate;
+    std::optional<uint256_t> accepted_certificate_digest;
+};
+
+AdaptiveV3CertifiedActivationGate::AdaptiveV3CertifiedActivationGate(
+    AdaptiveV3ActivationSchedule schedule,
+    ReplicaID local_replica,
+    std::shared_ptr<const PrivKeyBLS> local_private_key,
+    std::vector<AdaptiveV3ReadinessMember> membership,
+    std::size_t fixed_quorum)
+    : state_(new State(
+          std::move(schedule),
+          local_replica,
+          std::move(local_private_key),
+          std::move(membership),
+          fixed_quorum))
+{}
+
+AdaptiveV3CertifiedActivationGate::~AdaptiveV3CertifiedActivationGate() =
+    default;
+
+AdaptiveV3BoundaryResult
+AdaptiveV3CertifiedActivationGate::observe_predecessor_commit(
+    std::uint64_t committed_height,
+    const ConfigurationId &configuration,
+    std::uint64_t generation,
+    const uint256_t &block_hash,
+    std::uint64_t source_sequence,
+    std::uint64_t monotonic_raw_ns) noexcept
+{
+    try
+    {
+        if (state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::blocked)
+            return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+        if (configuration.epoch_number !=
+                state_->schedule.predecessor_epoch_number ||
+            configuration.epoch_digest !=
+                state_->schedule.predecessor_epoch_digest ||
+            generation == 0 || zero_digest(block_hash) ||
+            !state_->matches_latched_predecessor(configuration, generation))
+            return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+        const auto packed_generation = generation - 1;
+        if (static_cast<std::uint32_t>(packed_generation >> 32) !=
+            configuration.epoch_number)
+            return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+
+        if (state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::active)
+            return {
+                AdaptiveV3BoundaryDisposition::already_prepared,
+                std::nullopt};
+
+        state_->latch_predecessor(configuration, generation);
+        state_->latest_predecessor_commit_height = committed_height;
+        if (committed_height < state_->schedule.activation_height)
+            return {AdaptiveV3BoundaryDisposition::waiting, std::nullopt};
+        if (state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::prepared)
+            return {
+                AdaptiveV3BoundaryDisposition::already_prepared,
+                std::nullopt};
+        if (committed_height != state_->schedule.activation_height ||
+            source_sequence == 0)
+            return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+
+        AdaptiveV3ActivationReadyIdentity identity;
+        identity.membership_digest = state_->readiness_membership_digest;
+        identity.predecessor_boundary_configuration = configuration;
+        identity.predecessor_boundary_generation = generation;
+        identity.successor_configuration = {
+            state_->schedule.successor_epoch_number,
+            0,
+            state_->schedule.successor_epoch_digest};
+        identity.successor_activation_generation =
+            state_->schedule.successor_activation_generation;
+        identity.command_payload_digest =
+            state_->schedule.command_payload_digest;
+        identity.command_block_height =
+            state_->schedule.command_block_height;
+        identity.command_block_hash = state_->schedule.command_block_hash;
+        identity.activation_delay_blocks =
+            state_->schedule.activation_delay_blocks;
+        identity.activation_height = state_->schedule.activation_height;
+        identity.activation_boundary_block_hash = block_hash;
+
+        // Fence publication precedes the signing call.  If signing fails the
+        // replica remains safely fenced and terminally blocked.
+        state_->fence_engaged = true;
+        state_->activation_state =
+            AdaptiveV3CertifiedActivationState::prepared;
+        state_->prepared_identity = identity;
+        auto observation = sign_activation_ready_observation(
+            identity,
+            state_->local_replica,
+            source_sequence,
+            monotonic_raw_ns,
+            *state_->local_private_key);
+
+        if (state_->buffered_certificate.has_value() &&
+            state_->buffered_certificate->identity == identity)
+        {
+            state_->accepted_certificate_digest =
+                state_->buffered_certificate->certificate_digest;
+            state_->activate(committed_height);
+            state_->buffered_certificate.reset();
+            return {
+                AdaptiveV3BoundaryDisposition::
+                    activated_from_buffered_certificate,
+                std::move(observation)};
+        }
+        state_->buffered_certificate.reset();
+        return {
+            AdaptiveV3BoundaryDisposition::prepared,
+            std::move(observation)};
+    }
+    catch (...)
+    {
+        if (state_->fence_engaged)
+            state_->activation_state =
+                AdaptiveV3CertifiedActivationState::blocked;
+        return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+    }
+}
+
+AdaptiveV3CertificateDisposition
+AdaptiveV3CertifiedActivationGate::observe_certificate(
+    const AdaptiveV3ActivationReadinessCertificate &certificate) noexcept
+{
+    try
+    {
+        if (state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::blocked)
+            return AdaptiveV3CertificateDisposition::terminal;
+        const bool already_active = state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::active;
+
+        if (certificate.schema_version !=
+                kAdaptiveV3ActivationReadinessSchemaVersionV1 ||
+            certificate.observations.empty() ||
+            certificate.observations.size() > state_->public_members.size())
+            return AdaptiveV3CertificateDisposition::rejected_noncanonical;
+        for (std::size_t index = 1;
+             index < certificate.observations.size(); ++index)
+            if (certificate.observations[index - 1].signer_replica_id >=
+                certificate.observations[index].signer_replica_id)
+                return AdaptiveV3CertificateDisposition::
+                    rejected_noncanonical;
+
+        if (certificate.identity.predecessor_boundary_configuration
+                    .epoch_number <
+                state_->schedule.predecessor_epoch_number ||
+            certificate.identity.successor_configuration.epoch_number <
+                state_->schedule.successor_epoch_number)
+            return AdaptiveV3CertificateDisposition::rejected_stale;
+        if (!state_->identity_matches_schedule(certificate.identity))
+            return AdaptiveV3CertificateDisposition::rejected_wrong_identity;
+        for (const auto &observation : certificate.observations)
+            if (observation.identity != certificate.identity)
+                return AdaptiveV3CertificateDisposition::
+                    rejected_mixed_identity;
+        if (state_->prepared_identity.has_value() &&
+            certificate.identity != *state_->prepared_identity)
+            return AdaptiveV3CertificateDisposition::rejected_wrong_identity;
+        if (certificate.observations.size() < state_->quorum)
+            return AdaptiveV3CertificateDisposition::rejected_below_quorum;
+
+        for (const auto &observation : certificate.observations)
+        {
+            const auto member = std::lower_bound(
+                state_->public_members.begin(),
+                state_->public_members.end(),
+                observation.signer_replica_id,
+                [](const auto &entry, ReplicaID id) {
+                    return entry.first < id;
+                });
+            if (member == state_->public_members.end() ||
+                member->first != observation.signer_replica_id)
+                return AdaptiveV3CertificateDisposition::rejected_nonmember;
+            if (!verify_activation_ready_observation(
+                    observation, member->second))
+                return AdaptiveV3CertificateDisposition::
+                    rejected_invalid_signature;
+        }
+
+        if (!verify_activation_readiness_certificate(
+                certificate,
+                certificate.identity,
+                state_->readiness_membership_digest,
+                state_->public_members))
+            return AdaptiveV3CertificateDisposition::rejected_noncanonical;
+
+        if (already_active)
+            return state_->accepted_certificate_digest.has_value() &&
+                           *state_->accepted_certificate_digest ==
+                               certificate.certificate_digest &&
+                           state_->prepared_identity.has_value() &&
+                           *state_->prepared_identity == certificate.identity
+                       ? AdaptiveV3CertificateDisposition::duplicate
+                       : AdaptiveV3CertificateDisposition::terminal;
+
+        if (state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::awaiting_boundary)
+        {
+            state_->latch_predecessor(
+                certificate.identity.predecessor_boundary_configuration,
+                certificate.identity.predecessor_boundary_generation);
+            state_->buffered_certificate = certificate;
+            return AdaptiveV3CertificateDisposition::buffered_early;
+        }
+
+        const auto applied = state_->latest_predecessor_commit_height
+                                 .value_or(state_->schedule.activation_height);
+        state_->accepted_certificate_digest = certificate.certificate_digest;
+        state_->activate(applied);
+        return AdaptiveV3CertificateDisposition::accepted;
+    }
+    catch (...)
+    {
+        return AdaptiveV3CertificateDisposition::rejected_noncanonical;
+    }
+}
+
+AdaptiveV3CertifiedActivationState
+AdaptiveV3CertifiedActivationGate::state() const noexcept
+{
+    return state_->activation_state;
+}
+
+const ConfigurationId &
+AdaptiveV3CertifiedActivationGate::active_configuration() const noexcept
+{
+    return state_->active_configuration_value;
+}
+
+std::uint64_t
+AdaptiveV3CertifiedActivationGate::active_generation() const noexcept
+{
+    return state_->active_generation_value;
+}
+
+bool AdaptiveV3CertifiedActivationGate::vote_fence_engaged() const noexcept
+{
+    return state_->fence_engaged;
+}
+
+bool AdaptiveV3CertifiedActivationGate::may_authorize_vote(
+    const ConfigurationId &configuration,
+    std::uint64_t generation) const noexcept
+{
+    if (state_->activation_state ==
+        AdaptiveV3CertifiedActivationState::prepared ||
+        state_->activation_state ==
+            AdaptiveV3CertifiedActivationState::blocked)
+        return false;
+    return configuration == state_->active_configuration_value &&
+           generation == state_->active_generation_value;
+}
+
+std::optional<std::uint64_t>
+AdaptiveV3CertifiedActivationGate::scheduled_readiness_height()
+    const noexcept
+{
+    return state_->scheduled_height;
+}
+
+std::optional<std::uint64_t>
+AdaptiveV3CertifiedActivationGate::certificate_apply_committed_height()
+    const noexcept
+{
+    return state_->applied_height;
 }
 
 } // namespace hotstuff

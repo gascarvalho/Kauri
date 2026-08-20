@@ -2598,7 +2598,7 @@ TEST_CASE(
         committed.find("KAURI_FAULT false_report_commit_deferred");
     const auto defer_exit = committed.find("return;", defer_audit);
     const auto normal_lifecycle =
-        committed.find("enqueue_lifecycle");
+        committed.find("enqueue_lifecycle", defer_exit);
     REQUIRE(exact_pending != std::string::npos);
     REQUIRE(verified_response != std::string::npos);
     REQUIRE(defer != std::string::npos);

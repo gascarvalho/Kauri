@@ -23,6 +23,7 @@ from experiments.adaptive.kauri_experiment.focused_crash_pair_runtime import (
     load_focused_profile,
     prepare_focused_preflight,
     reload_pair_issuer_allocations,
+    reload_v13_readiness_allocations,
     verify_focused_authorization_receipt,
 )
 from experiments.adaptive.kauri_experiment.focused_crash_pair_validation import (
@@ -54,6 +55,11 @@ _V12_PROFILES = {
     "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v12.json",
     "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v12.json",
     "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v12.json",
+}
+_V13_PROFILES = {
+    "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v13.json",
+    "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v13.json",
+    "campaign": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v13.json",
 }
 
 
@@ -925,16 +931,18 @@ def _parser() -> argparse.ArgumentParser:
     pair = subparsers.add_parser("validate-pair")
     pair.add_argument("--pair-root", type=Path, required=True)
     pair.add_argument("--trusted-provenance", type=Path, required=True)
+    pair.add_argument("--readiness-verifier-path", type=Path)
     campaign = subparsers.add_parser("validate-campaign")
     campaign.add_argument("--campaign-root", type=Path, required=True)
     campaign.add_argument("--trusted-provenance", type=Path, required=True)
+    campaign.add_argument("--readiness-verifier-path", type=Path)
     return parser
 
 
 def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
-    canonical_path = _V12_PROFILES.get(mode)
+    canonical_path = _V13_PROFILES.get(mode)
     if canonical_path is None:
-        raise FocusedCrashPairCliError("execution mode has no frozen v12 profile")
+        raise FocusedCrashPairCliError("execution mode has no frozen v13 profile")
     canonical = load_focused_profile(canonical_path)
     if (
         profile.profile_id,
@@ -951,11 +959,11 @@ def _require_mode_profile(profile: FocusedProfile, mode: str) -> None:
 
 
 def _profile_path(profile: Path | None, mode: str) -> Path:
-    """Use the immutable v12 profile; archived paths fail exact binding."""
+    """Use the immutable v13 profile; archived paths fail exact binding."""
 
-    if mode not in _V12_PROFILES:
-        raise FocusedCrashPairCliError("execution mode has no frozen v12 profile")
-    return _V12_PROFILES[mode] if profile is None else profile
+    if mode not in _V13_PROFILES:
+        raise FocusedCrashPairCliError("execution mode has no frozen v13 profile")
+    return _V13_PROFILES[mode] if profile is None else profile
 
 
 def _authorized_execution(
@@ -1036,6 +1044,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             }
             if pair_issuers is not None:
                 invocation["pair_issuer_allocations"] = pair_issuers
+            context = preflight.get("execution_context")
+            if isinstance(context, Mapping) and "pair_readiness_allocations" in context:
+                binaries = context.get("binaries")
+                executables = (
+                    binaries.get("executables") if isinstance(binaries, Mapping) else None
+                )
+                keygen = executables.get("keygen") if isinstance(executables, Mapping) else None
+                keygen_path = keygen.get("path") if isinstance(keygen, Mapping) else None
+                if not isinstance(keygen_path, str):
+                    raise FocusedCrashPairCliError(
+                        "authorized v13 readiness allocation lacks keygen binding"
+                    )
+                invocation["pair_readiness_allocations"] = (
+                    reload_v13_readiness_allocations(
+                        preflight=preflight,
+                        authorization=authorization,
+                        keygen_record=keygen,
+                    )
+                )
             result = (
                 run_focused_campaign(**invocation)
                 if arguments.command == "campaign"
@@ -1047,6 +1074,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trusted_provenance=_read_json(
                     arguments.trusted_provenance, "trusted provenance"
                 ),
+                readiness_verifier_path=arguments.readiness_verifier_path,
             )
         else:
             result = validate_sealed_campaign(
@@ -1054,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 trusted_provenance=_read_json(
                     arguments.trusted_provenance, "trusted provenance"
                 ),
+                readiness_verifier_path=arguments.readiness_verifier_path,
             )
     except (
         FocusedCrashPairCliError,

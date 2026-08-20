@@ -305,6 +305,22 @@ bool payload_type(const StructuredEventPayload &payload,
             }
             return false;
         case 1:
+        {
+            const auto &event = std::get<EpochLifecycleEvent>(payload);
+            const bool has_v3_apply =
+                event.certificate_apply_committed_height.has_value();
+            const bool has_v3_digest =
+                event.activation_readiness_certificate_digest.has_value();
+            if (has_v3_apply != has_v3_digest ||
+                (has_v3_apply &&
+                 (event.transition != EpochLifecycleTransition::activated ||
+                  *event.certificate_apply_committed_height <
+                      event.activation_height ||
+                  *event.activation_readiness_certificate_digest ==
+                      uint256_t{})))
+            {
+                return false;
+            }
             switch (std::get<EpochLifecycleEvent>(payload).transition)
             {
                 case EpochLifecycleTransition::generated:
@@ -324,6 +340,7 @@ bool payload_type(const StructuredEventPayload &payload,
                     return true;
             }
             return false;
+        }
         case 2:
             if (const auto &event =
                     std::get<CommitStructuredEvent>(payload);
@@ -381,6 +398,87 @@ bool convergence_payload_type(
     return false;
 }
 
+bool adaptive_v3_readiness_payload_type(
+    const AdaptiveV3ReadinessStructuredEvent &event,
+    StructuredEventType &type) noexcept
+{
+    switch (event.transition)
+    {
+        case AdaptiveV3ReadinessTransition::activation_prepared:
+            type = StructuredEventType::adaptive_v3_activation_prepared;
+            return true;
+        case AdaptiveV3ReadinessTransition::activation_ready_signed:
+            type = StructuredEventType::adaptive_v3_activation_ready_signed;
+            return true;
+        case AdaptiveV3ReadinessTransition::observation_accepted:
+            type = StructuredEventType::adaptive_v3_observation_accepted;
+            return true;
+        case AdaptiveV3ReadinessTransition::observation_rejected:
+            type = StructuredEventType::adaptive_v3_observation_rejected;
+            return true;
+        case AdaptiveV3ReadinessTransition::source_quarantined:
+            type = StructuredEventType::adaptive_v3_source_quarantined;
+            return true;
+        case AdaptiveV3ReadinessTransition::certificate_assembled:
+            type = StructuredEventType::adaptive_v3_certificate_assembled;
+            return true;
+        case AdaptiveV3ReadinessTransition::certificate_delivery:
+            type = StructuredEventType::adaptive_v3_certificate_delivery;
+            return true;
+        case AdaptiveV3ReadinessTransition::certificate_accepted:
+            type = StructuredEventType::adaptive_v3_certificate_accepted;
+            return true;
+        case AdaptiveV3ReadinessTransition::certificate_rejected:
+            type = StructuredEventType::adaptive_v3_certificate_rejected;
+            return true;
+        case AdaptiveV3ReadinessTransition::certificate_acknowledged:
+            type = StructuredEventType::
+                adaptive_v3_certificate_acknowledged;
+            return true;
+        case AdaptiveV3ReadinessTransition::e2_eligibility:
+            type = StructuredEventType::adaptive_v3_e2_eligibility;
+            return true;
+        case AdaptiveV3ReadinessTransition::terminal:
+            type = StructuredEventType::adaptive_v3_terminal;
+            return true;
+        case AdaptiveV3ReadinessTransition::wire_rejected:
+            type = StructuredEventType::adaptive_v3_wire_rejected;
+            return true;
+    }
+    return false;
+}
+
+const char *adaptive_v3_command_terminal_reason_name(
+    AdaptiveV3CommandTerminalReason reason) noexcept
+{
+    switch (reason)
+    {
+        case AdaptiveV3CommandTerminalReason::invalid_committed_command:
+            return "invalid_committed_command";
+        case AdaptiveV3CommandTerminalReason::wrong_active_predecessor:
+            return "wrong_active_predecessor";
+        case AdaptiveV3CommandTerminalReason::invalid_successor_generation:
+            return "invalid_successor_generation";
+        case AdaptiveV3CommandTerminalReason::
+                successor_runtime_preparation_failed:
+            return "successor_runtime_preparation_failed";
+        case AdaptiveV3CommandTerminalReason::
+                committed_definition_recovery_failed:
+            return "committed_definition_recovery_failed";
+        case AdaptiveV3CommandTerminalReason::
+                committed_definition_retry_schedule_failed:
+            return "committed_definition_retry_schedule_failed";
+        case AdaptiveV3CommandTerminalReason::
+                readiness_source_sequence_exhausted:
+            return "readiness_source_sequence_exhausted";
+        case AdaptiveV3CommandTerminalReason::readiness_boundary_rejected:
+            return "readiness_boundary_rejected";
+        case AdaptiveV3CommandTerminalReason::readiness_internal_failure:
+            return "readiness_internal_failure";
+    }
+    return nullptr;
+}
+
 bool audit_payload_type(const AuditStructuredEventPayload &payload,
                         StructuredEventType &type) noexcept
 {
@@ -424,6 +522,13 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
             return true;
         case 11:
             type = StructuredEventType::fault_window_armed;
+            return true;
+        case 12:
+            return adaptive_v3_readiness_payload_type(
+                std::get<AdaptiveV3ReadinessStructuredEvent>(payload),
+                type);
+        case 13:
+            type = StructuredEventType::adaptive_v3_command_terminal;
             return true;
         default:
             return false;
@@ -826,6 +931,33 @@ bool valid_epoch_command_payload(
 
     return event.activation_height ==
         event.command_block_height + event.activation_delay_blocks;
+}
+
+bool valid_adaptive_v3_command_terminal_payload(
+    const AdaptiveV3CommandTerminalStructuredEvent &event,
+    StructuredEventSourceKind source_kind) noexcept
+{
+    const auto reason =
+        adaptive_v3_command_terminal_reason_name(event.reason);
+    const auto &command = event.command;
+    if (source_kind != StructuredEventSourceKind::replica ||
+        reason == nullptr || command.command_block_height == 0 ||
+        command.command_block_hash == uint256_t{} ||
+        command.predecessor_epoch_digest == uint256_t{} ||
+        command.successor_epoch_digest == uint256_t{} ||
+        command.payload_digest == uint256_t{})
+        return false;
+    const EpochChangePayload payload{
+        command.successor_epoch_number,
+        command.predecessor_epoch_digest,
+        command.successor_epoch_digest,
+        command.activation_delay_blocks};
+    if (epoch_change_payload_digest(payload) != command.payload_digest)
+        return false;
+    if (event.reason ==
+        AdaptiveV3CommandTerminalReason::invalid_committed_command)
+        return true;
+    return valid_epoch_command_payload(command, source_kind);
 }
 
 bool valid_reputation_payload(
@@ -1389,6 +1521,411 @@ bool valid_fault_window_armed_payload(
         valid_digest(event.fault_window_arm_sha256);
 }
 
+bool valid_adaptive_v3_identity(
+    const ActivationReadyIdentityV1 &identity,
+    const StructuredEventConfig &config) noexcept
+{
+    try
+    {
+        const ActivationReadinessWireLimits limits{
+            config.limits.maximum_line_bytes, 31};
+        return !encode_activation_ready_identity_v1(identity, limits).empty();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bool valid_adaptive_v3_readiness_payload(
+    const AdaptiveV3ReadinessStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const bool session_terminal = event.transition ==
+        AdaptiveV3ReadinessTransition::terminal &&
+        event.terminal_cycle_ordinal.has_value();
+    const bool wire_rejected = event.transition ==
+        AdaptiveV3ReadinessTransition::wire_rejected;
+    if ((!session_terminal && !wire_rejected &&
+         !valid_adaptive_v3_identity(event.identity, config)) ||
+        (session_terminal && event.terminal_identity.has_value() &&
+         !valid_adaptive_v3_identity(*event.terminal_identity, config)) ||
+        !valid_utf8(event.disposition) ||
+        event.disposition.size() > config.limits.maximum_identity_bytes ||
+        std::adjacent_find(
+            event.observed_signers.begin(),
+            event.observed_signers.end(),
+            [](ReplicaID left, ReplicaID right) {
+                return left >= right;
+            }) != event.observed_signers.end() ||
+        event.observed_signers.size() > 31)
+    {
+        return false;
+    }
+
+    const ActivationReadinessWireLimits limits{
+        config.limits.maximum_line_bytes, 31};
+    const auto no_signer_clock =
+        !event.signer_source_sequence.has_value() &&
+        !event.signer_monotonic_raw_ns.has_value();
+    const auto no_digests = !event.observation_digest.has_value() &&
+        !event.certificate_digest.has_value() &&
+        !event.payload_digest.has_value();
+    const auto no_collection = event.observed_signers.empty() &&
+        event.required_release_count == 0;
+    const auto no_e2_audit = !event.e2_cycle_ordinal.has_value() &&
+        !event.e1_bundle_digest.has_value() &&
+        !event.e2_final_ack_raw_ns.has_value() &&
+        !event.e2_common_commit.has_value() &&
+        event.e2_common_commit_sources.empty() &&
+        !event.e2_common_commit_raw_ns.has_value() &&
+        !event.e2_earliest_raw_ns.has_value() &&
+        !event.e2_actual_begin_raw_ns.has_value() &&
+        !event.e2_hard_deadline_raw_ns.has_value() &&
+        !event.e2_reserve_raw_ns.has_value();
+    const auto no_terminal_audit = !event.terminal_cycle_ordinal.has_value() &&
+        !event.terminal_reason.has_value() &&
+        !event.terminal_identity.has_value() &&
+        !event.terminal_bundle_digest.has_value();
+    if (event.transition != AdaptiveV3ReadinessTransition::e2_eligibility &&
+        !no_e2_audit)
+        return false;
+    if (event.transition != AdaptiveV3ReadinessTransition::terminal &&
+        !no_terminal_audit)
+        return false;
+    if (!wire_rejected && (event.wire_opcode.has_value() ||
+                           event.wire_payload_size.has_value()))
+        return false;
+
+    switch (event.transition)
+    {
+        case AdaptiveV3ReadinessTransition::wire_rejected:
+        {
+            if ((config.source.kind != StructuredEventSourceKind::replica &&
+                 config.source.kind != StructuredEventSourceKind::adaptation_manager) ||
+                !event.replica_id.has_value() || !no_signer_clock ||
+                event.observation_digest.has_value() ||
+                event.certificate_digest.has_value() ||
+                !event.payload_digest.has_value() ||
+                *event.payload_digest == uint256_t{} || !no_collection ||
+                event.delivery_attempt != 0 || event.delivery_enqueued ||
+                !event.canonical_wire_payload.has_value() ||
+                !event.wire_opcode.has_value() ||
+                !event.wire_payload_size.has_value() ||
+                *event.wire_payload_size != event.canonical_wire_payload->size() ||
+                *event.wire_payload_size > config.limits.maximum_line_bytes ||
+                !no_e2_audit || !no_terminal_audit ||
+                event.identity != ActivationReadyIdentityV1{})
+                return false;
+            const bool manager_wire = config.source.kind ==
+                StructuredEventSourceKind::adaptation_manager;
+            const bool observation = event.disposition == "observation_decode" &&
+                *event.wire_opcode == MsgActivationReadyObservation::opcode;
+            const bool ack = event.disposition == "ack_decode" &&
+                *event.wire_opcode == MsgActivationReadinessAck::opcode;
+            const bool certificate = event.disposition == "certificate_decode" &&
+                *event.wire_opcode == MsgActivationReadinessCertificate::opcode;
+            return (manager_wire ? (observation || ack) : certificate) &&
+                DataStream(*event.canonical_wire_payload).get_hash() ==
+                    *event.payload_digest;
+        }
+
+        case AdaptiveV3ReadinessTransition::activation_prepared:
+            return config.source.kind == StructuredEventSourceKind::replica &&
+                event.replica_id.has_value() && no_signer_clock &&
+                no_digests && no_collection && event.delivery_attempt == 0 &&
+                !event.canonical_wire_payload.has_value() &&
+                event.disposition.empty();
+
+        case AdaptiveV3ReadinessTransition::activation_ready_signed:
+        case AdaptiveV3ReadinessTransition::observation_accepted:
+        case AdaptiveV3ReadinessTransition::source_quarantined:
+        {
+            const bool replica_event = event.transition ==
+                AdaptiveV3ReadinessTransition::activation_ready_signed;
+            if (config.source.kind !=
+                    (replica_event
+                         ? StructuredEventSourceKind::replica
+                         : StructuredEventSourceKind::adaptation_manager) ||
+                !event.replica_id.has_value() ||
+                !event.signer_source_sequence.has_value() ||
+                *event.signer_source_sequence == 0 ||
+                !event.signer_monotonic_raw_ns.has_value() ||
+                !event.observation_digest.has_value() ||
+                *event.observation_digest == uint256_t{} ||
+                event.certificate_digest.has_value() ||
+                event.payload_digest.has_value() || !no_collection ||
+                event.delivery_attempt != 0 ||
+                !event.canonical_wire_payload.has_value())
+            {
+                return false;
+            }
+            const auto decoded = decode_activation_ready_observation(
+                *event.canonical_wire_payload, limits);
+            if (!decoded || decoded.value->identity != event.identity ||
+                decoded.value->signer_replica_id != *event.replica_id ||
+                decoded.value->signer_source_sequence !=
+                    *event.signer_source_sequence ||
+                decoded.value->signer_monotonic_raw_ns !=
+                    *event.signer_monotonic_raw_ns ||
+                activation_ready_observation_digest(*decoded.value) !=
+                    *event.observation_digest)
+            {
+                return false;
+            }
+            if (replica_event)
+                return event.disposition.empty();
+            if (event.transition ==
+                AdaptiveV3ReadinessTransition::source_quarantined)
+                return event.disposition == "rejected_conflict";
+            return event.disposition == "accepted" ||
+                event.disposition == "duplicate" ||
+                event.disposition == "released";
+        }
+
+        case AdaptiveV3ReadinessTransition::observation_rejected:
+        {
+            if (config.source.kind !=
+                    StructuredEventSourceKind::adaptation_manager ||
+                event.disposition.empty() ||
+                event.certificate_digest.has_value() ||
+                event.payload_digest.has_value() || !no_collection ||
+                event.delivery_attempt != 0)
+            {
+                return false;
+            }
+            if (!event.replica_id.has_value() ||
+                !event.canonical_wire_payload.has_value() ||
+                !event.observation_digest.has_value() ||
+                !event.signer_source_sequence.has_value() ||
+                !event.signer_monotonic_raw_ns.has_value())
+            {
+                return false;
+            }
+            const auto decoded = decode_activation_ready_observation(
+                *event.canonical_wire_payload, limits);
+            const bool collector_disposition =
+                event.disposition == "quarantined" ||
+                event.disposition == "rejected_peer_binding" ||
+                event.disposition == "rejected_nonmember" ||
+                event.disposition == "rejected_invalid_observation" ||
+                event.disposition == "rejected_wrong_identity";
+            return decoded && decoded.value->identity == event.identity &&
+                collector_disposition &&
+                ((event.disposition == "rejected_peer_binding" &&
+                  decoded.value->signer_replica_id != *event.replica_id) ||
+                 (event.disposition != "rejected_peer_binding" &&
+                  decoded.value->signer_replica_id == *event.replica_id)) &&
+                decoded.value->signer_source_sequence ==
+                    *event.signer_source_sequence &&
+                decoded.value->signer_monotonic_raw_ns ==
+                    *event.signer_monotonic_raw_ns &&
+                activation_ready_observation_digest(*decoded.value) ==
+                    *event.observation_digest;
+        }
+
+        case AdaptiveV3ReadinessTransition::certificate_assembled:
+        case AdaptiveV3ReadinessTransition::certificate_delivery:
+        case AdaptiveV3ReadinessTransition::certificate_accepted:
+        case AdaptiveV3ReadinessTransition::certificate_rejected:
+        {
+            const bool manager_event = event.transition ==
+                    AdaptiveV3ReadinessTransition::certificate_assembled ||
+                event.transition ==
+                    AdaptiveV3ReadinessTransition::certificate_delivery;
+            if (config.source.kind !=
+                    (manager_event
+                         ? StructuredEventSourceKind::adaptation_manager
+                         : StructuredEventSourceKind::replica) ||
+                !no_signer_clock || event.observation_digest.has_value() ||
+                !event.certificate_digest.has_value() ||
+                *event.certificate_digest == uint256_t{} ||
+                !event.payload_digest.has_value() ||
+                *event.payload_digest == uint256_t{} ||
+                !event.canonical_wire_payload.has_value())
+            {
+                return false;
+            }
+            const auto decoded = decode_activation_readiness_certificate(
+                *event.canonical_wire_payload, limits);
+            if (!decoded || decoded.value->identity != event.identity ||
+                decoded.value->certificate_digest !=
+                    *event.certificate_digest ||
+                activation_readiness_ack_payload_digest(
+                    MsgActivationReadinessCertificate::opcode,
+                    *event.canonical_wire_payload) != *event.payload_digest)
+            {
+                return false;
+            }
+            if (event.transition ==
+                AdaptiveV3ReadinessTransition::certificate_assembled)
+            {
+                std::vector<ReplicaID> certificate_signers;
+                certificate_signers.reserve(
+                    decoded.value->observations.size());
+                for (const auto &observation : decoded.value->observations)
+                    certificate_signers.push_back(
+                        observation.signer_replica_id);
+                return !event.replica_id.has_value() &&
+                    event.delivery_attempt == 0 &&
+                    event.required_release_count != 0 &&
+                    event.required_release_count ==
+                        event.observed_signers.size() &&
+                    event.observed_signers == certificate_signers &&
+                    event.disposition.empty();
+            }
+            if (event.transition ==
+                AdaptiveV3ReadinessTransition::certificate_delivery)
+            {
+                return event.replica_id.has_value() &&
+                    event.delivery_attempt != 0 && no_collection &&
+                    ((event.disposition == "queued" &&
+                      event.delivery_enqueued) ||
+                     event.disposition == "retry_exhausted" ||
+                     event.disposition == "deadline_expired");
+            }
+            return event.replica_id.has_value() &&
+                event.delivery_attempt == 0 && no_collection &&
+                ((event.transition ==
+                      AdaptiveV3ReadinessTransition::certificate_accepted &&
+                  event.disposition.empty()) ||
+                 (event.transition ==
+                      AdaptiveV3ReadinessTransition::certificate_rejected &&
+                  !event.disposition.empty()));
+        }
+
+        case AdaptiveV3ReadinessTransition::certificate_acknowledged:
+        {
+            if (config.source.kind !=
+                    StructuredEventSourceKind::adaptation_manager ||
+                !event.replica_id.has_value() || !no_signer_clock ||
+                event.observation_digest.has_value() ||
+                !event.certificate_digest.has_value() ||
+                !event.payload_digest.has_value() || !no_collection ||
+                event.delivery_attempt != 0 ||
+                !event.canonical_wire_payload.has_value())
+            {
+                return false;
+            }
+            const auto decoded = decode_activation_readiness_ack(
+                *event.canonical_wire_payload, limits);
+            return decoded && decoded.value->identity == event.identity &&
+                decoded.value->recipient_replica_id == *event.replica_id &&
+                decoded.value->certificate_digest ==
+                    *event.certificate_digest &&
+                decoded.value->payload_digest == *event.payload_digest &&
+                event.disposition == "acknowledged";
+        }
+
+        case AdaptiveV3ReadinessTransition::e2_eligibility:
+        {
+            constexpr std::uint64_t kE1ResidenceNs = 65'000'000'000ULL;
+            constexpr std::uint64_t kCommonStabilizationNs =
+                60'000'000'000ULL;
+            constexpr std::uint64_t kReserveNs = 90'000'000'000ULL;
+            if (config.source.kind !=
+                    StructuredEventSourceKind::adaptation_manager ||
+                event.replica_id.has_value() || !no_signer_clock ||
+                !no_digests || event.delivery_attempt != 0 ||
+                event.delivery_enqueued || event.canonical_wire_payload.has_value() ||
+                event.disposition != "eligible" ||
+                !no_terminal_audit ||
+                !event.e2_cycle_ordinal.has_value() ||
+                *event.e2_cycle_ordinal != 1 ||
+                !event.e1_bundle_digest.has_value() ||
+                *event.e1_bundle_digest == uint256_t{} ||
+                !event.e2_final_ack_raw_ns.has_value() ||
+                *event.e2_final_ack_raw_ns == 0 ||
+                !event.e2_common_commit.has_value() ||
+                event.e2_common_commit->configuration !=
+                    event.identity.successor_configuration ||
+                event.e2_common_commit->block_hash == uint256_t{} ||
+                !event.e2_common_commit_raw_ns.has_value() ||
+                !event.e2_earliest_raw_ns.has_value() ||
+                !event.e2_actual_begin_raw_ns.has_value() ||
+                !event.e2_hard_deadline_raw_ns.has_value() ||
+                !event.e2_reserve_raw_ns.has_value() ||
+                *event.e2_reserve_raw_ns != kReserveNs ||
+                event.e2_common_commit_sources.empty() ||
+                event.e2_common_commit_sources.size() > 31 ||
+                std::adjacent_find(event.e2_common_commit_sources.begin(),
+                    event.e2_common_commit_sources.end(),
+                    [](ReplicaID left, ReplicaID right) {
+                        return left >= right;
+                    }) != event.e2_common_commit_sources.end() ||
+                event.e2_common_commit_sources != event.observed_signers ||
+                event.required_release_count !=
+                    event.e2_common_commit_sources.size() ||
+                *event.e2_final_ack_raw_ns >
+                    std::numeric_limits<std::uint64_t>::max() - kE1ResidenceNs ||
+                *event.e2_common_commit_raw_ns >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        kCommonStabilizationNs ||
+                *event.e2_final_ack_raw_ns >
+                    std::numeric_limits<std::uint64_t>::max() -
+                        5'000'000'000ULL ||
+                *event.e2_common_commit_raw_ns <= *event.e2_final_ack_raw_ns ||
+                *event.e2_common_commit_raw_ns >=
+                    *event.e2_final_ack_raw_ns + 5'000'000'000ULL)
+                return false;
+            const auto earliest = std::max(
+                *event.e2_final_ack_raw_ns + kE1ResidenceNs,
+                *event.e2_common_commit_raw_ns + kCommonStabilizationNs);
+            return *event.e2_earliest_raw_ns == earliest &&
+                *event.e2_actual_begin_raw_ns >= earliest &&
+                *event.e2_actual_begin_raw_ns < *event.e2_hard_deadline_raw_ns &&
+                *event.e2_actual_begin_raw_ns <=
+                    std::numeric_limits<std::uint64_t>::max() - kReserveNs &&
+                *event.e2_actual_begin_raw_ns + kReserveNs <
+                    *event.e2_hard_deadline_raw_ns;
+        }
+
+        case AdaptiveV3ReadinessTransition::terminal:
+            if (config.source.kind ==
+                    StructuredEventSourceKind::replica)
+            {
+                return event.replica_id.has_value() && no_signer_clock &&
+                    no_digests && no_collection &&
+                    event.delivery_attempt == 0 &&
+                    !event.canonical_wire_payload.has_value() &&
+                    (event.disposition ==
+                         "observation_retry_exhausted" ||
+                     event.disposition ==
+                         "observation_schedule_failed" ||
+                     event.disposition ==
+                         "observation_encoding_failed" ||
+                     event.disposition ==
+                         "observation_internal_failure");
+            }
+            return config.source.kind ==
+                    StructuredEventSourceKind::adaptation_manager &&
+                !event.replica_id.has_value() && no_signer_clock &&
+                !event.observation_digest.has_value() && event.delivery_attempt == 0 &&
+                !event.canonical_wire_payload.has_value() &&
+                ((event.terminal_cycle_ordinal.has_value() &&
+                  event.terminal_reason.has_value() &&
+                  *event.terminal_reason >= 1 &&
+                  *event.terminal_reason <= 9 &&
+                  (!event.terminal_identity.has_value() ||
+                   event.identity == *event.terminal_identity) &&
+                  !event.certificate_digest.has_value() &&
+                  !event.payload_digest.has_value() &&
+                  (event.terminal_bundle_digest == std::nullopt ||
+                   *event.terminal_bundle_digest != uint256_t{}) &&
+                  !event.disposition.empty()) ||
+                 // Preserve the established certificate terminal shape for
+                 // replica-originated readiness until its producer migrates.
+                 (event.certificate_digest.has_value() &&
+                  *event.certificate_digest != uint256_t{} &&
+                  !event.payload_digest.has_value() &&
+                  event.required_release_count != 0 &&
+                  event.required_release_count == event.observed_signers.size() &&
+                  (event.disposition == "complete" ||
+                   event.disposition == "incomplete")));
+    }
+    return false;
+}
+
 bool valid_audit_payload(const AuditStructuredEventPayload &payload,
                          const StructuredEventConfig &config) noexcept
 {
@@ -1458,6 +1995,14 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 11:
             return valid_fault_window_armed_payload(
                 std::get<FaultWindowArmedStructuredEvent>(payload), config);
+        case 12:
+            return valid_adaptive_v3_readiness_payload(
+                std::get<AdaptiveV3ReadinessStructuredEvent>(payload),
+                config);
+        case 13:
+            return valid_adaptive_v3_command_terminal_payload(
+                std::get<AdaptiveV3CommandTerminalStructuredEvent>(payload),
+                config.source.kind);
         default:
             return false;
     }
@@ -1641,6 +2186,53 @@ void append_configuration(JsonLineBuilder &builder,
     builder.append_escaped(configuration.epoch_digest.to_hex());
 }
 
+std::string hexadecimal_bytes(const bytearray_t &bytes)
+{
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    if (bytes.size() > std::numeric_limits<std::size_t>::max() / 2)
+        throw LineLimitExceeded{};
+    result.reserve(bytes.size() * 2);
+    for (const auto byte : bytes)
+    {
+        result.push_back(digits[(byte >> 4) & 0x0f]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
+void append_activation_ready_identity(
+    JsonLineBuilder &builder,
+    const ActivationReadyIdentityV1 &identity)
+{
+    builder.append("{\"schema_version\":");
+    builder.append_integer(identity.schema_version);
+    builder.append(",\"membership_digest\":");
+    builder.append_escaped(identity.membership_digest.to_hex());
+    builder.append(",\"predecessor_boundary_configuration\":{");
+    append_configuration(
+        builder, identity.predecessor_boundary_configuration);
+    builder.append("},\"predecessor_boundary_generation\":");
+    builder.append_integer(identity.predecessor_boundary_generation);
+    builder.append(",\"successor_configuration\":{");
+    append_configuration(builder, identity.successor_configuration);
+    builder.append("},\"successor_activation_generation\":");
+    builder.append_integer(identity.successor_activation_generation);
+    builder.append(",\"command_payload_digest\":");
+    builder.append_escaped(identity.command_payload_digest.to_hex());
+    builder.append(",\"command_block_height\":");
+    builder.append_integer(identity.command_block_height);
+    builder.append(",\"command_block_hash\":");
+    builder.append_escaped(identity.command_block_hash.to_hex());
+    builder.append(",\"activation_delay_blocks\":");
+    builder.append_integer(identity.activation_delay_blocks);
+    builder.append(",\"activation_height\":");
+    builder.append_integer(identity.activation_height);
+    builder.append(",\"activation_boundary_block_hash\":");
+    builder.append_escaped(identity.activation_boundary_block_hash.to_hex());
+    builder.append('}');
+}
+
 void append_process_payload(JsonLineBuilder &builder,
                             const ProcessLifecycleEvent &event)
 {
@@ -1659,6 +2251,14 @@ void append_epoch_payload(JsonLineBuilder &builder,
     append_configuration(builder, event.configuration);
     builder.append(",\"activation_height\":");
     builder.append_integer(event.activation_height);
+    if (event.certificate_apply_committed_height.has_value())
+    {
+        builder.append(",\"certificate_apply_committed_height\":");
+        builder.append_integer(*event.certificate_apply_committed_height);
+        builder.append(",\"activation_readiness_certificate_digest\":");
+        builder.append_escaped(
+            event.activation_readiness_certificate_digest->to_hex());
+    }
     builder.append('}');
 }
 
@@ -1860,6 +2460,35 @@ void append_epoch_command_payload(
     builder.append_integer(event.activation_delay_blocks);
     builder.append(",\"activation_height\":");
     builder.append_integer(event.activation_height);
+    builder.append('}');
+}
+
+void append_adaptive_v3_command_terminal_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV3CommandTerminalStructuredEvent &event)
+{
+    const auto &command = event.command;
+    builder.append("{\"command_block_height\":");
+    builder.append_integer(command.command_block_height);
+    builder.append(",\"command_block_hash\":");
+    builder.append_escaped(command.command_block_hash.to_hex());
+    builder.append(",\"payload_digest\":");
+    builder.append_escaped(command.payload_digest.to_hex());
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(command.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(command.predecessor_epoch_digest.to_hex());
+    builder.append(",\"successor_epoch_number\":");
+    builder.append_integer(command.successor_epoch_number);
+    builder.append(",\"successor_epoch_digest\":");
+    builder.append_escaped(command.successor_epoch_digest.to_hex());
+    builder.append(",\"activation_delay_blocks\":");
+    builder.append_integer(command.activation_delay_blocks);
+    builder.append(",\"activation_height\":");
+    builder.append_integer(command.activation_height);
+    builder.append(",\"disposition\":");
+    builder.append_escaped(
+        adaptive_v3_command_terminal_reason_name(event.reason));
     builder.append('}');
 }
 
@@ -2311,6 +2940,123 @@ void append_manager_session_terminal_payload(
     builder.append('}');
 }
 
+void append_replica_ids(
+    JsonLineBuilder &builder,
+    const std::vector<ReplicaID> &values);
+
+void append_optional_digest(
+    JsonLineBuilder &builder,
+    const std::optional<uint256_t> &digest)
+{
+    if (digest.has_value())
+        builder.append_escaped(digest->to_hex());
+    else
+        builder.append("null");
+}
+
+void append_adaptive_v3_readiness_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV3ReadinessStructuredEvent &event)
+{
+    builder.append("{\"identity\":");
+    if (event.transition == AdaptiveV3ReadinessTransition::terminal &&
+        event.terminal_cycle_ordinal.has_value())
+    {
+        if (event.terminal_identity.has_value())
+            append_activation_ready_identity(builder, *event.terminal_identity);
+        else
+            builder.append("null");
+    }
+    else if (event.transition == AdaptiveV3ReadinessTransition::wire_rejected)
+        builder.append("null");
+    else
+        append_activation_ready_identity(builder, event.identity);
+    builder.append(",\"replica_id\":");
+    if (event.replica_id.has_value())
+        builder.append_integer(*event.replica_id);
+    else
+        builder.append("null");
+    builder.append(",\"signer_source_sequence\":");
+    if (event.signer_source_sequence.has_value())
+        builder.append_integer(*event.signer_source_sequence);
+    else
+        builder.append("null");
+    builder.append(",\"signer_monotonic_raw_ns\":");
+    if (event.signer_monotonic_raw_ns.has_value())
+        builder.append_integer(*event.signer_monotonic_raw_ns);
+    else
+        builder.append("null");
+    builder.append(",\"observation_digest\":");
+    append_optional_digest(builder, event.observation_digest);
+    builder.append(",\"certificate_digest\":");
+    append_optional_digest(builder, event.certificate_digest);
+    builder.append(",\"payload_digest\":");
+    append_optional_digest(builder, event.payload_digest);
+    builder.append(",\"observed_signers\":");
+    append_replica_ids(builder, event.observed_signers);
+    builder.append(",\"required_release_count\":");
+    builder.append_integer(event.required_release_count);
+    builder.append(",\"delivery_attempt\":");
+    builder.append_integer(event.delivery_attempt);
+    builder.append(",\"delivery_enqueued\":");
+    builder.append(event.delivery_enqueued ? "true" : "false");
+    builder.append(",\"canonical_wire_payload_hex\":");
+    if (event.canonical_wire_payload.has_value())
+        builder.append_escaped(
+            hexadecimal_bytes(*event.canonical_wire_payload));
+    else
+        builder.append("null");
+    builder.append(",\"wire_opcode\":");
+    if (event.wire_opcode.has_value()) builder.append_integer(*event.wire_opcode); else builder.append("null");
+    builder.append(",\"wire_payload_size\":");
+    if (event.wire_payload_size.has_value()) builder.append_integer(*event.wire_payload_size); else builder.append("null");
+    builder.append(",\"disposition\":");
+    if (event.disposition.empty())
+        builder.append("null");
+    else
+        builder.append_escaped(event.disposition);
+    builder.append(",\"terminal_cycle_ordinal\":");
+    if (event.terminal_cycle_ordinal.has_value())
+        builder.append_integer(*event.terminal_cycle_ordinal);
+    else
+        builder.append("null");
+    builder.append(",\"terminal_reason\":");
+    if (event.terminal_reason.has_value())
+        builder.append_integer(*event.terminal_reason);
+    else
+        builder.append("null");
+    builder.append(",\"terminal_identity\":");
+    if (event.terminal_identity.has_value())
+        append_activation_ready_identity(builder, *event.terminal_identity);
+    else
+        builder.append("null");
+    builder.append(",\"terminal_bundle_digest\":");
+    append_optional_digest(builder, event.terminal_bundle_digest);
+    builder.append(",\"e2_cycle_ordinal\":");
+    if (event.e2_cycle_ordinal.has_value()) builder.append_integer(*event.e2_cycle_ordinal); else builder.append("null");
+    builder.append(",\"e1_bundle_digest\":");
+    append_optional_digest(builder, event.e1_bundle_digest);
+    builder.append(",\"e2_final_ack_raw_ns\":");
+    if (event.e2_final_ack_raw_ns.has_value()) builder.append_integer(*event.e2_final_ack_raw_ns); else builder.append("null");
+    builder.append(",\"e2_common_commit\":");
+    if (event.e2_common_commit.has_value()) {
+        builder.append("{"); append_configuration(builder, event.e2_common_commit->configuration);
+        builder.append(",\"block_hash\":"); builder.append_escaped(event.e2_common_commit->block_hash.to_hex()); builder.append("}");
+    } else builder.append("null");
+    builder.append(",\"e2_common_commit_sources\":"); append_replica_ids(builder, event.e2_common_commit_sources);
+    builder.append(",\"e2_common_commit_raw_ns\":");
+    if (event.e2_common_commit_raw_ns.has_value()) builder.append_integer(*event.e2_common_commit_raw_ns); else builder.append("null");
+    builder.append(",\"e2_earliest_raw_ns\":");
+    if (event.e2_earliest_raw_ns.has_value()) builder.append_integer(*event.e2_earliest_raw_ns); else builder.append("null");
+    builder.append(",\"e2_actual_begin_raw_ns\":");
+    if (event.e2_actual_begin_raw_ns.has_value()) builder.append_integer(*event.e2_actual_begin_raw_ns); else builder.append("null");
+    builder.append(",\"e2_hard_deadline_raw_ns\":");
+    if (event.e2_hard_deadline_raw_ns.has_value()) builder.append_integer(*event.e2_hard_deadline_raw_ns); else builder.append("null");
+    builder.append(",\"e2_reserve_raw_ns\":");
+    if (event.e2_reserve_raw_ns.has_value()) builder.append_integer(*event.e2_reserve_raw_ns); else builder.append("null");
+    builder.append('}');
+}
+
 void append_replica_ids(JsonLineBuilder &builder,
                         const std::vector<ReplicaID> &values)
 {
@@ -2557,6 +3303,16 @@ std::string serialize_audit_event(
         case 11:
             append_fault_window_armed_payload(
                 builder, std::get<FaultWindowArmedStructuredEvent>(event));
+            break;
+        case 12:
+            append_adaptive_v3_readiness_payload(
+                builder,
+                std::get<AdaptiveV3ReadinessStructuredEvent>(event));
+            break;
+        case 13:
+            append_adaptive_v3_command_terminal_payload(
+                builder,
+                std::get<AdaptiveV3CommandTerminalStructuredEvent>(event));
             break;
         default:
             throw std::bad_variant_access{};
@@ -3068,6 +3824,34 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2.cross_commit_retention_ready";
         case StructuredEventType::fault_window_armed:
             return "fault_window_armed";
+        case StructuredEventType::adaptive_v3_activation_prepared:
+            return "epoch.activation_prepared";
+        case StructuredEventType::adaptive_v3_activation_ready_signed:
+            return "epoch.activation_ready_signed";
+        case StructuredEventType::adaptive_v3_observation_accepted:
+            return "adaptive_v3.readiness_observation_accepted";
+        case StructuredEventType::adaptive_v3_observation_rejected:
+            return "adaptive_v3.readiness_observation_rejected";
+        case StructuredEventType::adaptive_v3_source_quarantined:
+            return "adaptive_v3.readiness_source_quarantined";
+        case StructuredEventType::adaptive_v3_certificate_assembled:
+            return "adaptive_v3.readiness_certificate_assembled";
+        case StructuredEventType::adaptive_v3_certificate_delivery:
+            return "adaptive_v3.readiness_certificate_delivery";
+        case StructuredEventType::adaptive_v3_certificate_accepted:
+            return "adaptive_v3.readiness_certificate_accepted";
+        case StructuredEventType::adaptive_v3_certificate_rejected:
+            return "adaptive_v3.readiness_certificate_rejected";
+        case StructuredEventType::adaptive_v3_certificate_acknowledged:
+            return "adaptive_v3.readiness_certificate_acknowledged";
+        case StructuredEventType::adaptive_v3_e2_eligibility:
+            return "adaptive_v3.e2_eligibility";
+        case StructuredEventType::adaptive_v3_terminal:
+            return "adaptive_v3.readiness_terminal";
+        case StructuredEventType::adaptive_v3_wire_rejected:
+            return "adaptive_v3.readiness_wire_rejected";
+        case StructuredEventType::adaptive_v3_command_terminal:
+            return "adaptive_v3.command_terminal";
         default:
             break;
     }
@@ -3405,6 +4189,13 @@ void StructuredEventSink::emit(
         return serialize_event(
             state.config, payload, type, sequence, monotonic_ns);
     });
+}
+
+bool StructuredEventSink::is_designated_commit_observer() const noexcept
+{
+    const auto &config = state_->config;
+    return config.designated_commit_observer &&
+           same_source(config.source, *config.designated_commit_observer);
 }
 
 void StructuredEventSink::emit_adaptive(

@@ -261,6 +261,25 @@ TEST_CASE(
         CHECK(manager_help.output.find(option) != std::string::npos);
     }
 
+    const auto adaptive_v3_help = run_program(
+        KAURI_ADAPTATION_MANAGER_PATH,
+        {"--protocol-mode", "adaptive_v3", "--help"});
+    REQUIRE(adaptive_v3_help.status == 0);
+    for (const auto *option : {
+             "protocol-mode",
+             "activation-readiness-member",
+             "activation-readiness-release-count",
+             "activation-readiness-maximum-delivery-attempts",
+             "activation-readiness-retry-interval-ticks"})
+    {
+        CAPTURE(option);
+        CHECK(adaptive_v3_help.output.find(option) != std::string::npos);
+    }
+    CHECK(adaptive_v3_help.output.find("required-nonresponsive") !=
+          std::string::npos);
+    CHECK(manager_help.output.find("activation-readiness-member") !=
+          std::string::npos);
+
     const auto rejected = run_program(
         KAURI_HOTSTUFF_APP_PATH, valid_adaptive_v2_arguments());
     CHECK(rejected.status != 0);
@@ -287,6 +306,335 @@ TEST_CASE(
     CHECK(manager.find(
               "StructuredEventSourceKind::adaptation_manager") !=
           std::string::npos);
+}
+
+TEST_CASE(
+    "adaptive-v3 manager owns authenticated delivery through durable stop",
+    "[cert13][m1][adaptive-v3][manager][ownership][transport][wiring]")
+{
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto v3_begin = manager.find(
+        "class AdaptiveV3ManagerModeState final");
+    const auto v2_begin = manager.find(
+        "class AdaptiveV2ManagerModeState final", v3_begin);
+    REQUIRE(v3_begin != std::string::npos);
+    REQUIRE(v2_begin != std::string::npos);
+    const auto v3 = manager.substr(v3_begin, v2_begin - v3_begin);
+    const auto run = function_body(v3, "int run_adaptive_v3()");
+    const auto stop_runtime = function_body(v3, "void stop_runtime()");
+    const auto transport_begin = manager.find(
+        "class AdaptiveV3ManagerTransport final");
+    REQUIRE(transport_begin != std::string::npos);
+    const auto transport = manager.substr(transport_begin, v3_begin - transport_begin);
+    const auto handlers = function_body(transport, "void register_handlers()");
+    const auto transport_start = function_body(transport, "void start()");
+    const auto transport_stop = function_body(transport, "bool stop() noexcept");
+    const auto observation = function_body(v3, "void handle_observation(");
+    const auto acknowledgement = function_body(v3, "void handle_ack(");
+    const auto deliveries = function_body(v3, "void drive_deliveries()");
+    const auto assembled = function_body(
+        v3, "void emit_certificate_assembled() noexcept");
+    const auto begin_next = function_body(
+        v3, "void begin_next_transition_cycle() noexcept");
+    const auto e2_audit = function_body(
+        v3, "void emit_e2_eligibility(");
+    const auto wire_rejected = function_body(
+        v3, "void emit_wire_rejected(");
+    const auto evaluate = function_body(
+        v3, "void evaluate_transition_cycle()");
+    const auto shape_audit = function_body(
+        v3, "void emit_v3_shape_decision(");
+    const auto evidence_audit = function_body(
+        v3, "void emit_v3_evidence_snapshot(");
+    const auto accepted_evidence = function_body(
+        v3, "void emit_new_v3_accepted_observations()");
+    const auto common_ingest = function_body(v3, "void ingest_common(");
+    REQUIRE_FALSE(run.empty());
+    REQUIRE_FALSE(stop_runtime.empty());
+    REQUIRE_FALSE(handlers.empty());
+    REQUIRE_FALSE(observation.empty());
+    REQUIRE_FALSE(acknowledgement.empty());
+    REQUIRE_FALSE(deliveries.empty());
+    REQUIRE_FALSE(assembled.empty());
+    REQUIRE_FALSE(begin_next.empty());
+    REQUIRE_FALSE(e2_audit.empty());
+    REQUIRE_FALSE(wire_rejected.empty());
+    REQUIRE_FALSE(evaluate.empty());
+    REQUIRE_FALSE(shape_audit.empty());
+    REQUIRE_FALSE(evidence_audit.empty());
+    REQUIRE_FALSE(accepted_evidence.empty());
+    REQUIRE_FALSE(common_ingest.empty());
+
+    const auto dispatch = run.find("event_context_.dispatch()");
+    const auto runtime_stop = run.find("stop_runtime()", dispatch);
+    const auto stopped = run.find(
+        "ProcessLifecycleState::stopped", runtime_stop);
+    REQUIRE(dispatch != std::string::npos);
+    REQUIRE(runtime_stop != std::string::npos);
+    REQUIRE(stopped != std::string::npos);
+    CHECK(dispatch < runtime_stop);
+    CHECK(runtime_stop < stopped);
+    CHECK(stop_runtime.find("retry_timer_.del()") != std::string::npos);
+    CHECK(stop_runtime.find("transport_.stop()") != std::string::npos);
+    CHECK(transport_stop.find("callbacks_ = {}") != std::string::npos);
+    CHECK(transport_stop.find("network_.stop()") != std::string::npos);
+    CHECK(transport_stop.find("network_.terminate()") == std::string::npos);
+
+    const auto compact_handlers = without_whitespace(handlers);
+    CHECK(compact_handlers.find(
+              "static_pointer_cast<ManagerNetwork::conn_t::type>") !=
+          std::string::npos);
+    CHECK(compact_handlers.find("authenticated_source(peer_connection)") !=
+          std::string::npos);
+    const auto observation_auth = handlers.find(
+        "authenticated_source(connection)");
+    const auto observation_owner = observation.find(
+        "facade_.v3_observe_readiness(");
+    REQUIRE(observation_auth != std::string::npos);
+    REQUIRE(observation_owner != std::string::npos);
+    CHECK(handlers.find("callbacks_.observation") != std::string::npos);
+    CHECK(without_whitespace(acknowledgement).find(
+              "facade_.v3_acknowledge(source,manager_tick_ns(),payload)") !=
+          std::string::npos);
+    CHECK(deliveries.find("transport_.send_certificate") !=
+          std::string::npos);
+    CHECK(deliveries.find("AdaptiveV3ManagerSessionStatus::terminal") !=
+          std::string::npos);
+    CHECK(deliveries.find("emit_new_session_terminals()") !=
+          std::string::npos);
+
+    SECTION("authenticated malformed readiness wire is sealed before return")
+    {
+        const auto observation_decode = observation.find(
+            "decode_activation_ready_observation(");
+        const auto observation_audit = observation.find(
+            "emit_wire_rejected(", observation_decode);
+        const auto observation_owner = observation.find(
+            "facade_.v3_observe_readiness(", observation_audit);
+        const auto ack_decode = acknowledgement.find(
+            "decode_activation_readiness_ack(");
+        const auto ack_audit = acknowledgement.find(
+            "emit_wire_rejected(", ack_decode);
+        const auto ack_owner = acknowledgement.find(
+            "facade_.v3_acknowledge(", ack_audit);
+        REQUIRE(observation_decode != std::string::npos);
+        REQUIRE(observation_audit != std::string::npos);
+        REQUIRE(observation_owner != std::string::npos);
+        REQUIRE(ack_decode != std::string::npos);
+        REQUIRE(ack_audit != std::string::npos);
+        REQUIRE(ack_owner != std::string::npos);
+        CHECK(observation_decode < observation_audit);
+        CHECK(observation_audit < observation_owner);
+        CHECK(ack_decode < ack_audit);
+        CHECK(ack_audit < ack_owner);
+        CHECK(wire_rejected.find("wire_rejected") != std::string::npos);
+        CHECK(wire_rejected.find("payload_digest") != std::string::npos);
+        CHECK(wire_rejected.find("canonical_wire_payload") != std::string::npos);
+        const auto wire_emit = wire_rejected.find("emit_readiness");
+        const auto wire_drain = wire_rejected.find("event_sink_.drain()", wire_emit);
+        const auto wire_health = wire_rejected.find("event_sink_.health()", wire_drain);
+        REQUIRE(wire_emit != std::string::npos);
+        REQUIRE(wire_drain != std::string::npos);
+        REQUIRE(wire_health != std::string::npos);
+        CHECK(wire_emit < wire_drain);
+        CHECK(wire_drain < wire_health);
+        CHECK(wire_rejected.find("fail()") != std::string::npos);
+    }
+
+    SECTION("assembled certificate audits bind the exact delivery wire bytes")
+    {
+        const auto wire = assembled.find(
+            "encode_activation_readiness_certificate(");
+        const auto payload = assembled.find("canonical_wire_payload", wire);
+        const auto digest = assembled.find(
+            "activation_readiness_ack_payload_digest(", payload);
+        const auto opcode = assembled.find(
+            "MsgActivationReadinessCertificate::opcode", digest);
+        const auto emit = assembled.find("emit_readiness", opcode);
+        REQUIRE(wire != std::string::npos);
+        REQUIRE(payload != std::string::npos);
+        REQUIRE(digest != std::string::npos);
+        REQUIRE(opcode != std::string::npos);
+        REQUIRE(emit != std::string::npos);
+        CHECK(wire < payload);
+        CHECK(payload < digest);
+        CHECK(digest < emit);
+        CHECK(assembled.find("payload_digest =\n            certificate->certificate_digest") == std::string::npos);
+    }
+
+    SECTION("E2 eligibility is sealed after its atomic session transition")
+    {
+        const auto atomic_begin = begin_next.find("v3_begin_e2_at(");
+        const auto audit = begin_next.find("emit_e2_eligibility(", atomic_begin);
+        const auto drain = begin_next.find("event_sink_.drain()", audit);
+        const auto evaluate = begin_next.find("evaluate_transition_cycle()", drain);
+        REQUIRE(atomic_begin != std::string::npos);
+        REQUIRE(audit != std::string::npos);
+        REQUIRE(drain != std::string::npos);
+        REQUIRE(evaluate != std::string::npos);
+        CHECK(atomic_begin < audit);
+        CHECK(audit < drain);
+        CHECK(drain < evaluate);
+        CHECK(e2_audit.find("e1_bundle_digest") != std::string::npos);
+        CHECK(e2_audit.find("e2_common_commit") != std::string::npos);
+        CHECK(e2_audit.find("e2_actual_begin_raw_ns") != std::string::npos);
+    }
+
+    SECTION("selected v3 evidence is durable before bundle publication")
+    {
+        const auto bundle_write = evaluate.find("write_exclusive_bundle(");
+        const auto shape = evaluate.find(
+            "emit_v3_shape_decision(", bundle_write);
+        const auto evidence = evaluate.find(
+            "emit_v3_evidence_snapshot(", shape);
+        const auto readiness = evaluate.find(
+            "facade_.v3_begin_readiness(", evidence);
+        const auto send = evaluate.find("transport_.send_bundle(", readiness);
+        REQUIRE(bundle_write != std::string::npos);
+        REQUIRE(shape != std::string::npos);
+        REQUIRE(evidence != std::string::npos);
+        REQUIRE(readiness != std::string::npos);
+        REQUIRE(send != std::string::npos);
+        CHECK(bundle_write < shape);
+        CHECK(shape < evidence);
+        CHECK(evidence < readiness);
+        CHECK(readiness < send);
+        CHECK(shape_audit.find("facade_.controller_audit()") !=
+              std::string::npos);
+        CHECK(evidence_audit.find("facade_.controller_audit()") !=
+              std::string::npos);
+        CHECK(evidence_audit.find(
+                  "serialize_adaptive_v2_evidence_snapshot_payload(") !=
+              std::string::npos);
+        const auto emit = evidence_audit.find("event_sink_.emit_audit(");
+        const auto drain = evidence_audit.find("event_sink_.drain()", emit);
+        const auto artifact = evidence_audit.find(
+            "write_exclusive_json(", drain);
+        REQUIRE(emit != std::string::npos);
+        REQUIRE(drain != std::string::npos);
+        REQUIRE(artifact != std::string::npos);
+        CHECK(emit < drain);
+        CHECK(drain < artifact);
+    }
+
+    SECTION("v3 accepted evidence is durable before controller evaluation")
+    {
+        const auto ingest = common_ingest.find("operation(source, message)");
+        const auto accepted = common_ingest.find(
+            "emit_new_v3_accepted_observations()", ingest);
+        const auto evaluate = common_ingest.find(
+            "evaluate_transition_cycle()", accepted);
+        REQUIRE(ingest != std::string::npos);
+        REQUIRE(accepted != std::string::npos);
+        REQUIRE(evaluate != std::string::npos);
+        CHECK(ingest < accepted);
+        CHECK(accepted < evaluate);
+        CHECK(accepted_evidence.find(
+                  "EvidenceObservationAcceptedStructuredEvent") !=
+              std::string::npos);
+        const auto emit = accepted_evidence.find("event_sink_.emit_audit(");
+        const auto drain = accepted_evidence.find(
+            "event_sink_.drain()", emit);
+        REQUIRE(emit != std::string::npos);
+        REQUIRE(drain != std::string::npos);
+        CHECK(emit < drain);
+    }
+
+    CHECK(v3.find("fault_receipt") == std::string::npos);
+    CHECK(v3.find("crash") == std::string::npos);
+    CHECK(v3.find("process_status") == std::string::npos);
+    CHECK(v3.find("quorum") == std::string::npos);
+
+    const auto main = function_body(manager, "int main(");
+    const auto owner = main.find("std::make_unique<AdaptationManager>(");
+    const auto execute = main.find(
+        "manager->run()", owner);
+    const auto destroy = main.find("manager.reset()", execute);
+    const auto shutdown = main.find("event_sink.shutdown()", destroy);
+    REQUIRE(owner != std::string::npos);
+    REQUIRE(execute != std::string::npos);
+    REQUIRE(destroy != std::string::npos);
+    REQUIRE(shutdown != std::string::npos);
+    CHECK(owner < execute);
+    CHECK(execute < destroy);
+    CHECK(destroy < shutdown);
+}
+
+TEST_CASE(
+    "CERT13 unified v3 manager derives two certified cycles without a preseeded identity",
+    "[cert13][v3][manager][lifecycle][n7][n31][intentional-red]")
+{
+    /*
+     * This is deliberately an executable-owner contract, rather than a
+     * collector unit test.  The collector can already assemble one fixed
+     * identity certificate; the manager must instead derive each identity
+     * from the authoritative committed transition, keep running through the
+     * first ACK quorum, and arm the next transition in the same process.
+     *
+     * The assertions are intentionally RED until that lifecycle replaces the
+     * one-shot --activation-readiness-identity bootstrap.  They keep the
+     * N=7 (Q=5/R=5) and N=31 (Q=21/R=28) policy outside the fixed-quorum
+     * verifier: the manager's release threshold is operational only.
+     */
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto parse = function_body(
+        manager, "AdaptiveV3ManagerOptions parse_adaptive_v3_options(");
+    const auto v3_begin = manager.find(
+        "class AdaptiveV3ManagerModeState final");
+    const auto v2_begin = manager.find("class AdaptiveV2ManagerModeState final", v3_begin);
+    REQUIRE_FALSE(parse.empty());
+    REQUIRE(v3_begin != std::string::npos);
+    REQUIRE(v2_begin != std::string::npos);
+    const auto v3 = manager.substr(v3_begin, v2_begin - v3_begin);
+
+    SECTION("the v3 CLI carries public transition authority, not a forged readiness identity")
+    {
+        const auto manager_help = run_program(
+            KAURI_ADAPTATION_MANAGER_PATH,
+            {"--protocol-mode", "adaptive_v3", "--help"});
+        REQUIRE(manager_help.status == 0);
+        CHECK(parse.find("activation-readiness-identity") ==
+              std::string::npos);
+        CHECK(manager_help.output.find("activation-readiness-identity") ==
+              std::string::npos);
+        CHECK(manager_help.output.find("issuer-id") !=
+              std::string::npos);
+        CHECK(manager_help.output.find("transition-request") !=
+              std::string::npos);
+        CHECK(manager_help.output.find("selection") != std::string::npos);
+    }
+
+    SECTION("E0 to E1 keeps Q verification distinct from R release")
+    {
+        CHECK(v3.find("AdaptiveV3ManagerSession") !=
+              std::string::npos);
+    CHECK(manager.find("manager_controller_config") != std::string::npos);
+        CHECK(v3.find("required_release_count") != std::string::npos);
+        CHECK(v3.find("certificate_assembled") != std::string::npos);
+        CHECK(v3.find("quarantine") != std::string::npos);
+        CHECK(v3.find("ingest_common") != std::string::npos);
+    }
+
+    SECTION("ACK quorum rotates the first cycle but does not terminate the process")
+    {
+        CHECK(v3.find("begin_next_transition_cycle") !=
+              std::string::npos);
+        CHECK(manager.find("residency_ticks") !=
+              std::string::npos);
+        CHECK(manager.find("65'000") != std::string::npos);
+        CHECK(v3.find("begin_next_transition_cycle") !=
+              std::string::npos);
+        CHECK(v3.find("AdaptiveV3ManagerSessionStatus::terminal") != std::string::npos);
+        CHECK(v3.find("emitted_session_terminals_") != std::string::npos);
+    }
+
+    SECTION("both certificate and delivery deadlines are bounded before E2 terminality")
+    {
+        CHECK(manager.find("pre_certificate_window_ticks") !=
+              std::string::npos);
+        CHECK(manager.find("delivery_window_ticks") != std::string::npos);
+        CHECK(v3.find("kAdaptiveV3TickSeconds") != std::string::npos);
+    }
 }
 
 TEST_CASE(
@@ -445,10 +793,15 @@ TEST_CASE(
 {
     const auto manager = source("examples/adaptation_manager.cpp");
     const auto main = function_body(manager, "int main(");
-    const auto run = function_body(manager, "int run()");
-    const auto stop_runtime = function_body(
-        manager, "void stop_runtime()");
-    const auto evaluate = function_body(manager, "void evaluate()");
+    const auto legacy_manager_begin = manager.find(
+        "class AdaptationManager final");
+    REQUIRE(legacy_manager_begin != std::string::npos);
+    const auto v2_begin = manager.find("class AdaptiveV2ManagerModeState final");
+    REQUIRE(v2_begin != std::string::npos);
+    const auto v2 = manager.substr(v2_begin, legacy_manager_begin - v2_begin);
+    const auto run = function_body(v2, "int run()");
+    const auto stop_runtime = function_body(v2, "void stop_runtime()");
+    const auto evaluate = function_body(v2, "void evaluate()");
     REQUIRE_FALSE(main.empty());
     REQUIRE_FALSE(run.empty());
     REQUIRE_FALSE(stop_runtime.empty());
@@ -565,10 +918,15 @@ TEST_CASE(
         REQUIRE(catch_runtime_stop != std::string::npos);
         CHECK(catch_stop_context < catch_runtime_stop);
 
-        const auto main_shutdown = main.find(".shutdown()");
+        const auto legacy_manager_run = main.find("manager->run()");
+        const auto main_shutdown = legacy_manager_run == std::string::npos
+            ? std::string::npos
+            : main.find(".shutdown()", legacy_manager_run);
+        REQUIRE(legacy_manager_run != std::string::npos);
         REQUIRE(main_shutdown != std::string::npos);
-        CHECK(main.find("manager->run()") < main_shutdown);
-        CHECK(main.find("manager.reset()") < main_shutdown);
+        CHECK(legacy_manager_run < main_shutdown);
+        CHECK(main.find("manager.reset()", legacy_manager_run) <
+              main_shutdown);
     }
 
     SECTION("score trajectory uses one monotonic emission cursor")

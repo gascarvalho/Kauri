@@ -139,7 +139,8 @@ namespace hotstuff
         bool is_adaptive_epoch_mode(EpochProtocolMode mode) noexcept
         {
             return mode == EpochProtocolMode::adaptive_v1 ||
-                   mode == EpochProtocolMode::adaptive_v2;
+                   mode == EpochProtocolMode::adaptive_v2 ||
+                   mode == EpochProtocolMode::adaptive_v3;
         }
 
         std::uint64_t adaptive_monotonic_now_ns() noexcept
@@ -1803,7 +1804,8 @@ namespace hotstuff
     const EpochDefinition &HotStuffBase::register_initial_epoch(
         const Epoch &epoch)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return register_legacy_epoch(epoch);
         if (exact_epochs == nullptr)
             throw std::logic_error(
@@ -2023,7 +2025,8 @@ namespace hotstuff
                     configuration,
                     future_proposals,
                     static_cast<ProposalAdmissionEffects &>(*this),
-                    epoch_protocol_mode == EpochProtocolMode::adaptive_v2
+                    (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+                     epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
                         ? ProposalRelayPolicy::
                               adaptive_v2_deferred_until_arm_attempt
                         : ProposalRelayPolicy::eager_before_processing);
@@ -2077,7 +2080,8 @@ namespace hotstuff
     HotStuffBase::pre_vote_epoch_change_gate(
         const Proposal &proposal) const noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return bypass_epoch_change_gate();
         try
         {
@@ -2118,7 +2122,8 @@ namespace hotstuff
                 epoch_change_maximum_ancestry_blocks,
                 *epoch_change_verifier,
                 *active_epoch,
-                *exact_epochs);
+                *exact_epochs,
+                epoch_protocol_mode);
             switch (result.disposition)
             {
             case EpochChangeProposalDisposition::accepted:
@@ -2244,7 +2249,8 @@ namespace hotstuff
     void HotStuffBase::send_epoch_definition_request(
         const EpochDefinitionRequest &request) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return;
         try
         {
@@ -2361,8 +2367,12 @@ namespace hotstuff
         const AuthorizedEpochChange &command,
         const ActivationRecord &record) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            block == nullptr ||
+        const auto recovery_wire_schema =
+            epoch_wire_schema_for_mode(epoch_protocol_mode);
+        if (!(epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+              epoch_protocol_mode == EpochProtocolMode::adaptive_v3) ||
+            !recovery_wire_schema ||
+            command.protocol_mode != epoch_protocol_mode || block == nullptr ||
             block->get_hash() == uint256_t{} ||
             command.payload.successor_epoch_digest == uint256_t{} ||
             record.predecessor_epoch_digest !=
@@ -2404,8 +2414,8 @@ namespace hotstuff
             }
 
             const EpochDefinitionRequest request{
-                kEpochWireSchemaVersionV2,
-                EpochProtocolMode::adaptive_v2,
+                *recovery_wire_schema,
+                epoch_protocol_mode,
                 command.payload.successor_epoch_digest};
             auto retry_generation =
                 next_committed_epoch_definition_retry_generation++;
@@ -2519,13 +2529,18 @@ namespace hotstuff
         pending_committed_epoch_change.reset();
         reset_committed_epoch_definition_recovery();
         committed_epoch_change_history.reset();
-        mark_adaptive_v2_convergence_evidence_unhealthy(
-            "committed_definition_retry_schedule_failed");
-        if (adaptive_epoch_runtime != nullptr)
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
         {
-            adaptive_epoch_runtime->adapter.fail_committed_v2(
-                ActivationBlockReason::invalid_activation_record);
+            mark_adaptive_v2_convergence_evidence_unhealthy(
+                "committed_definition_retry_schedule_failed");
+            if (adaptive_epoch_runtime != nullptr)
+                adaptive_epoch_runtime->adapter.fail_committed_v2(
+                    ActivationBlockReason::invalid_activation_record);
         }
+        else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+            emit_adaptive_v3_command_terminal(
+                AdaptiveV3CommandTerminalReason::
+                    committed_definition_retry_schedule_failed);
     }
 
     void HotStuffBase::cancel_committed_epoch_definition_retry() noexcept
@@ -2682,7 +2697,8 @@ namespace hotstuff
     void HotStuffBase::record_committed_epoch_change_history(
         const block_t &block) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return;
         if (!committed_epoch_change_history ||
             pending_committed_epoch_change)
@@ -2722,9 +2738,14 @@ namespace hotstuff
             }
 
             auto command = previous.snapshot.command;
-            const auto extracted = extract_epoch_change_block_extra(
-                block->get_extra(),
-                epoch_change_maximum_block_extra_bytes);
+            const auto extracted =
+                epoch_protocol_mode == EpochProtocolMode::adaptive_v3
+                    ? extract_epoch_change_block_extra_v3(
+                          block->get_extra(),
+                          epoch_change_maximum_block_extra_bytes)
+                    : extract_epoch_change_block_extra(
+                          block->get_extra(),
+                          epoch_change_maximum_block_extra_bytes);
             if (extracted.disposition ==
                     EpochChangeExtraDisposition::present &&
                 extracted.command && extracted.payload_digest &&
@@ -2786,9 +2807,11 @@ namespace hotstuff
                     successor == nullptr &&
                     validation.recovery_request.has_value() &&
                     validation.recovery_request->wire_schema_version ==
-                        kEpochWireSchemaVersionV2 &&
+                        (epoch_protocol_mode == EpochProtocolMode::adaptive_v3
+                             ? kEpochWireSchemaVersionV3
+                             : kEpochWireSchemaVersionV2) &&
                     validation.recovery_request->protocol_mode ==
-                        EpochProtocolMode::adaptive_v2 &&
+                        epoch_protocol_mode &&
                     validation.recovery_request->successor_epoch_digest ==
                         extracted.command->payload.successor_epoch_digest;
                 if ((!available_definition &&
@@ -6389,7 +6412,9 @@ namespace hotstuff
     void HotStuffBase::emit_epoch_lifecycle_event(
         EpochLifecycleTransition transition,
         const ConfigurationId &configuration,
-        std::uint64_t activation_height) noexcept
+        std::uint64_t activation_height,
+        std::optional<std::uint64_t> certificate_apply_height,
+        std::optional<uint256_t> certificate_digest) noexcept
     {
         if (structured_event_emitter == nullptr)
             return;
@@ -6397,7 +6422,11 @@ namespace hotstuff
         {
             structured_event_emitter->emit(
                 StructuredEventPayload{EpochLifecycleEvent{
-                    transition, configuration, activation_height}});
+                    transition,
+                    configuration,
+                    activation_height,
+                    certificate_apply_height,
+                    certificate_digest}});
         }
         catch (...)
         {
@@ -8207,8 +8236,9 @@ namespace hotstuff
         MsgEpochDefinitionRequest &&message,
         const Net::conn_t &conn)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            exact_epochs == nullptr)
+        if (!(epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+              epoch_protocol_mode == EpochProtocolMode::adaptive_v3) ||
+            conn == nullptr || exact_epochs == nullptr)
             return;
         const auto peer = conn->get_peer_id();
         const auto authenticated = peer_id_map.find(peer);
@@ -8220,7 +8250,7 @@ namespace hotstuff
 
         const auto decoded = decode_epoch_definition_request(
             static_cast<bytearray_t>(message.serialized),
-            EpochProtocolMode::adaptive_v2,
+            epoch_protocol_mode,
             epoch_wire_limits);
         if (!decoded)
             return;
@@ -8235,9 +8265,13 @@ namespace hotstuff
 
         try
         {
+            const auto reply_wire_schema =
+                epoch_wire_schema_for_mode(epoch_protocol_mode);
+            if (!reply_wire_schema)
+                return;
             const EpochDefinitionReply reply{
-                kEpochWireSchemaVersionV2,
-                EpochProtocolMode::adaptive_v2,
+                *reply_wire_schema,
+                epoch_protocol_mode,
                 definition->epoch_digest(),
                 available_epoch_definition(*definition)};
             const MsgEpochDefinitionReply response(
@@ -8255,8 +8289,10 @@ namespace hotstuff
         MsgEpochDefinitionReply &&message,
         const Net::conn_t &conn)
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
-            exact_epochs == nullptr || proposal_admission == nullptr)
+        if (!(epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+              epoch_protocol_mode == EpochProtocolMode::adaptive_v3) ||
+            conn == nullptr || exact_epochs == nullptr ||
+            proposal_admission == nullptr)
             return;
         const auto peer = conn->get_peer_id();
         const auto authenticated = peer_id_map.find(peer);
@@ -8268,7 +8304,7 @@ namespace hotstuff
 
         const auto decoded = decode_epoch_definition_reply(
             static_cast<bytearray_t>(message.serialized),
-            EpochProtocolMode::adaptive_v2,
+            epoch_protocol_mode,
             epoch_wire_limits);
         if (!decoded)
             return;
@@ -8278,17 +8314,19 @@ namespace hotstuff
         auto deferred = deferred_epoch_definition_recoveries.find(
             successor_epoch_digest);
         const bool deferred_recovery_live =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             deferred != deferred_epoch_definition_recoveries.end() &&
             deferred->second.request_live &&
             deferred->second.request.successor_epoch_digest ==
                 successor_epoch_digest;
         const bool committed_recovery_live =
             committed_epoch_definition_recovery.has_value() &&
+            epoch_wire_schema_for_mode(epoch_protocol_mode).has_value() &&
             committed_epoch_definition_recovery->request
                     .wire_schema_version ==
-                kEpochWireSchemaVersionV2 &&
+                *epoch_wire_schema_for_mode(epoch_protocol_mode) &&
             committed_epoch_definition_recovery->request.protocol_mode ==
-                EpochProtocolMode::adaptive_v2 &&
+                epoch_protocol_mode &&
             committed_epoch_definition_recovery->request
                     .successor_epoch_digest ==
                 successor_epoch_digest;
@@ -8355,8 +8393,27 @@ namespace hotstuff
             return;
 
         if (committed_recovery_live &&
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             !recover_committed_epoch_definition(*staged.definition))
             return;
+        if (committed_recovery_live &&
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            if (!adaptive_v3_activation_gate ||
+                !adaptive_v3_committed_command ||
+                adaptive_epoch_runtime == nullptr ||
+                adaptive_v3_committed_command->protocol_mode !=
+                    EpochProtocolMode::adaptive_v3 ||
+                adaptive_v3_committed_command->payload
+                        .successor_epoch_digest !=
+                    successor_epoch_digest ||
+                adaptive_epoch_runtime->adapter.prepare_committed_v3(
+                    *staged.definition) != EpochIngressError::none)
+                return;
+            adaptive_v3_runtime_prepared = true;
+            reset_committed_epoch_definition_recovery();
+            resume_adaptive_v3_runtime_preparation();
+        }
 
         if (deferred_recovery_live)
         {
@@ -8418,6 +8475,895 @@ namespace hotstuff
         {
             HOTSTUFF_LOG_WARN(
                 "[EPOCH] Adaptive-v2 successor inbox failed internally");
+        }
+    }
+
+    void HotStuffBase::adaptive_v3_epoch_change_bundle_handler(
+        MsgAdaptiveV3EpochChangeBundle &&message,
+        const Net::conn_t &conn)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            conn == nullptr || adaptive_v2_command_inbox == nullptr ||
+            !adaptive_v2_epoch_change_bundle_limits.has_value() ||
+            epoch_change_verifier == nullptr || exact_epochs == nullptr ||
+            adaptive_epoch_runtime == nullptr)
+            return;
+        const auto peer = conn->get_peer_id();
+        const auto pinned_connection = pn.get_peer_conn(peer);
+        const auto *certificate = conn->get_peer_cert();
+        if (!authorize_manager_peer(peer) || pinned_connection == nullptr ||
+            pinned_connection != conn || certificate == nullptr ||
+            PeerId(*certificate) != peer)
+            return;
+        const auto decoded = decode_adaptive_v3_epoch_change_bundle(
+            static_cast<bytearray_t>(message.serialized),
+            *adaptive_v2_epoch_change_bundle_limits);
+        if (!decoded)
+            return;
+        const auto active =
+            adaptive_epoch_runtime->activation.active_effect().configuration;
+        const auto *active_epoch = exact_epochs->find_epoch(
+            active.epoch_number);
+        if (active_epoch == nullptr ||
+            active_epoch->epoch_digest() != active.epoch_digest)
+            return;
+        const auto result = adaptive_v2_command_inbox->ingest(
+            *decoded.value, *active_epoch, *epoch_change_verifier,
+            *exact_epochs);
+        if (result.disposition ==
+            AdaptiveV2CommandIngestDisposition::internal_failure)
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Adaptive-v3 successor inbox failed internally");
+        if ((result.disposition ==
+                 AdaptiveV2CommandIngestDisposition::accepted ||
+             result.disposition ==
+                 AdaptiveV2CommandIngestDisposition::duplicate) &&
+            adaptive_v3_committed_command && result.material &&
+            result.material->payload_digest ==
+                epoch_change_payload_digest(
+                    adaptive_v3_committed_command->payload))
+        {
+            const auto *successor = exact_epochs->find_epoch_by_digest(
+                adaptive_v3_committed_command->payload
+                    .successor_epoch_digest);
+            if (successor == nullptr)
+            {
+                if (committed_epoch_definition_recovery &&
+                    committed_epoch_definition_recovery->request
+                            .protocol_mode ==
+                        EpochProtocolMode::adaptive_v3)
+                    send_epoch_definition_request(
+                        committed_epoch_definition_recovery->request);
+                return;
+            }
+            if (adaptive_epoch_runtime->adapter.prepare_committed_v3(
+                    *successor) == EpochIngressError::none)
+            {
+                adaptive_v3_runtime_prepared = true;
+                reset_committed_epoch_definition_recovery();
+                resume_adaptive_v3_runtime_preparation();
+            }
+        }
+    }
+
+    void HotStuffBase::resume_adaptive_v3_runtime_preparation() noexcept
+    {
+        if (!adaptive_v3_config || !adaptive_v3_runtime_prepared ||
+            !adaptive_v3_activation_gate ||
+            adaptive_v3_observation_terminal ||
+            adaptive_v3_command_terminal_emitted)
+            return;
+        std::optional<ActivationReadyIdentityV1> failure_identity;
+        try
+        {
+            const auto boundary_block = adaptive_v3_boundary_block;
+            const auto latest_block = adaptive_v3_latest_committed_block;
+            if (adaptive_v3_deferred_observation)
+            {
+                failure_identity =
+                    adaptive_v3_deferred_observation->identity;
+                const auto observation = *adaptive_v3_deferred_observation;
+                adaptive_v3_deferred_observation.reset();
+                enqueue_adaptive_v3_observation(observation);
+            }
+            if (adaptive_v3_deferred_certificate)
+            {
+                failure_identity =
+                    adaptive_v3_deferred_certificate->identity;
+                const auto deferred = *adaptive_v3_deferred_certificate;
+                adaptive_v3_deferred_certificate.reset();
+                const auto payload = encode_activation_readiness_certificate(
+                    deferred,
+                    adaptive_v3_config->readiness_wire_limits);
+                ingest_adaptive_v3_readiness_certificate(deferred, payload);
+            }
+            if (adaptive_v3_activation_gate && boundary_block != nullptr)
+                process_adaptive_v3_post_block_commit(boundary_block);
+            if (adaptive_v3_activation_gate && latest_block != nullptr &&
+                latest_block != boundary_block)
+                process_adaptive_v3_post_block_commit(latest_block);
+        }
+        catch (...)
+        {
+            if (failure_identity)
+                emit_adaptive_v3_observation_terminal(
+                    *failure_identity, "observation_internal_failure");
+            else
+                emit_adaptive_v3_command_terminal(
+                    AdaptiveV3CommandTerminalReason::
+                        readiness_internal_failure);
+        }
+    }
+
+    bool HotStuffBase::emit_adaptive_v3_readiness_event(
+        AdaptiveV3ReadinessStructuredEvent event,
+        bool drain_before_return) noexcept
+    {
+        if (audit_event_emitter == nullptr)
+            return false;
+        try
+        {
+            audit_event_emitter->emit_audit(
+                AuditStructuredEventPayload{std::move(event)});
+            auto *owner = dynamic_cast<StructuredEventDrainOwner *>(
+                audit_event_emitter);
+            if (drain_before_return)
+            {
+                // Malformed authenticated wire must be durable before the
+                // handler returns; a queued-only record is not evidence.
+                if (owner == nullptr)
+                    return false;
+                owner->drain();
+            }
+            return owner == nullptr || owner->health().healthy;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    void HotStuffBase::fail_adaptive_v3_readiness_audit() noexcept
+    {
+        // No readiness identity is available for malformed wire, so this is
+        // deliberately a local fail-closed fence rather than a terminal audit
+        // that would manufacture an identity.
+        adaptive_v3_observation_terminal = true;
+    }
+
+    void HotStuffBase::emit_adaptive_v3_observation_terminal(
+        const ActivationReadyIdentityV1 &identity,
+        const char *disposition) noexcept
+    {
+        if (adaptive_v3_observation_terminal)
+            return;
+        adaptive_v3_observation_terminal = true;
+        AdaptiveV3ReadinessStructuredEvent event;
+        event.transition = AdaptiveV3ReadinessTransition::terminal;
+        event.identity = identity;
+        event.replica_id = get_id();
+        event.disposition = disposition == nullptr
+            ? "observation_internal_failure" : disposition;
+        emit_adaptive_v3_readiness_event(std::move(event));
+    }
+
+    void HotStuffBase::emit_adaptive_v3_command_terminal(
+        AdaptiveV3CommandTerminalReason reason) noexcept
+    {
+        if (adaptive_v3_command_terminal_emitted ||
+            !adaptive_v3_command_evidence)
+            return;
+        adaptive_v3_command_terminal_emitted = true;
+        adaptive_v3_observation_terminal = true;
+        try
+        {
+            AdaptiveV3CommandTerminalStructuredEvent event;
+            event.command = *adaptive_v3_command_evidence;
+            event.reason = reason;
+            if (audit_event_emitter)
+                audit_event_emitter->emit_audit(
+                    AuditStructuredEventPayload{std::move(event)});
+        }
+        catch (...)
+        {}
+    }
+
+    void HotStuffBase::cancel_adaptive_v3_observation_retry() noexcept
+    {
+        auto cancellation =
+            std::move(adaptive_v3_observation_retry_cancellation);
+        adaptive_v3_observation_retry_cancellation = {};
+        if (!cancellation)
+            return;
+        try
+        {
+            cancellation();
+        }
+        catch (...)
+        {}
+    }
+
+    void HotStuffBase::schedule_adaptive_v3_observation_retry() noexcept
+    {
+        if (!adaptive_v3_config || adaptive_v3_observation_terminal ||
+            adaptive_v3_pending_observation == std::nullopt ||
+            adaptive_v3_observation_retry_cancellation)
+            return;
+        const auto delay = std::chrono::milliseconds(
+            adaptive_v3_config->observation_retry_interval_ms);
+        const auto access = exact_runtime_access;
+        adaptive_v3_observation_retry_cancellation =
+            aggregation_scheduler->schedule_after(
+                std::chrono::duration_cast<
+                    AggregationScheduler::Duration>(delay),
+                [access]() {
+                    auto runtime = access->acquire();
+                    if (!runtime)
+                        return;
+                    auto &owner = runtime->owner();
+                    owner.adaptive_v3_observation_retry_cancellation = {};
+                    owner.transmit_adaptive_v3_observation();
+                });
+        if (!adaptive_v3_observation_retry_cancellation &&
+            adaptive_v3_signed_observation)
+            emit_adaptive_v3_observation_terminal(
+                adaptive_v3_signed_observation->identity,
+                "observation_schedule_failed");
+    }
+
+    void HotStuffBase::transmit_adaptive_v3_observation() noexcept
+    {
+        if (!adaptive_v3_config || !adaptive_v3_pending_observation ||
+            adaptive_v3_observation_terminal ||
+            !epoch_manager_peer.has_value())
+            return;
+        if (!adaptive_v3_signed_observation)
+        {
+            emit_adaptive_v3_command_terminal(
+                AdaptiveV3CommandTerminalReason::
+                    readiness_internal_failure);
+            return;
+        }
+        if (adaptive_v3_observation_attempts >=
+            adaptive_v3_config->maximum_observation_attempts)
+        {
+            emit_adaptive_v3_observation_terminal(
+                adaptive_v3_signed_observation->identity,
+                "observation_retry_exhausted");
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Adaptive-v3 readiness observation retry exhausted");
+            return;
+        }
+        ++adaptive_v3_observation_attempts;
+        try
+        {
+            const auto connection = pn.get_peer_conn(*epoch_manager_peer);
+            const auto *certificate = connection == nullptr
+                ? nullptr : connection->get_peer_cert();
+            if (connection != nullptr && !connection->is_terminated() &&
+                certificate != nullptr &&
+                PeerId(*certificate) == *epoch_manager_peer)
+                pn.send_msg(
+                    MsgActivationReadyObservation(
+                        DataStream(*adaptive_v3_pending_observation)),
+                    connection);
+        }
+        catch (...)
+        {}
+        schedule_adaptive_v3_observation_retry();
+    }
+
+    void HotStuffBase::enqueue_adaptive_v3_observation(
+        const AdaptiveV3ActivationReadyObservation &observation) noexcept
+    {
+        if (!adaptive_v3_config || adaptive_v3_pending_observation ||
+            adaptive_v3_signed_observation)
+            return;
+        try
+        {
+            const auto payload = encode_activation_ready_observation(
+                observation,
+                adaptive_v3_config->readiness_wire_limits);
+            adaptive_v3_signed_observation = observation;
+            adaptive_v3_pending_observation = payload;
+            AdaptiveV3ReadinessStructuredEvent event;
+            event.transition =
+                AdaptiveV3ReadinessTransition::activation_ready_signed;
+            event.identity = observation.identity;
+            event.replica_id = get_id();
+            event.signer_source_sequence =
+                observation.signer_source_sequence;
+            event.signer_monotonic_raw_ns =
+                observation.signer_monotonic_raw_ns;
+            event.observation_digest =
+                activation_ready_observation_digest(observation);
+            event.canonical_wire_payload = payload;
+            emit_adaptive_v3_readiness_event(std::move(event));
+            transmit_adaptive_v3_observation();
+        }
+        catch (...)
+        {
+            emit_adaptive_v3_observation_terminal(
+                observation.identity,
+                "observation_encoding_failed");
+        }
+    }
+
+    void HotStuffBase::acknowledge_adaptive_v3_certificate() noexcept
+    {
+        if (!adaptive_v3_config || !adaptive_v3_accepted_certificate ||
+            !epoch_manager_peer)
+            return;
+        try
+        {
+            const auto certificate_payload =
+                encode_activation_readiness_certificate(
+                    *adaptive_v3_accepted_certificate,
+                    adaptive_v3_config->readiness_wire_limits);
+            ActivationReadinessAckV1 acknowledgement;
+            acknowledgement.acknowledged_opcode =
+                MsgActivationReadinessCertificate::opcode;
+            acknowledgement.recipient_replica_id = get_id();
+            acknowledgement.identity =
+                adaptive_v3_accepted_certificate->identity;
+            acknowledgement.certificate_digest =
+                adaptive_v3_accepted_certificate->certificate_digest;
+            acknowledgement.payload_digest =
+                activation_readiness_ack_payload_digest(
+                    MsgActivationReadinessCertificate::opcode,
+                    certificate_payload);
+            const auto acknowledgement_payload =
+                encode_activation_readiness_ack(
+                    acknowledgement,
+                    adaptive_v3_config->readiness_wire_limits);
+            adaptive_v3_certificate_ack_sent =
+                transmit_adaptive_v3_acknowledgement(
+                    acknowledgement_payload);
+        }
+        catch (...)
+        {}
+    }
+
+    bool HotStuffBase::transmit_adaptive_v3_acknowledgement(
+        const bytearray_t &canonical_payload) noexcept
+    {
+        if (!adaptive_v3_config || !epoch_manager_peer ||
+            canonical_payload.empty())
+            return false;
+        try
+        {
+            const auto decoded = decode_activation_readiness_ack(
+                canonical_payload,
+                adaptive_v3_config->readiness_wire_limits);
+            if (!decoded ||
+                decoded.value->recipient_replica_id != get_id())
+                return false;
+            const auto connection = pn.get_peer_conn(*epoch_manager_peer);
+            const auto *peer_certificate = connection == nullptr
+                ? nullptr : connection->get_peer_cert();
+            if (connection == nullptr || connection->is_terminated() ||
+                peer_certificate == nullptr ||
+                PeerId(*peer_certificate) != *epoch_manager_peer)
+                return false;
+            pn.send_msg(
+                MsgActivationReadinessAck(
+                    DataStream(canonical_payload)),
+                connection);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    std::unique_ptr<HotStuffBase::AdaptiveV3RetiredActivationReceipt>
+    HotStuffBase::prepare_adaptive_v3_retirement(
+        const AdaptiveV3ActivationReadinessCertificate &certificate,
+        const bytearray_t &canonical_certificate_payload) const
+    {
+        if (!adaptive_v3_config)
+            throw std::logic_error(
+                "adaptive-v3 retirement requires runtime configuration");
+        const auto encoded_certificate =
+            encode_activation_readiness_certificate(
+                certificate,
+                adaptive_v3_config->readiness_wire_limits);
+        if (encoded_certificate != canonical_certificate_payload)
+            throw std::invalid_argument(
+                "adaptive-v3 retirement certificate is noncanonical");
+        ActivationReadinessAckV1 acknowledgement;
+        acknowledgement.acknowledged_opcode =
+            MsgActivationReadinessCertificate::opcode;
+        acknowledgement.recipient_replica_id = get_id();
+        acknowledgement.identity = certificate.identity;
+        acknowledgement.certificate_digest =
+            certificate.certificate_digest;
+        acknowledgement.payload_digest =
+            activation_readiness_ack_payload_digest(
+                MsgActivationReadinessCertificate::opcode,
+                canonical_certificate_payload);
+        auto acknowledgement_payload = encode_activation_readiness_ack(
+            acknowledgement,
+            adaptive_v3_config->readiness_wire_limits);
+        return std::make_unique<AdaptiveV3RetiredActivationReceipt>(
+            AdaptiveV3RetiredActivationReceipt{
+                certificate.identity,
+                certificate.certificate_digest,
+                canonical_certificate_payload,
+                std::move(acknowledgement_payload)});
+    }
+
+    void HotStuffBase::publish_adaptive_v3_activation(
+        const EpochRuntimeUpdate &update,
+        std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+            prepared_receipt,
+        std::unique_ptr<AdaptiveV3ReadinessStructuredEvent>
+            accepted_event) noexcept
+    {
+        if (!adaptive_v3_activation_gate || !prepared_receipt ||
+            adaptive_epoch_runtime == nullptr)
+            return;
+
+        // The live binding has already installed update. Ownership transfer
+        // and current-cycle retirement are therefore deliberately allocation
+        // free and precede every drain, event, or network side effect.
+        adaptive_v3_retired_activation_receipt.swap(prepared_receipt);
+        const auto scheduled_height = adaptive_v3_activation_gate
+            ->scheduled_readiness_height().value_or(0);
+        const auto applied_height = adaptive_v3_activation_gate
+            ->certificate_apply_committed_height();
+        const auto certificate_digest =
+            adaptive_v3_retired_activation_receipt->certificate_digest;
+        adaptive_v3_activation_gate.reset();
+        adaptive_v3_committed_command.reset();
+        adaptive_v3_pending_observation.reset();
+        adaptive_v3_signed_observation.reset();
+        adaptive_v3_deferred_observation.reset();
+        adaptive_v3_accepted_certificate.reset();
+        adaptive_v3_deferred_certificate.reset();
+        adaptive_v3_prepared_activation_receipt.reset();
+        adaptive_v3_boundary_block = nullptr;
+        adaptive_v3_latest_committed_block = nullptr;
+        adaptive_v3_runtime_prepared = false;
+        adaptive_v3_observation_attempts = 0;
+        adaptive_v3_observation_terminal = false;
+        adaptive_v3_certificate_ack_sent = false;
+        adaptive_v3_command_evidence.reset();
+        adaptive_v3_command_terminal_emitted = false;
+
+        cancel_adaptive_v3_observation_retry();
+        reset_committed_epoch_definition_recovery();
+        if (accepted_event)
+            emit_adaptive_v3_readiness_event(
+                std::move(*accepted_event));
+        const auto drain =
+            adaptive_epoch_runtime->adapter.drain_activated_futures();
+        if (adaptive_v2_command_inbox)
+            static_cast<void>(
+                adaptive_v2_command_inbox->observe_activation(
+                    update.activation.configuration,
+                    update.activation.generation));
+        emit_epoch_lifecycle_event(
+            EpochLifecycleTransition::activated,
+            update.activation.configuration,
+            scheduled_height,
+            applied_height,
+            certificate_digest);
+        if (drain.status != EpochFutureDrainStatus::complete)
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Adaptive-v3 future proposal drain incomplete");
+        adaptive_v3_certificate_ack_sent =
+            transmit_adaptive_v3_acknowledgement(
+                adaptive_v3_retired_activation_receipt
+                    ->canonical_acknowledgement_payload);
+    }
+
+    void HotStuffBase::adaptive_v3_readiness_certificate_handler(
+        MsgActivationReadinessCertificate &&message,
+        const Net::conn_t &connection)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            !adaptive_v3_config || connection == nullptr ||
+            !epoch_manager_peer)
+            return;
+        const auto pinned = pn.get_peer_conn(*epoch_manager_peer);
+        const auto *certificate = connection->get_peer_cert();
+        if (pinned == nullptr || pinned != connection ||
+            certificate == nullptr ||
+            PeerId(*certificate) != *epoch_manager_peer)
+            return;
+        const auto payload = static_cast<bytearray_t>(message.serialized);
+        const auto decoded = decode_activation_readiness_certificate(
+            payload, adaptive_v3_config->readiness_wire_limits);
+        if (!decoded)
+        {
+            // TLS has authenticated the manager peer, but no identity can be
+            // recovered from malformed certificate wire.  Seal raw evidence
+            // before returning so a later valid certificate cannot erase it.
+            try
+            {
+                AdaptiveV3ReadinessStructuredEvent event;
+                event.transition = AdaptiveV3ReadinessTransition::wire_rejected;
+                event.replica_id = get_id();
+                event.wire_opcode = MsgActivationReadinessCertificate::opcode;
+                event.wire_payload_size = payload.size();
+                event.payload_digest = DataStream(payload).get_hash();
+                event.canonical_wire_payload = payload;
+                event.disposition = "certificate_decode";
+                if (!emit_adaptive_v3_readiness_event(
+                        std::move(event), true))
+                    fail_adaptive_v3_readiness_audit();
+            }
+            catch (...)
+            {
+                fail_adaptive_v3_readiness_audit();
+            }
+            return;
+        }
+        if (adaptive_v3_retired_activation_receipt &&
+            decoded.value->identity ==
+                adaptive_v3_retired_activation_receipt->identity &&
+            decoded.value->certificate_digest ==
+                adaptive_v3_retired_activation_receipt
+                    ->certificate_digest &&
+            payload == adaptive_v3_retired_activation_receipt
+                ->canonical_certificate_payload)
+        {
+            adaptive_v3_certificate_ack_sent =
+                transmit_adaptive_v3_acknowledgement(
+                    adaptive_v3_retired_activation_receipt
+                        ->canonical_acknowledgement_payload);
+            return;
+        }
+        if (!adaptive_v3_activation_gate)
+            return;
+        if (adaptive_v3_observation_terminal ||
+            adaptive_v3_command_terminal_emitted)
+            return;
+        if (epoch_live_binding == nullptr)
+            return;
+        if (!adaptive_v3_runtime_prepared)
+        {
+            if (!adaptive_v3_deferred_certificate)
+                adaptive_v3_deferred_certificate = *decoded.value;
+            else if (encode_activation_readiness_certificate(
+                         *adaptive_v3_deferred_certificate,
+                         adaptive_v3_config->readiness_wire_limits) !=
+                     payload)
+                emit_adaptive_v3_observation_terminal(
+                    adaptive_v3_deferred_certificate->identity,
+                    "observation_internal_failure");
+            return;
+        }
+        ingest_adaptive_v3_readiness_certificate(*decoded.value, payload);
+    }
+
+    void HotStuffBase::ingest_adaptive_v3_readiness_certificate(
+        const AdaptiveV3ActivationReadinessCertificate &certificate,
+        const bytearray_t &canonical_payload) noexcept
+    {
+        if (!adaptive_v3_runtime_prepared ||
+            !adaptive_v3_activation_gate || epoch_live_binding == nullptr ||
+            adaptive_v3_observation_terminal ||
+            adaptive_v3_command_terminal_emitted)
+            return;
+        std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+            prepared_receipt;
+        std::unique_ptr<ActivationReadinessCertificateV1>
+            accepted_certificate;
+        std::unique_ptr<AdaptiveV3ReadinessStructuredEvent> event;
+        try
+        {
+            prepared_receipt = prepare_adaptive_v3_retirement(
+                certificate, canonical_payload);
+            accepted_certificate =
+                std::make_unique<ActivationReadinessCertificateV1>(
+                    certificate);
+            event = std::make_unique<AdaptiveV3ReadinessStructuredEvent>();
+            event->identity = certificate.identity;
+            event->replica_id = get_id();
+            event->certificate_digest = certificate.certificate_digest;
+            event->payload_digest = activation_readiness_ack_payload_digest(
+                MsgActivationReadinessCertificate::opcode,
+                canonical_payload);
+            event->canonical_wire_payload = canonical_payload;
+        }
+        catch (...)
+        {
+            emit_adaptive_v3_observation_terminal(
+                certificate.identity, "observation_internal_failure");
+            return;
+        }
+        const auto result = epoch_live_binding
+            ->apply_v3_readiness_certificate(
+                *adaptive_v3_activation_gate, certificate);
+        if (result.error == EpochIngressError::none &&
+            (result.disposition == AdaptiveV3CertificateDisposition::accepted ||
+             result.disposition ==
+                 AdaptiveV3CertificateDisposition::buffered_early ||
+             result.disposition == AdaptiveV3CertificateDisposition::duplicate))
+        {
+            event->transition =
+                AdaptiveV3ReadinessTransition::certificate_accepted;
+            if (result.disposition ==
+                AdaptiveV3CertificateDisposition::buffered_early)
+            {
+                adaptive_v3_accepted_certificate =
+                    std::move(accepted_certificate);
+                adaptive_v3_prepared_activation_receipt =
+                    std::move(prepared_receipt);
+                emit_adaptive_v3_readiness_event(std::move(*event));
+                return;
+            }
+            if (result.disposition !=
+                AdaptiveV3CertificateDisposition::buffered_early)
+            {
+                cancel_adaptive_v3_observation_retry();
+                adaptive_v3_pending_observation.reset();
+                if (result.update)
+                    publish_adaptive_v3_activation(
+                        *result.update,
+                        std::move(prepared_receipt),
+                        std::move(event));
+                else
+                {
+                    adaptive_v3_accepted_certificate =
+                        std::move(accepted_certificate);
+                    emit_adaptive_v3_readiness_event(std::move(*event));
+                    acknowledge_adaptive_v3_certificate();
+                }
+            }
+            return;
+        }
+        event->transition =
+            AdaptiveV3ReadinessTransition::certificate_rejected;
+        event->disposition = "rejected";
+        emit_adaptive_v3_readiness_event(std::move(*event));
+    }
+
+    void HotStuffBase::process_adaptive_v3_post_block_commit(
+        const block_t &block) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            !adaptive_v3_config || block == nullptr ||
+            adaptive_epoch_runtime == nullptr ||
+            epoch_live_binding == nullptr || exact_epochs == nullptr ||
+            adaptive_v3_observation_terminal ||
+            adaptive_v3_command_terminal_emitted)
+            return;
+        try
+        {
+            adaptive_v3_latest_committed_block = block;
+            if (pending_committed_epoch_change &&
+                pending_committed_epoch_change->block_hash ==
+                    block->get_hash())
+            {
+                const auto command =
+                    pending_committed_epoch_change->command;
+                const auto payload_digest =
+                    pending_committed_epoch_change->payload_digest;
+                pending_committed_epoch_change.reset();
+                const auto raw_activation_height =
+                    command.payload.activation_delay_blocks != 0 &&
+                    block->get_height() <=
+                        std::numeric_limits<std::uint64_t>::max() -
+                            command.payload.activation_delay_blocks
+                    ? block->get_height() +
+                        command.payload.activation_delay_blocks
+                    : 0;
+                adaptive_v3_command_evidence =
+                    EpochCommandCommittedStructuredEvent{
+                        block->get_height(),
+                        block->get_hash(),
+                        command.payload.successor_epoch_number == 0
+                            ? 0
+                            : command.payload.successor_epoch_number - 1,
+                        command.payload.predecessor_epoch_digest,
+                        command.payload.successor_epoch_number,
+                        command.payload.successor_epoch_digest,
+                        payload_digest,
+                        command.payload.activation_delay_blocks,
+                        raw_activation_height};
+                adaptive_v3_command_terminal_emitted = false;
+                if (command.protocol_mode !=
+                        EpochProtocolMode::adaptive_v3 ||
+                    command.schema_version !=
+                        kEpochChangeSchemaVersionV2 ||
+                    (adaptive_v3_retired_activation_receipt &&
+                     payload_digest ==
+                         adaptive_v3_retired_activation_receipt->identity
+                             .command_payload_digest) ||
+                    adaptive_v3_activation_gate ||
+                    adaptive_v3_committed_command ||
+                    command.payload.activation_delay_blocks == 0 ||
+                    block->get_height() >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            command.payload.activation_delay_blocks)
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            invalid_committed_command);
+                    return;
+                }
+                const auto active =
+                    adaptive_epoch_runtime->activation.active_effect();
+                if (active.definition == nullptr ||
+                    active.configuration.epoch_digest !=
+                        command.payload.predecessor_epoch_digest ||
+                    active.configuration.epoch_number ==
+                        std::numeric_limits<std::uint32_t>::max() ||
+                    command.payload.successor_epoch_number !=
+                        active.configuration.epoch_number + 1)
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            wrong_active_predecessor);
+                    return;
+                }
+                const auto successor_generation =
+                    checked_activation_generation(
+                        command.payload.successor_epoch_number, 0);
+                if (!successor_generation)
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            invalid_successor_generation);
+                    return;
+                }
+                const auto activation_height =
+                    block->get_height() +
+                    command.payload.activation_delay_blocks;
+                AdaptiveV3ActivationSchedule schedule{
+                    active.definition->membership_digest(),
+                    active.configuration.epoch_number,
+                    active.configuration.epoch_digest,
+                    command.payload.successor_epoch_number,
+                    command.payload.successor_epoch_digest,
+                    *successor_generation,
+                    payload_digest,
+                    block->get_height(),
+                    block->get_hash(),
+                    command.payload.activation_delay_blocks,
+                    activation_height};
+                const auto member_count =
+                    adaptive_v3_config->readiness_membership.size();
+                const auto fixed_quorum =
+                    2 * ((member_count - 1) / 3) + 1;
+                adaptive_v3_activation_gate =
+                    std::make_unique<AdaptiveV3CertifiedActivationGate>(
+                        schedule,
+                        get_id(),
+                        adaptive_v3_config
+                            ->local_readiness_private_key,
+                        adaptive_v3_config->readiness_membership,
+                        fixed_quorum);
+                adaptive_v3_committed_command = command;
+                adaptive_v3_observation_attempts = 0;
+                adaptive_v3_observation_terminal = false;
+                adaptive_v3_certificate_ack_sent = false;
+                const auto *successor = exact_epochs->find_epoch_by_digest(
+                    command.payload.successor_epoch_digest);
+                if (successor != nullptr)
+                {
+                    if (adaptive_epoch_runtime->adapter.prepare_committed_v3(
+                            *successor) != EpochIngressError::none)
+                    {
+                        emit_adaptive_v3_command_terminal(
+                            AdaptiveV3CommandTerminalReason::
+                                successor_runtime_preparation_failed);
+                        return;
+                    }
+                    adaptive_v3_runtime_prepared = true;
+                }
+                const ActivationRecord record{
+                    active.configuration.epoch_number,
+                    active.configuration.epoch_digest,
+                    command.payload.successor_epoch_number,
+                    command.payload.successor_epoch_digest,
+                    payload_digest,
+                    block->get_height(),
+                    command.payload.activation_delay_blocks,
+                    activation_height};
+                emit_epoch_command_committed_event(block, command, record);
+                if (successor == nullptr &&
+                    !retain_committed_epoch_definition_recovery(
+                        block, command, record))
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            committed_definition_recovery_failed);
+                    return;
+                }
+            }
+
+            if (!adaptive_v3_activation_gate)
+                return;
+            const auto scheduled = adaptive_v3_activation_gate
+                                       ->scheduled_readiness_height();
+            if (scheduled && block->get_height() == *scheduled)
+                adaptive_v3_boundary_block = block;
+            const auto active =
+                adaptive_epoch_runtime->activation.active_effect();
+            auto source_sequence = std::uint64_t{0};
+            if (scheduled && block->get_height() == *scheduled &&
+                !adaptive_v3_signed_observation &&
+                !adaptive_v3_deferred_observation)
+            {
+                if (adaptive_v3_readiness_source_sequence ==
+                    std::numeric_limits<std::uint64_t>::max())
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            readiness_source_sequence_exhausted);
+                    return;
+                }
+                source_sequence =
+                    ++adaptive_v3_readiness_source_sequence;
+            }
+            const auto result =
+                epoch_live_binding->on_v3_post_block_commit(
+                    *adaptive_v3_activation_gate,
+                    block->get_height(),
+                    active.configuration,
+                    active.generation,
+                    block->get_hash(),
+                    source_sequence,
+                    adaptive_evidence_monotonic_now_ns());
+            if (result.error != EpochIngressError::none ||
+                result.boundary.disposition ==
+                    AdaptiveV3BoundaryDisposition::rejected)
+            {
+                emit_adaptive_v3_command_terminal(
+                    AdaptiveV3CommandTerminalReason::
+                        readiness_boundary_rejected);
+                return;
+            }
+            if (result.boundary.observation)
+            {
+                AdaptiveV3ReadinessStructuredEvent prepared;
+                prepared.transition =
+                    AdaptiveV3ReadinessTransition::activation_prepared;
+                prepared.identity = result.boundary.observation->identity;
+                prepared.replica_id = get_id();
+                emit_adaptive_v3_readiness_event(std::move(prepared));
+                emit_epoch_lifecycle_event(
+                    EpochLifecycleTransition::activation_armed,
+                    active.configuration,
+                    scheduled.value_or(block->get_height()));
+                if (adaptive_v3_runtime_prepared)
+                    enqueue_adaptive_v3_observation(
+                        *result.boundary.observation);
+                else
+                    adaptive_v3_deferred_observation =
+                        *result.boundary.observation;
+            }
+            if (result.update)
+                publish_adaptive_v3_activation(
+                    *result.update,
+                    std::move(
+                        adaptive_v3_prepared_activation_receipt));
+        }
+        catch (...)
+        {
+            if (adaptive_v3_signed_observation)
+                emit_adaptive_v3_observation_terminal(
+                    adaptive_v3_signed_observation->identity,
+                    "observation_internal_failure");
+            else if (adaptive_v3_deferred_observation)
+                emit_adaptive_v3_observation_terminal(
+                    adaptive_v3_deferred_observation->identity,
+                    "observation_internal_failure");
+            else if (adaptive_v3_accepted_certificate)
+                emit_adaptive_v3_observation_terminal(
+                    adaptive_v3_accepted_certificate->identity,
+                    "observation_internal_failure");
+            else
+                emit_adaptive_v3_command_terminal(
+                    AdaptiveV3CommandTerminalReason::
+                        readiness_internal_failure);
+            HOTSTUFF_LOG_WARN(
+                "[EPOCH] Failed adaptive-v3 post-block commit processing");
         }
     }
 
@@ -9527,7 +10473,8 @@ namespace hotstuff
                                size_t nworker,
                                const Net::Config &netconfig,
                                NetAddr reputation_addr,
-                               EpochProtocolMode protocol_mode) : HotStuffCore(rid, std::move(priv_key)),
+                               EpochProtocolMode protocol_mode,
+                               std::optional<AdaptiveV3RuntimeConfig> v3_config) : HotStuffCore(rid, std::move(priv_key)),
                                                           listen_addr(listen_addr),
                                                           blk_size(blk_size),
                                                           ec(ec),
@@ -9535,6 +10482,7 @@ namespace hotstuff
                                                           vpool(ec, nworker),
                                                           pn(ec, netconfig),
                                                           epoch_protocol_mode(protocol_mode),
+                                                          adaptive_v3_config(std::move(v3_config)),
                                                           pmaker(std::move(pmaker)),
                                                           fetched(0), delivered(0),
                                                           nsent(0), nrecv(0),
@@ -9554,6 +10502,71 @@ namespace hotstuff
                                                           reconfig_count(0),
                                                           warmup_finished(false)
     {
+        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v3) !=
+            adaptive_v3_config.has_value())
+            throw HotStuffError(
+                "adaptive-v3 runtime requires one complete isolated configuration");
+        if (adaptive_v3_config)
+        {
+            const auto &configured = *adaptive_v3_config;
+            const auto member_count = configured.readiness_membership.size();
+            if (configured.manager_peer.is_null() ||
+                configured.manager_address.is_null() ||
+                configured.local_readiness_private_key == nullptr ||
+                member_count < 4 || (member_count - 1) % 3 != 0 ||
+                configured.readiness_wire_limits.maximum_members !=
+                    member_count ||
+                configured.readiness_wire_limits.maximum_payload_bytes == 0 ||
+                configured.maximum_block_extra_bytes == 0 ||
+                configured.maximum_ancestry_blocks == 0 ||
+                configured.maximum_bundle_bytes == 0 ||
+                configured.maximum_block_extra_bytes >
+                    configured.maximum_bundle_bytes ||
+                configured.maximum_observation_attempts == 0 ||
+                configured.observation_retry_interval_ms == 0 ||
+                rid >= member_count)
+                throw HotStuffError(
+                    "adaptive-v3 runtime configuration is incomplete");
+            std::set<std::string> public_keys;
+            for (std::size_t index = 0; index < member_count; ++index)
+            {
+                const auto &member = configured.readiness_membership[index];
+                if (member.replica_id != static_cast<ReplicaID>(index) ||
+                    !public_keys.insert(
+                        salticidae::get_hex(member.public_key.to_bytes()))
+                         .second)
+                    throw HotStuffError(
+                        "adaptive-v3 readiness membership is not canonical");
+            }
+            if (configured.readiness_membership[rid].public_key.to_bytes() !=
+                PubKeyBLS(*configured.local_readiness_private_key).to_bytes())
+                throw HotStuffError(
+                    "adaptive-v3 local readiness key does not match membership");
+            epoch_manager_peer = configured.manager_peer;
+            epoch_manager_address = configured.manager_address;
+            epoch_change_maximum_block_extra_bytes =
+                configured.maximum_block_extra_bytes;
+            epoch_change_maximum_ancestry_blocks =
+                configured.maximum_ancestry_blocks;
+            adaptive_v2_epoch_change_bundle_limits = EpochChangeBundleLimits{
+                configured.maximum_bundle_bytes,
+                configured.maximum_block_extra_bytes,
+                epoch_wire_limits};
+            epoch_change_verifier = std::make_unique<EpochChangeVerifier>(
+                configured.epoch_change_issuer,
+                configured.epoch_change_delay_bounds,
+                EpochProtocolMode::adaptive_v3);
+            adaptive_v2_command_inbox =
+                std::make_unique<AdaptiveV2CommandInbox>(
+                    AdaptiveV2CommandInboxLimits{
+                        configured.maximum_bundle_bytes,
+                        configured.maximum_block_extra_bytes,
+                        std::numeric_limits<std::uint64_t>::max()},
+                    EpochProtocolMode::adaptive_v3);
+            valid_tls_certs.insert(
+                static_cast<const uint256_t &>(configured.manager_peer));
+        }
+
         initialize_committed_epoch_change_history();
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
         {
@@ -9572,6 +10585,9 @@ namespace hotstuff
             adaptive_v2_reporting_outbox =
                 std::make_unique<AdaptiveV2ReportingOutbox>(
                     std::move(reporting_config));
+        }
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+        {
             adaptive_v2_response_evidence =
                 std::make_unique<AdaptiveV2ResponseEvidenceBridge>(
                     get_id());
@@ -9647,6 +10663,27 @@ namespace hotstuff
                         });
                 });
         }
+        else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            // V3 uses the shared bounded lifecycle FIFO only for exact
+            // ProposalCommitted notices; v2 evidence and convergence state
+            // stays absent on this branch.
+            AdaptiveV2ReportingOutboxConfig reporting_config;
+            reporting_config.source_replica_id = get_id();
+            reporting_config.limits.maximum_delivery_attempts =
+                adaptive_v2_reporting_maximum_delivery_attempts;
+            reporting_config.limits.initial_retry_backoff_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        adaptive_v2_evidence_retry_delay).count());
+            reporting_config.limits.maximum_retry_backoff_ns =
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        adaptive_v2_reporting_maximum_retry_delay).count());
+            adaptive_v2_reporting_outbox =
+                std::make_unique<AdaptiveV2ReportingOutbox>(
+                    std::move(reporting_config));
+        }
         rebuild_aggregation_timeout_coordinator();
 
         /* register the handlers for msg from replicas */
@@ -9660,15 +10697,30 @@ namespace hotstuff
             install_adaptive_consensus_handlers();
             install_adaptive_v2_definition_handlers();
         }
+        else if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            install_adaptive_consensus_handlers();
+            install_adaptive_v3_handlers();
+        }
         else
             install_legacy_consensus_handlers();
+        if (adaptive_v3_config)
+        {
+            pn.add_peer(adaptive_v3_config->manager_peer);
+            pn.set_peer_addr(
+                adaptive_v3_config->manager_peer,
+                adaptive_v3_config->manager_address);
+        }
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::req_blk_handler, this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(&HotStuffBase::resp_blk_handler, this, _1, _2));
         pn.reg_conn_handler(salticidae::generic_bind(&HotStuffBase::conn_handler, this, _1, _2));
         pn.start();
         pn.listen(listen_addr);
+        if (adaptive_v3_config)
+            pn.conn_peer(adaptive_v3_config->manager_peer);
 
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
         {
             rn.start();
             reputation_server_conn = rn.connect_sync(reputation_addr);
@@ -9730,6 +10782,28 @@ namespace hotstuff
             this, _1, _2));
         pn.reg_handler(salticidae::generic_bind(
             &HotStuffBase::experiment_post_qc_audit_relay_handler,
+            this, _1, _2));
+    }
+
+    void HotStuffBase::install_adaptive_v3_handlers()
+    {
+        static_assert(
+            MsgAdaptiveV3EpochChangeBundle::opcode == 0x20 &&
+            MsgActivationReadyObservation::opcode == 0x21 &&
+            MsgActivationReadinessCertificate::opcode == 0x22 &&
+            MsgActivationReadinessAck::opcode == 0x23,
+            "adaptive-v3 opcodes must remain isolated");
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_v3_epoch_change_bundle_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_v3_readiness_certificate_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_definition_request_handler,
+            this, _1, _2));
+        pn.reg_handler(salticidae::generic_bind(
+            &HotStuffBase::adaptive_definition_reply_handler,
             this, _1, _2));
     }
 
@@ -10074,7 +11148,28 @@ namespace hotstuff
         const std::optional<ProposalKey> &key,
         bool initialization_predecessor_required) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            if (!key.has_value() || adaptive_v2_reporting_outbox == nullptr)
+                return;
+            try
+            {
+                const auto status = adaptive_v2_reporting_outbox->enqueue_lifecycle(
+                    ProposalLifecycleFact{ProposalCommitted{*key}});
+                if (status == AdaptiveV2ReportingEnqueueStatus::queued ||
+                    status == AdaptiveV2ReportingEnqueueStatus::capacity_exceeded)
+                    schedule_adaptive_v2_reporting_flush(
+                        adaptive_v2_evidence_retry_delay);
+            }
+            catch (...)
+            {
+                // The authenticated manager lifecycle report is observational;
+                // never let allocation or transport preparation affect consensus.
+            }
+            return;
+        }
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return;
         if (!pending_adaptive_v2_commit.has_value())
         {
@@ -10653,7 +11748,7 @@ namespace hotstuff
     void HotStuffBase::schedule_adaptive_v2_reporting_flush(
         AggregationScheduler::Duration delay) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             adaptive_v2_reporting_outbox == nullptr ||
             aggregation_scheduler == nullptr ||
             !epoch_manager_peer.has_value() ||
@@ -10703,7 +11798,7 @@ namespace hotstuff
 
     void HotStuffBase::flush_adaptive_v2_reporting() noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             adaptive_v2_reporting_outbox == nullptr ||
             !epoch_manager_peer.has_value() ||
             !authorize_manager_peer(*epoch_manager_peer))
@@ -12067,10 +13162,20 @@ namespace hotstuff
 
     bool HotStuffBase::admit_local(const Proposal &prop)
     {
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+             epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
             (adaptive_epoch_runtime == nullptr ||
              !adaptive_epoch_runtime->activation.admits_new_proposals()))
             return false;
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            adaptive_v3_activation_gate != nullptr)
+        {
+            const auto active =
+                adaptive_epoch_runtime->activation.active_effect();
+            if (!adaptive_v3_activation_gate->may_authorize_vote(
+                    active.configuration, active.generation))
+                return false;
+        }
         const auto metadata = exact_context_metadata(prop.key());
         if (!metadata.has_value() || metadata->tree.root != get_id())
             return false;
@@ -12206,7 +13311,8 @@ namespace hotstuff
         // Self-authored traffic is not evidence that another replica can
         // make progress in this view. Only received proposals, QCs, and
         // commits may postpone leader suspicion.
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+             epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
             adaptive_v2_command_inbox == nullptr ||
             !adaptive_v2_pending_command_reservation.has_value())
             return;
@@ -12748,7 +13854,7 @@ namespace hotstuff
         const ProposalKey &key,
         std::uint64_t generation) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             generation == 0)
             return false;
         try
@@ -12783,7 +13889,8 @@ namespace hotstuff
         const ProposalKey &key,
         std::uint64_t generation) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+             epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
             generation == 0)
             return false;
         try
@@ -12844,7 +13951,7 @@ namespace hotstuff
         std::uint64_t generation,
         RetainedCommitEventIdentityRollback *rollback) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+        if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             generation == 0 || proposal.blk == nullptr ||
             proposal.key().block_hash != proposal.blk->get_hash())
             return false;
@@ -13406,7 +14513,8 @@ namespace hotstuff
         const CommittedProposalIdentityResolution &identity,
         bool allow_runtime_generation_recovery) noexcept
     {
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
             return;
         pending_adaptive_v2_commit.reset();
         if (blk == nullptr)
@@ -13656,7 +14764,9 @@ namespace hotstuff
             identity,
             verified_direct_certifier != nullptr);
         report_adaptive_v2_committed(
-            pending_adaptive_v2_commit.has_value()
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3
+                ? authoritative_key
+                : pending_adaptive_v2_commit.has_value()
                 ? pending_adaptive_v2_commit->committed_key
                 : std::nullopt,
             !authoritative_key.has_value() ||
@@ -13709,6 +14819,35 @@ namespace hotstuff
         const block_t &blk,
         std::uint64_t commit_batch_index)
     {
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            if (blk == nullptr)
+            {
+                pending_committed_epoch_change.reset();
+                return;
+            }
+            emit_commit_observed_event(blk, commit_batch_index);
+            if (pending_adaptive_v2_commit &&
+                pending_adaptive_v2_commit->block_hash == blk->get_hash())
+            {
+                const auto disposition =
+                    pending_adaptive_v2_commit->event_identity_disposition;
+                if (disposition == CommittedProposalIdentityDisposition::exact &&
+                    structured_event_emitter != nullptr &&
+                    structured_event_emitter->is_designated_commit_observer())
+                    emit_committed_block_event(
+                        blk, pending_adaptive_v2_commit->event_committed_key,
+                        pending_adaptive_v2_commit->event_view_generation,
+                        commit_batch_index, std::nullopt);
+                else if (disposition ==
+                         CommittedProposalIdentityDisposition::unavailable)
+                    emit_commit_identity_unavailable_event(
+                        blk, commit_batch_index);
+            }
+            pending_adaptive_v2_commit.reset();
+            process_adaptive_v3_post_block_commit(blk);
+            return;
+        }
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
             return;
 
@@ -14185,6 +15324,7 @@ namespace hotstuff
         experiment_post_qc_audit_deadline_cancellation = {};
         experiment_post_qc_audit_expiry_cancellation = {};
         cancel_adaptive_v2_reporting_flush();
+        cancel_adaptive_v3_observation_retry();
         reset_committed_epoch_definition_recovery();
         epoch_live_binding = nullptr;
         adaptive_epoch_runtime.reset();
@@ -14755,6 +15895,25 @@ namespace hotstuff
             throw HotStuffError(
                 "adaptive-v2 startup requires a positive tree switch period");
         }
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            if (!adaptive_v3_config ||
+                replicas.size() !=
+                    adaptive_v3_config->readiness_membership.size() ||
+                !derive_byzantine_quorum(replicas.size()).has_value())
+                throw HotStuffError(
+                    "adaptive-v3 startup requires the exact configured N=3f+1 membership");
+            for (std::size_t index = 0; index < replicas.size(); ++index)
+            {
+                const auto *key = dynamic_cast<const PubKeyBLS *>(
+                    std::get<1>(replicas[index]).get());
+                if (key == nullptr || key->to_bytes() !=
+                    adaptive_v3_config->readiness_membership[index]
+                        .public_key.to_bytes())
+                    throw HotStuffError(
+                        "adaptive-v3 consensus and readiness membership keys differ");
+            }
+        }
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
             (epoch_change_verifier == nullptr ||
              epoch_change_maximum_block_extra_bytes == 0 ||
@@ -14783,15 +15942,17 @@ namespace hotstuff
         /* ((n - 1) + 1 - 1) / 3 */
         uint32_t nfaulty = peers.size() / 3;
         const auto byzantine =
-            epoch_protocol_mode == EpochProtocolMode::adaptive_v2
+            (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+             epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
                 ? derive_byzantine_quorum(config.nreplicas)
                 : std::optional<ByzantineQuorum>();
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+             epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
             (!byzantine.has_value() ||
              byzantine->fault_threshold != nfaulty))
         {
             throw HotStuffError(
-                "adaptive-v2 startup requires exact N = 3f + 1");
+                "adaptive startup requires exact N = 3f + 1");
         }
         for (const PeerId &peer : peers)
         {
@@ -14800,11 +15961,12 @@ namespace hotstuff
         if (nfaulty == 0)
             LOG_WARN("too few replicas in the system to tolerate any failure");
         on_init(nfaulty);
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+             epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
             config.nmajority != byzantine->quorum)
         {
             throw HotStuffError(
-                "adaptive-v2 startup quorum does not equal 2f + 1");
+                "adaptive startup quorum does not equal 2f + 1");
         }
         pmaker->init(this);
 
@@ -14813,7 +15975,8 @@ namespace hotstuff
         get_pace_maker()->update_tree_proposer();
         activate_initial_leader_view();
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v1 ||
-            epoch_protocol_mode == EpochProtocolMode::adaptive_v2)
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
             initialize_adaptive_epoch_runtime();
         get_pace_maker()->setup();
 
@@ -14825,7 +15988,8 @@ namespace hotstuff
         final_buffer.reserve(blk_size);
         cmd_pending_buffer.reserve(max_cmd_pending_size);
 
-        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
         {
             ev_report_timer = TimerEvent(ec, [this](TimerEvent &)
                                          { this->on_report_timer(); });
@@ -14944,7 +16108,8 @@ namespace hotstuff
                    bool include_latest_piped_parent)
             -> std::optional<AdaptiveV2CommandReservation>
         {
-            if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 ||
+            if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+                 epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
                 adaptive_v2_command_inbox == nullptr ||
                 adaptive_epoch_runtime == nullptr ||
                 !committed_epoch_change_history.has_value() ||
@@ -14992,7 +16157,8 @@ namespace hotstuff
                 active_effect.configuration.epoch_digest,
                 committed_epoch_change_history->snapshot,
                 epoch_change_maximum_block_extra_bytes,
-                epoch_change_maximum_ancestry_blocks);
+                epoch_change_maximum_ancestry_blocks,
+                epoch_protocol_mode);
             if (!history)
                 return std::nullopt;
 

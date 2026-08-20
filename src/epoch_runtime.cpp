@@ -348,7 +348,8 @@ EpochRuntimePlan make_runtime_plan(
     bytearray_t canonical_stage)
 {
     if (protocol_mode != EpochProtocolMode::adaptive_v1 &&
-        protocol_mode != EpochProtocolMode::adaptive_v2)
+        protocol_mode != EpochProtocolMode::adaptive_v2 &&
+        protocol_mode != EpochProtocolMode::adaptive_v3)
         throw std::invalid_argument(
             "runtime plan requires an adaptive protocol mode");
     if (epoch_digest == uint256_t{} || canonical_stage.empty())
@@ -396,8 +397,14 @@ EpochRuntimePlan make_runtime_plan(
     return plan;
 }
 
-EpochRuntimePlan make_runtime_plan(const EpochDefinition &definition)
+EpochRuntimePlan make_runtime_plan(
+    const EpochDefinition &definition,
+    EpochProtocolMode protocol_mode)
 {
+    if (protocol_mode != EpochProtocolMode::adaptive_v2 &&
+        protocol_mode != EpochProtocolMode::adaptive_v3)
+        throw std::invalid_argument(
+            "committed runtime requires adaptive v2 or adaptive v3");
     if (definition.schema_version() !=
             kEpochDefinitionSchemaVersionV2 ||
         definition.activation_height() != 0)
@@ -405,7 +412,7 @@ EpochRuntimePlan make_runtime_plan(const EpochDefinition &definition)
             "committed v2 runtime requires a schedule-free definition");
 
     auto plan = make_runtime_plan(
-        EpochProtocolMode::adaptive_v2,
+        protocol_mode,
         definition.epoch_number(),
         definition.epoch_digest(),
         definition.trees(),
@@ -828,6 +835,7 @@ struct HotStuffEpochRuntimeAdapter::State
     EpochProtocolMode mode;
     EpochWireLimits limits;
     EpochRuntimeTransaction &transaction;
+    AdaptiveV3CertifiedActivationGate *v3_gate{nullptr};
     std::optional<PreparedEpochRuntime> retained;
     std::vector<EpochTreeRuntimeInput> staged_configurations;
     std::optional<EpochActivationEffect> draining_effect;
@@ -980,7 +988,71 @@ EpochIngressError HotStuffEpochRuntimeAdapter::prepare_committed_v2(
             return retained_matches() ? EpochIngressError::none
                                       : EpochIngressError::state_rejected;
 
-        auto plan = make_runtime_plan(successor_definition);
+        auto plan = make_runtime_plan(
+            successor_definition, EpochProtocolMode::adaptive_v2);
+        auto staged_configurations = plan.trees;
+        auto prepared = state_->transaction.prepare(plan);
+        if (!prepared)
+            return EpochIngressError::runtime_preparation_failed;
+        CandidatePreparation candidate(
+            state_->transaction, std::move(*prepared));
+
+        state_->staged_configurations.swap(staged_configurations);
+        state_->retained.emplace(candidate.release());
+        return EpochIngressError::none;
+    }
+    catch (...)
+    {
+        return EpochIngressError::runtime_preparation_failed;
+    }
+}
+
+EpochIngressError HotStuffEpochRuntimeAdapter::prepare_committed_v3(
+    const EpochDefinition &successor_definition) noexcept
+{
+    if (state_->mode != EpochProtocolMode::adaptive_v3 || state_->stopped)
+        return EpochIngressError::state_rejected;
+
+    try
+    {
+        const auto active = state_->activation.active_effect();
+        if (active.definition == nullptr ||
+            active.definition->schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            successor_definition.schema_version() !=
+                kEpochDefinitionSchemaVersionV2 ||
+            successor_definition.activation_height() != 0 ||
+            active.configuration.epoch_number ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            successor_definition.epoch_number() !=
+                active.configuration.epoch_number + 1 ||
+            successor_definition.previous_epoch_digest() !=
+                active.configuration.epoch_digest ||
+            successor_definition.membership_digest() !=
+                active.definition->membership_digest())
+            return EpochIngressError::validation_failed;
+
+        const auto retained_matches = [this, &successor_definition]() {
+            return state_->retained.has_value() &&
+                   !state_->staged_configurations.empty() &&
+                   state_->staged_configurations.size() ==
+                       successor_definition.trees().size() &&
+                   std::all_of(
+                       state_->staged_configurations.begin(),
+                       state_->staged_configurations.end(),
+                       [&successor_definition](const auto &tree) {
+                           return tree.configuration.epoch_number ==
+                                      successor_definition.epoch_number() &&
+                                  tree.configuration.epoch_digest ==
+                                      successor_definition.epoch_digest();
+                       });
+        };
+        if (state_->retained)
+            return retained_matches() ? EpochIngressError::none
+                                      : EpochIngressError::state_rejected;
+
+        auto plan = make_runtime_plan(
+            successor_definition, EpochProtocolMode::adaptive_v3);
         auto staged_configurations = plan.trees;
         auto prepared = state_->transaction.prepare(plan);
         if (!prepared)
@@ -1086,6 +1158,64 @@ EpochCommitIngressResult finish_commit(
     }
 }
 
+template <typename AdapterState>
+std::optional<EpochRuntimeUpdate> finish_v3_activation(
+    AdapterState &state,
+    const AdaptiveV3ActivationReadyIdentity &identity) noexcept
+{
+    try
+    {
+        const auto preview =
+            state.activation.preview_v3_certified_activation(
+                identity.predecessor_boundary_configuration,
+                identity.predecessor_boundary_generation,
+                identity.successor_configuration,
+                identity.successor_activation_generation);
+        const bool exact_runtime =
+            state.retained.has_value() &&
+            preview.transition == ActivationTransition::activated &&
+            preview.effect.has_value() &&
+            std::any_of(
+                state.staged_configurations.begin(),
+                state.staged_configurations.end(),
+                [&preview](const auto &tree) {
+                    return tree.configuration ==
+                           preview.effect->configuration;
+                });
+        if (!exact_runtime)
+            return std::nullopt;
+
+        const auto previous = state.activation.active_effect();
+        const auto actual = state.activation.apply_v3_certified_activation(
+            identity.predecessor_boundary_configuration,
+            identity.predecessor_boundary_generation,
+            identity.successor_configuration,
+            identity.successor_activation_generation);
+        if (actual.transition != ActivationTransition::activated ||
+            !actual.effect.has_value())
+            return std::nullopt;
+
+        const auto update = runtime_update(*actual.effect);
+        auto prepared = state.consume_retained();
+        state.transaction.commit(std::move(prepared), update);
+        state.retire_staged_epoch(update.activation.configuration);
+        state.draining_effect.emplace(previous);
+        if (state.future_drain_configuration &&
+            *state.future_drain_configuration !=
+                update.activation.configuration)
+            state.retire_exhausted_configuration(
+                *state.future_drain_configuration);
+        state.future_drain_configuration = update.activation.configuration;
+        state.completed_drain_configuration.reset();
+        state.remaining_hint.reset();
+        return update;
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
 } // namespace
 
 EpochCommitIngressResult HotStuffEpochRuntimeAdapter::on_predecessor_commit(
@@ -1169,6 +1299,115 @@ HotStuffEpochRuntimeAdapter::on_v2_post_block_commit(
             ActivationBlockReason::none,
             std::nullopt};
     }
+}
+
+AdaptiveV3CommitIngressResult
+HotStuffEpochRuntimeAdapter::on_v3_post_block_commit(
+    AdaptiveV3CertifiedActivationGate &gate,
+    std::uint64_t height,
+    const ConfigurationId &predecessor_configuration,
+    std::uint64_t predecessor_generation,
+    const uint256_t &block_hash,
+    std::uint64_t source_sequence,
+    std::uint64_t monotonic_raw_ns) noexcept
+{
+    AdaptiveV3CommitIngressResult result;
+    if (state_->mode != EpochProtocolMode::adaptive_v3 || state_->stopped ||
+        (state_->v3_gate != nullptr && state_->v3_gate != &gate))
+    {
+        result.error = EpochIngressError::state_rejected;
+        return result;
+    }
+    state_->v3_gate = &gate;
+    result.boundary = gate.observe_predecessor_commit(
+        height,
+        predecessor_configuration,
+        predecessor_generation,
+        block_hash,
+        source_sequence,
+        monotonic_raw_ns);
+    if (result.boundary.disposition !=
+        AdaptiveV3BoundaryDisposition::activated_from_buffered_certificate)
+        return result;
+
+    const auto &successor = gate.active_configuration();
+    const auto predecessor = predecessor_configuration;
+    AdaptiveV3ActivationReadyIdentity identity;
+    if (result.boundary.observation.has_value())
+        identity = result.boundary.observation->identity;
+    else
+    {
+        result.error = EpochIngressError::state_rejected;
+        return result;
+    }
+    auto update = finish_v3_activation(*state_, identity);
+    if (update.has_value())
+        result.update.emplace(std::move(*update));
+    if (!result.update.has_value() ||
+        result.update->activation.configuration != successor ||
+        predecessor == successor)
+        result.error = EpochIngressError::missing_prepared_runtime;
+    return result;
+}
+
+AdaptiveV3CertificateIngressResult
+HotStuffEpochRuntimeAdapter::apply_v3_readiness_certificate(
+    AdaptiveV3CertifiedActivationGate &gate,
+    const AdaptiveV3ActivationReadinessCertificate &certificate) noexcept
+{
+    AdaptiveV3CertificateIngressResult result;
+    if (state_->mode != EpochProtocolMode::adaptive_v3 || state_->stopped ||
+        (state_->v3_gate != nullptr && state_->v3_gate != &gate))
+    {
+        result.error = EpochIngressError::state_rejected;
+        return result;
+    }
+    state_->v3_gate = &gate;
+
+    if (gate.state() == AdaptiveV3CertifiedActivationState::active)
+    {
+        result.disposition = gate.observe_certificate(certificate);
+        if (result.disposition !=
+                AdaptiveV3CertificateDisposition::duplicate &&
+            result.disposition !=
+                AdaptiveV3CertificateDisposition::terminal)
+            result.error = EpochIngressError::state_rejected;
+        return result;
+    }
+
+    // A certificate must never advance the pure gate unless the exact
+    // successor runtime can be published in the same serialized operation.
+    // Missing definitions/runtimes therefore remain retryable and inert.
+    const auto preview = state_->activation.preview_v3_certified_activation(
+        certificate.identity.predecessor_boundary_configuration,
+        certificate.identity.predecessor_boundary_generation,
+        certificate.identity.successor_configuration,
+        certificate.identity.successor_activation_generation);
+    const bool exact_runtime =
+        state_->retained.has_value() &&
+        preview.transition == ActivationTransition::activated &&
+        preview.effect.has_value() &&
+        std::any_of(
+            state_->staged_configurations.begin(),
+            state_->staged_configurations.end(),
+            [&preview](const auto &tree) {
+                return tree.configuration == preview.effect->configuration;
+            });
+    if (!exact_runtime)
+    {
+        result.error = EpochIngressError::missing_prepared_runtime;
+        return result;
+    }
+
+    result.disposition = gate.observe_certificate(certificate);
+    if (result.disposition != AdaptiveV3CertificateDisposition::accepted)
+        return result;
+    auto update = finish_v3_activation(*state_, certificate.identity);
+    if (update.has_value())
+        result.update.emplace(std::move(*update));
+    if (!result.update.has_value())
+        result.error = EpochIngressError::state_rejected;
+    return result;
 }
 
 EpochCommitIngressResult HotStuffEpochRuntimeAdapter::replay_blocked_commit()
@@ -1261,7 +1500,14 @@ EpochConsensusIngressResult HotStuffEpochRuntimeAdapter::handle_proposal(
             return rejected_consensus(
                 EpochIngressError::wire_rejected,
                 EpochConsensusWireError::invalid_body);
-        if (!state_->activation.admits_new_proposals())
+        const bool v3_prepared =
+            state_->mode == EpochProtocolMode::adaptive_v3 &&
+            state_->v3_gate != nullptr &&
+            (state_->v3_gate->state() ==
+                 AdaptiveV3CertifiedActivationState::prepared ||
+             state_->v3_gate->state() ==
+                 AdaptiveV3CertifiedActivationState::blocked);
+        if (!state_->activation.admits_new_proposals() || v3_prepared)
             return {
                 EpochIngressError::none,
                 EpochConsensusWireError::none,
@@ -1388,6 +1634,14 @@ EpochConsensusIngressResult handle_contribution(
         const bool draining = effect &&
             (effect->configuration != active.configuration ||
              effect->generation != active.generation);
+        const bool fenced_predecessor =
+            state.mode == EpochProtocolMode::adaptive_v3 &&
+            state.v3_gate != nullptr &&
+            state.v3_gate->vote_fence_engaged() &&
+            state.v3_gate->state() !=
+                AdaptiveV3CertifiedActivationState::active &&
+            effect && effect->configuration == active.configuration &&
+            effect->generation == active.generation;
         const auto *const tree = effect
             ? find_tree(*effect, envelope.configuration.tree_id)
             : nullptr;
@@ -1395,7 +1649,7 @@ EpochConsensusIngressResult handle_contribution(
             envelope.originator != *peer.replica_id ||
             tree == nullptr || tree->members_breadth_first.empty() ||
             envelope.proposer != tree->members_breadth_first.front() ||
-            (draining &&
+            ((draining || fenced_predecessor) &&
              !state.contexts.acquire_open_context(
                  envelope.key()).has_value()))
             return rejected_consensus(EpochIngressError::state_rejected);

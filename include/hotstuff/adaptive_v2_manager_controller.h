@@ -30,6 +30,7 @@ struct AdaptiveV2ManagerControllerConfig
     AdaptiveV2TransitionPolicy transition_policy;
     ShapeV1Config shape_selection;
     bool shape_adaptation_enabled{false};
+    EpochProtocolMode successor_protocol_mode{EpochProtocolMode::adaptive_v2};
 };
 
 enum class AdaptiveV2ManagerControllerStatus : std::uint8_t
@@ -93,6 +94,7 @@ public:
     const std::vector<EvidenceReputationAuditUpdate> &
     score_trajectory() const noexcept;
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
+    const AdaptiveV3EpochChangeBundle *successor_bundle_v3() const noexcept;
     const ShapeDecisionRecord *shape_decision() const noexcept;
     const AdaptiveV2ManagerControllerFailureDetail *
     failure_detail() const noexcept;

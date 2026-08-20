@@ -28,6 +28,7 @@
 #include <memory>
 #include <optional>
 #include <random>
+#include <set>
 #include <system_error>
 #include <unistd.h>
 #include <signal.h>
@@ -137,7 +138,9 @@ public:
                 const Net::Config &repnet_config,
                 const ClientNetwork<opcode_t>::Config &clinet_config,
                 NetAddr reputation_addr,
-                EpochProtocolMode protocol_mode);
+                EpochProtocolMode protocol_mode,
+                std::optional<hotstuff::AdaptiveV3RuntimeConfig> v3_config =
+                    std::nullopt);
 
     void start(
         const std::vector<
@@ -735,6 +738,52 @@ hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key(
     }
 }
 
+hotstuff::AdaptiveV3ReadinessMember
+parse_adaptive_v3_readiness_member(const std::string &raw)
+{
+    const auto comma = raw.find(',');
+    if (comma == std::string::npos ||
+        raw.find(',', comma + 1) != std::string::npos)
+        throw HotStuffError(
+            "activation-readiness member must use id,bls-public-key-hex");
+    const auto id_text = raw.substr(0, comma);
+    if (id_text.empty() ||
+        (id_text.size() > 1 && id_text.front() == '0') ||
+        !std::all_of(
+            id_text.begin(), id_text.end(),
+            [](unsigned char value) {
+                return value >= '0' && value <= '9';
+            }))
+        throw HotStuffError(
+            "activation-readiness member id is not canonical");
+    const auto key_hex = raw.substr(comma + 1);
+    if (key_hex.size() != bls::G1Element::SIZE * 2 ||
+        !std::all_of(
+            key_hex.begin(), key_hex.end(),
+            [](unsigned char value) {
+                return (value >= '0' && value <= '9') ||
+                       (value >= 'a' && value <= 'f');
+            }))
+        throw HotStuffError(
+            "activation-readiness member public key must use canonical lowercase hexadecimal");
+    try
+    {
+        return hotstuff::AdaptiveV3ReadinessMember{
+            parse_adaptive_v2_unsigned<ReplicaID>(
+                id_text, "activation-readiness member id", false),
+            hotstuff::PubKeyBLS(hotstuff::from_hex(key_hex))};
+    }
+    catch (const HotStuffError &)
+    {
+        throw;
+    }
+    catch (...)
+    {
+        throw HotStuffError(
+            "activation-readiness member public key is invalid");
+    }
+}
+
 std::optional<AdaptiveV2PreVoteConfig>
 parse_adaptive_v2_pre_vote_config(
     const std::string &protocol_mode,
@@ -745,7 +794,8 @@ parse_adaptive_v2_pre_vote_config(
     const std::string &maximum_block_extra_bytes,
     const std::string &maximum_ancestry_blocks)
 {
-    if (protocol_mode != "adaptive_v2")
+    if (protocol_mode != "adaptive_v2" &&
+        protocol_mode != "adaptive_v3")
         return std::nullopt;
 
     const auto minimum_delay = parse_adaptive_v2_unsigned<std::uint64_t>(
@@ -785,7 +835,8 @@ std::optional<AdaptiveV2ManagerPin> parse_adaptive_v2_manager_pin(
     const std::string &manager_address,
     const std::string &manager_tls_certificate_hex)
 {
-    if (protocol_mode != "adaptive_v2")
+    if (protocol_mode != "adaptive_v2" &&
+        protocol_mode != "adaptive_v3")
         return std::nullopt;
     if (manager_address.empty())
         throw HotStuffError(
@@ -838,7 +889,8 @@ parse_replica_structured_event_options(
     const std::string &commit_observer_id,
     const std::string &commit_observer_instance)
 {
-    if (protocol_mode != "adaptive_v2")
+    if (protocol_mode != "adaptive_v2" &&
+        protocol_mode != "adaptive_v3")
         return std::nullopt;
 
     const auto require_value = [](const std::string &value,
@@ -939,6 +991,12 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_epoch_manager_address = Config::OptValStr::create("");
     auto opt_epoch_manager_tls_cert = Config::OptValStr::create("");
+    auto opt_activation_readiness_members =
+        Config::OptValStrVec::create();
+    auto opt_activation_readiness_maximum_observation_attempts =
+        Config::OptValStr::create("5");
+    auto opt_activation_readiness_observation_retry_interval_ms =
+        Config::OptValStr::create("1000");
     auto opt_structured_event_run_id = Config::OptValStr::create("");
     auto opt_structured_event_source_instance =
         Config::OptValStr::create("");
@@ -1043,7 +1101,7 @@ int main(int argc, char **argv)
         opt_epoch_protocol_mode,
         Config::SET_VAL,
         -1,
-        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)");
+        "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2, adaptive_v3)");
     config.add_opt(
         "adaptive-epoch-file",
         opt_adaptive_epoch_file,
@@ -1103,7 +1161,25 @@ int main(int argc, char **argv)
         opt_epoch_manager_tls_cert,
         Config::SET_VAL,
         -1,
-        "pinned adaptive-v2 manager TLS certificate DER in hex");
+        "pinned adaptive-v2/v3 manager TLS certificate");
+    config.add_opt(
+        "activation-readiness-member",
+        opt_activation_readiness_members,
+        Config::APPEND,
+        -1,
+        "adaptive-v3 member id and BLS public key");
+    config.add_opt(
+        "activation-readiness-maximum-observation-attempts",
+        opt_activation_readiness_maximum_observation_attempts,
+        Config::SET_VAL,
+        -1,
+        "adaptive-v3 observation delivery attempt bound");
+    config.add_opt(
+        "activation-readiness-observation-retry-interval-ms",
+        opt_activation_readiness_observation_retry_interval_ms,
+        Config::SET_VAL,
+        -1,
+        "adaptive-v3 observation retry interval in milliseconds");
     config.add_opt(
         "structured-event-run-id",
         opt_structured_event_run_id,
@@ -1350,6 +1426,8 @@ int main(int argc, char **argv)
         epoch_protocol_mode = EpochProtocolMode::adaptive_v1;
     else if (opt_epoch_protocol_mode->get() == "adaptive_v2")
         epoch_protocol_mode = EpochProtocolMode::adaptive_v2;
+    else if (opt_epoch_protocol_mode->get() == "adaptive_v3")
+        epoch_protocol_mode = EpochProtocolMode::adaptive_v3;
     else
         throw HotStuffError("invalid epoch protocol mode");
     const auto experiment_byzantine_options =
@@ -1404,17 +1482,27 @@ int main(int argc, char **argv)
         opt_epoch_protocol_mode->get(),
         opt_epoch_manager_address->get(),
         opt_epoch_manager_tls_cert->get());
-    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+    if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+         epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
         (opt_notls->get() || opt_tls_privkey->get().empty() ||
          opt_tls_cert->get().empty()))
     {
         throw HotStuffError(
-            "adaptive-v2 replica networking requires TLS credentials");
+            "adaptive-v2/v3 replica networking requires TLS credentials");
     }
-    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 &&
+    if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+         epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
         opt_max_rep_msg->get() <= 0)
         throw HotStuffError(
-            "adaptive-v2 maximum replica message size must be positive");
+            "adaptive-v2/v3 maximum replica message size must be positive");
+    if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 &&
+        !opt_activation_readiness_members->get().empty())
+        throw HotStuffError(
+            "activation-readiness membership is adaptive-v3 only");
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+        !opt_adaptive_epoch_file->get().empty())
+        throw HotStuffError(
+            "adaptive-v3 forbids trusted-local epoch bootstrap");
     if (opt_adaptive_activation_height->get() < 0)
         throw HotStuffError("adaptive activation height must be non-negative");
     std::string binding_addr = std::get<0>(replicas[idx]);
@@ -1474,6 +1562,74 @@ int main(int argc, char **argv)
     clinet_config
         .burst_size(opt_cliburst->get())
         .nworker(opt_clinworker->get());
+    std::optional<hotstuff::AdaptiveV3RuntimeConfig> adaptive_v3_config;
+    if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+    {
+        if (!adaptive_v2_pre_vote_config || !adaptive_v2_manager_pin)
+            throw HotStuffError(
+                "adaptive-v3 issuer or manager configuration is unavailable");
+        std::vector<hotstuff::AdaptiveV3ReadinessMember> membership;
+        membership.reserve(
+            opt_activation_readiness_members->get().size());
+        std::set<std::string> readiness_public_keys;
+        for (const auto &raw :
+             opt_activation_readiness_members->get())
+        {
+            auto member = parse_adaptive_v3_readiness_member(raw);
+            if (member.replica_id != membership.size() ||
+                !readiness_public_keys.insert(
+                    salticidae::get_hex(
+                        member.public_key.to_bytes())).second)
+                throw HotStuffError(
+                    "adaptive-v3 readiness membership must be canonical, contiguous, and unique");
+            membership.push_back(std::move(member));
+        }
+        if (membership.size() != replicas.size() ||
+            membership.size() < 4 ||
+            (membership.size() - 1) % 3 != 0)
+            throw HotStuffError(
+                "adaptive-v3 readiness membership must equal one N=3f+1 replica set");
+        auto local_readiness_key =
+            std::make_shared<const hotstuff::PrivKeyBLS>(
+                hotstuff::from_hex(opt_privkey->get()));
+        if (membership[static_cast<std::size_t>(idx)]
+                .public_key.to_bytes() !=
+            hotstuff::PubKeyBLS(*local_readiness_key).to_bytes())
+            throw HotStuffError(
+                "adaptive-v3 local readiness key does not match the public manifest");
+        hotstuff::AdaptiveV3RuntimeConfig config_v3;
+        config_v3.manager_peer = adaptive_v2_manager_pin->peer;
+        config_v3.manager_address = adaptive_v2_manager_pin->address;
+        config_v3.local_readiness_private_key =
+            std::move(local_readiness_key);
+        config_v3.readiness_membership = std::move(membership);
+        config_v3.readiness_wire_limits.maximum_members = replicas.size();
+        config_v3.readiness_wire_limits.maximum_payload_bytes =
+            static_cast<std::size_t>(opt_max_rep_msg->get());
+        config_v3.epoch_change_issuer =
+            adaptive_v2_pre_vote_config->issuer;
+        config_v3.epoch_change_delay_bounds =
+            adaptive_v2_pre_vote_config->delay_bounds;
+        config_v3.maximum_block_extra_bytes =
+            adaptive_v2_pre_vote_config->maximum_block_extra_bytes;
+        config_v3.maximum_ancestry_blocks =
+            adaptive_v2_pre_vote_config->maximum_ancestry_blocks;
+        config_v3.maximum_bundle_bytes =
+            static_cast<std::size_t>(opt_max_rep_msg->get());
+        config_v3.maximum_observation_attempts =
+            parse_adaptive_v2_unsigned<std::size_t>(
+                opt_activation_readiness_maximum_observation_attempts
+                    ->get(),
+                "activation-readiness maximum observation attempts",
+                true);
+        config_v3.observation_retry_interval_ms =
+            parse_adaptive_v2_unsigned<std::uint64_t>(
+                opt_activation_readiness_observation_retry_interval_ms
+                    ->get(),
+                "activation-readiness observation retry interval ms",
+                true);
+        adaptive_v3_config = std::move(config_v3);
+    }
     papp = new HotStuffApp(opt_blk_size->get(),
                            opt_stat_period->get(),
                            idx,
@@ -1486,7 +1642,8 @@ int main(int argc, char **argv)
                            repnet_config,
                            clinet_config,
                            NetAddr(opt_client_ip->get(), 50500),
-                           epoch_protocol_mode);
+                           epoch_protocol_mode,
+                           std::move(adaptive_v3_config));
 
     std::optional<hotstuff::MonotonicRawStructuredEventClock>
         structured_event_clock;
@@ -1676,7 +1833,9 @@ HotStuffApp::HotStuffApp(uint32_t blk_size,
                          const Net::Config &repnet_config,
                          const ClientNetwork<opcode_t>::Config &clinet_config,
                          NetAddr reputation_addr,
-                         EpochProtocolMode protocol_mode) : HotStuff(blk_size, idx, raw_privkey, plisten_addr, std::move(pmaker), ec, nworker, repnet_config, reputation_addr, protocol_mode),
+                         EpochProtocolMode protocol_mode,
+                         std::optional<hotstuff::AdaptiveV3RuntimeConfig>
+                             v3_config) : HotStuff(blk_size, idx, raw_privkey, plisten_addr, std::move(pmaker), ec, nworker, repnet_config, reputation_addr, protocol_mode, std::move(v3_config)),
                                                     stat_period(stat_period),
                                                     ec(ec),
                                                     cn(req_ec, clinet_config),

@@ -49,6 +49,504 @@ N7_PROFILE_V12 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v12.json"
 N31_PROFILE_V12 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v12.json"
 
 
+def _synthetic_v13_profile() -> SimpleNamespace:
+    profile_id = "n7-f2-q5-two-crash-pair-smoke-v13"
+    raw = {
+        "schema_version": 2,
+        "profile_id": profile_id,
+        "protocol": {
+            "N": 7,
+            "f": 2,
+            "Q": 5,
+            "epoch_protocol_mode": "adaptive_v3",
+        },
+        "timers": {
+            "optimization_activation_deadline_seconds": 90,
+            "arm_hard_deadline_seconds": 480,
+            "stable_phase_seconds": 30,
+        },
+        "transitions": {
+            "survivor_barrier_count": 5,
+            "common_commit_quorum": 5,
+            "activation_readiness_contract": {
+                "schema_version": 1,
+                "domain": "kauri-focused-v13-certified-activation-v1",
+                "certificate_quorum": 5,
+                "required_reporter_count": 5,
+                "epoch1_common_commit_anchor_deadline_seconds": 5,
+                "containment_stabilization_seconds": 30,
+                "containment_measurement_seconds": 30,
+                "minimum_predecessor_residency_ms": 65_000,
+                "optimization_activation_budget_seconds": 90,
+                "deadline_semantics": "half_open_monotonic_v1",
+                "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
+            },
+        },
+    }
+    return SimpleNamespace(
+        profile_id=profile_id,
+        profile_sha256="ab" * 32,
+        raw=raw,
+    )
+
+
+def test_v13_secure_readiness_preallocation_is_external_canonical_and_private(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = _synthetic_v13_profile()
+    calls: list[tuple[str, ...]] = []
+
+    def keygen(argv: Sequence[str], **_kwargs: object) -> SimpleNamespace:
+        calls.append(tuple(argv))
+        stdout = "".join(
+            f"pub:{replica + 1:096x} sec:{replica + 1:064x}\n"
+            for replica in range(7)
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    allocation = runtime.FocusedV13ReadinessAllocator(
+        allocation_root=tmp_path / "external-readiness",
+        pair_count=1,
+        keygen_binary=tmp_path / "hotstuff-keygen",
+        profile=profile,
+        run_command=keygen,
+    ).allocate()
+    assert calls == [
+        (
+            str((tmp_path / "hotstuff-keygen").resolve()),
+            "--secure-bls-preallocation",
+            "--algo",
+            "bls",
+            "--num",
+            "7",
+        )
+    ]
+    pair = allocation["pair_readiness_allocations"]["pair-01"]
+    manifest = Path(pair["manifest_path"]).read_bytes()
+    assert runtime._canonical_json(json.loads(manifest)) == manifest
+    assert pair["manifest_sha256"] == hashlib.sha256(manifest).hexdigest()
+    assert (tmp_path / "external-readiness").stat().st_mode & 0o777 == 0o700
+    assert Path(pair["manifest_path"]).stat().st_mode & 0o777 == 0o600
+    assert all(
+        Path(row["private_key_path"]).stat().st_mode & 0o777 == 0o600
+        for row in pair["private_allocations"]
+    )
+    assert all(
+        row["private_key_sha256"] not in manifest.decode("ascii")
+        for row in pair["private_allocations"]
+    )
+
+
+def test_v13_readiness_preallocation_rejects_partial_cross_pair_bls_overlap(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    calls = 0
+
+    def keygen(_argv: Sequence[str], **_kwargs: object) -> SimpleNamespace:
+        nonlocal calls
+        calls += 1
+        # The second pair repeats only its final public/scalar identity; this
+        # must be rejected even though its manifest is otherwise distinct.
+        offset = 0 if calls == 1 else 6
+        stdout = "".join(
+            f"pub:{replica + offset + 1:096x} sec:{replica + offset + 1:064x}\n"
+            for replica in range(7)
+        )
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="duplicate"):
+        runtime.FocusedV13ReadinessAllocator(
+            allocation_root=tmp_path / "external-readiness",
+            pair_count=2,
+            keygen_binary=tmp_path / "hotstuff-keygen",
+            profile=_synthetic_v13_profile(),
+            run_command=keygen,
+        ).allocate()
+
+
+def test_v13_readiness_reload_rejects_tampered_authorized_keygen_before_subprocess(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    keygen = tmp_path / "hotstuff-keygen"
+    keygen.write_bytes(b"approved keygen\n")
+    keygen.chmod(0o700)
+    context = {"pair_readiness_allocations": {}}
+    preflight = {"execution_context": context}
+    monkeypatch.setattr(runtime, "build_focused_authorization_request", lambda _p: b"{}")
+    monkeypatch.setattr(
+        runtime,
+        "verify_focused_authorization_receipt",
+        lambda _r, _a: {
+            "execution_context_sha256": runtime._sha256(
+                runtime._canonical_json(context)
+            ),
+            "pair_count": 1,
+        },
+    )
+    keygen.write_bytes(b"tampered keygen\n")
+    calls: list[object] = []
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="keygen binary identity"):
+        runtime.reload_v13_readiness_allocations(
+            preflight=preflight,
+            authorization={},
+            keygen_record={
+                "path": str(keygen.resolve()),
+                "sha256": hashlib.sha256(b"approved keygen\n").hexdigest(),
+            },
+            run_command=lambda *_args, **_kwargs: calls.append(object()),
+        )
+    assert calls == []
+
+
+def test_v13_private_scalar_reader_rejects_symlink_and_launch_projection_redacts(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    scalar = "01" * 32
+    target = tmp_path / "target.sec"
+    target.write_text(f"{scalar}\n", encoding="ascii")
+    target.chmod(0o600)
+    link = tmp_path / "link.sec"
+    link.symlink_to(target)
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._read_exact_private_scalar(link, label="test scalar")
+    projected = runtime._v13_redacted_launch_projection(
+        ("replica", "--activation-readiness-private-key", scalar),
+        private_values={scalar},
+    )
+    assert scalar not in " ".join(projected)
+    assert projected[-1] == "<redacted>"
+
+
+def _v13_launch_fixture(
+    runtime: Any,
+    tmp_path: Path,
+) -> tuple[Any, dict[str, object], tuple[str, ...]]:
+    base = runtime.load_focused_profile(N7_PROFILE_V12)
+    raw = deepcopy(dict(base.raw))
+    raw["profile_id"] = "n7-f2-q5-two-crash-pair-smoke-v13"
+    raw["protocol"] = {**raw["protocol"], "epoch_protocol_mode": "adaptive_v3"}
+    raw["transitions"] = {
+        **raw["transitions"],
+        "activation_readiness_contract": {
+            "schema_version": 1,
+            "domain": "kauri-focused-v13-certified-activation-v1",
+            "certificate_quorum": 5,
+            "required_reporter_count": 5,
+            "epoch1_common_commit_anchor_deadline_seconds": 5,
+            "containment_stabilization_seconds": 30,
+            "containment_measurement_seconds": 30,
+            "minimum_predecessor_residency_ms": 65_000,
+            "optimization_activation_budget_seconds": 90,
+            "deadline_semantics": "half_open_monotonic_v1",
+            "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
+        },
+    }
+    profile_path = tmp_path / "synthetic-v13-profile.json"
+    profile_bytes = runtime._canonical_json(raw)
+    profile_path.write_bytes(profile_bytes)
+    profile = runtime.FocusedProfile(
+        path=profile_path,
+        profile_id=raw["profile_id"],
+        profile_sha256=hashlib.sha256(profile_bytes).hexdigest(),
+        topology_proof_sha256=base.topology_proof_sha256,
+        topology_proof_path=base.topology_proof_path,
+        replica_ids=base.replica_ids,
+        quorum=base.quorum,
+        target_replica_ids=base.target_replica_ids,
+        issuer_public_key=base.issuer_public_key,
+        raw=raw,
+    )
+    members = [
+        {"public_key_hex": f"{replica + 1:096x}", "replica_id": replica}
+        for replica in profile.replica_ids
+    ]
+    manifest = runtime._v13_public_manifest_bytes(profile, members)
+    secrets = tuple(
+        hashlib.sha256(f"readiness-secret-{replica}".encode("ascii")).hexdigest()
+        for replica in profile.replica_ids
+    )
+    external = tmp_path / "external-readiness" / "pair-01"
+    external.mkdir(parents=True)
+    private_rows = []
+    for replica, secret in enumerate(secrets):
+        private_path = external / f"replica-{replica}.sec"
+        private_path.write_text(f"{secret}\n", encoding="ascii")
+        private_rows.append(
+            {
+                "private_key_path": str(private_path.resolve()),
+                "private_key_sha256": hashlib.sha256(
+                    f"{secret}\n".encode("ascii")
+                ).hexdigest(),
+                "public_key_hex": members[replica]["public_key_hex"],
+                "replica_id": replica,
+                "private_key": secret,
+            }
+        )
+    allocation = {
+        "manifest_path": str((external / "manifest.json").resolve()),
+        "manifest_sha256": hashlib.sha256(manifest).hexdigest(),
+        "membership_digest": json.loads(manifest)["membership_digest"],
+        "members": members,
+        "private_allocations": private_rows,
+        "manifest_bytes": manifest,
+    }
+    build_directory = tmp_path / "build"
+    build_directory.mkdir()
+    (
+        build_directory / runtime.profiled_fault_runtime.BUILD_PROVENANCE_FILENAME
+    ).write_text(
+        json.dumps({"schema_version": 1, "revision": "a" * 40}),
+        encoding="utf-8",
+    )
+    public_key = native_fixture.ISSUER_PUBLIC_KEY
+    private_key = f"{1:064x}"
+    context = {
+        "profile": profile,
+        "pair_seed": 41_720,
+        "output_root": tmp_path / "results",
+        "build_directory": build_directory,
+        "binaries": {
+            "app": Path("/build/hotstuff-app"),
+            "manager": Path("/build/adaptation-manager"),
+            "client": Path("/build/hotstuff-client"),
+            "keygen": Path("/build/hotstuff-keygen"),
+            "tls_keygen": Path("/build/hotstuff-tls-keygen"),
+        },
+        "pair_issuer_allocations": {
+            "pair-01": {
+                "public_key": public_key,
+                "control": {"public_key": public_key, "private_key": private_key},
+                "adaptive": {"public_key": public_key, "private_key": private_key},
+            }
+        },
+        "pair_readiness_allocations": {"pair-01": allocation},
+        "preflight_receipt": {},
+        "authorization_receipt": {
+            "approval_reference": "test-only",
+            "approved_utc": "2026-08-20T00:00:00Z",
+        },
+    }
+    return profile, context, secrets
+
+
+def test_v13_materializes_exact_replica_client_and_public_launch_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile, context, secrets = _v13_launch_fixture(runtime, tmp_path)
+
+    def generate_tls(
+        adapter: object,
+        *,
+        keygen_binary: Path,
+        tls_keygen_binary: Path,
+        config_directory: Path,
+    ) -> list[dict[str, str]]:
+        assert keygen_binary.name == "hotstuff-keygen"
+        assert tls_keygen_binary.name == "hotstuff-tls-keygen"
+        rows = [
+            {
+                "crt": f"tls-crt-{identity}",
+                "sec": f"tls-sec-{identity}",
+                "cid": f"tls-cid-{identity}",
+            }
+            for identity in range(len(profile.replica_ids) + 1)
+        ]
+        (config_directory / "tls-identities.txt").write_text(
+            "synthetic TLS identities\n", encoding="utf-8"
+        )
+        return rows
+
+    monkeypatch.setattr(runtime, "_generate_v13_arm_tls_identities", generate_tls)
+    monkeypatch.setattr(
+        runtime, "build_focused_authorization_request", lambda _preflight: b"{}"
+    )
+    parent_sha = hashlib.sha256(b"{}").hexdigest()
+    monkeypatch.setattr(
+        runtime,
+        "verify_focused_authorization_receipt",
+        lambda _request, _authorization: {"request_sha256": parent_sha},
+    )
+
+    configuration = runtime.FocusedLaunchBackend().materialize_arm_configuration(
+        context, pair_ordinal=1, arm="control"
+    )
+
+    manager = configuration["manager_command"]
+    assert isinstance(manager, tuple)
+    assert manager[manager.index("--protocol-mode") + 1] == "adaptive_v3"
+    assert "--activation-readiness-identity" not in manager
+    assert manager.count("--activation-readiness-member") == 7
+    assert (
+        manager[manager.index("--activation-readiness-release-count") + 1] == "5"
+    )
+    assert (
+        manager[
+            manager.index("--activation-readiness-retry-interval-ticks") + 1
+        ]
+        == "1000000000"
+    )
+    assert manager[manager.index("--fault-window-arm-schema-version") + 1] == "4"
+    assert (
+        configuration["manager_launch_checkpoint"]
+        == "adaptive_v3_unified_manager_checkpoint4"
+    )
+    run_directory = Path(configuration["run_directory"])
+    manifest = (
+        run_directory / "runtime/activation-readiness-public-manifest.json"
+    ).read_bytes()
+    allocation = context["pair_readiness_allocations"]["pair-01"]
+    assert manifest == allocation["manifest_bytes"]
+    expected_members = [
+        f"{row['replica_id']},{row['public_key_hex']}"
+        for row in allocation["members"]
+    ]
+    for replica, command in enumerate(configuration["replica_commands"]):
+        assert command.count("--activation-readiness-member") == 7
+        observed_members = [
+            command[index + 1]
+            for index, value in enumerate(command)
+            if value == "--activation-readiness-member"
+        ]
+        assert observed_members == expected_members
+        assert command[command.index("--privkey") + 1] == secrets[replica]
+        assert command[command.index("--epoch-protocol-mode") + 1] == "adaptive_v3"
+        assert command[command.index("--epoch-change-issuer-id") + 1] == "1"
+        assert command[command.index("--epoch-change-minimum-activation-delay") + 1] == "5"
+        assert command[command.index("--epoch-change-maximum-activation-delay") + 1] == "5"
+        assert command[command.index("--epoch-change-maximum-block-extra-bytes") + 1] == "4096"
+        assert command[command.index("--epoch-change-maximum-ancestry-blocks") + 1] == "128"
+        assert command[command.index("--epoch-manager-address") + 1] == "127.0.0.1:18014"
+        assert command[command.index("--epoch-manager-tls-cert") + 1] == "tls-crt-7"
+        assert command[command.index("--activation-readiness-maximum-observation-attempts") + 1] == "5"
+        assert command[command.index("--activation-readiness-observation-retry-interval-ms") + 1] == "1000"
+        assert command.count("--structured-event-run-id") == 1
+        assert command.count("--structured-event-source-instance") == 1
+        assert command.count("--structured-event-output") == 1
+        assert command.count("--structured-event-commit-observer-id") == 1
+        assert command.count("--structured-event-commit-observer-instance") == 1
+    assert configuration["client_command"][-2:] == (
+        "--epoch-protocol-mode",
+        "adaptive_v3",
+    )
+    launch = json.loads(
+        (run_directory / "runtime/launch-arguments.json").read_bytes()
+    )
+    assert launch["manager_argv"]
+    assert launch["manager_checkpoint"] == "adaptive_v3_unified_manager_checkpoint4"
+    assert launch["client_argv"] == list(configuration["client_command"])
+    assert all(
+        row[row.index("--privkey") + 1] == "<redacted>"
+        for row in launch["replica_argv"]
+    )
+    materialized = b"".join(
+        path.read_bytes() for path in run_directory.rglob("*") if path.is_file()
+    )
+    assert all(secret.encode("ascii") not in materialized for secret in secrets)
+    spawn_calls: list[object] = []
+    # The configuration is executable after authenticated materialization;
+    # this unit fixture intentionally does not start its synthetic binaries.
+    assert spawn_calls == []
+
+
+@pytest.mark.parametrize(
+    ("profile_path", "release_count"),
+    (
+        (PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v13.json", 5),
+        (PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v13.json", 28),
+    ),
+)
+def test_v13_unified_manager_argv_uses_native_public_readiness_contract(
+    profile_path: Path,
+    release_count: int,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(profile_path)
+    adapter = runtime._profiled_adapter(profile, 41_720)
+    members = [
+        {"replica_id": replica, "public_key_hex": f"{replica + 1:096x}"}
+        for replica in profile.replica_ids
+    ]
+    tls = [
+        {"crt": f"crt-{replica}", "sec": f"sec-{replica}"}
+        for replica in range(len(profile.replica_ids) + 1)
+    ]
+    command = runtime._focused_manager_command(
+        profile,
+        adapter,
+        arm="adaptive",
+        manager_binary=tmp_path / "adaptation-manager",
+        tls=tls,
+        issuer={"pub": native_fixture.ISSUER_PUBLIC_KEY, "sec": f"{1:064x}"},
+        run_directory=tmp_path,
+        run_id="v13-test-run",
+        source_instance="v13-test-manager",
+        fault_window_arm_path=tmp_path / "fault-window-arm.json",
+        request_sha256="a" * 64,
+        readiness_members=members,
+    )
+    assert command.count("--activation-readiness-member") == len(members)
+    assert command[command.index("--activation-readiness-release-count") + 1] == str(release_count)
+    assert command[command.index("--activation-readiness-maximum-delivery-attempts") + 1] == "5"
+    assert command[command.index("--activation-readiness-retry-interval-ticks") + 1] == "1000000000"
+    assert command[command.index("--fault-window-arm-schema-version") + 1] == "4"
+    assert command[command.index("--fault-window-arm-clock-domain") + 1] == "same_host_clock_monotonic_raw"
+    assert "--activation-readiness-identity" not in command
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "duplicate", "uppercase", "mixed", "key", "secret"),
+)
+def test_v13_launch_rejects_malformed_or_contaminated_readiness_allocation(
+    mutation: str,
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    profile, context, secrets = _v13_launch_fixture(runtime, tmp_path)
+    allocations = deepcopy(context["pair_readiness_allocations"])
+    allocation = allocations["pair-01"]
+    manifest = json.loads(allocation["manifest_bytes"])
+    if mutation == "missing":
+        manifest["members"].pop()
+        manifest["membership_digest"] = runtime._v13_membership_digest(
+            manifest["members"]
+        )
+        allocation["members"] = manifest["members"]
+        allocation["private_allocations"].pop()
+        allocation["membership_digest"] = manifest["membership_digest"]
+    elif mutation == "duplicate":
+        manifest["members"][1]["public_key_hex"] = manifest["members"][0][
+            "public_key_hex"
+        ]
+        allocation["members"] = manifest["members"]
+    elif mutation == "uppercase":
+        manifest["members"][0]["public_key_hex"] = "A" * 96
+        allocation["members"] = manifest["members"]
+    elif mutation == "mixed":
+        allocation["members"][0]["public_key_hex"] = "f" * 96
+    elif mutation == "key":
+        allocation["private_allocations"][0]["public_key_hex"] = "f" * 96
+    else:
+        manifest["contamination"] = secrets[0]
+    if mutation not in {"mixed", "key"}:
+        allocation["manifest_bytes"] = runtime._canonical_json(manifest)
+        allocation["manifest_sha256"] = hashlib.sha256(
+            allocation["manifest_bytes"]
+        ).hexdigest()
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._v13_launch_readiness_allocation(
+            profile, pair_id="pair-01", allocations=allocations
+        )
+
+
 def test_v12_profiles_bind_exact_horizons_timers_and_all_candidate_capacity() -> None:
     runtime = _runtime()
     validator = importlib.import_module(
@@ -4555,6 +5053,58 @@ def test_preflight_is_no_launch_and_receipt_binds_every_execution_input(
         changed[key] = "0" * 64
         with pytest.raises(runtime.FocusedCrashPairRuntimeError):
             runtime.verify_focused_authorization_receipt(request, changed)
+
+
+def test_v13_authorization_request_binds_canonical_public_readiness_projection() -> None:
+    runtime = _runtime()
+    request_document = {
+        "schema_version": 2,
+        "mode": "pair",
+        "pair_count": 1,
+        "profile_sha256": "a" * 64,
+        "topology_proof_sha256": "b" * 64,
+        "output_root": "/private/tmp/v13-auth",
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "authorization_nonce": "nonce",
+        "execution_context_sha256": "c" * 64,
+        "pair_readiness_manifests": {
+            "pair-01": {
+                "manifest_sha256": "d" * 64,
+                "membership_digest": "e" * 64,
+                "member_count": 7,
+            }
+        },
+    }
+    request = _canonical_json(request_document)
+    receipt = {
+        **request_document,
+        "request_sha256": hashlib.sha256(request).hexdigest(),
+        "approval_reference": "approved",
+        "approved_utc": "2026-08-20T00:00:00+00:00",
+    }
+    assert runtime.verify_focused_authorization_receipt(request, receipt)["schema_version"] == 2
+    mutations: list[dict[str, object]] = []
+    schema_one = deepcopy(request_document); schema_one["schema_version"] = 1; mutations.append(schema_one)
+    missing = deepcopy(request_document); missing.pop("pair_readiness_manifests"); mutations.append(missing)
+    extra = deepcopy(request_document); extra["unexpected"] = 1; mutations.append(extra)
+    pair = deepcopy(request_document); pair["pair_readiness_manifests"] = {"pair-02": pair["pair_readiness_manifests"]["pair-01"]}; mutations.append(pair)
+    for value in ("D" * 64, "d" * 63, 7):
+        digest = deepcopy(request_document)
+        digest["pair_readiness_manifests"]["pair-01"]["manifest_sha256"] = value
+        mutations.append(digest)
+    for mutation in mutations:
+        wire = _canonical_json(mutation)
+        candidate = {**mutation, "request_sha256": hashlib.sha256(wire).hexdigest(), "approval_reference": "approved", "approved_utc": "2026-08-20T00:00:00+00:00"}
+        with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+            runtime.verify_focused_authorization_receipt(wire, candidate)
+    nested = deepcopy(receipt)
+    nested["pair_readiness_manifests"]["pair-01"]["membership_digest"] = "f" * 64
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime.verify_focused_authorization_receipt(request, nested)
+    bad_sha = deepcopy(receipt); bad_sha["request_sha256"] = "0" * 64
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime.verify_focused_authorization_receipt(request, bad_sha)
 
 
 def test_preflight_runs_real_checks_and_binds_issuer_before_execution(

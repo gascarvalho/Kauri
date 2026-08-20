@@ -34,6 +34,7 @@
 #include "hotstuff/util.h"
 #include "hotstuff/adaptive_v2_reporting_outbox.h"
 #include "hotstuff/adaptive_v2_response_evidence.h"
+#include "hotstuff/adaptive_v3_activation_readiness.h"
 #include "hotstuff/aggregation.h"
 #include "hotstuff/block_delivery_orchestration.h"
 #include "hotstuff/consensus.h"
@@ -49,6 +50,22 @@
 
 namespace hotstuff
 {
+
+    struct AdaptiveV3RuntimeConfig
+    {
+        PeerId manager_peer;
+        NetAddr manager_address;
+        std::shared_ptr<const PrivKeyBLS> local_readiness_private_key;
+        std::vector<AdaptiveV3ReadinessMember> readiness_membership;
+        ActivationReadinessWireLimits readiness_wire_limits;
+        EpochChangeIssuer epoch_change_issuer;
+        EpochChangeDelayBounds epoch_change_delay_bounds;
+        std::size_t maximum_block_extra_bytes{0};
+        std::size_t maximum_ancestry_blocks{0};
+        std::size_t maximum_bundle_bytes{0};
+        std::size_t maximum_observation_attempts{0};
+        std::uint64_t observation_retry_interval_ms{0};
+    };
 
     using salticidae::_1;
     using salticidae::_2;
@@ -1046,6 +1063,45 @@ namespace hotstuff
         const EpochProtocolMode epoch_protocol_mode;
         std::optional<PeerId> epoch_manager_peer;
         std::optional<NetAddr> epoch_manager_address;
+        std::optional<AdaptiveV3RuntimeConfig> adaptive_v3_config;
+        std::unique_ptr<AdaptiveV3CertifiedActivationGate>
+            adaptive_v3_activation_gate;
+        std::optional<bytearray_t> adaptive_v3_pending_observation;
+        std::optional<ActivationReadyObservationV1>
+            adaptive_v3_signed_observation;
+        std::optional<ActivationReadyObservationV1>
+            adaptive_v3_deferred_observation;
+        std::unique_ptr<ActivationReadinessCertificateV1>
+            adaptive_v3_accepted_certificate;
+        std::optional<ActivationReadinessCertificateV1>
+            adaptive_v3_deferred_certificate;
+        std::optional<AuthorizedEpochChange> adaptive_v3_committed_command;
+        block_t adaptive_v3_boundary_block;
+        block_t adaptive_v3_latest_committed_block;
+        struct AdaptiveV3RetiredActivationReceipt
+        {
+            ActivationReadyIdentityV1 identity;
+            uint256_t certificate_digest;
+            bytearray_t canonical_certificate_payload;
+            bytearray_t canonical_acknowledgement_payload;
+        };
+        // One exact retired cycle is sufficient for stale rejection and
+        // byte-identical ACK replay while keeping current-cycle authority
+        // bounded independently of the reporter sequence watermark.
+        std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+            adaptive_v3_prepared_activation_receipt;
+        std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+            adaptive_v3_retired_activation_receipt;
+        bool adaptive_v3_runtime_prepared{false};
+        AggregationScheduler::Cancellation
+            adaptive_v3_observation_retry_cancellation;
+        std::size_t adaptive_v3_observation_attempts{0};
+        std::uint64_t adaptive_v3_readiness_source_sequence{0};
+        bool adaptive_v3_observation_terminal{false};
+        bool adaptive_v3_certificate_ack_sent{false};
+        std::optional<EpochCommandCommittedStructuredEvent>
+            adaptive_v3_command_evidence;
+        bool adaptive_v3_command_terminal_emitted{false};
         EpochWireLimits epoch_wire_limits{4 << 20, 128, 4096, 4096};
         std::uint64_t epoch_activation_grace_blocks{1};
         bool adaptive_demo_markers{false};
@@ -1498,6 +1554,7 @@ namespace hotstuff
         void install_adaptive_epoch_handlers();
         void install_adaptive_consensus_handlers();
         void install_adaptive_v2_definition_handlers();
+        void install_adaptive_v3_handlers();
         void experiment_post_qc_audit_relay_handler(
             MsgExperimentPostQcAuditRelay &&message,
             const Net::conn_t &connection);
@@ -1513,6 +1570,45 @@ namespace hotstuff
         void adaptive_v2_convergence_ack_handler(
             MsgAdaptiveV2ConvergenceObservationAck &&message,
             const Net::conn_t &connection);
+        void adaptive_v3_epoch_change_bundle_handler(
+            MsgAdaptiveV3EpochChangeBundle &&message,
+            const Net::conn_t &connection);
+        void adaptive_v3_readiness_certificate_handler(
+            MsgActivationReadinessCertificate &&message,
+            const Net::conn_t &connection);
+        void ingest_adaptive_v3_readiness_certificate(
+            const AdaptiveV3ActivationReadinessCertificate &certificate,
+            const bytearray_t &canonical_payload) noexcept;
+        void process_adaptive_v3_post_block_commit(
+            const block_t &block) noexcept;
+        void publish_adaptive_v3_activation(
+            const EpochRuntimeUpdate &update,
+            std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+                prepared_receipt,
+            std::unique_ptr<AdaptiveV3ReadinessStructuredEvent>
+                accepted_event = nullptr) noexcept;
+        std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
+            prepare_adaptive_v3_retirement(
+                const AdaptiveV3ActivationReadinessCertificate &certificate,
+                const bytearray_t &canonical_certificate_payload) const;
+        void resume_adaptive_v3_runtime_preparation() noexcept;
+        void enqueue_adaptive_v3_observation(
+            const AdaptiveV3ActivationReadyObservation &observation) noexcept;
+        void transmit_adaptive_v3_observation() noexcept;
+        void schedule_adaptive_v3_observation_retry() noexcept;
+        void cancel_adaptive_v3_observation_retry() noexcept;
+        void acknowledge_adaptive_v3_certificate() noexcept;
+        bool transmit_adaptive_v3_acknowledgement(
+            const bytearray_t &canonical_payload) noexcept;
+        void emit_adaptive_v3_observation_terminal(
+            const ActivationReadyIdentityV1 &identity,
+            const char *disposition) noexcept;
+        void emit_adaptive_v3_command_terminal(
+            AdaptiveV3CommandTerminalReason reason) noexcept;
+        bool emit_adaptive_v3_readiness_event(
+            AdaptiveV3ReadinessStructuredEvent event,
+            bool drain_before_return = false) noexcept;
+        void fail_adaptive_v3_readiness_audit() noexcept;
         bool authorize_manager_peer(const PeerId &peer) const noexcept;
         void bind_adaptive_v2_manager_reporting_transport();
         EvidenceTransportResult enqueue_adaptive_v2_evidence_report(
@@ -1835,7 +1931,11 @@ namespace hotstuff
         void emit_epoch_lifecycle_event(
             EpochLifecycleTransition transition,
             const ConfigurationId &configuration,
-            std::uint64_t activation_height) noexcept;
+            std::uint64_t activation_height,
+            std::optional<std::uint64_t> certificate_apply_height =
+                std::nullopt,
+            std::optional<uint256_t> certificate_digest =
+                std::nullopt) noexcept;
         void try_finish_exact_context(
             const ProposalContextLease &lease);
         bool publish_exact_root_qc(
@@ -1943,7 +2043,9 @@ namespace hotstuff
                      const Net::Config &netconfi,
                      NetAddr reputation_addr,
                      EpochProtocolMode protocol_mode =
-                         EpochProtocolMode::legacy_static);
+                         EpochProtocolMode::legacy_static,
+                     std::optional<AdaptiveV3RuntimeConfig> v3_config =
+                         std::nullopt);
 
         ~HotStuffBase();
 
@@ -2096,7 +2198,9 @@ namespace hotstuff
                  const Net::Config &netconfig = Net::Config(),
                  NetAddr reputation_addr = NetAddr(),
                  EpochProtocolMode protocol_mode =
-                     EpochProtocolMode::legacy_static) : HotStuffBase(blk_size,
+                     EpochProtocolMode::legacy_static,
+                 std::optional<AdaptiveV3RuntimeConfig> v3_config =
+                     std::nullopt) : HotStuffBase(blk_size,
                                                                      rid,
                                                                      new PrivKeyType(raw_privkey),
                                                                      listen_addr,
@@ -2105,7 +2209,8 @@ namespace hotstuff
                                                                      nworker,
                                                                      netconfig,
                                                                      reputation_addr,
-                                                                     protocol_mode) {}
+                                                                     protocol_mode,
+                                                                     std::move(v3_config)) {}
 
         void start(const std::vector<std::tuple<NetAddr, bytearray_t, bytearray_t>> &replicas, bool ec_loop = false)
         {

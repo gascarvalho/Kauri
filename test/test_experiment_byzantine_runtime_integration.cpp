@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <csignal>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -1129,6 +1130,14 @@ private:
 class RecordingProtocolEmitter final : public StructuredEventEmitter
 {
 public:
+    explicit RecordingProtocolEmitter(bool designated = true)
+        : designated_(designated)
+    {}
+
+    bool is_designated_commit_observer() const noexcept override
+    {
+        return designated_;
+    }
     void emit(const StructuredEventPayload &payload) noexcept override
     {
         try
@@ -1141,11 +1150,57 @@ public:
     }
 
     std::vector<StructuredEventPayload> events;
+
+private:
+    bool designated_{true};
+};
+
+class ScopedSigpipeIgnore final
+{
+public:
+    ScopedSigpipeIgnore()
+        : previous_(std::signal(SIGPIPE, SIG_IGN))
+    {}
+    ~ScopedSigpipeIgnore() { std::signal(SIGPIPE, previous_); }
+
+private:
+    using Handler = void (*)(int);
+    Handler previous_{SIG_DFL};
 };
 
 uint256_t digest(const std::string &label)
 {
     return DataStream(label).get_hash();
+}
+
+AdaptiveV3RuntimeConfig adaptive_v3_runtime_config(ReplicaID local_replica)
+{
+    AdaptiveV3RuntimeConfig config;
+    const auto manager_address = NetAddr("127.0.0.1:19001");
+    config.manager_peer = PeerId(manager_address);
+    config.manager_address = manager_address;
+    for (ReplicaID replica = 0; replica < 4; ++replica)
+    {
+        auto key = std::make_shared<PrivKeyBLS>();
+        key->from_rand();
+        config.readiness_membership.push_back(
+            AdaptiveV3ReadinessMember{replica, PubKeyBLS(*key)});
+        if (replica == local_replica)
+            config.local_readiness_private_key = std::move(key);
+    }
+    const bytearray_t issuer_secret(32, 1);
+    const PrivKeySecp256k1 issuer_key(issuer_secret);
+    config.epoch_change_issuer =
+        EpochChangeIssuer{17, PubKeySecp256k1(issuer_key)};
+    config.epoch_change_delay_bounds = EpochChangeDelayBounds{1, 20};
+    config.readiness_wire_limits.maximum_members = 4;
+    config.readiness_wire_limits.maximum_payload_bytes = 4U * 1024U * 1024U;
+    config.maximum_block_extra_bytes = 4U * 1024U * 1024U;
+    config.maximum_ancestry_blocks = 64;
+    config.maximum_bundle_bytes = 4U * 1024U * 1024U;
+    config.maximum_observation_attempts = 3;
+    config.observation_retry_interval_ms = 1;
+    return config;
 }
 
 ExperimentByzantineOptions rotating_options(
@@ -2144,6 +2199,189 @@ TEST_CASE(
     CHECK_FALSE(Access::convergence_evidence_healthy(runtime));
     CHECK(Access::has_response_attempt_arm_failure(runtime, key));
     CHECK(Access::response_attempt_arm_failure_count(runtime) == 1);
+}
+
+TEST_CASE(
+    "adaptive-v3 commit reporting preserves exact lifecycle and one authority",
+    "[adaptive-v3][evidence][commit][lifecycle][runtime-integration]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+
+    SECTION("a designated exact commit emits one authoritative event")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::replace_aggregation_scheduler(
+            runtime, std::make_unique<ThrowingAggregationScheduler>());
+        auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "v3-designated");
+        const ProposalKey key{configuration, block->get_hash()};
+        Access::seed_view_generation(runtime, key, 17);
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 17));
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, Access::direct_certifier(runtime, key));
+        REQUIRE(cached.key == key);
+        REQUIRE(cached.event_key == key);
+
+        Access::report_and_post_commit(runtime, block);
+
+        REQUIRE(emitter.events.size() == 2);
+        REQUIRE(std::get_if<CommitObservedStructuredEvent>(
+                    &emitter.events[0]) != nullptr);
+        const auto *committed =
+            std::get_if<CommitStructuredEvent>(&emitter.events[1]);
+        REQUIRE(committed != nullptr);
+        CHECK(committed->decision_proof == key);
+        CHECK(committed->view_generation == 17);
+        REQUIRE(outbox.front() != nullptr);
+        CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::lifecycle);
+        const auto decoded = decode_proposal_lifecycle_notice(
+            outbox.front()->canonical_payload, ProposalLifecycleWireLimits{});
+        REQUIRE(decoded);
+        CHECK(decoded.notice->source_replica_id == 1);
+        CHECK(decoded.notice->source_sequence == 1);
+        REQUIRE(std::holds_alternative<ProposalCommitted>(
+            decoded.notice->fact));
+        const auto &fact = std::get<ProposalCommitted>(decoded.notice->fact);
+        CHECK(fact.proposal == key);
+        CHECK(fact.evidence_sequence_fence == 0);
+    }
+
+    SECTION("non-designated and inexact commits never become authoritative")
+    {
+        for (const bool designated : {false, true})
+        {
+            EventContext event_context;
+            TestHotStuff runtime(
+                1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+                new ActiveRuntimePaceMaker(1), event_context, 0,
+                HotStuffBase::Net::Config(), NetAddr(),
+                EpochProtocolMode::adaptive_v3,
+                adaptive_v3_runtime_config(1));
+            const auto configuration =
+                Access::initialize_active_runtime(runtime);
+            Access::replace_aggregation_scheduler(
+                runtime, std::make_unique<ThrowingAggregationScheduler>());
+            auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+            RecordingProtocolEmitter emitter(designated);
+            runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+            const auto block = indirect_commit_block(
+                runtime,
+                designated ? "v3-conflicting" : "v3-nondesignated");
+            if (!designated)
+            {
+                const ProposalKey key{configuration, block->get_hash()};
+                Access::seed_view_generation(runtime, key, 23);
+                REQUIRE(Access::retain_commit_event_identity(runtime, key, 23));
+                const auto cached = Access::resolve_and_cache_commit(
+                    runtime,
+                    block,
+                    {},
+                    Access::direct_certifier(runtime, key));
+                REQUIRE(cached.event_key == key);
+            }
+            else
+            {
+                const auto cached = Access::resolve_and_cache_commit(
+                    runtime, block, {}, nullptr);
+                CHECK(cached.event_conflicted);
+            }
+
+            Access::report_and_post_commit(runtime, block);
+
+            REQUIRE(emitter.events.size() == 1);
+            CHECK(std::get_if<CommitObservedStructuredEvent>(
+                      &emitter.events[0]) != nullptr);
+            CHECK(std::none_of(
+                emitter.events.begin(), emitter.events.end(),
+                [](const auto &event) {
+                    return std::get_if<CommitStructuredEvent>(&event) !=
+                           nullptr;
+                }));
+            CHECK(outbox.diagnostics().pending_reports ==
+                  (designated ? 0 : 1));
+        }
+    }
+
+    SECTION("a legal unavailable identity remains explicitly non-authoritative")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        static_cast<void>(Access::initialize_active_runtime(runtime));
+        Access::replace_aggregation_scheduler(
+            runtime, std::make_unique<ThrowingAggregationScheduler>());
+        auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "v3-unavailable");
+        const auto cached =
+            Access::resolve_and_cache_commit(runtime, block, {}, nullptr, true);
+        CHECK(cached.unavailable);
+        CHECK(cached.event_unavailable);
+
+        Access::report_and_post_commit(runtime, block);
+
+        CHECK(outbox.diagnostics().pending_reports == 0);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events[0]) != nullptr);
+        CHECK(std::get_if<CommitIdentityUnavailableStructuredEvent>(
+                  &emitter.events[1]) != nullptr);
+        CHECK(std::none_of(
+            emitter.events.begin(), emitter.events.end(),
+            [](const auto &event) {
+                return std::get_if<CommitStructuredEvent>(&event) != nullptr;
+            }));
+    }
+
+    SECTION("lifecycle capacity never mutates or substitutes an exact report")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::replace_aggregation_scheduler(
+            runtime, std::make_unique<ThrowingAggregationScheduler>());
+        auto &outbox = Access::reset_reporting_outbox(runtime, 1);
+        const ProposalKey first{configuration, digest("v3-capacity-first")};
+        const ProposalKey second{configuration, digest("v3-capacity-second")};
+
+        Access::report_committed(runtime, first);
+        Access::report_committed(runtime, second);
+
+        CHECK(outbox.diagnostics().pending_reports == 1);
+        REQUIRE(outbox.front() != nullptr);
+        CHECK(outbox.front()->stream == AdaptiveV2ReportingStream::lifecycle);
+        const auto decoded = decode_proposal_lifecycle_notice(
+            outbox.front()->canonical_payload, ProposalLifecycleWireLimits{});
+        REQUIRE(decoded);
+        REQUIRE(std::holds_alternative<ProposalCommitted>(
+            decoded.notice->fact));
+        CHECK(std::get<ProposalCommitted>(decoded.notice->fact).proposal ==
+              first);
+        CHECK(decoded.notice->source_replica_id == 1);
+        CHECK(decoded.notice->source_sequence == 1);
+        CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
+        CHECK(Access::convergence_evidence_healthy(runtime));
+    }
 }
 
 TEST_CASE(

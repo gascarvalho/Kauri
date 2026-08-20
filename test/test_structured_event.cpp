@@ -2053,8 +2053,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 12,
-        "the audit capability appends cross-commit readiness evidence");
+        std::variant_size<AuditStructuredEventPayload>::value == 14,
+        "the audit capability appends adaptive-v3 readiness and command terminal evidence");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -2100,6 +2100,16 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<10, AuditStructuredEventPayload>,
             AdaptiveV2CrossCommitRetentionReadyStructuredEvent>::value,
         "the eleventh audit payload is exact cross-commit readiness");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<12, AuditStructuredEventPayload>,
+            hotstuff::AdaptiveV3ReadinessStructuredEvent>::value,
+        "the thirteenth audit payload is certified activation readiness");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<13, AuditStructuredEventPayload>,
+            hotstuff::AdaptiveV3CommandTerminalStructuredEvent>::value,
+        "the fourteenth audit payload is pre-readiness command terminal");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -5620,4 +5630,391 @@ TEST_CASE(
     invalid = event;
     invalid.queued_candidate_qc_published = true;
     CHECK(rejects(config, std::move(invalid)));
+}
+
+TEST_CASE("CERT13 M1 registers and strictly serializes readiness evidence",
+          "[adaptive-v3][structured-event][m1]")
+{
+    using Transition = hotstuff::AdaptiveV3ReadinessTransition;
+    using Event = hotstuff::AdaptiveV3ReadinessStructuredEvent;
+
+    const std::array<std::pair<StructuredEventType, const char *>, 14> names{{
+        {StructuredEventType::adaptive_v3_activation_prepared,
+         "epoch.activation_prepared"},
+        {StructuredEventType::adaptive_v3_activation_ready_signed,
+         "epoch.activation_ready_signed"},
+        {StructuredEventType::adaptive_v3_observation_accepted,
+         "adaptive_v3.readiness_observation_accepted"},
+        {StructuredEventType::adaptive_v3_observation_rejected,
+         "adaptive_v3.readiness_observation_rejected"},
+        {StructuredEventType::adaptive_v3_source_quarantined,
+         "adaptive_v3.readiness_source_quarantined"},
+        {StructuredEventType::adaptive_v3_certificate_assembled,
+         "adaptive_v3.readiness_certificate_assembled"},
+        {StructuredEventType::adaptive_v3_certificate_delivery,
+         "adaptive_v3.readiness_certificate_delivery"},
+        {StructuredEventType::adaptive_v3_certificate_accepted,
+         "adaptive_v3.readiness_certificate_accepted"},
+        {StructuredEventType::adaptive_v3_certificate_rejected,
+         "adaptive_v3.readiness_certificate_rejected"},
+        {StructuredEventType::adaptive_v3_certificate_acknowledged,
+         "adaptive_v3.readiness_certificate_acknowledged"},
+        {StructuredEventType::adaptive_v3_e2_eligibility,
+         "adaptive_v3.e2_eligibility"},
+        {StructuredEventType::adaptive_v3_terminal,
+         "adaptive_v3.readiness_terminal"},
+        {StructuredEventType::adaptive_v3_wire_rejected,
+         "adaptive_v3.readiness_wire_rejected"},
+        {StructuredEventType::adaptive_v3_command_terminal,
+         "adaptive_v3.command_terminal"},
+    }};
+    for (const auto &entry : names)
+        CHECK(std::string(structured_event_type_name(entry.first)) ==
+              entry.second);
+
+    std::vector<std::unique_ptr<hotstuff::PrivKeyBLS>> keys;
+    std::vector<std::pair<ReplicaID, hotstuff::PubKeyBLS>> members;
+    for (ReplicaID id = 0; id < 7; ++id)
+    {
+        auto key = std::make_unique<hotstuff::PrivKeyBLS>();
+        key->from_rand();
+        members.emplace_back(id, hotstuff::PubKeyBLS(*key));
+        keys.emplace_back(std::move(key));
+    }
+    hotstuff::ActivationReadyIdentityV1 identity;
+    identity.membership_digest =
+        hotstuff::canonical_activation_readiness_membership_digest(members);
+    identity.predecessor_boundary_configuration =
+        {12, 0, digest("cert13-predecessor")};
+    identity.predecessor_boundary_generation =
+        *hotstuff::checked_activation_generation(12, 1);
+    identity.successor_configuration =
+        {13, 0, digest("cert13-successor")};
+    identity.successor_activation_generation =
+        *hotstuff::checked_activation_generation(13, 0);
+    identity.command_payload_digest = digest("cert13-command");
+    identity.command_block_height = 200;
+    identity.command_block_hash = digest("cert13-command-block");
+    identity.activation_delay_blocks = 2;
+    identity.activation_height = 202;
+    identity.activation_boundary_block_hash = digest("cert13-boundary");
+
+    const auto observation = hotstuff::sign_activation_ready_observation(
+        identity, 2, 7, 900, *keys[2]);
+    const auto observation_bytes =
+        hotstuff::encode_activation_ready_observation(
+            observation, {64 * 1024, 7});
+    const auto observation_digest =
+        hotstuff::activation_ready_observation_digest(observation);
+
+    std::vector<hotstuff::ActivationReadyObservationV1> observations;
+    for (ReplicaID id = 0; id < 5; ++id)
+    {
+        observations.push_back(
+            hotstuff::sign_activation_ready_observation(
+                identity, id, 1, id + 1, *keys[id]));
+    }
+    const auto certificate =
+        hotstuff::make_activation_readiness_certificate(
+            identity, std::move(observations));
+    const auto certificate_bytes =
+        hotstuff::encode_activation_readiness_certificate(
+            certificate, {64 * 1024, 7});
+    const auto certificate_payload_digest =
+        hotstuff::activation_readiness_ack_payload_digest(
+            hotstuff::MsgActivationReadinessCertificate::opcode,
+            certificate_bytes);
+
+    hotstuff::ActivationReadinessAckV1 acknowledgement;
+    acknowledgement.acknowledged_opcode =
+        hotstuff::MsgActivationReadinessCertificate::opcode;
+    acknowledgement.recipient_replica_id = 2;
+    acknowledgement.identity = identity;
+    acknowledgement.certificate_digest = certificate.certificate_digest;
+    acknowledgement.payload_digest = certificate_payload_digest;
+    const auto acknowledgement_bytes =
+        hotstuff::encode_activation_readiness_ack(
+            acknowledgement, {64 * 1024, 7});
+
+    auto manager_config = event_config();
+    manager_config.source = {
+        StructuredEventSourceKind::adaptation_manager,
+        "manager-0",
+        "spawn-13"};
+    manager_config.designated_commit_observer.reset();
+    auto replica_config = event_config();
+    replica_config.designated_commit_observer.reset();
+
+    const auto emits = [](StructuredEventConfig config, Event event) {
+        FakeClock clock({1000});
+        MemoryOutput output;
+        StructuredEventSink sink(std::move(config), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{std::move(event)});
+        sink.shutdown();
+        return std::make_pair(sink.health(), output.bytes());
+    };
+
+    hotstuff::bytearray_t malformed_wire{0x13, 0x37, 0x00};
+    Event wire_rejected;
+    wire_rejected.transition = Transition::wire_rejected;
+    wire_rejected.replica_id = 2;
+    wire_rejected.wire_opcode = hotstuff::MsgActivationReadyObservation::opcode;
+    wire_rejected.wire_payload_size = malformed_wire.size();
+    wire_rejected.payload_digest =
+        hotstuff::DataStream(malformed_wire).get_hash();
+    wire_rejected.canonical_wire_payload = malformed_wire;
+    wire_rejected.disposition = "observation_decode";
+    const auto wire_result = emits(manager_config, wire_rejected);
+    REQUIRE(wire_result.first.healthy);
+    const std::string wire_json(wire_result.second.begin(),
+                                wire_result.second.end());
+    CHECK(wire_json.find("\"identity\":null") != std::string::npos);
+    CHECK(wire_json.find("\"wire_payload_size\":3") != std::string::npos);
+
+    auto wire_mutated = wire_rejected;
+    wire_mutated.identity = identity;
+    CHECK_FALSE(emits(manager_config, std::move(wire_mutated)).first.healthy);
+    wire_mutated = wire_rejected;
+    wire_mutated.wire_payload_size = 2;
+    CHECK_FALSE(emits(manager_config, std::move(wire_mutated)).first.healthy);
+    wire_mutated = wire_rejected;
+    wire_mutated.payload_digest = digest("forged-wire");
+    CHECK_FALSE(emits(manager_config, std::move(wire_mutated)).first.healthy);
+    wire_mutated = wire_rejected;
+    wire_mutated.wire_opcode = hotstuff::MsgActivationReadinessCertificate::opcode;
+    CHECK_FALSE(emits(manager_config, std::move(wire_mutated)).first.healthy);
+    auto replica_wire = wire_rejected;
+    replica_wire.wire_opcode = hotstuff::MsgActivationReadinessCertificate::opcode;
+    replica_wire.disposition = "certificate_decode";
+    REQUIRE(emits(replica_config, replica_wire).first.healthy);
+    replica_wire.disposition = "ack_decode";
+    CHECK_FALSE(emits(replica_config, std::move(replica_wire)).first.healthy);
+
+    // The old observation_rejected wire-decode shape could carry a fabricated
+    // identity.  It is no longer accepted: malformed authenticated traffic is
+    // identity-free `wire_rejected` only.
+    Event fabricated_wire_rejection;
+    fabricated_wire_rejection.transition = Transition::observation_rejected;
+    fabricated_wire_rejection.identity = identity;
+    fabricated_wire_rejection.replica_id = 2;
+    fabricated_wire_rejection.canonical_wire_payload = malformed_wire;
+    fabricated_wire_rejection.disposition = "rejected_wire_decode";
+    CHECK_FALSE(emits(manager_config,
+                      std::move(fabricated_wire_rejection)).first.healthy);
+
+    Event valid_rejection;
+    valid_rejection.transition = Transition::observation_rejected;
+    valid_rejection.identity = identity;
+    valid_rejection.replica_id = 2;
+    valid_rejection.signer_source_sequence = 7;
+    valid_rejection.signer_monotonic_raw_ns = 900;
+    valid_rejection.observation_digest = observation_digest;
+    valid_rejection.canonical_wire_payload = observation_bytes;
+    valid_rejection.disposition = "rejected_nonmember";
+    REQUIRE(emits(manager_config, valid_rejection).first.healthy);
+    valid_rejection.disposition = "quarantined";
+    REQUIRE(emits(manager_config, valid_rejection).first.healthy);
+    for (const auto *disposition : {"rejected_wire_decode",
+                                    "rejected_unauthenticated_source",
+                                    "rejected_conflict", "made_up"})
+    {
+        auto invalid_rejection = valid_rejection;
+        invalid_rejection.disposition = disposition;
+        CHECK_FALSE(emits(manager_config,
+                          std::move(invalid_rejection)).first.healthy);
+    }
+
+    Event signed_event;
+    signed_event.transition = Transition::activation_ready_signed;
+    signed_event.identity = identity;
+    signed_event.replica_id = 2;
+    signed_event.signer_source_sequence = 7;
+    signed_event.signer_monotonic_raw_ns = 900;
+    signed_event.observation_digest = observation_digest;
+    signed_event.canonical_wire_payload = observation_bytes;
+    const auto signed_result = emits(replica_config, signed_event);
+    REQUIRE(signed_result.first.healthy);
+    REQUIRE(hotstuff::parse_structured_event_prefix(signed_result.second).status ==
+            StructuredEventPrefixStatus::complete);
+
+    auto accepted_event = signed_event;
+    accepted_event.transition = Transition::observation_accepted;
+    accepted_event.disposition = "accepted";
+    REQUIRE(emits(manager_config, accepted_event).first.healthy);
+
+    auto quarantined_event = accepted_event;
+    quarantined_event.transition = Transition::source_quarantined;
+    quarantined_event.disposition = "rejected_conflict";
+    REQUIRE(emits(manager_config, quarantined_event).first.healthy);
+
+    Event assembled_event;
+    assembled_event.transition = Transition::certificate_assembled;
+    assembled_event.identity = identity;
+    assembled_event.certificate_digest = certificate.certificate_digest;
+    assembled_event.payload_digest = certificate_payload_digest;
+    assembled_event.observed_signers = {0, 1, 2, 3, 4};
+    assembled_event.required_release_count = 5;
+    assembled_event.canonical_wire_payload = certificate_bytes;
+    const auto assembled_result = emits(manager_config, assembled_event);
+    REQUIRE(assembled_result.first.healthy);
+    const std::string assembled_json(
+        assembled_result.second.begin(), assembled_result.second.end());
+    CHECK(assembled_json.find("\"canonical_wire_payload_hex\":\"") !=
+          std::string::npos);
+
+    auto delivery_event = assembled_event;
+    delivery_event.transition = Transition::certificate_delivery;
+    delivery_event.replica_id = 2;
+    delivery_event.observed_signers.clear();
+    delivery_event.required_release_count = 0;
+    delivery_event.delivery_attempt = 1;
+    delivery_event.delivery_enqueued = true;
+    delivery_event.disposition = "queued";
+    REQUIRE(emits(manager_config, delivery_event).first.healthy);
+
+    auto deadline_delivery = delivery_event;
+    deadline_delivery.delivery_enqueued = false;
+    deadline_delivery.disposition = "deadline_expired";
+    REQUIRE(emits(manager_config, deadline_delivery).first.healthy);
+    deadline_delivery.delivery_enqueued = true;
+    REQUIRE(emits(manager_config, deadline_delivery).first.healthy);
+
+    Event ack_event;
+    ack_event.transition = Transition::certificate_acknowledged;
+    ack_event.identity = identity;
+    ack_event.replica_id = 2;
+    ack_event.certificate_digest = certificate.certificate_digest;
+    ack_event.payload_digest = certificate_payload_digest;
+    ack_event.canonical_wire_payload = acknowledgement_bytes;
+    ack_event.disposition = "acknowledged";
+    REQUIRE(emits(manager_config, ack_event).first.healthy);
+
+    Event e2_event;
+    e2_event.transition = Transition::e2_eligibility;
+    e2_event.identity = identity;
+    e2_event.observed_signers = {0, 1, 2, 3, 4};
+    e2_event.required_release_count = 5;
+    e2_event.disposition = "eligible";
+    e2_event.e2_cycle_ordinal = 1;
+    e2_event.e1_bundle_digest = digest("cert13-e1-bundle");
+    e2_event.e2_final_ack_raw_ns = 100;
+    e2_event.e2_common_commit = ProposalKey{
+        identity.successor_configuration, digest("cert13-e1-common")};
+    e2_event.e2_common_commit_sources = {0, 1, 2, 3, 4};
+    e2_event.e2_common_commit_raw_ns = 1'000'000'100ULL;
+    e2_event.e2_earliest_raw_ns = 65'000'000'100ULL;
+    e2_event.e2_actual_begin_raw_ns = 65'000'000'100ULL;
+    e2_event.e2_hard_deadline_raw_ns = 155'000'000'101ULL;
+    e2_event.e2_reserve_raw_ns = 90'000'000'000ULL;
+    REQUIRE(emits(manager_config, e2_event).first.healthy);
+    auto e2_mutated = e2_event;
+    e2_mutated.e2_common_commit_raw_ns = 5'000'000'100ULL;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.e2_actual_begin_raw_ns = 65'000'000'099ULL;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.e2_hard_deadline_raw_ns = 155'000'000'100ULL;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.terminal_cycle_ordinal = 0;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.terminal_reason = 1;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.terminal_identity = identity;
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+    e2_mutated = e2_event;
+    e2_mutated.terminal_bundle_digest = digest("forged-terminal");
+    CHECK_FALSE(emits(manager_config, std::move(e2_mutated)).first.healthy);
+
+    Event terminal_event;
+    terminal_event.transition = Transition::terminal;
+    terminal_event.identity = identity;
+    terminal_event.certificate_digest = certificate.certificate_digest;
+    terminal_event.observed_signers = {0, 1, 2, 3, 4};
+    terminal_event.required_release_count = 5;
+    terminal_event.disposition = "complete";
+    REQUIRE(emits(manager_config, terminal_event).first.healthy);
+
+    auto mutated = assembled_event;
+    mutated.observed_signers = {0, 1, 2, 3, 6};
+    const auto rejected = emits(manager_config, mutated);
+    CHECK_FALSE(rejected.first.healthy);
+    CHECK(rejected.first.first_failure ==
+          StructuredEventFailure::invalid_payload);
+
+    CHECK_FALSE(emits(manager_config, signed_event).first.healthy);
+}
+
+TEST_CASE("CERT13 command terminal is exact and mutation-sensitive",
+          "[adaptive-v3][structured-event][terminal][command]")
+{
+    auto command = epoch_command_event();
+    command.payload_digest = hotstuff::epoch_change_payload_digest(
+        hotstuff::EpochChangePayload{
+            command.successor_epoch_number,
+            command.predecessor_epoch_digest,
+            command.successor_epoch_digest,
+            command.activation_delay_blocks});
+    hotstuff::AdaptiveV3CommandTerminalStructuredEvent event{
+        command,
+        hotstuff::AdaptiveV3CommandTerminalReason::
+            committed_definition_recovery_failed};
+    const auto emit = [](auto candidate) {
+        FakeClock clock({1000});
+        MemoryOutput output;
+        StructuredEventSink sink(event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{std::move(candidate)});
+        sink.shutdown();
+        return std::make_pair(sink.health(), output.bytes());
+    };
+    const auto accepted = emit(event);
+    REQUIRE(accepted.first.healthy);
+    const std::string json(accepted.second.begin(), accepted.second.end());
+    CHECK(json.find(
+              "\"event_type\":\"adaptive_v3.command_terminal\"") !=
+          std::string::npos);
+    CHECK(json.find(
+              "\"disposition\":\"committed_definition_recovery_failed\"") !=
+          std::string::npos);
+
+    auto mutated = event;
+    mutated.command.payload_digest = digest("wrong-command-payload");
+    CHECK_FALSE(emit(std::move(mutated)).first.healthy);
+    mutated = event;
+    mutated.command.command_block_hash = {};
+    CHECK_FALSE(emit(std::move(mutated)).first.healthy);
+}
+
+TEST_CASE("CERT13 epoch activation evidence adds heights only for v3",
+          "[adaptive-v3][structured-event][archive]")
+{
+    auto config = event_config();
+    EpochLifecycleEvent v3{
+        EpochLifecycleTransition::activated,
+        configuration(13, 0, "cert13-active"),
+        202};
+    v3.certificate_apply_committed_height = 205;
+    v3.activation_readiness_certificate_digest = digest("cert13-certificate");
+
+    FakeClock clock({1000});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+    sink.emit(StructuredEventPayload{v3});
+    sink.shutdown();
+    REQUIRE(sink.health().healthy);
+    const auto value = rendered(output);
+    CHECK(value.find("\"activation_height\":202") != std::string::npos);
+    CHECK(value.find("\"certificate_apply_committed_height\":205") !=
+          std::string::npos);
+
+    auto partial = v3;
+    partial.activation_readiness_certificate_digest.reset();
+    FakeClock bad_clock({1001});
+    MemoryOutput bad_output;
+    StructuredEventSink bad_sink(config, bad_clock, bad_output);
+    bad_sink.emit(StructuredEventPayload{partial});
+    CHECK_FALSE(bad_sink.health().healthy);
 }

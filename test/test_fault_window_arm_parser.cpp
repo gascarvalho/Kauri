@@ -4,6 +4,9 @@
 #include "../examples/adaptation_manager.cpp"
 
 #include <string>
+#include <iterator>
+#include <memory>
+#include <vector>
 
 #include "catch.hpp"
 
@@ -23,6 +26,101 @@ constexpr char kDigestE[] =
 
 std::string replace_once(std::string value, const std::string &from,
                          const std::string &to);
+
+template <typename Result, typename Operation>
+Result with_arguments(
+    std::vector<std::string> arguments,
+    Operation operation)
+{
+    std::vector<char *> raw;
+    raw.reserve(arguments.size());
+    for (auto &argument : arguments)
+        raw.push_back(argument.data());
+    return operation(static_cast<int>(raw.size()), raw.data());
+}
+
+AdaptiveV3ManagerOptions parse_adaptive_v3_test_options(
+    std::vector<std::string> arguments)
+{
+    optind = 1;
+#if defined(__APPLE__)
+    optreset = 1;
+#endif
+    return with_arguments<AdaptiveV3ManagerOptions>(
+        std::move(arguments),
+        [](int argc, char **argv) {
+            return parse_adaptive_v3_options(argc, argv);
+        });
+}
+
+struct AdaptiveV3CliFixture
+{
+    std::vector<std::unique_ptr<hotstuff::PrivKeyBLS>> readiness_keys;
+    std::vector<std::pair<ReplicaID, hotstuff::PubKeyBLS>> members;
+    std::vector<std::string> replica_certificates;
+    std::string manager_private_key;
+    std::string manager_certificate;
+
+    AdaptiveV3CliFixture()
+    {
+        auto tls_key = salticidae::PKey::create_privkey_rsa(1024);
+        manager_private_key = salticidae::get_hex(tls_key.get_privkey_der());
+        manager_certificate = salticidae::get_hex(
+            salticidae::X509::create_self_signed_from_pubkey(
+                tls_key, "PT", "adaptive-v3-manager").get_der());
+        for (ReplicaID id = 0; id < 7; ++id)
+        {
+            auto readiness_key = std::make_unique<hotstuff::PrivKeyBLS>();
+            readiness_key->from_rand();
+            members.emplace_back(id, hotstuff::PubKeyBLS(*readiness_key));
+            readiness_keys.emplace_back(std::move(readiness_key));
+            const auto common_name =
+                std::string{"adaptive-v3-replica-"} + std::to_string(id);
+            replica_certificates.push_back(salticidae::get_hex(
+                salticidae::X509::create_self_signed_from_pubkey(
+                    tls_key, "PT", common_name.c_str()).get_der()));
+        }
+    }
+
+    std::string member(ReplicaID id) const
+    {
+        return std::to_string(id) + "," +
+            salticidae::get_hex(members.at(id).second.to_bytes());
+    }
+
+    std::vector<std::string> arguments() const
+    {
+        std::vector<std::string> result{
+            "adaptation-manager",
+            "--protocol-mode", "adaptive_v3",
+            "--listen", "127.0.0.1:19000"};
+        for (ReplicaID id = 0; id < 7; ++id)
+        {
+            result.insert(result.end(), {
+                "--replica",
+                std::to_string(id) + ",127.0.0.1:" +
+                    std::to_string(19001 + id) + "," +
+                    replica_certificates.at(id),
+                "--activation-readiness-member", member(id)});
+        }
+        result.insert(result.end(), {
+            "--activation-readiness-release-count", "5",
+            "--activation-readiness-maximum-delivery-attempts", "2",
+            "--activation-readiness-retry-interval-ticks", "10",
+            "--tls-privkey", manager_private_key,
+            "--tls-cert", manager_certificate,
+            "--issuer-id", "17",
+            "--issuer-private-key",
+            "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57",
+            "--transition-request",
+            R"({"policy_intent":"fault_containment","evidence_window_rule":"fresh_exact_predecessor_after_common_commit","transition_artifact_id":"facade-fixture","bundle_path":"transitions/facade-fixture/successor.bundle","evidence_snapshot_path":"transitions/facade-fixture/evidence-snapshot.json","predecessor_epoch_number":0,"successor_epoch_number":1,"minimum_predecessor_residency_ms":0,"policy_parameters":{"containment_baseline_roots":[{"tree_id":0,"replica_id":0},{"tree_id":1,"replica_id":1},{"tree_id":2,"replica_id":2},{"tree_id":3,"replica_id":3},{"tree_id":4,"replica_id":4}]}})",
+            "--bundle-output", "/tmp/transitions/facade-fixture/successor.bundle",
+            "--structured-event-run-id", "cert13-m1",
+            "--structured-event-source-instance", "manager-1",
+            "--structured-event-output", "/tmp/cert13-m1-unused.ndjson"});
+        return result;
+    }
+};
 
 FaultWindowArmBindings bindings()
 {
@@ -413,4 +511,123 @@ TEST_CASE(
             "[20,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,"
             "19,21,22,23,24,25,26,27,28,29,30]"),
         n31_v4_bindings());
+}
+
+TEST_CASE(
+    "adaptive-v3 manager CLI accepts only its canonical membership schema",
+    "[cert13][m1][adaptive-v3][manager][cli][parser]")
+{
+    AdaptiveV3CliFixture fixture;
+    const auto options = parse_adaptive_v3_test_options(
+        fixture.arguments());
+    REQUIRE(options.replicas.size() == 7);
+    REQUIRE(options.readiness_membership.size() == 7);
+    CHECK(options.required_release_count == 5);
+    CHECK(options.maximum_delivery_attempts == 2);
+    CHECK(options.retry_interval_ticks == 10);
+    CHECK_NOTHROW(network_config(options));
+
+    auto precomputed_identity = fixture.arguments();
+    precomputed_identity.insert(
+        precomputed_identity.end(),
+        {"--activation-readiness-identity", "00"});
+    CHECK_THROWS(parse_adaptive_v3_test_options(precomputed_identity));
+
+    CHECK(with_arguments<bool>(
+        {"adaptation-manager", "--protocol-mode", "adaptive_v3"},
+        [](int argc, char **argv) {
+            return adaptive_v3_requested(argc, argv);
+        }));
+    CHECK_FALSE(with_arguments<bool>(
+        {"adaptation-manager", "--help"},
+        [](int argc, char **argv) {
+            return adaptive_v3_requested(argc, argv);
+        }));
+    CHECK_THROWS_AS(with_arguments<bool>(
+        {"adaptation-manager", "--protocol-mode", "adaptive_v2"},
+        [](int argc, char **argv) {
+            return adaptive_v3_requested(argc, argv);
+        }), std::invalid_argument);
+
+    // The common parser remains v3-only when --protocol-mode is present;
+    // its v2 route must not acquire the v3 readiness policy by accident.
+    CHECK_THROWS_AS(
+        parse_adaptive_v3_test_options(
+            {"adaptation-manager", "--protocol-mode", "adaptive_v2"}),
+        std::invalid_argument);
+    CHECK_THROWS_AS(with_arguments<bool>(
+        {"adaptation-manager", "--protocol-mode=adaptive_v3",
+         "--protocol-mode", "adaptive_v3"},
+        [](int argc, char **argv) {
+            return adaptive_v3_requested(argc, argv);
+        }), std::invalid_argument);
+
+    CHECK_THROWS_AS(
+        parse_adaptive_v3_readiness_member(
+            std::string{"00,"} + fixture.member(0).substr(2)),
+        std::invalid_argument);
+    auto uppercase = fixture.member(0);
+    const auto letter = uppercase.find_first_of("abcdef");
+    REQUIRE(letter != std::string::npos);
+    uppercase[letter] = static_cast<char>(
+        std::toupper(static_cast<unsigned char>(uppercase[letter])));
+    CHECK_THROWS_AS(
+        parse_adaptive_v3_readiness_member(uppercase),
+        std::invalid_argument);
+
+    auto mixed = fixture.arguments();
+    mixed.insert(mixed.end(), {"--required-nonresponsive", "2"});
+    const auto common_v3 = parse_adaptive_v3_test_options(mixed);
+    CHECK(common_v3.manager.required_nonresponsive == 2);
+
+    auto noncanonical_release = fixture.arguments();
+    const auto release_option = std::find(
+        noncanonical_release.begin(), noncanonical_release.end(),
+        "--activation-readiness-release-count");
+    REQUIRE(release_option != noncanonical_release.end());
+    REQUIRE(std::next(release_option) != noncanonical_release.end());
+    *std::next(release_option) = "05";
+    CHECK_THROWS_AS(
+        parse_adaptive_v3_test_options(noncanonical_release),
+        std::invalid_argument);
+
+}
+
+TEST_CASE(
+    "adaptive-v3 manager rejects duplicate BLS public identities",
+    "[.][intentional-red][cert13][adaptive-v3][manager][cli][parser]")
+{
+    AdaptiveV3CliFixture fixture;
+    auto duplicate_key = fixture.arguments();
+    std::size_t member_ordinal = 0;
+    for (std::size_t index = 0; index + 1 < duplicate_key.size(); ++index)
+    {
+        if (duplicate_key[index] != "--activation-readiness-member")
+            continue;
+        if (member_ordinal == 6)
+            duplicate_key[index + 1] =
+                std::string{"6,"} + fixture.member(5).substr(2);
+        ++member_ordinal;
+    }
+    REQUIRE(member_ordinal == 7);
+    CHECK_THROWS_AS(parse_adaptive_v3_test_options(duplicate_key),
+                    std::invalid_argument);
+}
+
+TEST_CASE(
+    "adaptive-v3 TLS certificate identity maps to one signed member source",
+    "[cert13][m1][adaptive-v3][manager][transport][tls]")
+{
+    AdaptiveV3CliFixture fixture;
+    const auto options = parse_adaptive_v3_test_options(
+        fixture.arguments());
+    std::unordered_map<PeerId, ReplicaID> peer_to_replica;
+    for (const auto &replica : options.replicas)
+        peer_to_replica.emplace(replica.peer_id, replica.replica_id);
+
+    CHECK(lookup_adaptive_v3_tls_source(
+              peer_to_replica, options.replicas[3].peer_id) ==
+          std::optional<ReplicaID>{3});
+    CHECK_FALSE(lookup_adaptive_v3_tls_source(
+        peer_to_replica, options.local_peer_id).has_value());
 }

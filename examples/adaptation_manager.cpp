@@ -27,6 +27,7 @@
 #include <cstring>
 #include <exception>
 #include <fcntl.h>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -35,6 +36,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <time.h>
 #include <unistd.h>
 #include <unordered_map>
 #include <utility>
@@ -47,11 +49,14 @@
 
 #include "hotstuff/adaptation_manager.h"
 #include "hotstuff/adaptation_manager_profile.h"
+#include "hotstuff/adaptive_manager_session_facade.h"
 #include "hotstuff/crypto.h"
 #include "hotstuff/adaptive_v2_convergence_ack_wire.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/adaptive_v2_selection.h"
+#include "hotstuff/adaptive_v3_manager_activation.h"
+#include "hotstuff/adaptive_v3_manager_session.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
 
@@ -85,6 +90,9 @@ using hotstuff::MsgAdaptiveV2ConvergenceObservationAck;
 using hotstuff::MsgAdaptiveV2ReadinessNotice;
 using hotstuff::MsgEvidenceReport;
 using hotstuff::MsgProposalLifecycleNotice;
+using hotstuff::MsgActivationReadyObservation;
+using hotstuff::MsgActivationReadinessCertificate;
+using hotstuff::MsgActivationReadinessAck;
 using hotstuff::PrivKeySecp256k1;
 using hotstuff::ReplicaID;
 using hotstuff::TreePlacementInput;
@@ -107,6 +115,8 @@ constexpr std::uint32_t kConvergenceMaximumAttempts = 5;
 constexpr std::uint64_t kConvergenceTicksPerSecond = 10;
 constexpr std::uint64_t kConvergenceDefaultDeadlineTicks = 120;
 constexpr double kConvergenceTimerSeconds = 0.1;
+// AdaptiveV3ManagerSession uses half-open monotonic millisecond deadlines.
+constexpr double kAdaptiveV3TickSeconds = 0.001;
 // Bound isolated-ingress latency while batching a burst at one fixed deadline.
 constexpr double kEvaluationCoalescingSeconds = 0.05;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
@@ -193,6 +203,27 @@ struct FaultWindowArmDocument
     hotstuff::FaultWindowArmedStructuredEvent event;
 };
 
+enum class FaultWindowArmReadStatus : std::uint8_t
+{
+    consumed,
+    missing,
+    invalid,
+    io_failure,
+};
+
+struct FaultWindowArmReadResult
+{
+    FaultWindowArmReadStatus status{FaultWindowArmReadStatus::invalid};
+    std::optional<FaultWindowArmDocument> document;
+    struct stat metadata {};
+};
+
+// This is the sole file-to-arm boundary for both manager modes.  It keeps the
+// arm file's no-follow, regular-file, bounded-read, and EOF-stability checks
+// independent from either mode's state transition or audit ownership.
+FaultWindowArmReadResult read_fault_window_arm(
+    const FaultWindowArmBindings &bindings) noexcept;
+
 struct ManagerOptions
 {
     NetAddr listen_address;
@@ -237,6 +268,31 @@ struct ManagerOptions
         experiment_drop_bundle_attempt;
     std::optional<std::uint32_t>
         experiment_drop_activation_ack;
+};
+
+struct AdaptiveV3ManagerOptions
+{
+    // The v3 process has the same authoritative transition input as v2.  The
+    // readiness material below is deliberately public operational policy; it
+    // is not a substitute for a committed transition identity.
+    ManagerOptions manager;
+    NetAddr listen_address;
+    bytearray_t tls_private_key_der;
+    bytearray_t tls_certificate_der;
+    PeerId local_peer_id;
+    std::vector<ReplicaEndpoint> replicas;
+    // The one-shot manager below still compiles while the session-owned
+    // transport path is being wired.  It is never populated from the CLI.
+    hotstuff::ActivationReadyIdentityV1 expected_identity;
+    std::vector<std::pair<ReplicaID, hotstuff::PubKeyBLS>>
+        readiness_membership;
+    std::size_t required_release_count{0};
+    std::uint32_t maximum_delivery_attempts{5};
+    std::uint64_t retry_interval_ticks{1};
+    hotstuff::ActivationReadinessWireLimits wire_limits;
+    std::string structured_event_run_id;
+    std::string structured_event_source_instance;
+    std::string structured_event_output;
 };
 
 template <typename Value>
@@ -545,6 +601,88 @@ private:
     const FaultWindowArmBindings &bindings_;
     std::size_t position_{0};
 };
+
+FaultWindowArmReadResult read_fault_window_arm(
+    const FaultWindowArmBindings &bindings) noexcept
+{
+    FaultWindowArmReadResult result;
+    int descriptor = ::open(bindings.path.c_str(),
+                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0)
+    {
+        result.status = errno == ENOENT ? FaultWindowArmReadStatus::missing :
+            FaultWindowArmReadStatus::io_failure;
+        return result;
+    }
+    auto close_descriptor = [&] {
+        if (descriptor < 0)
+            return true;
+        const auto closed = ::close(descriptor) == 0;
+        descriptor = -1;
+        return closed;
+    };
+    try
+    {
+        if (::fstat(descriptor, &result.metadata) != 0)
+        {
+            result.status = FaultWindowArmReadStatus::io_failure;
+            close_descriptor();
+            return result;
+        }
+        if (!S_ISREG(result.metadata.st_mode) || result.metadata.st_size <= 0 ||
+            static_cast<std::uint64_t>(result.metadata.st_size) >
+                kMaximumFaultWindowArmBytes)
+        {
+            result.status = FaultWindowArmReadStatus::invalid;
+            close_descriptor();
+            return result;
+        }
+        std::string bytes(static_cast<std::size_t>(result.metadata.st_size), '\0');
+        std::size_t offset = 0;
+        while (offset < bytes.size())
+        {
+            const auto read = ::read(descriptor, bytes.data() + offset,
+                                     bytes.size() - offset);
+            if (read < 0 && errno == EINTR)
+                continue;
+            if (read <= 0)
+            {
+                result.status = FaultWindowArmReadStatus::io_failure;
+                close_descriptor();
+                return result;
+            }
+            offset += static_cast<std::size_t>(read);
+        }
+        char trailing = 0;
+        for (;;)
+        {
+            const auto read = ::read(descriptor, &trailing, 1);
+            if (read < 0 && errno == EINTR)
+                continue;
+            if (read != 0)
+            {
+                result.status = FaultWindowArmReadStatus::io_failure;
+                close_descriptor();
+                return result;
+            }
+            break;
+        }
+        if (!close_descriptor())
+        {
+            result.status = FaultWindowArmReadStatus::io_failure;
+            return result;
+        }
+        result.document = FaultWindowArmJsonParser(bytes, bindings).parse();
+        result.status = FaultWindowArmReadStatus::consumed;
+    }
+    catch (...)
+    {
+        close_descriptor();
+        result.document.reset();
+        result.status = FaultWindowArmReadStatus::invalid;
+    }
+    return result;
+}
 
 class TransitionJsonParser final
 {
@@ -1174,6 +1312,358 @@ ReplicaEndpoint parse_replica_endpoint(const std::string &raw)
         PeerId(certificate)};
 }
 
+std::pair<ReplicaID, hotstuff::PubKeyBLS>
+parse_adaptive_v3_readiness_member(const std::string &raw)
+{
+    const auto comma = raw.find(',');
+    if (comma == std::string::npos ||
+        raw.find(',', comma + 1) != std::string::npos)
+    {
+        throw std::invalid_argument(
+            "activation-readiness member must use id,bls-public-key-hex");
+    }
+    const auto id_text = raw.substr(0, comma);
+    if (id_text.empty() ||
+        (id_text.size() > 1 && id_text.front() == '0') ||
+        !std::all_of(
+            id_text.begin(), id_text.end(),
+            [](unsigned char value) {
+                return value >= '0' && value <= '9';
+            }))
+    {
+        throw std::invalid_argument(
+            "activation-readiness member id is not canonical");
+    }
+    const auto id = parse_unsigned<ReplicaID>(
+        id_text, "activation-readiness member id", false);
+    const auto public_key_hex = raw.substr(comma + 1);
+    if (!std::all_of(
+            public_key_hex.begin(), public_key_hex.end(),
+            [](unsigned char value) {
+                return (value >= '0' && value <= '9') ||
+                    (value >= 'a' && value <= 'f');
+            }))
+    {
+        throw std::invalid_argument(
+            "activation-readiness member public key must use lowercase hexadecimal");
+    }
+    const auto key_bytes = parse_hex(
+        public_key_hex,
+        "activation-readiness member public key",
+        bls::G1Element::SIZE * 2);
+    return {id, hotstuff::PubKeyBLS(key_bytes)};
+}
+
+template <typename Value>
+Value parse_adaptive_v3_positive_unsigned(
+    const std::string &text,
+    const char *field)
+{
+    if (text.empty() || text.front() == '0' ||
+        !std::all_of(
+            text.begin(), text.end(),
+            [](unsigned char value) {
+                return value >= '0' && value <= '9';
+            }))
+    {
+        throw std::invalid_argument(
+            std::string(field) +
+            " must be a canonical positive unsigned decimal");
+    }
+    return parse_unsigned<Value>(text, field, true);
+}
+
+std::optional<ReplicaID> lookup_adaptive_v3_tls_source(
+    const std::unordered_map<PeerId, ReplicaID> &peer_to_replica,
+    const PeerId &peer) noexcept
+{
+    try
+    {
+        const auto found = peer_to_replica.find(peer);
+        return found == peer_to_replica.end()
+                   ? std::nullopt
+                   : std::optional<ReplicaID>{found->second};
+    }
+    catch (...)
+    {
+        return std::nullopt;
+    }
+}
+
+bool adaptive_v3_requested(int argc, char **argv)
+{
+    bool found = false;
+    for (int index = 1; index < argc; ++index)
+    {
+        const std::string argument{argv[index]};
+        if (argument == "--protocol-mode")
+        {
+            if (found || index + 1 >= argc ||
+                std::string{argv[++index]} != "adaptive_v3")
+            {
+                throw std::invalid_argument(
+                    "protocol-mode must be exactly adaptive_v3 when supplied");
+            }
+            found = true;
+        }
+        else if (argument.rfind("--protocol-mode=", 0) == 0)
+        {
+            if (found || argument != "--protocol-mode=adaptive_v3")
+            {
+                throw std::invalid_argument(
+                    "protocol-mode must be exactly adaptive_v3 when supplied");
+            }
+            found = true;
+        }
+    }
+    return found;
+}
+
+// The legacy parser remains the single authority for issuer, transition,
+// selection, topology, evidence, fault-window, residency, TLS, and event
+// arguments.  v3 only adds its public BLS/readiness policy.
+ManagerOptions parse_options(int argc, char **argv);
+
+AdaptiveV3ManagerOptions parse_adaptive_v3_options(int argc, char **argv)
+{
+    AdaptiveV3ManagerOptions unified;
+    unified.manager = parse_options(argc, argv);
+
+    const auto values = [argc, argv](const char *name) {
+        std::vector<std::string> result;
+        const std::string bare = std::string{"--"} + name;
+        const std::string equals = bare + "=";
+        for (int index = 1; index < argc; ++index)
+        {
+            const std::string argument{argv[index]};
+            if (argument == bare)
+            {
+                if (++index >= argc)
+                    throw std::invalid_argument(
+                        std::string(name) + " requires a value");
+                result.emplace_back(argv[index]);
+            }
+            else if (argument.rfind(equals, 0) == 0)
+                result.emplace_back(argument.substr(equals.size()));
+        }
+        return result;
+    };
+    if (!values("activation-readiness-" "identity").empty())
+        throw std::invalid_argument(
+            "activation-readiness identity is derived from the committed v3 bundle");
+    const auto protocol = values("protocol-mode");
+    if (protocol.size() != 1 || protocol.front() != "adaptive_v3")
+        throw std::invalid_argument("adaptive-v3 protocol mode is required");
+
+    unified.listen_address = unified.manager.listen_address;
+    unified.tls_private_key_der = unified.manager.tls_private_key_der;
+    unified.tls_certificate_der = unified.manager.tls_certificate_der;
+    unified.local_peer_id = unified.manager.local_peer_id;
+    unified.replicas = unified.manager.replicas;
+    for (const auto &raw : values("activation-readiness-member"))
+        unified.readiness_membership.push_back(
+            parse_adaptive_v3_readiness_member(raw));
+    if (unified.replicas.size() < 4 ||
+        (unified.replicas.size() - 1) % 3 != 0 ||
+        unified.replicas.size() != unified.readiness_membership.size())
+        throw std::invalid_argument(
+            "adaptive-v3 replica and readiness manifests must define one N=3f+1 membership");
+    for (std::size_t index = 0; index < unified.replicas.size(); ++index)
+        if (unified.replicas[index].replica_id != index ||
+            unified.readiness_membership[index].first != index)
+            throw std::invalid_argument(
+                "adaptive-v3 manifests must be canonical and contiguous");
+    std::set<std::string> readiness_public_keys;
+    for (const auto &member : unified.readiness_membership)
+        if (!readiness_public_keys.insert(salticidae::get_hex(
+                member.second.to_bytes())).second)
+            throw std::invalid_argument(
+                "adaptive-v3 readiness membership public keys must be unique");
+    unified.wire_limits = {64 * 1024, unified.replicas.size()};
+    const auto release = values("activation-readiness-release-count");
+    const auto attempts = values("activation-readiness-maximum-delivery-attempts");
+    const auto retry = values("activation-readiness-retry-interval-ticks");
+    if (release.size() != 1 || attempts.size() != 1 || retry.size() != 1)
+        throw std::invalid_argument("adaptive-v3 readiness policy is required exactly once");
+    unified.required_release_count =
+        parse_adaptive_v3_positive_unsigned<std::size_t>(release.front(), "activation-readiness release count");
+    const auto quorum = 2 * ((unified.replicas.size() - 1) / 3) + 1;
+    if (unified.required_release_count < quorum ||
+        unified.required_release_count > unified.replicas.size())
+        throw std::invalid_argument(
+            "activation-readiness release count is outside [Q,N]");
+    unified.maximum_delivery_attempts =
+        parse_adaptive_v3_positive_unsigned<std::uint32_t>(attempts.front(), "activation-readiness maximum delivery attempts");
+    unified.retry_interval_ticks =
+        parse_adaptive_v3_positive_unsigned<std::uint64_t>(retry.front(), "activation-readiness retry interval ticks");
+    unified.structured_event_run_id = unified.manager.structured_event_run_id;
+    unified.structured_event_source_instance = unified.manager.structured_event_source_instance;
+    unified.structured_event_output = unified.manager.structured_event_output;
+    return unified;
+
+    // Kept below temporarily as a compile-visible record of the old parser;
+    // the return above is the only executable v3 parser path.
+    Config config("hotstuff.gen.conf");
+    auto opt_help = Config::OptValFlag::create(false);
+    auto opt_protocol_mode = Config::OptValStr::create();
+    auto opt_listen = Config::OptValStr::create();
+    auto opt_replicas = Config::OptValStrVec::create();
+    auto opt_members = Config::OptValStrVec::create();
+    auto opt_identity = Config::OptValStr::create();
+    auto opt_release_count = Config::OptValStr::create();
+    auto opt_maximum_attempts = Config::OptValStr::create("5");
+    auto opt_retry_ticks = Config::OptValStr::create("1");
+    auto opt_tls_private_key = Config::OptValStr::create();
+    auto opt_tls_certificate = Config::OptValStr::create();
+    auto opt_run_id = Config::OptValStr::create();
+    auto opt_source_instance = Config::OptValStr::create();
+    auto opt_output = Config::OptValStr::create();
+
+    config.add_opt("help", opt_help, Config::SWITCH_ON, 'h');
+    config.add_opt("protocol-mode", opt_protocol_mode, Config::SET_VAL);
+    config.add_opt("listen", opt_listen, Config::SET_VAL);
+    config.add_opt("replica", opt_replicas, Config::APPEND);
+    config.add_opt(
+        "activation-readiness-member", opt_members, Config::APPEND);
+    config.add_opt(
+        "activation-readiness-" "identity", opt_identity, Config::SET_VAL);
+    config.add_opt(
+        "activation-readiness-release-count",
+        opt_release_count,
+        Config::SET_VAL);
+    config.add_opt(
+        "activation-readiness-maximum-delivery-attempts",
+        opt_maximum_attempts,
+        Config::SET_VAL);
+    config.add_opt(
+        "activation-readiness-retry-interval-ticks",
+        opt_retry_ticks,
+        Config::SET_VAL);
+    config.add_opt("tls-privkey", opt_tls_private_key, Config::SET_VAL);
+    config.add_opt("tls-cert", opt_tls_certificate, Config::SET_VAL);
+    config.add_opt("structured-event-run-id", opt_run_id, Config::SET_VAL);
+    config.add_opt(
+        "structured-event-source-instance",
+        opt_source_instance,
+        Config::SET_VAL);
+    config.add_opt("structured-event-output", opt_output, Config::SET_VAL);
+    config.parse(argc, argv);
+    if (opt_help->get())
+    {
+        config.print_help();
+        std::exit(0);
+    }
+    if (opt_protocol_mode->get() != "adaptive_v3")
+        throw std::invalid_argument("adaptive-v3 protocol mode is required");
+
+    AdaptiveV3ManagerOptions options;
+    options.listen_address = NetAddr(opt_listen->get());
+    if (options.listen_address.is_null())
+        throw std::invalid_argument("listen address is invalid");
+    options.tls_private_key_der = parse_hex(
+        opt_tls_private_key->get(), "manager TLS private key");
+    options.tls_certificate_der = parse_hex(
+        opt_tls_certificate->get(), "manager TLS certificate");
+    options.local_peer_id = PeerId(salticidae::X509::create_from_der(
+        options.tls_certificate_der));
+
+    for (const auto &raw : opt_replicas->get())
+        options.replicas.push_back(parse_replica_endpoint(raw));
+    for (const auto &raw : opt_members->get())
+        options.readiness_membership.push_back(
+            parse_adaptive_v3_readiness_member(raw));
+    if (options.replicas.size() < 4 ||
+        (options.replicas.size() - 1) % 3 != 0 ||
+        options.replicas.size() != options.readiness_membership.size())
+    {
+        throw std::invalid_argument(
+            "adaptive-v3 replica and readiness manifests must define one N=3f+1 membership");
+    }
+
+    std::set<PeerId> peer_ids;
+    std::set<std::string> addresses;
+    std::set<std::string> legacy_readiness_public_keys;
+    for (std::size_t index = 0; index < options.replicas.size(); ++index)
+    {
+        const auto id = static_cast<ReplicaID>(index);
+        if (index > std::numeric_limits<ReplicaID>::max() ||
+            options.replicas[index].replica_id != id ||
+            options.readiness_membership[index].first != id ||
+            !peer_ids.insert(options.replicas[index].peer_id).second ||
+            !addresses.insert(
+                 std::string(options.replicas[index].address)).second ||
+            !legacy_readiness_public_keys.insert(salticidae::get_hex(
+                 options.readiness_membership[index].second.to_bytes())).second ||
+            options.replicas[index].peer_id == options.local_peer_id)
+        {
+            throw std::invalid_argument(
+                "adaptive-v3 manifests must be canonical, contiguous, and unique");
+        }
+    }
+
+    options.wire_limits.maximum_members = options.replicas.size();
+    options.wire_limits.maximum_payload_bytes = 64 * 1024;
+    const auto identity_hex = opt_identity->get();
+    if (!std::all_of(
+            identity_hex.begin(), identity_hex.end(),
+            [](unsigned char value) {
+                return (value >= '0' && value <= '9') ||
+                    (value >= 'a' && value <= 'f');
+            }))
+    {
+        throw std::invalid_argument(
+            "activation-readiness identity must use lowercase hexadecimal");
+    }
+    const auto identity_bytes = parse_hex(
+        identity_hex, "activation-readiness identity");
+    const auto decoded_identity =
+        hotstuff::decode_activation_ready_identity_v1(
+            identity_bytes, options.wire_limits);
+    if (!decoded_identity)
+        throw std::invalid_argument(
+            "activation-readiness identity is not canonical");
+    options.expected_identity = std::move(*decoded_identity.value);
+    if (options.expected_identity.membership_digest !=
+        hotstuff::canonical_activation_readiness_membership_digest(
+            options.readiness_membership))
+    {
+        throw std::invalid_argument(
+            "activation-readiness public manifest does not match identity");
+    }
+
+    options.required_release_count =
+        parse_adaptive_v3_positive_unsigned<std::size_t>(
+        opt_release_count->get(),
+        "activation-readiness release count");
+    const auto legacy_v3_quorum =
+        2 * ((options.replicas.size() - 1) / 3) + 1;
+    if (options.required_release_count < legacy_v3_quorum ||
+        options.required_release_count > options.replicas.size())
+    {
+        throw std::invalid_argument(
+            "activation-readiness release count is outside [Q,N]");
+    }
+    options.maximum_delivery_attempts =
+        parse_adaptive_v3_positive_unsigned<std::uint32_t>(
+        opt_maximum_attempts->get(),
+        "activation-readiness maximum delivery attempts");
+    options.retry_interval_ticks =
+        parse_adaptive_v3_positive_unsigned<std::uint64_t>(
+        opt_retry_ticks->get(),
+        "activation-readiness retry interval ticks");
+    options.structured_event_run_id = opt_run_id->get();
+    options.structured_event_source_instance = opt_source_instance->get();
+    options.structured_event_output = opt_output->get();
+    if (options.structured_event_run_id.empty() ||
+        options.structured_event_source_instance.empty() ||
+        options.structured_event_output.empty())
+    {
+        throw std::invalid_argument(
+            "adaptive-v3 structured-event identity and output are required");
+    }
+    return options;
+}
+
 EpochDefinitionInput manager_epoch_zero(const ManagerOptions &options)
 {
     auto epoch = hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
@@ -1256,6 +1746,15 @@ AdaptiveV2ManagerSessionConfig manager_session_config(
     return config;
 }
 
+hotstuff::AdaptiveManagerSessionFacadeConfig manager_session_facade_config(
+    const ManagerOptions &options)
+{
+    hotstuff::AdaptiveManagerSessionFacadeConfig config;
+    config.mode = hotstuff::AdaptiveManagerSessionMode::adaptive_v2;
+    config.v2 = manager_session_config(options);
+    return config;
+}
+
 std::vector<AdaptiveV2TransitionPolicy> transition_policies(
     const ManagerOptions &options)
 {
@@ -1299,6 +1798,37 @@ std::string transition_bundle_output_path(
     return request.bundle_output;
 }
 
+std::string transition_bundle_output_path(
+    const TransitionRequest &request,
+    const hotstuff::AdaptiveV3EpochChangeBundle &bundle,
+    const hotstuff::AdaptiveManagerSessionFacade &facade)
+{
+    const auto &definition = bundle.definition();
+    const auto &payload = bundle.command().payload;
+    const auto &ingress = facade.ingress();
+    const auto predecessor_epoch_number =
+        ingress.current_epoch().epoch_number();
+    const auto successor_epoch_number = definition.epoch_number;
+    const auto successor_epoch_digest = payload.successor_epoch_digest;
+    if (request.bundle_output.empty() ||
+        request.predecessor_epoch_number != predecessor_epoch_number ||
+        request.successor_epoch_number != successor_epoch_number ||
+        predecessor_epoch_number ==
+            std::numeric_limits<std::uint32_t>::max() ||
+        successor_epoch_number != predecessor_epoch_number + 1 ||
+        payload.successor_epoch_number != successor_epoch_number ||
+        definition.previous_epoch_digest !=
+            ingress.current_epoch().epoch_digest() ||
+        payload.predecessor_epoch_digest !=
+            definition.previous_epoch_digest ||
+        successor_epoch_digest != hotstuff::compute_epoch_digest(definition))
+    {
+        throw std::logic_error(
+            "v3 successor bundle does not match the explicit transition request");
+    }
+    return request.bundle_output;
+}
+
 hotstuff::StructuredEventConfig manager_structured_event_config(
     const ManagerOptions &options)
 {
@@ -1308,6 +1838,18 @@ hotstuff::StructuredEventConfig manager_structured_event_config(
             hotstuff::StructuredEventSourceKind::adaptation_manager,
             "adaptive-manager",
             options.structured_event_source_instance},
+        std::nullopt,
+        hotstuff::StructuredEventLimits{}};
+}
+
+hotstuff::StructuredEventConfig manager_structured_event_config(
+    const AdaptiveV3ManagerOptions &options)
+{
+    return {
+        options.structured_event_run_id,
+        {hotstuff::StructuredEventSourceKind::adaptation_manager,
+         "adaptation-manager",
+         options.structured_event_source_instance},
         std::nullopt,
         hotstuff::StructuredEventLimits{}};
 }
@@ -1605,13 +2147,38 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create();
     auto opt_experiment_drop_activation_ack =
         Config::OptValStr::create();
+    // Accepted here so the v3 parser can reuse this authoritative parser for
+    // every transition input.  v3-specific values are validated separately
+    // in parse_adaptive_v3_options.
+    auto opt_protocol_mode = Config::OptValStr::create();
+    auto opt_activation_readiness_members = Config::OptValStrVec::create();
+    auto opt_activation_readiness_release_count = Config::OptValStr::create();
+    auto opt_activation_readiness_maximum_delivery_attempts =
+        Config::OptValStr::create();
+    auto opt_activation_readiness_retry_interval_ticks =
+        Config::OptValStr::create();
 
     config.add_opt("help", opt_help, Config::SWITCH_ON, 'h');
+    config.add_opt("protocol-mode", opt_protocol_mode, Config::SET_VAL);
+    config.add_opt("activation-readiness-member",
+                   opt_activation_readiness_members, Config::APPEND);
+    config.add_opt("activation-readiness-release-count",
+                   opt_activation_readiness_release_count, Config::SET_VAL);
+    config.add_opt("activation-readiness-maximum-delivery-attempts",
+                   opt_activation_readiness_maximum_delivery_attempts,
+                   Config::SET_VAL);
+    config.add_opt("activation-readiness-retry-interval-ticks",
+                   opt_activation_readiness_retry_interval_ticks,
+                   Config::SET_VAL);
     config.add_opt("listen", opt_listen, Config::SET_VAL);
     config.add_opt("replica", opt_replicas, Config::APPEND);
     config.add_opt("tls-privkey", opt_tls_private_key, Config::SET_VAL);
     config.add_opt("tls-cert", opt_tls_certificate, Config::SET_VAL);
     config.add_opt("issuer-id", opt_issuer_id, Config::SET_VAL);
+    // Compatibility help alias: v3 profiles use the explicit issuer-id pair.
+    auto opt_epoch_change_issuer = Config::OptValStr::create();
+    config.add_opt("epoch-change-issuer", opt_epoch_change_issuer,
+                   Config::SET_VAL);
     config.add_opt(
         "issuer-private-key", opt_issuer_private_key, Config::SET_VAL);
     config.add_opt(
@@ -1763,6 +2330,13 @@ ManagerOptions parse_options(int argc, char **argv)
     {
         config.print_help();
         std::exit(0);
+    }
+
+    if (!opt_protocol_mode->get().empty() &&
+        opt_protocol_mode->get() != "adaptive_v3")
+    {
+        throw std::invalid_argument(
+            "protocol-mode must be adaptive_v3 when supplied");
     }
 
     ManagerOptions options;
@@ -2390,10 +2964,1306 @@ ManagerNetwork::Config network_config(const ManagerOptions &options)
     return config;
 }
 
-class AdaptationManager final
+ManagerNetwork::Config network_config(
+    const AdaptiveV3ManagerOptions &options)
+{
+    ManagerNetwork::Config config;
+    config.max_msg_size(4 << 20);
+    config.nworker(1);
+    config.enable_tls(true)
+        .tls_key(new salticidae::PKey(
+            salticidae::PKey::create_privkey_from_der(
+                options.tls_private_key_der)))
+        .tls_cert(new salticidae::X509(
+            salticidae::X509::create_from_der(
+                options.tls_certificate_der)));
+    config.allow_unknown_peer(false);
+    config.id_mode(ManagerNetwork::IdentityMode::CERT_BASED);
+    return config;
+}
+
+hotstuff::AdaptiveV3ManagerSessionConfig adaptive_v3_session_config(
+    const AdaptiveV3ManagerOptions &options)
+{
+    hotstuff::AdaptiveV3ManagerSessionConfig config;
+    config.active_tree_id = kInitialTreeId;
+    config.activation_generation = kInitialActivationGeneration;
+    config.ingress_limits = options.manager.runtime_shape.ingress_limits;
+    config.controller = manager_controller_config(options.manager);
+    config.controller.successor_protocol_mode =
+        hotstuff::EpochProtocolMode::adaptive_v3;
+    config.readiness_membership = options.readiness_membership;
+    config.required_release_count = options.required_release_count;
+    config.maximum_delivery_attempts = options.maximum_delivery_attempts;
+    if (options.retry_interval_ticks >
+        std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL)
+        throw std::invalid_argument("adaptive-v3 retry interval overflows nanoseconds");
+    config.retry_interval_ticks =
+        options.retry_interval_ticks * 1'000'000ULL;
+    // The common CLI stores its historical v2 deadline in deciseconds.  V3
+    // session timing is absolute CLOCK_MONOTONIC_RAW nanoseconds.
+    if (options.manager.convergence_deadline_ticks >
+        std::numeric_limits<std::uint64_t>::max() / 100'000'000ULL)
+        throw std::invalid_argument("adaptive-v3 deadline overflows nanoseconds");
+    const auto deadline_ns =
+        options.manager.convergence_deadline_ticks * 100'000'000ULL;
+    config.pre_certificate_window_ticks = deadline_ns;
+    config.delivery_window_ticks = deadline_ns;
+    config.residency_ticks = 65'000'000'000ULL;
+    config.common_commit_window_ticks = 5'000'000'000ULL;
+    config.common_commit_stabilization_ticks = 60'000'000'000ULL;
+    config.e2_reserve_ticks = 90'000'000'000ULL;
+    const auto policies = transition_policies(options.manager);
+    if (policies.empty() || policies.size() > 2 ||
+        policies.front().intent != TreePolicyKind::fault_containment ||
+        (policies.size() == 2 &&
+         policies[1].intent != TreePolicyKind::performance_optimization))
+    {
+        throw std::invalid_argument(
+            "adaptive-v3 requires one containment cycle or containment followed by optimization");
+    }
+    config.expected_cycle_count = policies.size();
+    config.wire_limits = options.wire_limits;
+    return config;
+}
+
+hotstuff::AdaptiveManagerSessionFacadeConfig
+adaptive_v3_session_facade_config(const AdaptiveV3ManagerOptions &options)
+{
+    hotstuff::AdaptiveManagerSessionFacadeConfig config;
+    config.mode = hotstuff::AdaptiveManagerSessionMode::adaptive_v3;
+    config.v3 = adaptive_v3_session_config(options);
+    return config;
+}
+
+const char *adaptive_v3_readiness_disposition_name(
+    hotstuff::AdaptiveV3ManagerReadinessDisposition disposition) noexcept
+{
+    using D = hotstuff::AdaptiveV3ManagerReadinessDisposition;
+    switch (disposition)
+    {
+        case D::accepted: return "accepted";
+        case D::duplicate: return "duplicate";
+        case D::quarantined: return "quarantined";
+        case D::rejected_peer_binding: return "rejected_peer_binding";
+        case D::rejected_nonmember: return "rejected_nonmember";
+        case D::rejected_invalid_observation:
+            return "rejected_invalid_observation";
+        case D::rejected_wrong_identity: return "rejected_wrong_identity";
+        case D::rejected_conflict: return "rejected_conflict";
+        case D::released: return "released";
+    }
+    return "rejected_invalid_observation";
+}
+
+class AdaptiveV3ManagerTransport final
 {
 public:
-    AdaptationManager(
+    struct Callbacks {
+        std::function<void(const AuthenticatedReporter &,
+                           const MsgAdaptiveV2ReadinessNotice &)> readiness;
+        std::function<void(const AuthenticatedReporter &,
+                           const MsgProposalLifecycleNotice &)> lifecycle;
+        std::function<void(const AuthenticatedReporter &,
+                           const MsgEvidenceReport &)> evidence;
+        std::function<void(MsgActivationReadyObservation &&, ReplicaID)>
+            observation;
+        std::function<void(MsgActivationReadinessAck &&, ReplicaID)> ack;
+        std::function<void()> fatal;
+    };
+
+    AdaptiveV3ManagerTransport(
+        EventContext &event_context, const ManagerNetwork::Config &net_config,
+        std::vector<ReplicaEndpoint> replicas, NetAddr listen_address,
+        Callbacks callbacks)
+        : network_(event_context, net_config), replicas_(std::move(replicas)),
+          listen_address_(std::move(listen_address)),
+          peer_to_replica_(make_peer_mapping(replicas_)),
+          callbacks_(std::move(callbacks))
+    {
+        register_handlers();
+    }
+
+    void start()
+    {
+        network_.start();
+        started_ = true;
+        for (const auto &replica : replicas_)
+        {
+            network_.add_peer(replica.peer_id);
+            network_.set_peer_addr(replica.peer_id, replica.address);
+        }
+        network_.listen(listen_address_);
+        for (const auto &replica : replicas_)
+            network_.conn_peer(replica.peer_id);
+    }
+
+    ~AdaptiveV3ManagerTransport() { static_cast<void>(stop()); }
+
+    bool stop() noexcept
+    {
+        if (!started_ || stopped_)
+            return true;
+        stopped_ = true;
+        // Network callbacks capture this transport.  Disable their owner
+        // callbacks before tearing the network down during shutdown/destruction.
+        callbacks_ = {};
+        try { network_.stop(); }
+        catch (...) { return false; }
+        return true;
+    }
+
+    bool send_certificate(ReplicaID recipient, const bytearray_t &bytes) noexcept
+    {
+        const auto replica = std::find_if(
+            replicas_.begin(), replicas_.end(),
+            [recipient](const ReplicaEndpoint &candidate) {
+                return candidate.replica_id == recipient;
+            });
+        if (replica == replicas_.end())
+            return false;
+        try
+        {
+            const auto connection = network_.get_peer_conn(replica->peer_id);
+            if (connection == nullptr || connection->is_terminated() ||
+                authenticated_source(connection) !=
+                    std::optional<ReplicaID>{recipient})
+            {
+                return false;
+            }
+            return network_.send_msg(
+                MsgActivationReadinessCertificate(DataStream(bytes)), connection);
+        }
+        catch (...) { return false; }
+    }
+
+    bool send_bundle(const hotstuff::AdaptiveV3EpochChangeBundle &bundle) noexcept
+    {
+        try
+        {
+            for (const auto &replica : replicas_)
+            {
+                const auto connection = network_.get_peer_conn(replica.peer_id);
+                if (connection == nullptr || connection->is_terminated() ||
+                    authenticated_source(connection) !=
+                        std::optional<ReplicaID>{replica.replica_id} ||
+                    !network_.send_msg(
+                        hotstuff::MsgAdaptiveV3EpochChangeBundle(bundle), connection))
+                    return false;
+            }
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+private:
+    static std::unordered_map<PeerId, ReplicaID> make_peer_mapping(
+        const std::vector<ReplicaEndpoint> &replicas)
+    {
+        std::unordered_map<PeerId, ReplicaID> mapping;
+        for (const auto &replica : replicas)
+            mapping.emplace(replica.peer_id, replica.replica_id);
+        return mapping;
+    }
+
+    std::optional<ReplicaID> authenticated_source(
+        const ManagerNetwork::conn_t &connection) const noexcept
+    {
+        try
+        {
+            if (connection == nullptr || connection->get_peer_cert() == nullptr)
+                return std::nullopt;
+            return lookup_adaptive_v3_tls_source(
+                peer_to_replica_, PeerId(*connection->get_peer_cert()));
+        }
+        catch (...) { return std::nullopt; }
+    }
+
+    template <typename Message, typename Callback>
+    void handle_common(Message &&message, const ManagerNetwork::conn_t &connection,
+                       Callback &&callback)
+    {
+        const auto source = authenticated_source(connection);
+        if (!source.has_value() || !callback)
+            return;
+        try { callback(AuthenticatedReporter{*source}, message); }
+        catch (...) { report_fatal(); }
+    }
+
+    void report_fatal() noexcept
+    {
+        try { if (callbacks_.fatal) callbacks_.fatal(); }
+        catch (...) {}
+    }
+
+    void register_handlers()
+    {
+        network_.reg_conn_handler(
+            [this](const salticidae::ConnPool::conn_t &connection, bool connected) {
+                const auto peer_connection = salticidae::static_pointer_cast<
+                    ManagerNetwork::conn_t::type>(connection);
+                return !connected || authenticated_source(peer_connection).has_value();
+            });
+        network_.reg_handler(
+            [this](MsgAdaptiveV2ReadinessNotice &&message,
+                   const ManagerNetwork::conn_t &connection) {
+                handle_common(std::move(message), connection, callbacks_.readiness);
+            });
+        network_.reg_handler(
+            [this](MsgProposalLifecycleNotice &&message,
+                   const ManagerNetwork::conn_t &connection) {
+                handle_common(std::move(message), connection, callbacks_.lifecycle);
+            });
+        network_.reg_handler(
+            [this](MsgEvidenceReport &&message,
+                   const ManagerNetwork::conn_t &connection) {
+                handle_common(std::move(message), connection, callbacks_.evidence);
+            });
+        network_.reg_handler(
+            [this](MsgActivationReadyObservation &&message,
+                   const ManagerNetwork::conn_t &connection) {
+                const auto source = authenticated_source(connection);
+                if (source.has_value() && callbacks_.observation)
+                {
+                    try { callbacks_.observation(std::move(message), *source); }
+                    catch (...) { report_fatal(); }
+                }
+            });
+        network_.reg_handler(
+            [this](MsgActivationReadinessAck &&message,
+                   const ManagerNetwork::conn_t &connection) {
+                const auto source = authenticated_source(connection);
+                if (source.has_value() && callbacks_.ack)
+                {
+                    try { callbacks_.ack(std::move(message), *source); }
+                    catch (...) { report_fatal(); }
+                }
+            });
+        network_.reg_error_handler(
+            [this](const std::exception_ptr, bool fatal, std::int32_t) {
+                if (fatal)
+                    report_fatal();
+            });
+    }
+
+    ManagerNetwork network_;
+    const std::vector<ReplicaEndpoint> replicas_;
+    const NetAddr listen_address_;
+    const std::unordered_map<PeerId, ReplicaID> peer_to_replica_;
+    Callbacks callbacks_;
+    bool started_{false};
+    bool stopped_{false};
+};
+
+class AdaptiveV3ManagerModeState final
+{
+public:
+    AdaptiveV3ManagerModeState(
+        EventContext &event_context,
+        AdaptiveV3ManagerOptions options,
+        const ManagerNetwork::Config &net_config,
+        hotstuff::StructuredEventSink &event_sink)
+        : event_context_(event_context), options_(std::move(options)),
+          facade_(options_.manager.membership,
+                  manager_epoch_zero(options_.manager),
+                  adaptive_v3_session_facade_config(options_)),
+          transition_policies_(transition_policies(options_.manager)),
+          event_sink_(event_sink),
+          transport_(event_context_, net_config, options_.replicas,
+              options_.listen_address, AdaptiveV3ManagerTransport::Callbacks{
+                  [this](const AuthenticatedReporter &source,
+                         const MsgAdaptiveV2ReadinessNotice &value) {
+                      ingest_common(source, value,
+                          [this](const AuthenticatedReporter &reporter,
+                                 const MsgAdaptiveV2ReadinessNotice &notice) {
+                              return facade_.ingest_readiness(reporter, notice);
+                          });
+                  },
+                  [this](const AuthenticatedReporter &source,
+                         const MsgProposalLifecycleNotice &value) {
+                      ingest_common(source, value,
+                          [this](const AuthenticatedReporter &reporter,
+                                 const MsgProposalLifecycleNotice &notice) {
+                              return facade_.v3_ingest_timed_lifecycle(
+                                  reporter, notice, manager_tick_ns());
+                          });
+                  },
+                  [this](const AuthenticatedReporter &source,
+                         const MsgEvidenceReport &value) {
+                      ingest_common(source, value,
+                          [this](const AuthenticatedReporter &reporter,
+                                 const MsgEvidenceReport &report) {
+                              return facade_.ingest_evidence(reporter, report);
+                          });
+                  },
+                  [this](MsgActivationReadyObservation &&message,
+                         ReplicaID source) {
+                      handle_observation(std::move(message), source);
+                  },
+                  [this](MsgActivationReadinessAck &&message, ReplicaID source) {
+                      handle_ack(std::move(message), source);
+                  },
+                  [this] { fail();
+                  }})
+    {
+        retry_timer_ = salticidae::TimerEvent(
+            event_context_, [this](salticidae::TimerEvent &) {
+                if (logical_tick_ ==
+                    std::numeric_limits<std::uint64_t>::max())
+                {
+                    fail();
+                    return;
+                }
+                ++logical_tick_;
+                const auto now_ns = manager_tick_ns();
+                facade_.v3_advance(now_ns);
+                emit_new_session_terminals();
+                if (facade_.v3_status() ==
+                        hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+                {
+                    // A deadline/retry terminal has no successful E2
+                    // certificate to report; it is fail-closed.
+                    fail();
+                    return;
+                }
+                drive_deliveries();
+                begin_next_transition_cycle();
+                if (!failed_ && facade_.v3_status() !=
+                        hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+                    retry_timer_.add(kAdaptiveV3TickSeconds);
+            });
+        fault_window_arm_timer_ = salticidae::TimerEvent(
+            event_context_, [this](salticidae::TimerEvent &) {
+                handle_fault_window_arm_timer();
+            });
+        if (options_.manager.fault_window_arm.has_value())
+        {
+            const auto seconds =
+                options_.manager.fault_window_arm->deadline_seconds;
+            if (seconds > static_cast<std::uint64_t>(
+                              std::numeric_limits<std::chrono::seconds::rep>::max()))
+                throw std::invalid_argument("fault-window arm deadline is out of range");
+            fault_window_arm_deadline_ = std::chrono::steady_clock::now() +
+                std::chrono::seconds(seconds);
+        }
+    }
+
+    int run_adaptive_v3()
+    {
+        salticidae::SigEvent interrupt(
+            event_context_, [this](int) { event_context_.stop(); });
+        salticidae::SigEvent terminate(
+            event_context_, [this](int) { event_context_.stop(); });
+        interrupt.add(SIGINT);
+        terminate.add(SIGTERM);
+
+        salticidae::TimerEvent structured_event_drain_timer;
+        bool process_started = false;
+        try
+        {
+            structured_event_drain_timer = salticidae::TimerEvent(
+                event_context_,
+                [this](salticidae::TimerEvent &timer) {
+                    event_sink_.drain();
+                    if (!event_sink_.health().healthy)
+                    {
+                        fail();
+                        return;
+                    }
+                    timer.add(0.05);
+                });
+
+            emit_process(hotstuff::ProcessLifecycleState::started);
+            process_started = true;
+            event_sink_.drain();
+            if (!event_sink_.health().healthy)
+            {
+                emit_process(hotstuff::ProcessLifecycleState::stopping);
+                stop_runtime();
+                emit_process(hotstuff::ProcessLifecycleState::stopped);
+                return 1;
+            }
+
+            transport_.start();
+            begin_next_transition_cycle();
+            emit_process(hotstuff::ProcessLifecycleState::ready);
+            if (!failed_)
+            {
+                retry_timer_.add(kAdaptiveV3TickSeconds);
+                structured_event_drain_timer.add(0.05);
+                event_context_.dispatch();
+            }
+
+            emit_process(hotstuff::ProcessLifecycleState::stopping);
+            event_context_.stop();
+            structured_event_drain_timer.del();
+            event_sink_.drain();
+            if (!event_sink_.health().healthy)
+                failed_ = true;
+            stop_runtime();
+            emit_process(hotstuff::ProcessLifecycleState::stopped);
+            event_sink_.drain();
+            return failed_ || emitted_session_terminals_ !=
+                    transition_policies_.size() ||
+                    facade_.v3_status() !=
+                        hotstuff::AdaptiveV3ManagerSessionStatus::terminal ||
+                    !event_sink_.health().healthy
+                ? 1
+                : 0;
+        }
+        catch (...)
+        {
+            if (process_started)
+                emit_process(hotstuff::ProcessLifecycleState::stopping);
+            event_context_.stop();
+            structured_event_drain_timer.del();
+            event_sink_.drain();
+            stop_runtime();
+            if (process_started)
+            {
+                emit_process(hotstuff::ProcessLifecycleState::stopped);
+                event_sink_.drain();
+            }
+            throw;
+        }
+    }
+
+private:
+    void emit_process(hotstuff::ProcessLifecycleState state) noexcept
+    {
+        event_sink_.emit(hotstuff::StructuredEventPayload{
+            hotstuff::ProcessLifecycleEvent{state, std::nullopt}});
+        if (!event_sink_.health().healthy)
+            fail();
+    }
+
+    void emit_new_v3_accepted_observations() noexcept
+    {
+        try
+        {
+            const auto &records = facade_.ingress().ledger().accepted();
+            if (emitted_accepted_observations_ > records.size())
+            {
+                fail();
+                return;
+            }
+            while (emitted_accepted_observations_ < records.size())
+            {
+                const hotstuff::AuditStructuredEventPayload event{
+                    hotstuff::EvidenceObservationAcceptedStructuredEvent{
+                        records[emitted_accepted_observations_]}};
+                event_sink_.emit_audit(event);
+                event_sink_.drain();
+                if (!event_sink_.health().healthy)
+                {
+                    fail();
+                    return;
+                }
+                ++emitted_accepted_observations_;
+            }
+        }
+        catch (...)
+        {
+            fail();
+        }
+    }
+
+    void emit_readiness(
+        hotstuff::AdaptiveV3ReadinessStructuredEvent event) noexcept
+    {
+        event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{std::move(event)});
+        if (!event_sink_.health().healthy)
+            fail();
+    }
+
+    // A TLS-authenticated peer can still send malformed v3 readiness wire.
+    // Preserve the exact bounded bytes without manufacturing an identity, and
+    // fail closed if the append-only audit cannot be sealed.
+    void emit_wire_rejected(ReplicaID source, hotstuff::opcode_t opcode,
+                            const hotstuff::bytearray_t &payload,
+                            const char *disposition) noexcept
+    {
+        try
+        {
+            hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                wire_rejected;
+            event.replica_id = source;
+            event.wire_opcode = opcode;
+            event.wire_payload_size = payload.size();
+            event.payload_digest = hotstuff::DataStream(payload).get_hash();
+            event.canonical_wire_payload = payload;
+            event.disposition = disposition;
+            emit_readiness(std::move(event));
+            // This is the exceptional malformed-wire path: drain now, rather
+            // than relying on the normal 50 ms batching timer, before the
+            // caller can continue or return.
+            event_sink_.drain();
+            if (!event_sink_.health().healthy)
+                fail();
+        }
+        catch (...)
+        {
+            fail();
+        }
+    }
+
+    void fail() noexcept
+    {
+        failed_ = true;
+        event_context_.stop();
+    }
+
+    void stop_runtime() noexcept
+    {
+        event_context_.stop();
+        retry_timer_.del();
+        fault_window_arm_timer_.del();
+        if (!transport_.stop())
+            failed_ = true;
+    }
+
+    void emit_new_session_terminals() noexcept
+    {
+        const auto *records = facade_.v3_terminal_records();
+        if (records == nullptr)
+            return;
+        while (emitted_session_terminals_ < records->size())
+        {
+            const auto &record = (*records)[emitted_session_terminals_];
+            hotstuff::AdaptiveV3ReadinessStructuredEvent terminal;
+            terminal.transition = hotstuff::AdaptiveV3ReadinessTransition::terminal;
+            terminal.terminal_cycle_ordinal = record.cycle_ordinal;
+            terminal.terminal_reason = static_cast<std::uint8_t>(record.reason);
+            terminal.terminal_identity = record.identity;
+            if (record.identity.has_value())
+                terminal.identity = *record.identity;
+            if (record.bundle_digest != hotstuff::uint256_t{})
+                terminal.terminal_bundle_digest = record.bundle_digest;
+            terminal.observed_signers = record.r_audit_sources;
+            terminal.required_release_count =
+                record.identity.has_value() ? options_.required_release_count : 0;
+            terminal.disposition = "session_terminal";
+            emit_readiness(std::move(terminal));
+            if (failed_)
+                return;
+            ++emitted_session_terminals_;
+        }
+    }
+
+    void emit_certificate_assembled() noexcept
+    {
+        const auto *certificate = facade_.v3_certificate();
+        if (certificate == nullptr)
+        {
+            fail();
+            return;
+        }
+        try
+        {
+            // The structured certificate event is a statement about the exact
+            // authenticated wire object that delivery will distribute.
+            const auto wire = hotstuff::encode_activation_readiness_certificate(
+                *certificate, options_.wire_limits);
+            hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                certificate_assembled;
+            event.identity = certificate->identity;
+            event.certificate_digest = certificate->certificate_digest;
+            event.canonical_wire_payload = wire;
+            event.payload_digest =
+                hotstuff::activation_readiness_ack_payload_digest(
+                    MsgActivationReadinessCertificate::opcode, wire);
+            for (const auto &observation : certificate->observations)
+                event.observed_signers.push_back(
+                    observation.signer_replica_id);
+            event.required_release_count = options_.required_release_count;
+            emit_readiness(std::move(event));
+        }
+        catch (...) { fail(); }
+    }
+
+    void drive_deliveries() noexcept
+    {
+        if (failed_ || facade_.v3_certificate() == nullptr)
+            return;
+        bool exhausted = false;
+        for (const auto &replica : options_.replicas)
+        {
+            const auto delivery = facade_.v3_begin_delivery(
+                replica.replica_id, manager_tick_ns());
+            if (!delivery.has_value())
+                continue;
+            const auto *certificate = facade_.v3_certificate();
+            if (certificate == nullptr)
+            {
+                fail();
+                return;
+            }
+            const auto certificate_identity = certificate->identity;
+            const auto certificate_digest = certificate->certificate_digest;
+            bool enqueued = false;
+            hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+            try
+            {
+                event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                    certificate_delivery;
+                event.identity = certificate_identity;
+                event.replica_id = replica.replica_id;
+                event.certificate_digest = certificate_digest;
+                event.payload_digest = delivery->payload_digest;
+                event.delivery_attempt = delivery->attempt;
+                // Reserve the longer terminal disposition before result
+                // recording; the result may destroy the reporting outbox.
+                event.disposition = "retry_exhausted";
+                event.canonical_wire_payload = *delivery->bytes;
+            }
+            catch (...)
+            {
+                fail();
+                return;
+            }
+            enqueued = transport_.send_certificate(
+                replica.replica_id, *delivery->bytes);
+            event.delivery_enqueued = enqueued;
+            const auto disposition = facade_.v3_record_delivery_result(
+                replica.replica_id,
+                delivery->attempt,
+                enqueued,
+                manager_tick_ns());
+            if (disposition ==
+                hotstuff::AdaptiveV3CertificateDeliveryDisposition::queued)
+                event.disposition = "queued";
+            else if (disposition ==
+                hotstuff::AdaptiveV3CertificateDeliveryDisposition::retry_exhausted)
+                event.disposition = "retry_exhausted";
+            else if (disposition ==
+                    hotstuff::AdaptiveV3CertificateDeliveryDisposition::invalid_ack &&
+                     facade_.v3_status() ==
+                        hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+                event.disposition = "deadline_expired";
+            else
+            {
+                fail();
+                return;
+            }
+            emit_readiness(std::move(event));
+            // The delivery result can clear the live certificate on terminal
+            // exhaustion.  Its immutable audit was cached above, so publish
+            // it before mirroring the appended terminal record.
+            emit_new_session_terminals();
+            if (failed_ || facade_.v3_status() ==
+                    hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+            {
+                fail();
+                return;
+            }
+            if (disposition ==
+                hotstuff::AdaptiveV3CertificateDeliveryDisposition::
+                    retry_exhausted)
+            {
+                exhausted = true;
+                break;
+            }
+        }
+        if (!failed_ &&
+            (exhausted || facade_.v3_status() ==
+                 hotstuff::AdaptiveV3ManagerSessionStatus::terminal))
+        {
+            emit_new_session_terminals();
+            fail();
+        }
+    }
+
+    void handle_observation(
+        MsgActivationReadyObservation &&message, ReplicaID source) noexcept
+    {
+        const auto payload = static_cast<bytearray_t>(message.serialized);
+        const auto decoded = hotstuff::decode_activation_ready_observation(
+            payload, options_.wire_limits);
+        if (!decoded)
+        {
+            emit_wire_rejected(
+                source, MsgActivationReadyObservation::opcode, payload,
+                "observation_decode");
+            return;
+        }
+        const auto result = facade_.v3_observe_readiness(
+            source, manager_tick_ns(), payload);
+        emit_new_session_terminals();
+        if (failed_ || facade_.v3_status() ==
+                hotstuff::AdaptiveV3ManagerSessionStatus::terminal)
+        {
+            fail();
+            return;
+        }
+        hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+        event.replica_id = source;
+        event.canonical_wire_payload = payload;
+        event.identity = decoded.value->identity;
+        event.signer_source_sequence =
+            decoded.value->signer_source_sequence;
+        event.signer_monotonic_raw_ns =
+            decoded.value->signer_monotonic_raw_ns;
+        event.observation_digest = result.observation_digest;
+        event.disposition = adaptive_v3_readiness_disposition_name(
+            result.disposition);
+        const bool released_conflict =
+            result.disposition ==
+                hotstuff::AdaptiveV3ManagerReadinessDisposition::
+                    rejected_conflict &&
+            facade_.v3_certificate() != nullptr;
+        if (result.disposition ==
+            hotstuff::AdaptiveV3ManagerReadinessDisposition::rejected_conflict)
+        {
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                source_quarantined;
+        }
+        else if (result.disposition ==
+                     hotstuff::AdaptiveV3ManagerReadinessDisposition::accepted ||
+                 result.disposition ==
+                     hotstuff::AdaptiveV3ManagerReadinessDisposition::duplicate ||
+                 result.disposition ==
+                     hotstuff::AdaptiveV3ManagerReadinessDisposition::released)
+        {
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                observation_accepted;
+        }
+        else
+        {
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                observation_rejected;
+        }
+        emit_readiness(std::move(event));
+        if (released_conflict && !failed_)
+        {
+            emit_new_session_terminals();
+            fail();
+            return;
+        }
+        if (result.certificate_assembled && !failed_)
+        {
+            emit_certificate_assembled();
+            drive_deliveries();
+        }
+    }
+
+    void handle_ack(
+        MsgActivationReadinessAck &&message, ReplicaID source) noexcept
+    {
+        const auto payload = static_cast<bytearray_t>(message.serialized);
+        const auto decoded = hotstuff::decode_activation_readiness_ack(
+            payload, options_.wire_limits);
+        if (!decoded)
+        {
+            emit_wire_rejected(
+                source, MsgActivationReadinessAck::opcode, payload,
+                "ack_decode");
+            return;
+        }
+        const auto disposition = facade_.v3_acknowledge(
+            source, manager_tick_ns(), payload);
+        if (decoded && disposition ==
+                hotstuff::AdaptiveV3CertificateDeliveryDisposition::
+                    rejected_ack)
+        {
+            emit_new_session_terminals();
+            fail();
+            return;
+        }
+        if (disposition !=
+                hotstuff::AdaptiveV3CertificateDeliveryDisposition::
+                    acknowledged)
+            return;
+        hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+        event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+            certificate_acknowledged;
+        event.identity = decoded.value->identity;
+        event.replica_id = source;
+        event.certificate_digest = decoded.value->certificate_digest;
+        event.payload_digest = decoded.value->payload_digest;
+        event.canonical_wire_payload = payload;
+        event.disposition = "acknowledged";
+        emit_readiness(std::move(event));
+        // E1 enters residency rather than terminal, but its append-only
+        // session record is already sealed by the final R ACK.
+        emit_new_session_terminals();
+        if (facade_.v3_status() ==
+                hotstuff::AdaptiveV3ManagerSessionStatus::terminal &&
+            !failed_)
+        {
+            if (!failed_)
+                event_context_.stop();
+        }
+    }
+
+    // The manager is source-blind: common authenticated evidence drives the
+    // controller; only the signed readiness observation binds a TLS peer to a
+    // v3 identity derived from the emitted bundle.
+    void begin_next_transition_cycle() noexcept
+    {
+        const auto phase = facade_.v3_status();
+        if (failed_ || !phase.has_value() ||
+            next_policy_ >= transition_policies_.size())
+            return;
+        const auto begin_tick = manager_tick_ns();
+        if (*phase != hotstuff::AdaptiveV3ManagerSessionStatus::idle &&
+            *phase != hotstuff::AdaptiveV3ManagerSessionStatus::residency)
+            return;
+        const auto containment_cycle = next_policy_ == 0;
+        if (!containment_cycle)
+        {
+            const auto eligibility = facade_.v3_begin_e2_at(
+                begin_tick, transition_policies_[next_policy_]);
+            if (!eligibility.has_value())
+                return;
+            ++next_policy_;
+            emit_e2_eligibility(*eligibility);
+            event_sink_.drain();
+            if (failed_ || !event_sink_.health().healthy)
+            {
+                fail();
+                return;
+            }
+            evaluate_transition_cycle();
+        }
+        else if (!facade_.begin_cycle(transition_policies_[next_policy_++]))
+            fail();
+        else if (containment_cycle &&
+                 options_.manager.fault_window_arm.has_value() &&
+                 !fault_window_armed_)
+            schedule_fault_window_arm();
+        else
+            evaluate_transition_cycle();
+    }
+
+    void emit_e2_eligibility(
+        const hotstuff::AdaptiveV3E2EligibilityAuditSnapshot &snapshot) noexcept
+    {
+        try
+        {
+            hotstuff::AdaptiveV3ReadinessStructuredEvent event;
+            event.transition = hotstuff::AdaptiveV3ReadinessTransition::
+                e2_eligibility;
+            event.identity = *snapshot.e1_identity;
+            event.observed_signers = snapshot.common_commit_sources;
+            event.required_release_count = snapshot.common_commit_sources.size();
+            event.disposition = "eligible";
+            event.e2_cycle_ordinal = snapshot.cycle_ordinal;
+            event.e1_bundle_digest = snapshot.e1_bundle_digest;
+            event.e2_final_ack_raw_ns = snapshot.final_ack_tick;
+            event.e2_common_commit = snapshot.common_commit;
+            event.e2_common_commit_sources = snapshot.common_commit_sources;
+            event.e2_common_commit_raw_ns = snapshot.common_commit_tick;
+            event.e2_earliest_raw_ns = snapshot.earliest_e2_tick;
+            event.e2_actual_begin_raw_ns = snapshot.actual_e2_begin_tick;
+            event.e2_hard_deadline_raw_ns = snapshot.hard_deadline_tick;
+            event.e2_reserve_raw_ns = snapshot.reserve_ticks;
+            emit_readiness(std::move(event));
+        }
+        catch (...) { fail(); }
+    }
+
+    bool try_arm_fault_window() noexcept
+    {
+        if (!options_.manager.fault_window_arm.has_value() || fault_window_armed_)
+            return true;
+        const auto &bindings = *options_.manager.fault_window_arm;
+        const auto read = read_fault_window_arm(bindings);
+        if (read.status == FaultWindowArmReadStatus::missing)
+            return false;
+        if (read.status != FaultWindowArmReadStatus::consumed ||
+            !read.document.has_value())
+        {
+            fail();
+            return false;
+        }
+        try
+        {
+            const auto &document = *read.document;
+            constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+            if (bindings.deadline_seconds >
+                    std::numeric_limits<std::uint64_t>::max() /
+                        kNanosecondsPerSecond)
+                throw std::overflow_error("v3 arm hard deadline overflows");
+            const auto duration_ns = bindings.deadline_seconds *
+                kNanosecondsPerSecond;
+            const auto fault_anchor_ns = document.event.evidence_start_monotonic_ns;
+            if (fault_anchor_ns >
+                    std::numeric_limits<std::uint64_t>::max() - duration_ns)
+                throw std::overflow_error("v3 arm hard deadline overflows");
+            const auto hard_deadline_ns = fault_anchor_ns + duration_ns;
+            if (manager_tick_ns() >= hard_deadline_ns ||
+                !facade_.arm_fault_window(document.arm) ||
+                !facade_.v3_arm_hard_deadline(hard_deadline_ns))
+                throw std::logic_error("manager session rejected fault-window arm");
+            event_sink_.emit_audit(
+                hotstuff::AuditStructuredEventPayload{document.event});
+            event_sink_.drain();
+            if (!event_sink_.health().healthy)
+                throw std::runtime_error("fault-window arm audit failed");
+            fault_window_armed_ = true;
+            fault_window_arm_timer_.del();
+            fault_window_arm_timer_pending_ = false;
+            return true;
+        }
+        catch (...)
+        {
+            fail();
+            return false;
+        }
+    }
+
+    void schedule_fault_window_arm() noexcept
+    {
+        if (!options_.manager.fault_window_arm.has_value() || fault_window_armed_ ||
+            fault_window_arm_timer_pending_)
+            return;
+        try
+        {
+            fault_window_arm_timer_pending_ = true;
+            fault_window_arm_timer_.add(kEvaluationCoalescingSeconds);
+        }
+        catch (...) { fail(); }
+    }
+
+    void handle_fault_window_arm_timer() noexcept
+    {
+        if (!fault_window_arm_timer_pending_ || failed_ || fault_window_armed_)
+            return;
+        if (try_arm_fault_window())
+        {
+            evaluate_transition_cycle();
+            return;
+        }
+        if (failed_)
+            return;
+        if (std::chrono::steady_clock::now() >= fault_window_arm_deadline_)
+        {
+            fail();
+            return;
+        }
+        try { fault_window_arm_timer_.add(kEvaluationCoalescingSeconds); }
+        catch (...) { fail(); }
+    }
+
+    const TransitionRequest *current_v3_transition_request() const noexcept
+    {
+        if (next_policy_ == 0 ||
+            next_policy_ > options_.manager.transition_requests.size())
+            return nullptr;
+        return &options_.manager.transition_requests[next_policy_ - 1];
+    }
+
+    void emit_v3_shape_decision(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV3EpochChangeBundle &bundle)
+    {
+        const auto controller = facade_.controller_audit();
+        if (!controller.has_value())
+            throw std::logic_error("v3 shape decision lacks controller audit");
+
+        const auto &predecessor = facade_.ingress().current_epoch();
+        const auto &successor = bundle.definition();
+        const bool preserves_initial_containment_shape =
+            request.predecessor_epoch_number == 0 &&
+            request.policy.intent == TreePolicyKind::fault_containment &&
+            !request.policy.apply_shape_selection;
+        if (preserves_initial_containment_shape)
+        {
+            if (predecessor.epoch_number() != 0 ||
+                controller->shape_decision.has_value() ||
+                predecessor.trees().empty() || successor.trees.empty())
+            {
+                throw std::logic_error(
+                    "v3 initial containment shape audit was invalid");
+            }
+            const auto fanout = predecessor.trees().front().fanout;
+            const auto pipeline_stretch =
+                predecessor.trees().front().pipeline_stretch;
+            const bool has_preserved_shape =
+                std::all_of(
+                    predecessor.trees().begin(), predecessor.trees().end(),
+                    [fanout, pipeline_stretch](const auto &tree) {
+                        return tree.fanout == fanout &&
+                            tree.pipeline_stretch == pipeline_stretch;
+                    }) &&
+                std::all_of(
+                    successor.trees.begin(), successor.trees.end(),
+                    [fanout, pipeline_stretch](const auto &tree) {
+                        return tree.fanout == fanout &&
+                            tree.pipeline_stretch == pipeline_stretch;
+                    });
+            if (!has_preserved_shape)
+                throw std::logic_error(
+                    "v3 initial containment shape was not preserved");
+            return;
+        }
+
+        if (!controller->shape_decision.has_value())
+            throw std::logic_error("v3 shape decision is absent");
+        const auto &decision = *controller->shape_decision;
+        if (decision.epoch_number != predecessor.epoch_number() ||
+            decision.epoch_digest != predecessor.epoch_digest() ||
+            decision.evidence_cutoff != controller->current_cutoff ||
+            decision.predecessor_tree_count != predecessor.trees().size() ||
+            decision.tree_count != successor.trees.size() ||
+            !std::all_of(
+                successor.trees.begin(), successor.trees.end(),
+                [&decision](const auto &tree) {
+                    return tree.fanout == decision.applied_fanout &&
+                        tree.pipeline_stretch ==
+                            decision.fixed_pipeline_stretch;
+                }))
+        {
+            throw std::logic_error(
+                "v3 shape decision does not bind the successor topology");
+        }
+
+        hotstuff::AdaptiveV2ShapeDecisionStructuredEvent event;
+        event.cycle_ordinal = next_policy_ - 1;
+        event.transition_artifact_id = request.transition_artifact_id;
+        event.decision = decision;
+        event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{std::move(event)});
+        event_sink_.drain();
+        if (!event_sink_.health().healthy)
+            throw std::runtime_error("v3 shape decision audit drain failed");
+    }
+
+    void emit_v3_evidence_snapshot(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV3EpochChangeBundle &bundle)
+    {
+        const auto controller = facade_.controller_audit();
+        if (!controller.has_value() || !controller->baseline_frozen)
+            throw std::logic_error(
+                "v3 evidence snapshot lacks a frozen controller audit");
+
+        const auto &ingress = facade_.ingress();
+        const auto &predecessor = ingress.current_epoch();
+        const auto &ledger = ingress.ledger();
+        const auto &definition = bundle.definition();
+        const auto activation_generation = ingress.activation_generation();
+        if (request.predecessor_epoch_number !=
+                predecessor.epoch_number() ||
+            definition.previous_epoch_digest !=
+                predecessor.epoch_digest() ||
+            definition.evidence_cutoff != controller->current_cutoff ||
+            definition.evidence_snapshot_id.empty() ||
+            activation_generation == 0 ||
+            controller->baseline_cutoff == 0 ||
+            controller->current_cutoff <= controller->baseline_cutoff ||
+            ledger.high_watermark() != controller->current_cutoff)
+        {
+            throw std::logic_error(
+                "v3 evidence snapshot window is not the selected exact prefix");
+        }
+
+        hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent event;
+        event.cycle_ordinal = next_policy_ - 1;
+        event.policy_intent = request.policy.intent;
+        event.transition_artifact_id = request.transition_artifact_id;
+        event.predecessor_epoch_number = predecessor.epoch_number();
+        event.predecessor_epoch_digest = predecessor.epoch_digest();
+        event.activation_generation = activation_generation;
+        event.baseline_cutoff = controller->baseline_cutoff;
+        event.current_cutoff = controller->current_cutoff;
+
+        std::uint64_t previous_ingestion_sequence = 0;
+        std::size_t accepted_prefix_count = 0;
+        bool has_post_baseline_observation = false;
+        for (const auto &record : ledger.accepted())
+        {
+            if (record.ingestion_sequence == 0 ||
+                record.ingestion_sequence <= previous_ingestion_sequence)
+                throw std::logic_error(
+                    "v3 accepted evidence is not canonically ordered");
+            previous_ingestion_sequence = record.ingestion_sequence;
+            if (record.ingestion_sequence > event.current_cutoff)
+                continue;
+
+            const auto &observation = record.observation;
+            if (observation.configuration.epoch_number !=
+                    event.predecessor_epoch_number ||
+                observation.configuration.epoch_digest !=
+                    event.predecessor_epoch_digest)
+                throw std::logic_error(
+                    "v3 evidence snapshot contains a mixed epoch");
+            if (observation.outcome == hotstuff::ResponseOutcome::timeout)
+            {
+                if (observation.response_duration_us != 0)
+                    throw std::logic_error(
+                        "v3 timeout evidence has a response duration");
+            }
+            else if (observation.outcome ==
+                         hotstuff::ResponseOutcome::late &&
+                     observation.response_duration_us == 0)
+                throw std::logic_error(
+                    "v3 late evidence has no response duration");
+            ++accepted_prefix_count;
+            has_post_baseline_observation =
+                has_post_baseline_observation ||
+                record.ingestion_sequence > event.baseline_cutoff;
+        }
+        if (accepted_prefix_count == 0 ||
+            accepted_prefix_count > event.current_cutoff ||
+            !has_post_baseline_observation)
+            throw std::logic_error(
+                "v3 evidence snapshot accepted prefix count is invalid");
+
+        const hotstuff::AcceptedEvidenceView full_prefix{
+            ledger.accepted().data(), accepted_prefix_count};
+        const auto full_prefix_snapshot = hotstuff::build_adaptation_snapshot(
+            options_.manager.membership,
+            hotstuff::AdaptationEpochId{
+                event.predecessor_epoch_number,
+                event.predecessor_epoch_digest},
+            full_prefix,
+            event.current_cutoff,
+            options_.manager.responsiveness_policy,
+            kSnapshotSeed);
+        if (full_prefix_snapshot.accepted_record_count() !=
+                accepted_prefix_count ||
+            full_prefix_snapshot.evidence_cutoff() != event.current_cutoff)
+            throw std::logic_error(
+                "v3 full evidence prefix snapshot is inconsistent");
+        event.full_prefix_snapshot_id = hotstuff::uint256_t(parse_hex(
+            full_prefix_snapshot.snapshot_id(),
+            "v3 full prefix evidence snapshot id", 64));
+        event.evidence_snapshot_id = hotstuff::uint256_t(parse_hex(
+            definition.evidence_snapshot_id,
+            "v3 selected evidence snapshot id", 64));
+        event.accepted_prefix_count = accepted_prefix_count;
+        if (event.full_prefix_snapshot_id == hotstuff::uint256_t{} ||
+            event.evidence_snapshot_id == hotstuff::uint256_t{})
+            throw std::logic_error("v3 evidence snapshot commitment is zero");
+
+        std::set<ReplicaID> eligible_leaders;
+        for (const auto &tree : definition.trees)
+        {
+            if (tree.members_breadth_first.empty() ||
+                !eligible_leaders.insert(
+                    tree.members_breadth_first.front()).second)
+                throw std::logic_error(
+                    "v3 successor tree leaders are not an exact ranking");
+            event.eligible_ranking.push_back(
+                tree.members_breadth_first.front());
+        }
+
+        auto canonical_payload =
+            hotstuff::serialize_adaptive_v2_evidence_snapshot_payload(
+                event,
+                hotstuff::StructuredEventLimits{}.maximum_line_bytes);
+        canonical_payload.push_back('\n');
+        event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{event});
+        event_sink_.drain();
+        if (!event_sink_.health().healthy)
+            throw std::runtime_error(
+                "v3 evidence snapshot audit drain failed");
+        write_exclusive_json(
+            request.evidence_snapshot_output, canonical_payload);
+    }
+
+    void evaluate_transition_cycle() noexcept
+    {
+        if (failed_ || facade_.v3_status() !=
+                hotstuff::AdaptiveV3ManagerSessionStatus::selecting)
+            return;
+        const auto status = facade_.evaluate();
+        emit_new_session_terminals();
+        if (status != AdaptiveV2ManagerControllerStatus::successor_ready &&
+            status != AdaptiveV2ManagerControllerStatus::already_ready)
+            return;
+        const auto *bundle = facade_.v3_successor_bundle();
+        if (bundle == nullptr)
+        {
+            fail();
+            return;
+        }
+        const auto *request = current_v3_transition_request();
+        if (request == nullptr)
+        {
+            fail();
+            return;
+        }
+        try
+        {
+            const auto output_path = transition_bundle_output_path(
+                *request, *bundle, facade_);
+            write_exclusive_bundle(output_path, bundle->canonical_bytes());
+            emit_v3_shape_decision(*request, *bundle);
+            emit_v3_evidence_snapshot(*request, *bundle);
+            if (!facade_.v3_begin_readiness(manager_tick_ns()))
+            {
+                emit_new_session_terminals();
+                throw std::runtime_error(
+                    "v3 manager session rejected readiness start");
+            }
+            if (!transport_.send_bundle(*bundle))
+                throw std::runtime_error("v3 successor bundle send failed");
+        }
+        catch (...)
+        {
+            emit_new_session_terminals();
+            fail();
+        }
+    }
+
+    template <typename Message, typename Ingest>
+    void ingest_common(const AuthenticatedReporter &source,
+                       const Message &message, Ingest &&operation)
+    {
+        if (failed_)
+            return;
+        const auto result = operation(source, message);
+        emit_new_v3_accepted_observations();
+        if (failed_)
+            return;
+        if (result.status == AdaptiveV2ManagerIngressStatus::evidence_unhealthy ||
+            result.status == AdaptiveV2ManagerIngressStatus::stopped)
+        {
+            fail();
+            return;
+        }
+        evaluate_transition_cycle();
+    }
+
+    EventContext &event_context_;
+    AdaptiveV3ManagerOptions options_;
+    hotstuff::AdaptiveManagerSessionFacade facade_;
+    std::vector<AdaptiveV2TransitionPolicy> transition_policies_;
+    std::size_t next_policy_{0};
+    hotstuff::StructuredEventSink &event_sink_;
+    AdaptiveV3ManagerTransport transport_;
+    std::uint64_t manager_tick_ns() const noexcept
+    {
+        timespec now{};
+        if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) != 0 || now.tv_sec < 0 ||
+            static_cast<std::uint64_t>(now.tv_sec) >
+                std::numeric_limits<std::uint64_t>::max() / 1000000000ULL)
+            return std::numeric_limits<std::uint64_t>::max();
+        return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL +
+            static_cast<std::uint64_t>(now.tv_nsec);
+    }
+
+    salticidae::TimerEvent retry_timer_;
+    salticidae::TimerEvent fault_window_arm_timer_;
+    std::chrono::steady_clock::time_point fault_window_arm_deadline_{};
+    std::uint64_t logical_tick_{0};
+    std::size_t emitted_accepted_observations_{0};
+    std::size_t emitted_session_terminals_{0};
+    bool fault_window_arm_timer_pending_{false};
+    bool fault_window_armed_{false};
+    bool failed_{false};
+};
+
+class AdaptiveV2ManagerModeState final
+{
+public:
+    AdaptiveV2ManagerModeState(
         EventContext &event_context,
         ManagerOptions options,
         const ManagerNetwork::Config &net_config,
@@ -2403,10 +4273,11 @@ public:
           monotonic_raw_clock_(monotonic_raw_clock),
           options_(std::move(options)),
           network_(event_context_, net_config),
-          session_(
+          facade_(
               options_.membership,
               manager_epoch_zero(options_),
-              manager_session_config(options_)),
+              manager_session_facade_config(options_)),
+          session_(*facade_.v2()),
           request_sequence_(transition_policies(options_)),
           structured_event_sink_(structured_event_sink)
     {
@@ -3755,95 +5626,47 @@ private:
     {
         if (!options_.fault_window_arm.has_value() || fault_window_armed_)
             return true;
-        const auto &bindings = *options_.fault_window_arm;
-        int flags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW;
-        int descriptor = ::open(bindings.path.c_str(), flags);
-        if (descriptor < 0)
+        const auto read = read_fault_window_arm(*options_.fault_window_arm);
+        if (read.status == FaultWindowArmReadStatus::missing)
+            return false;
+        if (read.status != FaultWindowArmReadStatus::consumed ||
+            !read.document.has_value())
         {
-            if (errno == ENOENT)
-                return false;
-            fail("fault_window_arm_open_failed",
-                 AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure);
+            const auto io_failure = read.status == FaultWindowArmReadStatus::io_failure;
+            fail(io_failure ? "fault_window_arm_io_failure" :
+                              "fault_window_arm_invalid",
+                 io_failure
+                     ? AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure
+                     : AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid);
             return false;
         }
-        bool io_failure = false;
         try
         {
-            struct stat metadata {};
-            if (::fstat(descriptor, &metadata) != 0)
-            {
-                io_failure = true;
-                throw std::invalid_argument("fault-window arm file is invalid");
-            }
-            if (!S_ISREG(metadata.st_mode) || metadata.st_size <= 0 ||
-                static_cast<std::uint64_t>(metadata.st_size) >
-                    kMaximumFaultWindowArmBytes)
-                throw std::invalid_argument("fault-window arm file is invalid");
-            std::string bytes(static_cast<std::size_t>(metadata.st_size), '\0');
-            std::size_t offset = 0;
-            while (offset < bytes.size())
-            {
-                const auto read = ::read(descriptor, bytes.data() + offset,
-                                         bytes.size() - offset);
-                if (read < 0 && errno == EINTR)
-                    continue;
-                if (read <= 0)
-                {
-                    io_failure = true;
-                    throw std::invalid_argument("fault-window arm is truncated");
-                }
-                offset += static_cast<std::size_t>(read);
-            }
-            char trailing = 0;
-            for (;;)
-            {
-                const auto read = ::read(descriptor, &trailing, 1);
-                if (read < 0 && errno == EINTR)
-                    continue;
-                if (read != 0)
-                {
-                    io_failure = true;
-                    throw std::invalid_argument(
-                        "fault-window arm changed while being read");
-                }
-                break;
-            }
-            const auto document = FaultWindowArmJsonParser(bytes, bindings).parse();
+            const auto &document = *read.document;
             if (!session_.arm_fault_window(document.arm))
                 throw std::logic_error("manager session rejected fault-window arm");
-            io_failure = true;
             structured_event_sink_.emit_audit(
                 hotstuff::AuditStructuredEventPayload{document.event});
             structured_event_sink_.drain();
             if (!structured_event_sink_.health().healthy)
                 throw std::runtime_error("fault-window arm audit failed");
-            const auto close_result = ::close(descriptor);
-            descriptor = -1;
-            if (close_result != 0)
-                throw std::system_error(errno, std::generic_category(),
-                                        "cannot close fault-window arm");
             fault_window_armed_ = true;
             // Force one post-arm evaluation even if the waiting poll already
             // observed the same readiness and evidence cutoff.
             last_evaluated_ready_members_.reset();
             last_evaluated_evidence_cutoff_.reset();
-            fault_window_arm_device_ = metadata.st_dev;
-            fault_window_arm_inode_ = metadata.st_ino;
-            fault_window_arm_size_ = metadata.st_size;
-            fault_window_arm_mtime_ = metadata.st_mtime;
+            fault_window_arm_device_ = read.metadata.st_dev;
+            fault_window_arm_inode_ = read.metadata.st_ino;
+            fault_window_arm_size_ = read.metadata.st_size;
+            fault_window_arm_mtime_ = read.metadata.st_mtime;
             fault_window_arm_timer.del();
             fault_window_arm_timer_pending_ = false;
             return true;
         }
         catch (...)
         {
-            if (descriptor >= 0)
-                ::close(descriptor);
-            fail(io_failure ? "fault_window_arm_io_failure" :
-                              "fault_window_arm_invalid",
-                 io_failure
-                     ? AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure
-                     : AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_invalid);
+            fail("fault_window_arm_io_failure",
+                 AdaptiveV2ManagerCycleTerminalReason::fault_window_arm_io_failure);
             return false;
         }
     }
@@ -5008,7 +6831,8 @@ private:
     ManagerOptions options_;
     ManagerNetwork network_;
     std::unordered_map<PeerId, ReplicaID> peer_to_replica_;
-    AdaptiveV2ManagerSession session_;
+    hotstuff::AdaptiveManagerSessionFacade facade_;
+    AdaptiveV2ManagerSession &session_;
     AdaptiveV2ManagerRequestSequence request_sequence_;
     hotstuff::StructuredEventSink &structured_event_sink_;
     hotstuff::AdaptiveV2ConvergenceWireLimits
@@ -5054,6 +6878,38 @@ private:
     bool failed_{false};
 };
 
+/** The executable owns exactly one protocol-mode state. */
+class AdaptationManager final
+{
+public:
+    AdaptationManager(
+        EventContext &event_context, ManagerOptions options,
+        const ManagerNetwork::Config &net_config,
+        hotstuff::StructuredEventClock &monotonic_raw_clock,
+        hotstuff::StructuredEventSink &structured_event_sink)
+        : v2_(std::make_unique<AdaptiveV2ManagerModeState>(
+              event_context, std::move(options), net_config,
+              monotonic_raw_clock, structured_event_sink)) {}
+
+    AdaptationManager(
+        EventContext &event_context, AdaptiveV3ManagerOptions options,
+        const ManagerNetwork::Config &net_config,
+        hotstuff::StructuredEventSink &event_sink)
+        : v3_(std::make_unique<AdaptiveV3ManagerModeState>(
+              event_context, std::move(options), net_config, event_sink)) {}
+
+    int run()
+    {
+        if (v2_)
+            return v2_->run();
+        return v3_->run_adaptive_v3();
+    }
+
+private:
+    std::unique_ptr<AdaptiveV2ManagerModeState> v2_;
+    std::unique_ptr<AdaptiveV3ManagerModeState> v3_;
+};
+
 } // namespace
 
 #ifndef KAURI_ADAPTATION_MANAGER_TESTING
@@ -5062,6 +6918,44 @@ int main(int argc, char **argv)
     std::signal(SIGPIPE, SIG_IGN);
     try
     {
+        if (adaptive_v3_requested(argc, argv))
+        {
+            auto options = parse_adaptive_v3_options(argc, argv);
+            const auto structured_event_config =
+                manager_structured_event_config(options);
+            hotstuff::MonotonicRawStructuredEventClock event_clock;
+            hotstuff::ExclusiveFileStructuredEventOutput event_output(
+                options.structured_event_output);
+            hotstuff::StructuredEventSink event_sink(
+                structured_event_config, event_clock, event_output);
+            if (!event_sink.health().healthy)
+                throw std::runtime_error(
+                    "structured-event sink configuration is unhealthy");
+            const auto net_config = network_config(options);
+            EventContext event_context;
+            auto manager = std::make_unique<AdaptationManager>(
+                event_context,
+                std::move(options),
+                net_config,
+                event_sink);
+            int run_status = 1;
+            std::exception_ptr run_failure;
+            try
+            {
+                run_status = manager->run();
+            }
+            catch (...)
+            {
+                run_failure = std::current_exception();
+            }
+            manager.reset();
+            event_sink.shutdown();
+            if (!event_sink.health().healthy)
+                return 1;
+            if (run_failure != nullptr)
+                std::rethrow_exception(run_failure);
+            return run_status;
+        }
         auto options = parse_options(argc, argv);
         const auto structured_event_config =
             manager_structured_event_config(options);

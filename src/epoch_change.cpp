@@ -19,6 +19,8 @@ constexpr char kEpochChangePayloadDomain[] =
     "kauri-epoch-change-payload-v1";
 constexpr char kAuthorizedEpochChangeDomain[] =
     "kauri-authorized-epoch-change-v1";
+const std::string kAdaptiveV3AuthorizedEpochChangeDomain =
+    "kauri-adaptive-v3-authorized-epoch-change-v2";
 constexpr std::size_t kSecp256k1SignatureBytes = 64;
 constexpr std::uint8_t kSecp256k1HalfOrder[32] = {
     0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -61,6 +63,40 @@ struct ReadException
 
 using Reader = detail::CanonicalWireReader<ReadException, ReadFailure>;
 
+std::optional<std::uint32_t> command_schema_for_mode(
+    EpochProtocolMode mode) noexcept
+{
+    switch (mode)
+    {
+    case EpochProtocolMode::adaptive_v2:
+        return kEpochChangeSchemaVersionV1;
+    case EpochProtocolMode::adaptive_v3:
+        return kEpochChangeSchemaVersionV2;
+    case EpochProtocolMode::legacy_static:
+    case EpochProtocolMode::adaptive_v1:
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
+std::string_view command_domain_for_mode(EpochProtocolMode mode)
+{
+    switch (mode)
+    {
+    case EpochProtocolMode::adaptive_v2:
+        return std::string_view(
+            kAuthorizedEpochChangeDomain,
+            sizeof(kAuthorizedEpochChangeDomain) - 1);
+    case EpochProtocolMode::adaptive_v3:
+        return kAdaptiveV3AuthorizedEpochChangeDomain;
+    case EpochProtocolMode::legacy_static:
+    case EpochProtocolMode::adaptive_v1:
+        break;
+    }
+    throw std::invalid_argument(
+        "epoch-change command requires a supported adaptive mode");
+}
+
 void append_digest(Writer &writer, const uint256_t &value)
 {
     writer.digest(
@@ -82,21 +118,15 @@ bytearray_t canonical_unsigned_command(
     const EpochChangePayload &payload,
     EpochChangeIssuerId issuer_id)
 {
-    if (schema_version != kEpochChangeSchemaVersionV1)
+    const auto expected_schema = command_schema_for_mode(protocol_mode);
+    if (!expected_schema || schema_version != *expected_schema)
     {
         throw std::invalid_argument(
             "unsupported epoch-change command schema");
     }
-    if (protocol_mode != EpochProtocolMode::adaptive_v2)
-    {
-        throw std::invalid_argument(
-            "epoch-change command requires adaptive-v2 mode");
-    }
 
     Writer writer;
-    writer.domain(std::string_view(
-        kAuthorizedEpochChangeDomain,
-        sizeof(kAuthorizedEpochChangeDomain) - 1));
+    writer.domain(command_domain_for_mode(protocol_mode));
     writer.integer(schema_version);
     writer.integer(static_cast<std::uint8_t>(protocol_mode));
     writer.integer(issuer_id);
@@ -204,122 +234,12 @@ bool same_recovery_request(
            left.successor_epoch_digest == right.successor_epoch_digest;
 }
 
-} // namespace
-
-bool EpochChangePayload::operator==(
-    const EpochChangePayload &other) const noexcept
-{
-    return successor_epoch_number == other.successor_epoch_number &&
-           predecessor_epoch_digest == other.predecessor_epoch_digest &&
-           successor_epoch_digest == other.successor_epoch_digest &&
-           activation_delay_blocks == other.activation_delay_blocks;
-}
-
-bool EpochChangePayload::operator!=(
-    const EpochChangePayload &other) const noexcept
-{
-    return !(*this == other);
-}
-
-bytearray_t canonical_serialize_epoch_change_payload(
-    const EpochChangePayload &payload)
-{
-    Writer writer;
-    writer.domain(std::string_view(
-        kEpochChangePayloadDomain,
-        sizeof(kEpochChangePayloadDomain) - 1));
-    append_payload_fields(writer, payload);
-    return std::move(writer).finish();
-}
-
-uint256_t epoch_change_payload_digest(const EpochChangePayload &payload)
-{
-    return DataStream(canonical_serialize_epoch_change_payload(payload))
-        .get_hash();
-}
-
-AuthorizedEpochChange authorize_epoch_change(
-    const EpochChangePayload &payload,
-    EpochChangeIssuerId issuer_id,
-    const PrivKeySecp256k1 &private_key)
-{
-    SigSecp256k1 signature;
-    signature.sign(
-        authorization_digest(
-            kEpochChangeSchemaVersionV1,
-            EpochProtocolMode::adaptive_v2,
-            payload,
-            issuer_id),
-        private_key);
-    return AuthorizedEpochChange{
-        kEpochChangeSchemaVersionV1,
-        EpochProtocolMode::adaptive_v2,
-        payload,
-        issuer_id,
-        std::move(signature)};
-}
-
-bool verify_epoch_change_signature(
-    const AuthorizedEpochChange &command,
-    const EpochChangeIssuer &issuer) noexcept
-{
-    if (command.schema_version != kEpochChangeSchemaVersionV1 ||
-        command.protocol_mode != EpochProtocolMode::adaptive_v2 ||
-        command.issuer_id != issuer.issuer_id)
-    {
-        return false;
-    }
-
-    try
-    {
-        auto signature = command.authorization;
-        return signature.verify(
-            authorization_digest(
-                command.schema_version,
-                command.protocol_mode,
-                command.payload,
-                command.issuer_id),
-            issuer.public_key);
-    }
-    catch (...)
-    {
-        return false;
-    }
-}
-
-bytearray_t canonical_epoch_change_signing_bytes(
-    const AuthorizedEpochChange &command)
-{
-    return canonical_unsigned_command(
-        command.schema_version,
-        command.protocol_mode,
-        command.payload,
-        command.issuer_id);
-}
-
-bytearray_t encode_authorized_epoch_change(
-    const AuthorizedEpochChange &command)
-{
-    auto encoded = canonical_epoch_change_signing_bytes(command);
-    const auto signature = command.authorization.to_bytes();
-    if (signature.size() != kSecp256k1SignatureBytes)
-    {
-        throw std::logic_error(
-            "epoch-change signature is not exactly 64 bytes");
-    }
-    encoded.insert(encoded.end(), signature.begin(), signature.end());
-    return encoded;
-}
-
-uint256_t epoch_change_envelope_digest(
-    const AuthorizedEpochChange &command)
-{
-    return DataStream(encode_authorized_epoch_change(command)).get_hash();
-}
-
-EpochChangeDecodeResult decode_authorized_epoch_change(
+EpochChangeDecodeResult decode_authorized_epoch_change_for_contract(
     const bytearray_t &payload,
-    std::size_t maximum_payload_bytes) noexcept
+    std::size_t maximum_payload_bytes,
+    std::string_view domain,
+    std::uint32_t expected_schema,
+    EpochProtocolMode expected_mode) noexcept
 {
     if (maximum_payload_bytes == 0)
     {
@@ -333,19 +253,15 @@ EpochChangeDecodeResult decode_authorized_epoch_change(
     try
     {
         Reader reader(payload, ReadFailure::truncated);
-        reader.domain(
-            std::string_view(
-                kAuthorizedEpochChangeDomain,
-                sizeof(kAuthorizedEpochChangeDomain) - 1),
-            ReadFailure::invalid_domain);
+        reader.domain(domain, ReadFailure::invalid_domain);
         const auto schema_version = reader.integer<std::uint32_t>();
-        if (schema_version != kEpochChangeSchemaVersionV1)
+        if (schema_version != expected_schema)
         {
             throw ReadException{ReadFailure::unsupported_schema};
         }
         const auto protocol_mode = static_cast<EpochProtocolMode>(
             reader.integer<std::uint8_t>());
-        if (protocol_mode != EpochProtocolMode::adaptive_v2)
+        if (protocol_mode != expected_mode)
         {
             throw ReadException{ReadFailure::unsupported_mode};
         }
@@ -405,9 +321,187 @@ EpochChangeDecodeResult decode_authorized_epoch_change(
     return {EpochChangeWireError::internal_failure, std::nullopt};
 }
 
+} // namespace
+
+bool EpochChangePayload::operator==(
+    const EpochChangePayload &other) const noexcept
+{
+    return successor_epoch_number == other.successor_epoch_number &&
+           predecessor_epoch_digest == other.predecessor_epoch_digest &&
+           successor_epoch_digest == other.successor_epoch_digest &&
+           activation_delay_blocks == other.activation_delay_blocks;
+}
+
+bool EpochChangePayload::operator!=(
+    const EpochChangePayload &other) const noexcept
+{
+    return !(*this == other);
+}
+
+bytearray_t canonical_serialize_epoch_change_payload(
+    const EpochChangePayload &payload)
+{
+    Writer writer;
+    writer.domain(std::string_view(
+        kEpochChangePayloadDomain,
+        sizeof(kEpochChangePayloadDomain) - 1));
+    append_payload_fields(writer, payload);
+    return std::move(writer).finish();
+}
+
+uint256_t epoch_change_payload_digest(const EpochChangePayload &payload)
+{
+    return DataStream(canonical_serialize_epoch_change_payload(payload))
+        .get_hash();
+}
+
+const std::string &adaptive_v3_authorized_epoch_change_domain() noexcept
+{
+    return kAdaptiveV3AuthorizedEpochChangeDomain;
+}
+
+AuthorizedEpochChange authorize_epoch_change(
+    const EpochChangePayload &payload,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &private_key)
+{
+    SigSecp256k1 signature;
+    signature.sign(
+        authorization_digest(
+            kEpochChangeSchemaVersionV1,
+            EpochProtocolMode::adaptive_v2,
+            payload,
+            issuer_id),
+        private_key);
+    return AuthorizedEpochChange{
+        kEpochChangeSchemaVersionV1,
+        EpochProtocolMode::adaptive_v2,
+        payload,
+        issuer_id,
+        std::move(signature)};
+}
+
+AuthorizedEpochChange authorize_epoch_change_v3(
+    const EpochChangePayload &payload,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &private_key)
+{
+    SigSecp256k1 signature;
+    signature.sign(
+        authorization_digest(
+            kEpochChangeSchemaVersionV2,
+            EpochProtocolMode::adaptive_v3,
+            payload,
+            issuer_id),
+        private_key);
+    return AuthorizedEpochChange{
+        kEpochChangeSchemaVersionV2,
+        EpochProtocolMode::adaptive_v3,
+        payload,
+        issuer_id,
+        std::move(signature)};
+}
+
+bool verify_epoch_change_signature(
+    const AuthorizedEpochChange &command,
+    const EpochChangeIssuer &issuer) noexcept
+{
+    const auto expected_schema =
+        command_schema_for_mode(command.protocol_mode);
+    if (!expected_schema || command.schema_version != *expected_schema ||
+        command.issuer_id != issuer.issuer_id)
+    {
+        return false;
+    }
+
+    try
+    {
+        auto signature = command.authorization;
+        return signature.verify(
+            authorization_digest(
+                command.schema_version,
+                command.protocol_mode,
+                command.payload,
+                command.issuer_id),
+            issuer.public_key);
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+bytearray_t canonical_epoch_change_signing_bytes(
+    const AuthorizedEpochChange &command)
+{
+    return canonical_unsigned_command(
+        command.schema_version,
+        command.protocol_mode,
+        command.payload,
+        command.issuer_id);
+}
+
+bytearray_t encode_authorized_epoch_change(
+    const AuthorizedEpochChange &command)
+{
+    auto encoded = canonical_epoch_change_signing_bytes(command);
+    const auto signature = command.authorization.to_bytes();
+    if (signature.size() != kSecp256k1SignatureBytes)
+    {
+        throw std::logic_error(
+            "epoch-change signature is not exactly 64 bytes");
+    }
+    encoded.insert(encoded.end(), signature.begin(), signature.end());
+    return encoded;
+}
+
+uint256_t epoch_change_envelope_digest(
+    const AuthorizedEpochChange &command)
+{
+    return DataStream(encode_authorized_epoch_change(command)).get_hash();
+}
+
+EpochChangeDecodeResult decode_authorized_epoch_change(
+    const bytearray_t &payload,
+    std::size_t maximum_payload_bytes) noexcept
+{
+    return decode_authorized_epoch_change_for_contract(
+        payload,
+        maximum_payload_bytes,
+        std::string_view(
+            kAuthorizedEpochChangeDomain,
+            sizeof(kAuthorizedEpochChangeDomain) - 1),
+        kEpochChangeSchemaVersionV1,
+        EpochProtocolMode::adaptive_v2);
+}
+
+EpochChangeDecodeResult decode_authorized_epoch_change_v3(
+    const bytearray_t &payload,
+    std::size_t maximum_payload_bytes) noexcept
+{
+    return decode_authorized_epoch_change_for_contract(
+        payload,
+        maximum_payload_bytes,
+        kAdaptiveV3AuthorizedEpochChangeDomain,
+        kEpochChangeSchemaVersionV2,
+        EpochProtocolMode::adaptive_v3);
+}
+
 bytearray_t encode_epoch_change_block_extra(
     const AuthorizedEpochChange &command)
 {
+    return encode_authorized_epoch_change(command);
+}
+
+bytearray_t encode_epoch_change_block_extra_v3(
+    const AuthorizedEpochChange &command)
+{
+    if (command.schema_version != kEpochChangeSchemaVersionV2 ||
+        command.protocol_mode != EpochProtocolMode::adaptive_v3)
+    {
+        throw std::invalid_argument(
+            "adaptive-v3 block extra requires an adaptive-v3 command");
+    }
     return encode_authorized_epoch_change(command);
 }
 
@@ -489,13 +583,92 @@ EpochChangeBlockExtraResult extract_epoch_change_block_extra(
     }
 }
 
+EpochChangeBlockExtraResult extract_epoch_change_block_extra_v3(
+    const bytearray_t &extra,
+    std::size_t maximum_payload_bytes) noexcept
+{
+    if (maximum_payload_bytes == 0)
+    {
+        return {
+            EpochChangeExtraDisposition::rejected,
+            EpochChangeWireError::invalid_limit,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+    }
+    if (extra.empty())
+    {
+        return {
+            EpochChangeExtraDisposition::absent,
+            EpochChangeWireError::none,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+    }
+
+    auto decoded = decode_authorized_epoch_change_v3(
+        extra, maximum_payload_bytes);
+    if (!decoded)
+    {
+        return {
+            EpochChangeExtraDisposition::rejected,
+            decoded.error,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+    }
+
+    try
+    {
+        const auto canonical = encode_epoch_change_block_extra_v3(
+            *decoded.value);
+        if (canonical != extra || !has_canonical_low_s_signature(extra))
+        {
+            return {
+                EpochChangeExtraDisposition::rejected,
+                EpochChangeWireError::noncanonical_encoding,
+                std::nullopt,
+                std::nullopt,
+                std::nullopt};
+        }
+        const auto payload_digest = epoch_change_payload_digest(
+            decoded.value->payload);
+        const auto envelope_digest = DataStream(extra).get_hash();
+        return {
+            EpochChangeExtraDisposition::present,
+            EpochChangeWireError::none,
+            std::move(decoded.value),
+            payload_digest,
+            envelope_digest};
+    }
+    catch (const std::bad_alloc &)
+    {
+        return {
+            EpochChangeExtraDisposition::rejected,
+            EpochChangeWireError::allocation_failure,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+    }
+    catch (...)
+    {
+        return {
+            EpochChangeExtraDisposition::rejected,
+            EpochChangeWireError::internal_failure,
+            std::nullopt,
+            std::nullopt,
+            std::nullopt};
+    }
+}
+
 EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
     const Block &proposal,
     const Block &committed_head,
     const uint256_t &candidate_predecessor_digest,
     const EpochChangeCommittedHistorySnapshot &committed_snapshot,
     std::size_t maximum_block_extra_bytes,
-    std::size_t maximum_ancestry_blocks) noexcept
+    std::size_t maximum_ancestry_blocks,
+    EpochProtocolMode protocol_mode) noexcept
 {
     if (maximum_block_extra_bytes == 0)
     {
@@ -535,8 +708,11 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
             if (block.get_extra().empty())
                 return true;
 
-            auto extracted = extract_epoch_change_block_extra(
-                block.get_extra(), maximum_block_extra_bytes);
+            auto extracted = protocol_mode == EpochProtocolMode::adaptive_v3
+                ? extract_epoch_change_block_extra_v3(
+                      block.get_extra(), maximum_block_extra_bytes)
+                : extract_epoch_change_block_extra(
+                      block.get_extra(), maximum_block_extra_bytes);
             if (extracted.disposition !=
                 EpochChangeExtraDisposition::present)
             {
@@ -692,14 +868,31 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
 EpochChangeVerifier::EpochChangeVerifier(
     EpochChangeIssuer issuer,
     EpochChangeDelayBounds delay_bounds)
+    : EpochChangeVerifier(
+          std::move(issuer),
+          delay_bounds,
+          EpochProtocolMode::adaptive_v2)
+{
+}
+
+EpochChangeVerifier::EpochChangeVerifier(
+    EpochChangeIssuer issuer,
+    EpochChangeDelayBounds delay_bounds,
+    EpochProtocolMode protocol_mode)
     : issuer_(std::move(issuer)),
-      delay_bounds_(delay_bounds)
+      delay_bounds_(delay_bounds),
+      protocol_mode_(protocol_mode)
 {
     if (delay_bounds_.minimum_blocks == 0 ||
         delay_bounds_.maximum_blocks < delay_bounds_.minimum_blocks)
     {
         throw std::invalid_argument(
             "epoch-change delay bounds must be nonzero and ordered");
+    }
+    if (!command_schema_for_mode(protocol_mode_))
+    {
+        throw std::invalid_argument(
+            "epoch-change verifier requires adaptive-v2 or adaptive-v3 mode");
     }
 }
 
@@ -710,12 +903,13 @@ EpochChangeValidationResult EpochChangeVerifier::validate(
     const EpochChangeHistoryView &history) const
 {
     const auto payload_digest = epoch_change_payload_digest(command.payload);
-    if (command.schema_version != kEpochChangeSchemaVersionV1)
+    const auto expected_schema = command_schema_for_mode(protocol_mode_);
+    if (!expected_schema || command.schema_version != *expected_schema)
     {
         return validation_result(
             EpochChangeDisposition::unsupported_schema, payload_digest);
     }
-    if (command.protocol_mode != EpochProtocolMode::adaptive_v2)
+    if (command.protocol_mode != protocol_mode_)
     {
         return validation_result(
             EpochChangeDisposition::unsupported_mode, payload_digest);
@@ -778,8 +972,10 @@ EpochChangeValidationResult EpochChangeVerifier::validate(
         auto result = result_for(
             EpochChangeDisposition::defer_missing_definition);
         result.recovery_request = EpochDefinitionRequest{
-            kEpochWireSchemaVersionV2,
-            EpochProtocolMode::adaptive_v2,
+            protocol_mode_ == EpochProtocolMode::adaptive_v2
+                ? kEpochWireSchemaVersionV2
+                : kEpochWireSchemaVersionV3,
+            protocol_mode_,
             command.payload.successor_epoch_digest};
         return result;
     }
@@ -812,10 +1008,12 @@ EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
     const EpochChangeVerifier &verifier,
     const EpochDefinition &active_epoch,
     const EpochStore &store,
-    const EpochChangeHistoryView &history) noexcept
+    const EpochChangeHistoryView &history,
+    EpochProtocolMode protocol_mode) noexcept
 {
-    auto extracted = extract_epoch_change_block_extra(
-        extra, maximum_payload_bytes);
+    auto extracted = protocol_mode == EpochProtocolMode::adaptive_v3
+        ? extract_epoch_change_block_extra_v3(extra, maximum_payload_bytes)
+        : extract_epoch_change_block_extra(extra, maximum_payload_bytes);
     if (extracted.disposition == EpochChangeExtraDisposition::absent)
     {
         return {
@@ -860,9 +1058,11 @@ EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
             disposition == EpochChangeProposalDisposition::defer &&
             validation.recovery_request &&
             validation.recovery_request->wire_schema_version ==
-                kEpochWireSchemaVersionV2 &&
+                (protocol_mode == EpochProtocolMode::adaptive_v3
+                     ? kEpochWireSchemaVersionV3
+                     : kEpochWireSchemaVersionV2) &&
             validation.recovery_request->protocol_mode ==
-                EpochProtocolMode::adaptive_v2 &&
+                protocol_mode &&
             validation.recovery_request->successor_epoch_digest ==
                 extracted.command->payload.successor_epoch_digest;
         if (disposition == EpochChangeProposalDisposition::defer &&
@@ -908,7 +1108,8 @@ EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
     std::size_t maximum_ancestry_blocks,
     const EpochChangeVerifier &verifier,
     const EpochDefinition &active_epoch,
-    const EpochStore &store) noexcept
+    const EpochStore &store,
+    EpochProtocolMode protocol_mode) noexcept
 {
     if (maximum_block_extra_bytes == 0)
     {
@@ -925,8 +1126,11 @@ EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
 
     try
     {
-        auto candidate_extra = extract_epoch_change_block_extra(
-            proposal.get_extra(), maximum_block_extra_bytes);
+        auto candidate_extra = protocol_mode == EpochProtocolMode::adaptive_v3
+            ? extract_epoch_change_block_extra_v3(
+                  proposal.get_extra(), maximum_block_extra_bytes)
+            : extract_epoch_change_block_extra(
+                  proposal.get_extra(), maximum_block_extra_bytes);
         if (candidate_extra.disposition ==
             EpochChangeExtraDisposition::rejected)
         {
@@ -967,7 +1171,8 @@ EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
             active_epoch.epoch_digest(),
             committed_snapshot,
             maximum_block_extra_bytes,
-            maximum_ancestry_blocks);
+            maximum_ancestry_blocks,
+            protocol_mode);
         if (!history)
         {
             if (history.error == EpochChangeProposalHistoryError::none &&
@@ -1059,7 +1264,8 @@ EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
             verifier,
             active_epoch,
             store,
-            history.history);
+            history.history,
+            protocol_mode);
         if (candidate.wire_error != EpochChangeWireError::none)
         {
             const auto wire_error =

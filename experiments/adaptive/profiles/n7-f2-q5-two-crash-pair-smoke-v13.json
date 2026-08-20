@@ -1,0 +1,258 @@
+{
+  "blinding": {
+    "forbidden": [
+      "crash_ids",
+      "target_pids",
+      "target_pgids",
+      "process_state",
+      "performance_labels"
+    ],
+    "manager_input_source": "authenticated_runtime_evidence_plus_bound_fault_window_arm"
+  },
+  "campaign": {
+    "automatic_retries": 0,
+    "claim_slot_count": 0,
+    "outcome_dependent_order": false,
+    "pair_count": 1,
+    "replacement_policy": "none",
+    "scientific_support_contract": {
+      "domain": "kauri-focused-campaign-scientific-support-v1",
+      "schema_version": 1
+    }
+  },
+  "campaign_member": false,
+  "evidence_guard": {
+    "horizon_tree_positions": 6,
+    "minimum_score_drop": 6,
+    "minimum_timeouts_per_reporter": 2,
+    "minimum_topology_eligible_reporter_capacity": 3,
+    "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+    "required_postfault_tree_positions": 6,
+    "required_qualifying_reporters": 3,
+    "schedule": "native_cyclic_epoch_zero",
+    "tree_switch_period_blocks": 2
+  },
+  "execution_class": "excluded_n7_smoke",
+  "fault": {
+    "automatic_retries": 0,
+    "kind": "atomic_process_group_sigkill",
+    "replacement_policy": "none",
+    "signal_number": 9,
+    "target_count": 2
+  },
+  "fault_window_arm": {
+    "clock_domain": "same_host_clock_monotonic_raw",
+    "domain": "epoch_zero_native_cyclic_tree_positions",
+    "manager_visibility": "target-identity/process-state blind; intervention-boundary aware",
+    "ordered_tree_prefix": [
+      6,
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "required_for_new_executions": true,
+    "required_observation_schema": 3,
+    "required_postfault_tree_positions": 6,
+    "schema_version": 4,
+    "selection_cardinality_policy": "all_guarded_up_to_fault_bound_v1",
+    "snapshot_evidence_basis": "exact_post_fault_attempt_start_v1",
+    "timeout_evidence_basis": "exact_timeout_attempt_id_v1"
+  },
+  "figure_eligible": false,
+  "frozen": true,
+  "matched_inputs": {
+    "shared_build": true,
+    "shared_epoch1_structure": true,
+    "shared_pair_seed": true,
+    "shared_revision": true,
+    "shared_workload": true
+  },
+  "measurement": {
+    "authoritative_replica_id": 2,
+    "bucket_width_seconds": 5,
+    "commit_event_type": "block.committed",
+    "phase_names": [
+      "baseline",
+      "fault",
+      "epoch1",
+      "late"
+    ],
+    "phase_window_contract": {
+      "control_optimization_hold_seconds": 30,
+      "domain": "kauri-focused-causal-phase-windows-v1",
+      "schema_version": 1,
+      "stabilization_offset_seconds": 30
+    }
+  },
+  "performance": {
+    "initial_root_top_ranked": false,
+    "labels_or_fault_truth_manager_visible": false,
+    "responsive_tiers": [
+      "fast",
+      "medium",
+      "slow"
+    ]
+  },
+  "ports": {
+    "base": 18000,
+    "require_available": true,
+    "stride": 1
+  },
+  "profile_id": "n7-f2-q5-two-crash-pair-smoke-v13",
+  "protocol": {
+    "N": 7,
+    "Q": 5,
+    "epoch_protocol_mode": "adaptive_v3",
+    "f": 2,
+    "fanout": 2,
+    "pipeline_stretch": 2,
+    "transactions_per_block": 1000
+  },
+  "schema_version": 2,
+  "thresholds": {
+    "adaptive_ratio_min_ppm": 1100000,
+    "containment_over_baseline_min_ppm": 800000,
+    "paired_ratio_min_ppm": 1100000
+  },
+  "timers": {
+    "adaptation_interval_seconds": 30,
+    "arm_hard_deadline_seconds": 480,
+    "containment_activation_deadline_seconds": 270,
+    "manager_convergence_timeout_seconds": 60,
+    "nonresponse_evidence_deadline_seconds": 180,
+    "optimization_activation_deadline_seconds": 90,
+    "postfault_configuration_coverage_deadline_seconds": 150,
+    "readiness_timeout_seconds": 60,
+    "stable_phase_seconds": 30
+  },
+  "topology": {
+    "active_tree_id": 6,
+    "epoch_zero_digest": "f550407e56cc54a8fd4e93d1997ebe658b75699f4f2a9e955f4cc829b52bec81",
+    "proof_path": "topology-proofs/n7-f2-q5-two-crash-pair-smoke-v13-topology-proof.json",
+    "proof_sha256": "8a43f845b41b8813df0c689adc1042baa4457af1c6061ad6db677434e5d4b99d",
+    "reporter_coverage_capacity": {
+      "domain": "kauri-topology-fault-window-reporter-capacity-v1",
+      "minimum_topology_eligible_reporter_capacity": 3,
+      "prefix_tree_ids": [
+        6,
+        0,
+        1,
+        2,
+        3,
+        4
+      ],
+      "reporter_selection_basis": "any_topology_valid_in_prefix_v1",
+      "schema_version": 1,
+      "targets": [
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 6
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 0
+        },
+        {
+          "eligible_reporters": [
+            {
+              "reporter_id": 4,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 2
+                }
+              ]
+            },
+            {
+              "reporter_id": 5,
+              "tree_relations": [
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 3
+                },
+                {
+                  "expected_message_type": "direct_vote",
+                  "tree_id": 4
+                }
+              ]
+            },
+            {
+              "reporter_id": 6,
+              "tree_relations": [
+                {
+                  "expected_message_type": "aggregate_relay",
+                  "tree_id": 6
+                }
+              ]
+            }
+          ],
+          "target_replica_id": 1
+        }
+      ]
+    },
+    "reviewed_target_replica_ids": [
+      0,
+      1
+    ]
+  },
+  "transitions": {
+    "activation_readiness_contract": {
+      "certificate_quorum": 5,
+      "containment_measurement_seconds": 30,
+      "containment_stabilization_seconds": 30,
+      "deadline_semantics": "half_open_monotonic_v1",
+      "domain": "kauri-focused-v13-certified-activation-v1",
+      "epoch1_common_commit_anchor_deadline_seconds": 5,
+      "minimum_predecessor_residency_ms": 65000,
+      "optimization_activation_budget_seconds": 90,
+      "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
+      "required_reporter_count": 5,
+      "schema_version": 1
+    },
+    "adaptive": [
+      "epoch1",
+      "epoch2"
+    ],
+    "adaptive_timing_contract": {
+      "domain": "kauri-focused-v10-transition-timing-v1",
+      "epoch1_common_commit_anchor_deadline_seconds": 5,
+      "optimization_minimum_predecessor_residency_ms": 65000,
+      "schema_version": 1
+    },
+    "common_commit_quorum": 5,
+    "control": [
+      "epoch1"
+    ],
+    "survivor_barrier_count": 5
+  }
+}

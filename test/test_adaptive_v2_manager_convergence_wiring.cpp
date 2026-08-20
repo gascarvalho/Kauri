@@ -96,6 +96,16 @@ std::string code_without_comments_or_literals(const std::string &contents)
             break;
         }
     }
+    // The executable now has one public AdaptationManager wrapper.  These
+    // v2 convergence assertions belong to its private v2 mode state, not to
+    // the mode-dispatch wrapper or the sibling v3 state.
+    const auto v2 = result.find("class AdaptiveV2ManagerModeState final");
+    if (v2 != std::string::npos)
+    {
+        const auto wrapper = result.find("class AdaptationManager final", v2);
+        REQUIRE(wrapper != std::string::npos);
+        return result.substr(v2, wrapper - v2);
+    }
     return result;
 }
 
@@ -161,11 +171,22 @@ std::string without_whitespace(const std::string &contents)
 bool owns_manager_session(const std::string &manager)
 {
     const auto compact = without_whitespace(manager);
-    return compact.find("AdaptiveV2ManagerSessionsession_") !=
+    return compact.find("AdaptiveManagerSessionFacadefacade_") !=
+               std::string::npos &&
+           compact.find("AdaptiveV2ManagerSession&session_") !=
                std::string::npos &&
            compact.find(
                "AdaptiveV2ManagerRequestSequencerequest_sequence_") !=
                std::string::npos;
+}
+
+std::string manager_options_parser(const std::string &contents)
+{
+    const auto definition = contents.find(
+        "ManagerOptions parse_options(int argc, char **argv)\n{");
+    REQUIRE(definition != std::string::npos);
+    return function_body(
+        contents.substr(definition), "ManagerOptions parse_options(");
 }
 
 double numeric_constant(
@@ -481,7 +502,7 @@ TEST_CASE(
           std::string::npos);
     if (owns_manager_session(code_without_comments_or_literals(manager)))
     {
-        CHECK(compact.find(
+        CHECK(without_whitespace(manager).find(
                   "config.convergence_window_ticks="
                   "options.convergence_deadline_ticks") !=
               std::string::npos);
@@ -825,7 +846,7 @@ TEST_CASE(
     const auto compact = without_whitespace(manager);
 
     const bool owns_session =
-        compact.find("AdaptiveV2ManagerSessionsession_") !=
+        compact.find("AdaptiveManagerSessionFacadefacade_") !=
         std::string::npos;
     const bool owns_request_sequence =
         compact.find("AdaptiveV2ManagerRequestSequencerequest_sequence_") !=
@@ -886,7 +907,8 @@ TEST_CASE(
           std::string::npos);
 
     const auto output_path = function_body(
-        manager, "std::string transition_bundle_output_path(");
+        source("examples/adaptation_manager.cpp"),
+        "std::string transition_bundle_output_path(");
     REQUIRE_FALSE(output_path.empty());
     CHECK(output_path.find("bundle_output") != std::string::npos);
     CHECK(output_path.find("successor_epoch_number") !=
@@ -898,13 +920,13 @@ TEST_CASE(
           std::string::npos);
     CHECK(manager.find("write_exclusive_bundle(") !=
           std::string::npos);
-    CHECK(manager.find(
+    CHECK(raw_manager.find(
               "request.evidence_snapshot_output =") !=
           std::string::npos);
-    CHECK(manager.find(
+    CHECK(raw_manager.find(
               "request.evidence_snapshot_path") !=
           std::string::npos);
-    CHECK(manager.find("exclusive_artifact_outputs") !=
+    CHECK(raw_manager.find("exclusive_artifact_outputs") !=
           std::string::npos);
 
     const auto snapshot = function_body(
@@ -954,7 +976,7 @@ TEST_CASE(
          "session_.start_convergence("}));
 
     const auto exclusive_json = function_body(
-        manager, "void write_exclusive_json(");
+        raw_manager, "void write_exclusive_json(");
     REQUIRE_FALSE(exclusive_json.empty());
     CHECK(exclusive_json.find("O_EXCL") != std::string::npos);
     CHECK(exclusive_json.find("O_NOFOLLOW") != std::string::npos);
@@ -1041,7 +1063,7 @@ TEST_CASE(
           std::string::npos);
 
     const auto config = function_body(
-        manager,
+        source("examples/adaptation_manager.cpp"),
         "hotstuff::StructuredEventConfig manager_structured_event_config(");
     REQUIRE_FALSE(config.empty());
     CHECK(config.find("maximum_line_bytes") == std::string::npos);
@@ -1292,7 +1314,7 @@ TEST_CASE(
 
     CHECK(manager.find("minimum_predecessor_residency_ms") !=
           std::string::npos);
-    CHECK(manager.find("kMaximumPredecessorResidencyMs") !=
+    CHECK(source("examples/adaptation_manager.cpp").find("kMaximumPredecessorResidencyMs") !=
           std::string::npos);
     CHECK(manager.find("predecessor_residency_timer") !=
           std::string::npos);
@@ -1348,8 +1370,8 @@ TEST_CASE(
               manager,
               "schedule_current_predecessor_residency()") == 2);
 
-    const auto parse_options = function_body(
-        manager, "ManagerOptions parse_options(");
+    const auto parse_options = manager_options_parser(
+        source("examples/adaptation_manager.cpp"));
     REQUIRE_FALSE(parse_options.empty());
     const auto first_request = parse_options.find(
         "options.transition_requests.empty()");
@@ -1526,8 +1548,7 @@ TEST_CASE(
               "cycle_1_selection_not_before_monotonic_ns") !=
           std::string::npos);
 
-    const auto parse_options = function_body(
-        manager, "ManagerOptions parse_options(");
+    const auto parse_options = manager_options_parser(raw_manager);
     REQUIRE_FALSE(parse_options.empty());
     const auto gate_parse = parse_options.find(
         "cycle_1_selection_not_before_monotonic_ns =");
@@ -1557,7 +1578,7 @@ TEST_CASE(
     CHECK(validation.find("minimum_post_baseline_observation_ms") !=
           std::string::npos);
 
-    const auto main_body = function_body(manager, "int main(");
+    const auto main_body = function_body(raw_manager, "int main(");
     REQUIRE_FALSE(main_body.empty());
     CHECK(contains_in_order(
         main_body,
@@ -1812,7 +1833,7 @@ TEST_CASE(
               "Config::SET_VAL)") != std::string::npos);
 
     const auto policy_parser = function_body(
-        manager,
+        raw_manager,
         "parse_cross_commit_retention_admission_policy(");
     REQUIRE_FALSE(policy_parser.empty());
     CHECK(policy_parser.find(
@@ -1823,8 +1844,7 @@ TEST_CASE(
     CHECK(policy_parser.find("throw std::invalid_argument") !=
           std::string::npos);
 
-    const auto parse_options = function_body(
-        manager, "ManagerOptions parse_options(");
+    const auto parse_options = manager_options_parser(raw_manager);
     REQUIRE_FALSE(parse_options.empty());
     CHECK(parse_options.find(
               "cycle_1_responsive_cross_commit_retention_admission_policy") !=

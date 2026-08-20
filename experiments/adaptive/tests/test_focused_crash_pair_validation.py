@@ -1593,7 +1593,7 @@ def test_sealed_campaign_propagates_only_v9_scientific_support(
     monkeypatch.setattr(
         validation,
         "validate_sealed_arm",
-        lambda _directory, *, trusted_provenance: {
+        lambda _directory, *, trusted_provenance, readiness_verifier_path=None: {
             "source_inventory_sha256": "1" * 64,
             "authoritative_commit_identity_sha256": "2" * 64,
             "epoch_identity_sha256": "3" * 64,

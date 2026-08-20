@@ -208,6 +208,7 @@ public:
 
 private:
     friend class AdaptiveV2ManagerSession;
+    friend class AdaptiveV3ManagerSession;
 
     AdaptiveV2ManagerIngressStatus prepare_same_epoch_window_reset()
         noexcept;

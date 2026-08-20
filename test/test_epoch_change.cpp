@@ -646,6 +646,60 @@ TEST_CASE("C07 retrieves adaptive definitions by digest",
     CHECK(request_round_trip.value->successor_epoch_digest == next_digest);
 }
 
+TEST_CASE("CERT13 v3 definition recovery uses only canonical schema three",
+          "[cert13][epoch-change][availability][wire][v3]")
+{
+    EpochStore store(membership());
+    const auto &active = store.stage(epoch_zero(), EpochValidationContext{});
+    const auto next = successor(active.epoch_digest());
+    const auto next_digest = hotstuff::compute_epoch_digest(next);
+    REQUIRE(hotstuff::epoch_wire_schema_for_mode(
+                EpochProtocolMode::adaptive_v3) ==
+            hotstuff::kEpochWireSchemaVersionV3);
+
+    const EpochDefinitionRequest request{
+        hotstuff::kEpochWireSchemaVersionV3,
+        EpochProtocolMode::adaptive_v3,
+        next_digest};
+    const auto request_wire = hotstuff::encode_epoch_wire(request, limits());
+    const auto decoded_request = hotstuff::decode_epoch_definition_request(
+        request_wire, EpochProtocolMode::adaptive_v3, limits());
+    REQUIRE(decoded_request);
+    CHECK(decoded_request.value->wire_schema_version ==
+          hotstuff::kEpochWireSchemaVersionV3);
+
+    auto wrong_request_wire = request_wire;
+    wrong_request_wire[0] = hotstuff::kEpochWireSchemaVersionV2;
+    const auto wrong_request = hotstuff::decode_epoch_definition_request(
+        wrong_request_wire, EpochProtocolMode::adaptive_v3, limits());
+    CHECK(wrong_request.error == hotstuff::EpochWireError::unsupported_schema);
+    CHECK_FALSE(wrong_request.value.has_value());
+    CHECK_THROWS(hotstuff::encode_epoch_wire(
+        EpochDefinitionRequest{
+            hotstuff::kEpochWireSchemaVersionV2,
+            EpochProtocolMode::adaptive_v3,
+            next_digest},
+        limits()));
+
+    const EpochDefinitionReply reply{
+        hotstuff::kEpochWireSchemaVersionV3,
+        EpochProtocolMode::adaptive_v3,
+        next_digest,
+        next};
+    const auto reply_wire = hotstuff::encode_epoch_wire(reply, limits());
+    const auto decoded_reply = hotstuff::decode_epoch_definition_reply(
+        reply_wire, EpochProtocolMode::adaptive_v3, limits());
+    REQUIRE(decoded_reply);
+    CHECK(decoded_reply.value->wire_schema_version ==
+          hotstuff::kEpochWireSchemaVersionV3);
+    auto wrong_reply_wire = reply_wire;
+    wrong_reply_wire[0] = hotstuff::kEpochWireSchemaVersionV2;
+    const auto wrong_reply = hotstuff::decode_epoch_definition_reply(
+        wrong_reply_wire, EpochProtocolMode::adaptive_v3, limits());
+    CHECK(wrong_reply.error == hotstuff::EpochWireError::unsupported_schema);
+    CHECK_FALSE(wrong_reply.value.has_value());
+}
+
 TEST_CASE("C07 definition reply decoder rejects mismatched and noncanonical bytes",
           "[c07][epoch-change][availability][wire][negative]")
 {

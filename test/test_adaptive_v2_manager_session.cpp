@@ -12,6 +12,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/epoch_activation.h"
+#include "support/adaptive_manager_evidence_fixture.h"
 
 #if __has_include("hotstuff/adaptive_v2_manager_session.h")
 #include "hotstuff/adaptive_v2_manager_session.h"
@@ -513,39 +514,21 @@ struct Fixture
 {
     explicit Fixture(
         AdaptiveV2ManagerSessionConfig config = session_config())
-        : session(kMembers, epoch_zero(), std::move(config))
+        : session(kMembers, epoch_zero(), std::move(config)),
+          evidence(
+              session,
+              kMembers,
+              kSurvivors,
+              session_config().ingress_limits)
     {}
 
     AdaptiveV2ManagerSession session;
-    std::array<std::uint64_t, 7> readiness_sequences{};
-    std::array<std::uint64_t, 7> lifecycle_sequences{};
-    std::array<std::uint64_t, 7> evidence_sequences{};
-    std::uint64_t proposal_counter{0};
+    kauri::test_support::AdaptiveManagerEvidenceDriver<
+        AdaptiveV2ManagerSession> evidence;
 
     void ready_all()
     {
-        for (const auto source : kMembers)
-        {
-            const AdaptiveV2ReadinessNotice notice{
-                hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
-                source,
-                ++readiness_sequences[source],
-                session.ingress().current_configuration(),
-                session.ingress().activation_generation(),
-                static_cast<std::uint64_t>(
-                    1'000'000 + readiness_sequences[source] * 100 +
-                    source)};
-            CHECK(route_readiness(
-                      session,
-                      AuthenticatedReporter{source},
-                      hotstuff::encode_adaptive_v2_readiness_notice(
-                          notice,
-                          session_config().ingress_limits
-                              .readiness_wire))
-                      .status ==
-                  AdaptiveV2ManagerIngressStatus::processed);
-        }
-        REQUIRE(session.ingress().all_members_ready());
+        evidence.ready_all();
     }
 
     ResponseObservation make_observation(
@@ -554,216 +537,45 @@ struct Fixture
         ResponseOutcome outcome,
         const std::string &label)
     {
-        const auto edge = leaf_edge(
-            session, target, reporter_occurrence);
-        ResponseObservation value;
-        value.reporter_id = edge.reporter;
-        value.observed_replica_id = target;
-        value.configuration = ConfigurationId{
-            session.ingress().current_epoch().epoch_number(),
-            edge.tree_id,
-            session.ingress().current_epoch().epoch_digest()};
-        value.block_hash = digest(
-            label + "-" + std::to_string(++proposal_counter));
-        value.expected_message_type = ExpectedMessageType::direct_vote;
-        value.outcome = outcome;
-        value.response_duration_us =
-            outcome == ResponseOutcome::timeout ? 0 : 20 + target;
-        value.deadline_duration_us = 100;
-        value.reporter_sequence =
-            ++evidence_sequences[value.reporter_id];
-        value.reporter_monotonic_ns =
-            value.reporter_sequence * 1'000;
-        if (outcome != ResponseOutcome::timeout)
-            value.signer_set = {target};
-        value.observation_id =
-            hotstuff::compute_response_observation_id(
-                value.attempt_identity());
-        return value;
+        return evidence.make_observation(
+            target, reporter_occurrence, outcome, label);
     }
 
     void record(ResponseObservation observation)
     {
-        for (ReplicaID source = 0; source < 3; ++source)
-        {
-            const ProposalLifecycleNotice notice{
-                hotstuff::kProposalLifecycleNoticeSchemaVersion,
-                source,
-                ++lifecycle_sequences[source],
-                ProposalLifecycleFact{NormalProposalRuntimeInitialized{
-                    observation.proposal_key()}}};
-            const auto result = route_lifecycle(
-                session,
-                AuthenticatedReporter{source},
-                hotstuff::encode_proposal_lifecycle_notice(
-                    notice,
-                    session_config().ingress_limits.lifecycle_wire));
-            CHECK(result.status ==
-                  (source < 2
-                       ? AdaptiveV2ManagerIngressStatus::
-                             awaiting_corroboration
-                       : AdaptiveV2ManagerIngressStatus::processed));
-        }
-        const auto result = route_evidence(
-            session,
-            AuthenticatedReporter{observation.reporter_id},
-            hotstuff::encode_evidence_batch(
-                ResponseObservationBatch{
-                    hotstuff::kEvidenceBatchSchemaVersion,
-                    {std::move(observation)}},
-                session_config().ingress_limits.evidence_wire));
-        REQUIRE(result.status ==
-                AdaptiveV2ManagerIngressStatus::processed);
-        REQUIRE(result.accepted_observations == 1);
+        evidence.record(std::move(observation));
     }
 
     void anchor_timeout_proposal(const ResponseObservation &timeout)
     {
-        const auto &trees = session.ingress().current_epoch().trees();
-        const auto tree = std::find_if(
-            trees.begin(), trees.end(), [&timeout](const auto &entry) {
-                return entry.tree_id == timeout.configuration.tree_id;
-            });
-        REQUIRE(tree != trees.end());
-        const auto first_leaf = first_leaf_index(
-            tree->members_breadth_first.size(), tree->fanout);
-        for (std::size_t position = first_leaf;
-             position < tree->members_breadth_first.size(); ++position)
-        {
-            const auto parent = (position - 1U) / tree->fanout;
-            const auto reporter = tree->members_breadth_first[parent];
-            const auto observed = tree->members_breadth_first[position];
-            if (reporter == timeout.reporter_id &&
-                observed == timeout.observed_replica_id)
-            {
-                continue;
-            }
-            ResponseObservation anchor;
-            anchor.reporter_id = reporter;
-            anchor.observed_replica_id = observed;
-            anchor.configuration = timeout.configuration;
-            anchor.block_hash = timeout.block_hash;
-            anchor.expected_message_type = ExpectedMessageType::direct_vote;
-            anchor.outcome = ResponseOutcome::on_time;
-            anchor.response_duration_us = 20;
-            anchor.deadline_duration_us = timeout.deadline_duration_us;
-            anchor.reporter_sequence = ++evidence_sequences[reporter];
-            anchor.reporter_monotonic_ns = anchor.reporter_sequence * 1'000;
-            anchor.signer_set = {observed};
-            anchor.observation_id = hotstuff::compute_response_observation_id(
-                anchor.attempt_identity());
-            const auto result = route_evidence(
-                session,
-                AuthenticatedReporter{anchor.reporter_id},
-                hotstuff::encode_evidence_batch(
-                    ResponseObservationBatch{
-                        hotstuff::kEvidenceBatchSchemaVersion, {anchor}},
-                    session_config().ingress_limits.evidence_wire));
-            REQUIRE(result.status == AdaptiveV2ManagerIngressStatus::processed);
-            REQUIRE(result.accepted_observations == 1);
-            return;
-        }
-        FAIL("fixture tree lacks a distinct direct-vote anchor");
+        evidence.anchor_timeout_proposal(timeout);
     }
 
     void cover_tree(std::uint32_t tree_id)
     {
-        const auto &trees = session.ingress().current_epoch().trees();
-        const auto tree = std::find_if(
-            trees.begin(), trees.end(), [tree_id](const auto &entry) {
-                return entry.tree_id == tree_id;
-            });
-        REQUIRE(tree != trees.end());
-        const auto position = first_leaf_index(
-            tree->members_breadth_first.size(), tree->fanout);
-        const auto parent = (position - 1U) / tree->fanout;
-        ResponseObservation anchor;
-        anchor.reporter_id = tree->members_breadth_first[parent];
-        anchor.observed_replica_id = tree->members_breadth_first[position];
-        anchor.configuration = ConfigurationId{
-            session.ingress().current_epoch().epoch_number(),
-            tree_id,
-            session.ingress().current_epoch().epoch_digest()};
-        anchor.block_hash = digest(
-            "v4-coverage-" + std::to_string(++proposal_counter));
-        anchor.expected_message_type = ExpectedMessageType::direct_vote;
-        anchor.outcome = ResponseOutcome::on_time;
-        anchor.response_duration_us = 20;
-        anchor.deadline_duration_us = 100;
-        anchor.reporter_sequence = ++evidence_sequences[anchor.reporter_id];
-        anchor.reporter_monotonic_ns = anchor.reporter_sequence * 1'000;
-        anchor.signer_set = {anchor.observed_replica_id};
-        anchor.observation_id = hotstuff::compute_response_observation_id(
-            anchor.attempt_identity());
-        record(std::move(anchor));
+        evidence.cover_tree(tree_id);
     }
 
     void responsive_baseline()
     {
-        for (const auto target : kMembers)
-        {
-            for (std::size_t attempt = 0; attempt < 2; ++attempt)
-            {
-                record(make_observation(
-                    target,
-                    attempt,
-                    ResponseOutcome::on_time,
-                    "baseline"));
-            }
-        }
+        evidence.responsive_baseline();
     }
 
     void responsive_survivor_baseline()
     {
-        for (const auto target : kSurvivors)
-        {
-            for (std::size_t attempt = 0; attempt < 2; ++attempt)
-            {
-                record(make_observation(
-                    target,
-                    attempt,
-                    ResponseOutcome::on_time,
-                    "survivor-baseline"));
-            }
-        }
+        evidence.responsive_survivor_baseline();
     }
 
     void persistent_timeouts(
         const std::array<ReplicaID, 2> &targets = {0, 1})
     {
-        for (const auto target : targets)
-        {
-            for (std::size_t reporter = 0; reporter < 3; ++reporter)
-            {
-                for (std::size_t attempt = 0; attempt < 2; ++attempt)
-                {
-                    record(make_observation(
-                        target,
-                        reporter,
-                        ResponseOutcome::timeout,
-                        "timeout"));
-                }
-            }
-        }
+        evidence.persistent_timeouts(
+            std::vector<ReplicaID>(targets.begin(), targets.end()));
     }
 
     void responsive_optimization_suffix()
     {
-        const std::array<std::size_t, 5> attempt_counts{{2, 3, 4, 2, 5}};
-        for (std::size_t index = 0; index < kSurvivors.size(); ++index)
-        {
-            const auto target = kSurvivors[index];
-            for (std::size_t attempt = 0;
-                 attempt < attempt_counts[index];
-                 ++attempt)
-            {
-                record(make_observation(
-                    target,
-                    0,
-                    ResponseOutcome::on_time,
-                    "optimization-suffix"));
-            }
-        }
+        evidence.responsive_optimization_suffix();
     }
 
     AdaptiveV2EpochChangeIdentity prepare_convergence(
@@ -1398,7 +1210,7 @@ void verify_terminal_outcome_contract()
         const AdaptiveV2ReadinessNotice replayed_readiness{
             hotstuff::kAdaptiveV2ReadinessNoticeSchemaVersionV1,
             0,
-            noop.readiness_sequences[0],
+            noop.evidence.readiness_sequence(0),
             noop_session.ingress().current_configuration(),
             noop_session.ingress().activation_generation(),
             999};
@@ -1417,7 +1229,7 @@ void verify_terminal_outcome_contract()
         const ProposalLifecycleNotice replayed_lifecycle{
             hotstuff::kProposalLifecycleNoticeSchemaVersion,
             0,
-            noop.lifecycle_sequences[0],
+            noop.evidence.lifecycle_sequence(0),
             ProposalLifecycleFact{NormalProposalRuntimeInitialized{
                 replayed_evidence.proposal_key()}}};
         CHECK(route_lifecycle(
@@ -1429,9 +1241,9 @@ void verify_terminal_outcome_contract()
                   .status ==
               AdaptiveV2ManagerIngressStatus::rejected_sequence);
 
-        REQUIRE(noop.evidence_sequences[replayed_reporter] > 1);
+        REQUIRE(noop.evidence.evidence_sequence(replayed_reporter) > 1);
         replayed_evidence.reporter_sequence =
-            noop.evidence_sequences[replayed_reporter] - 1;
+            noop.evidence.evidence_sequence(replayed_reporter) - 1;
         replayed_evidence.reporter_monotonic_ns =
             replayed_evidence.reporter_sequence * 1'000;
         replayed_evidence.observation_id =
@@ -2189,7 +2001,7 @@ TEST_CASE(
     fixture.responsive_baseline();
     REQUIRE(session.evaluate() ==
             AdaptiveV2ManagerControllerStatus::baseline_frozen);
-    fixture.evidence_sequences.fill(200);
+    fixture.evidence.set_all_evidence_sequences(200);
 
     hotstuff::AdaptiveV2FaultWindowArm arm;
     arm.predecessor_epoch_number = 0;

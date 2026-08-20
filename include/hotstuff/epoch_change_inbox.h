@@ -144,7 +144,8 @@ class AdaptiveV2CommandInbox final
 {
 public:
     explicit AdaptiveV2CommandInbox(
-        AdaptiveV2CommandInboxLimits limits = {});
+        AdaptiveV2CommandInboxLimits limits = {},
+        EpochProtocolMode protocol_mode = EpochProtocolMode::adaptive_v2);
     ~AdaptiveV2CommandInbox();
 
     AdaptiveV2CommandInbox(const AdaptiveV2CommandInbox &) = delete;
@@ -155,6 +156,11 @@ public:
 
     AdaptiveV2CommandIngestResult ingest(
         const AdaptiveV2EpochChangeBundle &bundle,
+        const EpochDefinition &active_epoch,
+        const EpochChangeVerifier &verifier,
+        EpochStore &store) noexcept;
+    AdaptiveV2CommandIngestResult ingest(
+        const AdaptiveV3EpochChangeBundle &bundle,
         const EpochDefinition &active_epoch,
         const EpochChangeVerifier &verifier,
         EpochStore &store) noexcept;
@@ -179,6 +185,13 @@ public:
     AdaptiveV2CommandInboxSnapshot snapshot() const noexcept;
 
 private:
+    AdaptiveV2CommandIngestResult ingest_components(
+        const AuthorizedEpochChange &command,
+        const EpochDefinitionInput &definition,
+        const bytearray_t &canonical_bundle,
+        const EpochDefinition &active_epoch,
+        const EpochChangeVerifier &verifier,
+        EpochStore &store) noexcept;
     struct State;
     std::unique_ptr<State> state_;
 };

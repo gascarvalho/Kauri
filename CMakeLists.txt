@@ -215,12 +215,18 @@ include_directories(include)
 add_library(hotstuff
     OBJECT
     src/adaptation.cpp
+    src/activation_readiness_wire.cpp
     src/adaptation_manager.cpp
     src/adaptation_manager_profile.cpp
     src/adaptive_v2_convergence_ack_wire.cpp
     src/adaptive_v2_convergence_wire.cpp
     src/adaptive_v2_epoch_factory.cpp
     src/adaptive_v2_manager_controller.cpp
+    src/adaptive_v3_manager_readiness.cpp
+    src/adaptive_v3_manager_activation.cpp
+    src/adaptive_v3_manager_session.cpp
+    src/adaptive_manager_session_facade.cpp
+    src/adaptive_v3_reporting_outbox.cpp
     src/adaptive_v2_manager_convergence.cpp
     src/adaptive_v2_manager_delivery.cpp
     src/adaptive_v2_manager_ingress.cpp

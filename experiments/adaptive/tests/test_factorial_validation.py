@@ -23041,3 +23041,96 @@ def test_campaign_ledger_replays_one_shot_prefix_and_rejects_continuation(
             results_by_id={first.slot_id: result},
             campaign_outcome="INCOMPLETE",
         )
+
+
+def _adaptive_v3_bundle_wire_for_decoder_test() -> tuple[bytes, str, dict[str, int]]:
+    """Construct one canonical v3 bundle without invoking native decoding."""
+    private_key, nonce = 1, 2
+    public = (validation._SECP256K1_GX, validation._SECP256K1_GY)
+    public_hex = f"02{public[0]:064x}"
+    members = (0, 1)
+    tree = Tree(0, 2, 1, members, ())
+    predecessor = "11" * 32
+    membership = validation._membership_digest(members)
+    canonical_definition = validation._epoch_canonical_bytes(
+        epoch_number=1,
+        previous_epoch_digest=predecessor,
+        membership_digest=membership,
+        generation_seed=7,
+        policy_version="adaptive-v3-test-policy",
+        evidence_snapshot_id="adaptive-v3-test-evidence",
+        evidence_cutoff=9,
+        trees=(tree,),
+    )
+    successor = validation._sha256(canonical_definition)
+    definition = (
+        validation._u(2, 4) + validation._u(1, 4)
+        + bytes.fromhex(predecessor) + bytes.fromhex(membership)
+        + validation._u(7, 8) + validation._cstr("adaptive-v3-test-policy")
+        + validation._cstr("adaptive-v3-test-evidence") + validation._u(9, 8)
+        + validation._u(1, 4) + validation._u(0, 4) + validation._u(2, 4)
+        + validation._u(1, 4) + validation._u(2, 4)
+        + b"".join(validation._u(member, 2) for member in members)
+        + validation._u(0, 4)
+    )
+    unsigned = (
+        validation._ADAPTIVE_V3_AUTHORIZED_COMMAND_DOMAIN
+        + validation._u(2, 4) + validation._u(3, 1) + validation._u(1, 4)
+        + validation._u(1, 4) + bytes.fromhex(predecessor)
+        + bytes.fromhex(successor) + validation._u(2, 8)
+    )
+    z = int.from_bytes(hashlib.sha256(unsigned).digest(), "big")
+    point = validation._secp256k1_multiply(nonce, public)
+    assert point is not None
+    r = point[0] % validation._SECP256K1_ORDER
+    s = pow(nonce, -1, validation._SECP256K1_ORDER) * (z + r * private_key)
+    s %= validation._SECP256K1_ORDER
+    if s > validation._SECP256K1_ORDER // 2:
+        s = validation._SECP256K1_ORDER - s
+    command = unsigned + r.to_bytes(32, "big") + s.to_bytes(32, "big")
+    reply = (
+        validation._u(3, 4) + validation._u(3, 1) + validation._u(6, 1)
+        + bytes.fromhex(successor) + definition
+    )
+    outer = (
+        validation._ADAPTIVE_V3_BUNDLE_DOMAIN + validation._u(2, 4)
+        + validation._u(3, 1) + validation._u(len(command), 4) + command
+        + validation._u(len(reply), 4) + reply
+    )
+    return outer, public_hex, {
+        "command": len(validation._ADAPTIVE_V3_BUNDLE_DOMAIN) + 5 + 4,
+        "reply": len(validation._ADAPTIVE_V3_BUNDLE_DOMAIN) + 5 + 4 + len(command) + 4,
+        "signature": len(validation._ADAPTIVE_V3_BUNDLE_DOMAIN) + 5 + 4 + len(unsigned),
+        "tree": len(outer) - 4,
+    }
+
+
+def test_independent_adaptive_v3_bundle_decoder_is_canonical_and_fail_closed() -> None:
+    wire, issuer, offsets = _adaptive_v3_bundle_wire_for_decoder_test()
+    decoded = validation.decode_adaptive_v3_epoch_change_bundle(
+        wire, issuer_public_key=issuer
+    )
+    assert decoded.command.successor_epoch_number == 1
+    assert decoded.epoch_number == 1
+    assert decoded.trees == (Tree(0, 2, 1, (0, 1), ()),)
+    with pytest.raises(FactorialValidationError):
+        validation.decode_epoch_change_bundle(wire, issuer_public_key=issuer)
+
+    mutations = []
+    domain = bytearray(wire); domain[0] ^= 1; mutations.append(domain)
+    schema = bytearray(wire); schema[len(validation._ADAPTIVE_V3_BUNDLE_DOMAIN) + 3] ^= 1; mutations.append(schema)
+    mode = bytearray(wire); mode[len(validation._ADAPTIVE_V3_BUNDLE_DOMAIN) + 4] = 2; mutations.append(mode)
+    command_domain = bytearray(wire); command_domain[offsets["command"]] ^= 1; mutations.append(command_domain)
+    command_schema = bytearray(wire); command_schema[offsets["command"] + len(validation._ADAPTIVE_V3_AUTHORIZED_COMMAND_DOMAIN) + 3] ^= 1; mutations.append(command_schema)
+    command_mode = bytearray(wire); command_mode[offsets["command"] + len(validation._ADAPTIVE_V3_AUTHORIZED_COMMAND_DOMAIN) + 4] = 2; mutations.append(command_mode)
+    signature = bytearray(wire); signature[offsets["signature"]] ^= 1; mutations.append(signature)
+    reply_schema = bytearray(wire); reply_schema[offsets["reply"] + 3] ^= 1; mutations.append(reply_schema)
+    reply_mode = bytearray(wire); reply_mode[offsets["reply"] + 4] = 2; mutations.append(reply_mode)
+    reply_digest = bytearray(wire); reply_digest[offsets["reply"] + 6] ^= 1; mutations.append(reply_digest)
+    tree = bytearray(wire); tree[offsets["tree"]] ^= 1; mutations.append(tree)
+    mutations.append(bytearray(wire + b"x"))
+    for mutation in mutations:
+        with pytest.raises(FactorialValidationError):
+            validation.decode_adaptive_v3_epoch_change_bundle(
+                bytes(mutation), issuer_public_key=issuer
+            )

@@ -22,6 +22,7 @@ namespace hotstuff
 
 constexpr std::uint32_t kEpochWireSchemaVersionV1 = 1;
 constexpr std::uint32_t kEpochWireSchemaVersionV2 = 2;
+constexpr std::uint32_t kEpochWireSchemaVersionV3 = 3;
 constexpr std::uint32_t kEpochWireSchemaVersion =
     kEpochWireSchemaVersionV1;
 
@@ -30,6 +31,7 @@ enum class EpochProtocolMode : std::uint8_t
     legacy_static = 0,
     adaptive_v1 = 1,
     adaptive_v2 = 2,
+    adaptive_v3 = 3,
 };
 
 enum class EpochWireKind : std::uint8_t
@@ -59,6 +61,9 @@ enum class EpochWireError : std::uint8_t
     wait_exempt_count_exceeded,
     unsupported_kind_for_mode,
 };
+
+std::optional<std::uint32_t> epoch_wire_schema_for_mode(
+    EpochProtocolMode mode) noexcept;
 
 struct EpochWireLimits
 {

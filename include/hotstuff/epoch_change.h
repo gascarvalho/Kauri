@@ -1,5 +1,6 @@
 /**
- * Signed, consensus-ordered adaptive-v2 epoch-change commands.
+ * Signed, consensus-ordered, version-partitioned adaptive epoch-change
+ * commands.
  */
 
 #ifndef HOTSTUFF_EPOCH_CHANGE_H_INCLUDED
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "hotstuff/crypto.h"
@@ -20,6 +22,7 @@ namespace hotstuff
 class Block;
 
 constexpr std::uint32_t kEpochChangeSchemaVersionV1 = 1;
+constexpr std::uint32_t kEpochChangeSchemaVersionV2 = 2;
 using EpochChangeIssuerId = std::uint32_t;
 
 struct EpochChangePayload
@@ -53,7 +56,14 @@ bytearray_t canonical_serialize_epoch_change_payload(
 
 uint256_t epoch_change_payload_digest(const EpochChangePayload &payload);
 
+const std::string &adaptive_v3_authorized_epoch_change_domain() noexcept;
+
 AuthorizedEpochChange authorize_epoch_change(
+    const EpochChangePayload &payload,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &private_key);
+
+AuthorizedEpochChange authorize_epoch_change_v3(
     const EpochChangePayload &payload,
     EpochChangeIssuerId issuer_id,
     const PrivKeySecp256k1 &private_key);
@@ -102,6 +112,10 @@ EpochChangeDecodeResult decode_authorized_epoch_change(
     const bytearray_t &payload,
     std::size_t maximum_payload_bytes) noexcept;
 
+EpochChangeDecodeResult decode_authorized_epoch_change_v3(
+    const bytearray_t &payload,
+    std::size_t maximum_payload_bytes) noexcept;
+
 enum class EpochChangeExtraDisposition : std::uint8_t
 {
     absent = 0,
@@ -122,7 +136,14 @@ struct EpochChangeBlockExtraResult
 bytearray_t encode_epoch_change_block_extra(
     const AuthorizedEpochChange &command);
 
+bytearray_t encode_epoch_change_block_extra_v3(
+    const AuthorizedEpochChange &command);
+
 EpochChangeBlockExtraResult extract_epoch_change_block_extra(
+    const bytearray_t &extra,
+    std::size_t maximum_payload_bytes) noexcept;
+
+EpochChangeBlockExtraResult extract_epoch_change_block_extra_v3(
     const bytearray_t &extra,
     std::size_t maximum_payload_bytes) noexcept;
 
@@ -240,7 +261,9 @@ EpochChangeProposalHistoryResult build_epoch_change_proposal_history(
     const uint256_t &candidate_predecessor_digest,
     const EpochChangeCommittedHistorySnapshot &committed_snapshot,
     std::size_t maximum_block_extra_bytes,
-    std::size_t maximum_ancestry_blocks) noexcept;
+    std::size_t maximum_ancestry_blocks,
+    EpochProtocolMode protocol_mode =
+        EpochProtocolMode::adaptive_v2) noexcept;
 
 struct EpochChangeValidationResult
 {
@@ -259,6 +282,11 @@ public:
         EpochChangeIssuer issuer,
         EpochChangeDelayBounds delay_bounds);
 
+    EpochChangeVerifier(
+        EpochChangeIssuer issuer,
+        EpochChangeDelayBounds delay_bounds,
+        EpochProtocolMode protocol_mode);
+
     EpochChangeValidationResult validate(
         const AuthorizedEpochChange &command,
         const EpochDefinition &active_epoch,
@@ -268,6 +296,7 @@ public:
 private:
     const EpochChangeIssuer issuer_;
     const EpochChangeDelayBounds delay_bounds_;
+    const EpochProtocolMode protocol_mode_;
 };
 
 enum class EpochChangeProposalDisposition : std::uint8_t
@@ -293,7 +322,9 @@ EpochChangeProposalControlResult evaluate_epoch_change_proposal_control(
     const EpochChangeVerifier &verifier,
     const EpochDefinition &active_epoch,
     const EpochStore &store,
-    const EpochChangeHistoryView &history) noexcept;
+    const EpochChangeHistoryView &history,
+    EpochProtocolMode protocol_mode =
+        EpochProtocolMode::adaptive_v2) noexcept;
 
 enum class EpochChangeProposalChainFailureSource : std::uint8_t
 {
@@ -340,7 +371,9 @@ EpochChangeProposalChainResult evaluate_epoch_change_proposal_chain(
     std::size_t maximum_ancestry_blocks,
     const EpochChangeVerifier &verifier,
     const EpochDefinition &active_epoch,
-    const EpochStore &store) noexcept;
+    const EpochStore &store,
+    EpochProtocolMode protocol_mode =
+        EpochProtocolMode::adaptive_v2) noexcept;
 
 } // namespace hotstuff
 

@@ -16,6 +16,8 @@
 #include <unistd.h>
 
 #include "catch.hpp"
+#include "hotstuff/hotstuff.h"
+#include "hotstuff/liveness.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
@@ -27,6 +29,15 @@
 
 namespace
 {
+
+class ConstructorGuardHotStuff final : public hotstuff::HotStuffNoSig
+{
+public:
+    using hotstuff::HotStuffNoSig::HotStuffNoSig;
+
+protected:
+    void state_machine_execute(const hotstuff::Finality &) override {}
+};
 
 std::string source(const char *relative_path)
 {
@@ -355,6 +366,326 @@ TEST_CASE("HotStuffBase owns one explicitly selected epoch protocol binding",
                 "lastCheckedHeight"})));
 }
 
+TEST_CASE("adaptive v3 construction requires complete configuration before side effects",
+          "[cert13][p3][hotstuff][archive-isolation]")
+{
+    using namespace hotstuff;
+
+    EventContext event_context;
+    CHECK_THROWS_WITH(
+        ConstructorGuardHotStuff(
+            1,
+            0,
+            bytearray_t{},
+            NetAddr("127.0.0.1:0"),
+            new PaceMakerDummy(1),
+            event_context,
+            0,
+            HotStuffBase::Net::Config(),
+            NetAddr(),
+            EpochProtocolMode::adaptive_v3),
+        "adaptive-v3 runtime requires one complete isolated configuration");
+
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto constructor = function_body(
+        implementation, "HotStuffBase::HotStuffBase(");
+
+    REQUIRE_FALSE(constructor.empty());
+    CHECK(contains_in_order(
+        constructor,
+        {"if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v3) !=",
+         "throw HotStuffError(",
+         "adaptive-v3 runtime requires one complete isolated configuration",
+         "initialize_committed_epoch_change_history()",
+         "install_adaptive_v3_handlers()",
+         "pn.start()",
+         "pn.listen(listen_addr)",
+         "pn.conn_peer(adaptive_v3_config->manager_peer)"}));
+    CHECK(count_occurrences(
+              constructor,
+              "adaptive-v3 runtime requires one complete isolated configuration") ==
+          1);
+}
+
+TEST_CASE("adaptive v3 live path fences before observation and activates only from certificate",
+          "[cert13][p3][hotstuff][activation-readiness]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto post_commit = function_body(
+        implementation,
+        "void HotStuffBase::process_adaptive_v3_post_block_commit(");
+    const auto certificate = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v3_readiness_certificate_handler(");
+    const auto retry = function_body(
+        implementation,
+        "void HotStuffBase::transmit_adaptive_v3_observation(");
+
+    REQUIRE_FALSE(post_commit.empty());
+    CHECK(contains_in_order(
+        post_commit,
+        {"prepare_committed_v3(",
+         "on_v3_post_block_commit(",
+         "result.boundary.observation",
+         "enqueue_adaptive_v3_observation(",
+         "if (result.update)",
+         "publish_adaptive_v3_activation("}));
+    CHECK(contains_all(
+        post_commit,
+        {"adaptive_v3_deferred_observation",
+         "adaptive_v3_runtime_prepared",
+         "scheduled_readiness_height"}));
+
+    REQUIRE_FALSE(certificate.empty());
+    CHECK(contains_in_order(
+        certificate,
+        {"pn.get_peer_conn(*epoch_manager_peer)",
+         "PeerId(*certificate) != *epoch_manager_peer",
+         "decode_activation_readiness_certificate(",
+         "AdaptiveV3ReadinessTransition::wire_rejected",
+         "emit_adaptive_v3_readiness_event(",
+         "std::move(event), true",
+         "if (!adaptive_v3_runtime_prepared)",
+         "adaptive_v3_deferred_certificate",
+         "ingest_adaptive_v3_readiness_certificate("}));
+    CHECK(contains_all(
+        certificate,
+        {"wire_opcode", "wire_payload_size",
+         "canonical_wire_payload", "certificate_decode"}));
+
+    REQUIRE_FALSE(retry.empty());
+    CHECK(contains_in_order(
+        retry,
+        {"adaptive_v3_observation_attempts >=",
+         "maximum_observation_attempts",
+         "emit_adaptive_v3_observation_terminal(",
+         "pn.get_peer_conn(*epoch_manager_peer)",
+         "schedule_adaptive_v3_observation_retry()"}));
+}
+
+TEST_CASE("adaptive v3 app and client expose isolated canonical flags",
+          "[cert13][p3][cli][archive-isolation]")
+{
+    const auto app = source("examples/hotstuff_app.cpp");
+    const auto client = source("examples/hotstuff_client.cpp");
+    CHECK(contains_all(
+        app,
+        {"\"adaptive_v3\"",
+         "\"activation-readiness-member\"",
+         "\"activation-readiness-maximum-observation-attempts\"",
+         "\"activation-readiness-observation-retry-interval-ms\"",
+         "adaptive-v3 forbids trusted-local epoch bootstrap",
+         "AdaptiveV3RuntimeConfig"}));
+    CHECK(contains_all(
+        client,
+        {"\"adaptive_v3\"",
+         "EpochProtocolMode::adaptive_v3",
+         "derive_byzantine_quorum"}));
+}
+
+TEST_CASE(
+    "adaptive v3 definition recovery remains v3 typed and resumes preparation",
+    "[cert13][p3][hotstuff][definition-recovery][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto request = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_request_handler(");
+    const auto reply = function_body(
+        implementation,
+        "HotStuffBase::adaptive_definition_reply_handler(");
+    const auto bundle = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v3_epoch_change_bundle_handler(");
+
+    REQUIRE_FALSE(request.empty());
+    REQUIRE_FALSE(reply.empty());
+    REQUIRE_FALSE(bundle.empty());
+    CHECK(request.find(
+              "epoch_protocol_mode != EpochProtocolMode::adaptive_v2") ==
+          std::string::npos);
+    CHECK(reply.find(
+              "epoch_protocol_mode != EpochProtocolMode::adaptive_v2") ==
+          std::string::npos);
+    CHECK(contains_all(
+        request,
+        {"EpochProtocolMode::adaptive_v3",
+         "epoch_wire_schema_for_mode(epoch_protocol_mode)",
+         "decode_epoch_definition_request("}));
+    CHECK(contains_all(
+        reply,
+        {"EpochProtocolMode::adaptive_v3",
+         "epoch_wire_schema_for_mode(epoch_protocol_mode)",
+         "decode_epoch_definition_reply("}));
+    CHECK(contains_all(
+        bundle,
+        {"successor == nullptr", "send_epoch_definition_request("}));
+    CHECK(contains_in_order(
+        reply,
+        {"stage_available_v2(",
+         "prepare_committed_v3(",
+         "adaptive_v3_runtime_prepared = true"}));
+}
+
+TEST_CASE(
+    "adaptive v3 replica lifecycle retires E1 and admits one exact E2 cycle",
+    "[cert13][p3][hotstuff][two-cycle][retirement][intentional-red]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto post_commit = function_body(
+        implementation,
+        "void HotStuffBase::process_adaptive_v3_post_block_commit(");
+    const auto publish = function_body(
+        implementation,
+        "void HotStuffBase::publish_adaptive_v3_activation(");
+    const auto certificate = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v3_readiness_certificate_handler(");
+
+    REQUIRE_FALSE(post_commit.empty());
+    REQUIRE_FALSE(publish.empty());
+    REQUIRE_FALSE(certificate.empty());
+    CHECK(header.find("struct AdaptiveV3RetiredActivationReceipt") !=
+          std::string::npos);
+    CHECK(header.find(
+              "std::unique_ptr<AdaptiveV3RetiredActivationReceipt>") !=
+          std::string::npos);
+    CHECK(contains_all(
+        publish,
+        {"adaptive_v3_retired_activation_receipt",
+         "adaptive_v3_retired_activation_receipt.swap(prepared_receipt)",
+         "adaptive_v3_activation_gate.reset()",
+         "adaptive_v3_committed_command.reset()",
+         "adaptive_v3_signed_observation.reset()",
+         "adaptive_v3_accepted_certificate.reset()",
+         "adaptive_v3_boundary_block = nullptr",
+         "adaptive_v3_latest_committed_block = nullptr",
+         "adaptive_v3_runtime_prepared = false",
+         "adaptive_v3_observation_attempts = 0",
+         "adaptive_v3_observation_terminal = false"}));
+    CHECK(post_commit.find(
+              "adaptive_v3_retired_activation_receipt") !=
+          std::string::npos);
+    CHECK(certificate.find(
+              "adaptive_v3_retired_activation_receipt") !=
+          std::string::npos);
+}
+
+TEST_CASE(
+    "adaptive v3 retirement prebuilds all fallible bytes before live authority",
+    "[cert13][p3][hotstuff][retirement][atomic][failure-injection]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto ingest = function_body(
+        implementation,
+        "void HotStuffBase::ingest_adaptive_v3_readiness_certificate(");
+    const auto publish = function_body(
+        implementation,
+        "void HotStuffBase::publish_adaptive_v3_activation(");
+    REQUIRE_FALSE(ingest.empty());
+    REQUIRE_FALSE(publish.empty());
+    CHECK(contains_in_order(
+        ingest,
+        {"prepare_adaptive_v3_retirement(",
+         "std::make_unique<ActivationReadinessCertificateV1>",
+         "std::make_unique<AdaptiveV3ReadinessStructuredEvent>",
+         "apply_v3_readiness_certificate(",
+         "publish_adaptive_v3_activation("}));
+    CHECK(contains_in_order(
+        publish,
+        {"adaptive_v3_retired_activation_receipt.swap(prepared_receipt)",
+         "adaptive_v3_activation_gate.reset()",
+         "adaptive_v3_committed_command.reset()",
+         "adaptive_v3_signed_observation.reset()",
+         "adaptive_v3_prepared_activation_receipt.reset()",
+         "cancel_adaptive_v3_observation_retry()",
+         "emit_adaptive_v3_readiness_event(",
+         "drain_activated_futures()",
+         "emit_epoch_lifecycle_event(",
+         "transmit_adaptive_v3_acknowledgement("}));
+}
+
+TEST_CASE(
+    "adaptive v3 terminal evidence separates readiness and command identity",
+    "[cert13][p3][hotstuff][terminal][fail-closed]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto process = function_body(
+        implementation,
+        "void HotStuffBase::process_adaptive_v3_post_block_commit(");
+    const auto certificate = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v3_readiness_certificate_handler(");
+    const auto recovery = function_body(
+        implementation,
+        "void HotStuffBase::dispatch_committed_epoch_definition_retry(");
+    const auto command_terminal = function_body(
+        implementation,
+        "void HotStuffBase::emit_adaptive_v3_command_terminal(");
+    REQUIRE_FALSE(process.empty());
+    REQUIRE_FALSE(certificate.empty());
+    REQUIRE_FALSE(recovery.empty());
+    REQUIRE_FALSE(command_terminal.empty());
+    CHECK(process.find("adaptive_v3_observation_terminal = true") ==
+          std::string::npos);
+    CHECK(certificate.find("adaptive_v3_observation_terminal = true") ==
+          std::string::npos);
+    CHECK(contains_all(
+        process,
+        {"invalid_committed_command",
+         "wrong_active_predecessor",
+         "invalid_successor_generation",
+         "successor_runtime_preparation_failed",
+         "committed_definition_recovery_failed",
+         "readiness_source_sequence_exhausted",
+         "readiness_boundary_rejected",
+         "emit_adaptive_v3_observation_terminal("}));
+    CHECK(recovery.find(
+              "committed_definition_retry_schedule_failed") !=
+          std::string::npos);
+    CHECK(contains_all(
+        command_terminal,
+        {"adaptive_v3_command_terminal_emitted",
+         "adaptive_v3_command_evidence",
+         "AdaptiveV3CommandTerminalStructuredEvent",
+         "emit_audit("}));
+}
+
+TEST_CASE(
+    "adaptive v3 lifecycle evidence and duplicate ACK replay are complete",
+    "[cert13][p3][hotstuff][events][ack-replay][intentional-red]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto manager = source("examples/adaptation_manager.cpp");
+    const auto post_commit = function_body(
+        implementation,
+        "void HotStuffBase::process_adaptive_v3_post_block_commit(");
+    const auto ingest = function_body(
+        implementation,
+        "void HotStuffBase::ingest_adaptive_v3_readiness_certificate(");
+    const auto acknowledge = function_body(
+        implementation,
+        "void HotStuffBase::acknowledge_adaptive_v3_certificate(");
+
+    REQUIRE_FALSE(post_commit.empty());
+    REQUIRE_FALSE(ingest.empty());
+    REQUIRE_FALSE(acknowledge.empty());
+    CHECK(post_commit.find(
+              "AdaptiveV3ReadinessTransition::activation_prepared") !=
+          std::string::npos);
+    CHECK(manager.find("certificate_acknowledged") !=
+          std::string::npos);
+    CHECK(manager.find("AdaptiveV3ReadinessTransition::terminal") !=
+          std::string::npos);
+    CHECK(ingest.find("AdaptiveV3CertificateDisposition::duplicate") !=
+          std::string::npos);
+    CHECK(ingest.find("acknowledge_adaptive_v3_certificate()") !=
+          std::string::npos);
+    CHECK(acknowledge.find("adaptive_v3_certificate_ack_sent ||") ==
+          std::string::npos);
+}
+
 TEST_CASE("adaptive pn handlers authenticate the connection before delegation",
           "[rem-d11][epoch-live-binding][network][intentional-red]")
 {
@@ -477,7 +808,8 @@ TEST_CASE(
          "maximum_retry_backoff_ns"}));
     CHECK(contains_in_order(
         constructor,
-        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)",
+        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&",
+         "epoch_protocol_mode != EpochProtocolMode::adaptive_v3",
          "rn.start()",
          "rn.connect_sync(reputation_addr)"}));
 
@@ -623,7 +955,8 @@ TEST_CASE(
     REQUIRE_FALSE(start.empty());
     CHECK(contains_in_order(
         start,
-        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2)",
+        {"if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&",
+         "epoch_protocol_mode != EpochProtocolMode::adaptive_v3",
          "ev_report_timer = TimerEvent",
          "ev_report_timer.add(report_period)"}));
     REQUIRE_FALSE(legacy_report.empty());
@@ -1268,11 +1601,12 @@ TEST_CASE(
     REQUIRE_FALSE(retain.empty());
     CHECK(contains_in_order(
         retain,
-        {"record.command_commit_height != block->get_height()",
+        {"epoch_wire_schema_for_mode(epoch_protocol_mode)",
+         "record.command_commit_height != block->get_height()",
          "record.activation_height <",
          "EpochDefinitionRequest request{",
-         "kEpochWireSchemaVersionV2",
-         "EpochProtocolMode::adaptive_v2",
+         "*recovery_wire_schema",
+         "epoch_protocol_mode",
          "command.payload.successor_epoch_digest",
          "committed_epoch_definition_recovery.emplace(",
          "block->get_hash()",
@@ -2153,7 +2487,7 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     REQUIRE_FALSE(retain_proposal_bridge.empty());
     CHECK(contains_all(
         retain_proposal_bridge,
-        {"EpochProtocolMode::adaptive_v2",
+        {"is_adaptive_epoch_mode(epoch_protocol_mode)",
          "generation == 0",
          "proposal.key().block_hash != proposal.blk->get_hash()",
          "retain_owned(proposal.key())",
@@ -2344,12 +2678,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
 
     REQUIRE_FALSE(post_commit.empty());
     CHECK(count_occurrences(
-              post_commit, "emit_commit_observed_event(") == 1);
+              post_commit, "emit_commit_observed_event(") == 2);
     CHECK(count_occurrences(
-              post_commit, "emit_committed_block_event(") == 1);
+              post_commit, "emit_committed_block_event(") == 2);
     CHECK(count_occurrences(
               post_commit,
-              "emit_commit_identity_unavailable_event(") == 1);
+              "emit_commit_identity_unavailable_event(") == 2);
     CHECK(count_occurrences(
               post_commit, "emit_epoch_command_committed_event(") == 1);
     CHECK(contains_in_order(
@@ -2728,7 +3062,7 @@ TEST_CASE("adaptive v2 server CLI exposes every pinned pre-vote input",
     REQUIRE_FALSE(main.empty());
 
     CHECK(app.find(
-              "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2)") !=
+              "epoch protocol mode (legacy_static, adaptive_v1, adaptive_v2, adaptive_v3)") !=
           std::string::npos);
     CHECK(contains_in_order(
         main,

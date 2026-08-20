@@ -158,6 +158,43 @@ HotStuffEpochLiveBinding::on_v2_post_block_commit(
         adapter_.on_v2_post_block_commit(height, predecessor_digest));
 }
 
+AdaptiveV3CommitIngressResult
+HotStuffEpochLiveBinding::on_v3_post_block_commit(
+    AdaptiveV3CertifiedActivationGate &gate,
+    std::uint64_t height,
+    const ConfigurationId &predecessor_configuration,
+    std::uint64_t predecessor_generation,
+    const uint256_t &block_hash,
+    std::uint64_t source_sequence,
+    std::uint64_t monotonic_raw_ns) noexcept
+{
+    auto result = adapter_.on_v3_post_block_commit(
+        gate,
+        height,
+        predecessor_configuration,
+        predecessor_generation,
+        block_hash,
+        source_sequence,
+        monotonic_raw_ns);
+    if (result.error == EpochIngressError::none &&
+        result.update.has_value())
+        live_effects_.apply_update(*result.update);
+    return result;
+}
+
+AdaptiveV3CertificateIngressResult
+HotStuffEpochLiveBinding::apply_v3_readiness_certificate(
+    AdaptiveV3CertifiedActivationGate &gate,
+    const AdaptiveV3ActivationReadinessCertificate &certificate) noexcept
+{
+    auto result = adapter_.apply_v3_readiness_certificate(
+        gate, certificate);
+    if (result.error == EpochIngressError::none &&
+        result.update.has_value())
+        live_effects_.apply_update(*result.update);
+    return result;
+}
+
 EpochCommitIngressResult HotStuffEpochLiveBinding::replay_blocked_commit()
     noexcept
 {

@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <vector>
 
 #include "hotstuff/adaptive_v2_selection.h"
@@ -62,6 +63,67 @@ struct AdaptiveV2EpochFactoryResult
                bundle != nullptr;
     }
 };
+
+/** Protocol-neutral, fully canonical successor definition and unsigned
+ * transition payload.  Signing and bundle encoding are deliberately left to
+ * a protocol-specific wrapper. */
+struct AdaptiveSuccessorMaterial
+{
+    EpochDefinitionInput definition;
+    EpochChangePayload payload;
+};
+
+struct AdaptiveSuccessorMaterialResult
+{
+    AdaptiveV2EpochFactoryStatus status{
+        AdaptiveV2EpochFactoryStatus::internal_failure};
+    std::optional<AdaptiveSuccessorMaterial> material;
+
+    AdaptiveSuccessorMaterialResult() = default;
+    AdaptiveSuccessorMaterialResult(
+        AdaptiveV2EpochFactoryStatus result_status,
+        std::optional<AdaptiveSuccessorMaterial> result_material)
+        : status(result_status), material(std::move(result_material))
+    {}
+    AdaptiveSuccessorMaterialResult(AdaptiveV2EpochFactoryResult rejected)
+        : status(rejected.status)
+    {}
+
+    explicit operator bool() const noexcept
+    {
+        return status == AdaptiveV2EpochFactoryStatus::success &&
+               material.has_value();
+    }
+};
+
+AdaptiveSuccessorMaterialResult build_adaptive_successor_material(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    const EpochChangeBundleLimits &bundle_limits) noexcept;
+
+struct AdaptiveV3EpochFactoryResult
+{
+    AdaptiveV2EpochFactoryStatus status{
+        AdaptiveV2EpochFactoryStatus::internal_failure};
+    std::unique_ptr<const AdaptiveV3EpochChangeBundle> bundle;
+    explicit operator bool() const noexcept
+    {
+        return status == AdaptiveV2EpochFactoryStatus::success && bundle;
+    }
+};
+
+AdaptiveV3EpochFactoryResult build_adaptive_v3_successor_bundle(
+    const EpochDefinition &current_epoch,
+    const AdaptiveV2SelectionResult &selection,
+    const AdaptiveV2TransitionPolicy &transition_policy,
+    const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept;
 
 /**
  * Validate one successful selection and turn it into a signed, immutable

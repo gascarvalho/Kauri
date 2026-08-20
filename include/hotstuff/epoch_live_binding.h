@@ -125,6 +125,18 @@ public:
     EpochCommitIngressResult on_v2_post_block_commit(
         std::uint64_t height,
         const uint256_t &predecessor_digest) noexcept;
+    AdaptiveV3CommitIngressResult on_v3_post_block_commit(
+        AdaptiveV3CertifiedActivationGate &gate,
+        std::uint64_t height,
+        const ConfigurationId &predecessor_configuration,
+        std::uint64_t predecessor_generation,
+        const uint256_t &block_hash,
+        std::uint64_t source_sequence,
+        std::uint64_t monotonic_raw_ns) noexcept;
+    AdaptiveV3CertificateIngressResult apply_v3_readiness_certificate(
+        AdaptiveV3CertifiedActivationGate &gate,
+        const AdaptiveV3ActivationReadinessCertificate &certificate)
+        noexcept;
     EpochCommitIngressResult replay_blocked_commit() noexcept;
     std::optional<EpochActivationEffect> active_view()
         const noexcept override;
