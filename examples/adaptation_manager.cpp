@@ -3851,12 +3851,95 @@ private:
     // The manager is source-blind: common authenticated evidence drives the
     // controller; only the signed readiness observation binds a TLS peer to a
     // v3 identity derived from the emitted bundle.
+    bool v3_transition_policy_matches_current_roots(
+        const AdaptiveV2TransitionPolicy &policy) const noexcept
+    {
+        if (policy.intent != TreePolicyKind::fault_containment)
+            return policy.containment_baseline_roots.empty();
+
+        const auto &trees = facade_.ingress().current_epoch().trees();
+        if (policy.containment_baseline_roots.size() !=
+            options_.manager.runtime_shape.tree_shape.tree_count)
+            return false;
+        for (const auto &root : policy.containment_baseline_roots)
+        {
+            const auto tree = std::find_if(
+                trees.begin(), trees.end(),
+                [&root](const EpochTreeDefinition &candidate) {
+                    return candidate.tree_id == root.tree_id;
+                });
+            if (tree == trees.end() ||
+                tree->members_breadth_first.empty() ||
+                tree->members_breadth_first.front() != root.replica_id)
+                return false;
+        }
+        return true;
+    }
+
+    std::optional<AdaptiveV2TransitionPolicy>
+    resolved_v3_transition_policy(std::size_t index) const noexcept
+    {
+        try
+        {
+            if (index >= transition_policies_.size() ||
+                index >= options_.manager.transition_requests.size())
+                return std::nullopt;
+            auto resolved = transition_policies_[index];
+            const auto &request = options_.manager.transition_requests[index];
+            if (request.resolve_containment_roots_from_predecessor)
+            {
+                if (resolved.intent != TreePolicyKind::fault_containment ||
+                    !resolved.containment_baseline_roots.empty())
+                    return std::nullopt;
+                const auto tree_count =
+                    options_.manager.runtime_shape.tree_shape.tree_count;
+                std::vector<std::optional<ReplicaID>> roots(tree_count);
+                for (const auto &tree :
+                     facade_.ingress().current_epoch().trees())
+                {
+                    if (tree.tree_id >= tree_count)
+                        continue;
+                    if (tree.members_breadth_first.empty() ||
+                        roots[tree.tree_id].has_value())
+                        return std::nullopt;
+                    roots[tree.tree_id] =
+                        tree.members_breadth_first.front();
+                }
+                std::set<ReplicaID> unique_roots;
+                for (std::uint32_t tree_id = 0;
+                     tree_id < tree_count;
+                     ++tree_id)
+                {
+                    if (!roots[tree_id].has_value() ||
+                        !unique_roots.insert(*roots[tree_id]).second)
+                        return std::nullopt;
+                    resolved.containment_baseline_roots.push_back(
+                        hotstuff::BaselineRoot{tree_id, *roots[tree_id]});
+                }
+            }
+            return v3_transition_policy_matches_current_roots(resolved)
+                ? std::optional<AdaptiveV2TransitionPolicy>{
+                      std::move(resolved)}
+                : std::nullopt;
+        }
+        catch (...)
+        {
+            return std::nullopt;
+        }
+    }
+
     void begin_next_transition_cycle() noexcept
     {
         const auto phase = facade_.v3_status();
         if (failed_ || !phase.has_value() ||
             next_policy_ >= transition_policies_.size())
             return;
+        const auto policy = resolved_v3_transition_policy(next_policy_);
+        if (!policy.has_value())
+        {
+            fail("transition_policy_resolution_failed");
+            return;
+        }
         const auto begin_tick = manager_tick_ns();
         if (*phase != hotstuff::AdaptiveV3ManagerSessionStatus::idle &&
             *phase != hotstuff::AdaptiveV3ManagerSessionStatus::residency)
@@ -3865,7 +3948,7 @@ private:
         if (!containment_cycle)
         {
             const auto eligibility = facade_.v3_begin_e2_at(
-                begin_tick, transition_policies_[next_policy_]);
+                begin_tick, *policy);
             if (!eligibility.has_value())
                 return;
             ++next_policy_;
@@ -3878,14 +3961,18 @@ private:
             }
             evaluate_transition_cycle();
         }
-        else if (!facade_.begin_cycle(transition_policies_[next_policy_++]))
+        else if (!facade_.begin_cycle(*policy))
             fail("containment_cycle_begin_rejected");
-        else if (containment_cycle &&
-                 options_.manager.fault_window_arm.has_value() &&
-                 !fault_window_armed_)
-            schedule_fault_window_arm();
         else
-            evaluate_transition_cycle();
+        {
+            ++next_policy_;
+            if (containment_cycle &&
+                options_.manager.fault_window_arm.has_value() &&
+                !fault_window_armed_)
+                schedule_fault_window_arm();
+            else
+                evaluate_transition_cycle();
+        }
     }
 
     void emit_e2_eligibility(

@@ -290,6 +290,13 @@ TEST_CASE(
           std::string::npos);
     CHECK(manager.find("fail(\"controller_unhealthy\")") !=
           std::string::npos);
+    CHECK(manager.find("resolved_v3_transition_policy") !=
+          std::string::npos);
+    CHECK(manager.find(
+              "request.resolve_containment_roots_from_predecessor") !=
+          std::string::npos);
+    CHECK(manager.find("facade_.begin_cycle(*policy)") !=
+          std::string::npos);
     CHECK(manager.find(
               "fail(\"fault_window_hard_deadline_session_rejected\")") !=
           std::string::npos);
