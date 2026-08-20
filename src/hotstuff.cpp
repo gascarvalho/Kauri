@@ -14766,6 +14766,39 @@ namespace hotstuff
                     event_generation.reset();
                 }
             }
+            else if (
+                epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+                disposition ==
+                    CommittedProposalIdentityDisposition::conflicting &&
+                identity.provenance ==
+                    CommittedProposalIdentityProvenance::core_unproven &&
+                retained != retained_commit_event_identities.end())
+            {
+                // A multi-block commit batch may not carry a direct certifier
+                // for every ancestor.  V3 retains the exact authenticated
+                // proposal identity before consensus cleanup, with permanent
+                // conflict tombstones.  Reuse only that evidence identity so
+                // the designated observer can emit a complete authoritative
+                // commit chain; protocol admission and consensus are
+                // unchanged.
+                if (retained->second.key.has_value() &&
+                    retained->second.view_generation.has_value() &&
+                    retained->second.key->block_hash == blk->get_hash() &&
+                    *retained->second.view_generation != 0)
+                {
+                    event_disposition =
+                        CommittedProposalIdentityDisposition::exact;
+                    event_key = retained->second.key;
+                    event_generation = retained->second.view_generation;
+                }
+                else
+                {
+                    event_disposition =
+                        CommittedProposalIdentityDisposition::conflicting;
+                    event_key.reset();
+                    event_generation.reset();
+                }
+            }
             retained_commit_event_identities.erase(blk->get_hash());
         }
         catch (...)

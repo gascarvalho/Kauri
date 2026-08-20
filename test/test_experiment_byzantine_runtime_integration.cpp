@@ -892,6 +892,37 @@ public:
                     conflicting};
     }
 
+    static CachedCommitIdentity resolve_and_cache_unproven_commit(
+        HotStuffBase &runtime,
+        const block_t &block)
+    {
+        const auto resolution = runtime.resolve_committed_proposal_identity(
+            block,
+            {},
+            nullptr,
+            HotStuffBase::CommittedProposalIdentityProvenance::core_unproven);
+        runtime.cache_adaptive_v2_commit(block, resolution, false);
+        if (!runtime.pending_adaptive_v2_commit.has_value())
+            return {};
+        return CachedCommitIdentity{
+            runtime.pending_adaptive_v2_commit->committed_key,
+            runtime.pending_adaptive_v2_commit->view_generation,
+            runtime.pending_adaptive_v2_commit->identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    unavailable,
+            runtime.pending_adaptive_v2_commit->identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    conflicting,
+            runtime.pending_adaptive_v2_commit->event_committed_key,
+            runtime.pending_adaptive_v2_commit->event_view_generation,
+            runtime.pending_adaptive_v2_commit->event_identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    unavailable,
+            runtime.pending_adaptive_v2_commit->event_identity_disposition ==
+                HotStuffBase::CommittedProposalIdentityDisposition::
+                    conflicting};
+    }
+
     static void report_and_post_commit(
         HotStuffBase &runtime,
         const block_t &block,
@@ -2744,6 +2775,44 @@ TEST_CASE(
     "[adaptive-v2][evidence][commit][identity-unavailable][retained][runtime-integration]")
 {
     using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+
+    SECTION("v3 recovers an authenticated ancestor in a commit batch")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        RecordingProtocolEmitter emitter;
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "v3-unproven-retained");
+        const ProposalKey key{configuration, block->get_hash()};
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 29));
+
+        const auto cached =
+            Access::resolve_and_cache_unproven_commit(runtime, block);
+        CHECK_FALSE(cached.key.has_value());
+        CHECK(cached.conflicted);
+        REQUIRE(cached.event_key == key);
+        CHECK(cached.event_generation == 29);
+        CHECK_FALSE(cached.event_unavailable);
+        CHECK_FALSE(cached.event_conflicted);
+
+        Access::report_and_post_commit(runtime, block, 1);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(&emitter.events[0]) !=
+              nullptr);
+        const auto *committed =
+            std::get_if<CommitStructuredEvent>(&emitter.events[1]);
+        REQUIRE(committed != nullptr);
+        CHECK(committed->block_hash == block->get_hash());
+        CHECK(committed->decision_proof == key);
+        CHECK(committed->view_generation == 29);
+        CHECK(committed->commit_batch_index == 1);
+    }
 
     SECTION("a verified direct certifier remains protocol and event exact")
     {
