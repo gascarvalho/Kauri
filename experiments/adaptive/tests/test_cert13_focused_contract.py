@@ -1229,7 +1229,9 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
     elif mutation == "non_r_activation":
         activation["source_id"] = "replica-1"
     elif mutation == "wrong_apply_height":
-        activation["payload"]["certificate_apply_committed_height"] += 1
+        activation["payload"]["certificate_apply_committed_height"] = (
+            cycle["identity"]["activation_height"] - 1
+        )
     elif mutation == "wrong_certificate_digest":
         activation["payload"]["activation_readiness_certificate_digest"] = (
             "00" * 32
@@ -1245,6 +1247,50 @@ def test_v13_native_transition_mutations_fail_closed(mutation: str) -> None:
 
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation._validate_v13_transition(events, decoded, cycle, contract)
+
+
+def test_v13_transition_accepts_delayed_certificate_application_when_available(
+) -> None:
+    validation, original_events, contract, original_cycles = (
+        _native_v13_e2_common_state()
+    )
+    events = deepcopy(original_events)
+    cycle = deepcopy(original_cycles[0])
+    arm = Path(os.environ["KAURI_CERT13_NATIVE_FIXTURE_ROOT"]) / "adaptive"
+    contract.update(
+        {
+            "profile": {
+                "profile_id": "n7-f2-q5-two-crash-pair-smoke-v13"
+            },
+            "quorum": 5,
+        }
+    )
+    issuer = (arm / "raw" / "issuer-public-key.txt").read_text().strip()
+    _wire, decoded = validation._decode_bundle(
+        arm / "raw" / "epoch1.bundle", issuer, 1, contract
+    )
+    activation = next(
+        event
+        for event in events
+        if event["event_type"] == "epoch.activated"
+        and event["source_id"] == "replica-2"
+        and event["payload"]["epoch_number"] == decoded.epoch_number
+    )
+    activation["payload"]["certificate_apply_committed_height"] += 1
+    validation._validate_v13_transition(events, decoded, cycle, contract)
+    bundle_digests = [
+        hashlib.sha256(
+            (arm / "raw" / f"epoch{epoch}.bundle").read_bytes()
+        ).hexdigest()
+        for epoch in (1, 2)
+    ]
+    reconstructed = validation._reconstruct_v13_certified_readiness(
+        events,
+        contract,
+        expected_cycle_count=2,
+        bundle_digests=bundle_digests,
+    )
+    assert len(reconstructed) == 2
 
 
 @pytest.mark.parametrize(

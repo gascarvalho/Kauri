@@ -5925,7 +5925,7 @@ class FocusedRawEvidenceSource:
                         "transition certificate apply height",
                         1,
                     )
-                    != activation_height
+                    < activation_height
                     or _digest(
                         payload.get("activation_readiness_certificate_digest"),
                         "transition readiness certificate digest",
@@ -5981,7 +5981,14 @@ class FocusedRawEvidenceSource:
                     or activation_height != command_height + activation_delay
                 ):
                     _error(f"raw Epoch {epoch} transition payload drifted")
-            payloads.add(_canonical_json(payload))
+            comparable_payload = dict(payload)
+            if activation and _is_v13_profile(self._profile):
+                # Certified activation is bound to the scheduled boundary,
+                # but a valid certificate may arrive at a later local
+                # committed height.  Replicas therefore need not agree on
+                # the diagnostic application height.
+                comparable_payload.pop("certificate_apply_committed_height")
+            payloads.add(_canonical_json(comparable_payload))
         if len(payloads) != 1:
             _error(f"raw Epoch {epoch} transition payloads conflict")
         if source_ids != expected_sources and not diagnostic_allow_incomplete:

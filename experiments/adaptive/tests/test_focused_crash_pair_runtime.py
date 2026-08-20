@@ -3644,10 +3644,24 @@ def test_v13_transition_barrier_accepts_exact_readiness_activation_fields(
     assert snapshot is not None
     assert snapshot["witness_count"] == 5
 
-    payload = next(
-        event["payload"] for event in events
-        if event["event_type"] == "epoch.activated"
-    )
+    activation_events = [
+        event for event in events if event["event_type"] == "epoch.activated"
+    ]
+    delayed_payload = activation_events[0]["payload"]
+    assert isinstance(delayed_payload, dict)
+    delayed_payload["certificate_apply_committed_height"] = 16
+    snapshot = source._transition(events, 1, activation=True)
+    assert snapshot is not None
+
+    delayed_payload["certificate_apply_committed_height"] = 14
+    with pytest.raises(
+        _runtime_module.FocusedCrashPairRuntimeError,
+        match="transition readiness binding drifted",
+    ):
+        source._transition(events, 1, activation=True)
+    delayed_payload["certificate_apply_committed_height"] = 16
+
+    payload = activation_events[1]["payload"]
     assert isinstance(payload, dict)
     payload.pop("activation_readiness_certificate_digest")
     with pytest.raises(

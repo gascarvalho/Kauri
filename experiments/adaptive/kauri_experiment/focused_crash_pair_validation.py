@@ -4044,10 +4044,28 @@ def _reconstruct_v13_certified_readiness(
             expected_activation = {
                 **identity["successor_configuration"],
                 "activation_height": identity["activation_height"],
-                "certificate_apply_committed_height": identity["activation_height"],
                 "activation_readiness_certificate_digest": certificate["certificate_digest"],
             }
-            if dict(activation) != expected_activation:
+            expected_activation_keys = set(expected_activation) | {
+                "certificate_apply_committed_height"
+            }
+            if (
+                set(activation) != expected_activation_keys
+                or any(
+                    activation.get(key) != value
+                    for key, value in expected_activation.items()
+                )
+                or _uint64(
+                    activation.get("certificate_apply_committed_height"),
+                    "v13 certificate apply height",
+                    1,
+                )
+                < _uint64(
+                    identity["activation_height"],
+                    "v13 scheduled activation height",
+                    1,
+                )
+            ):
                 _error("v13 replica activation certificate binding drifted")
 
         results.append({
@@ -4287,8 +4305,10 @@ def _validate_v13_transition(
     expected_activation = {
         **successor_configuration,
         "activation_height": identity["activation_height"],
-        "certificate_apply_committed_height": identity["activation_height"],
         "activation_readiness_certificate_digest": certificate_digest,
+    }
+    expected_activation_keys = set(expected_activation) | {
+        "certificate_apply_committed_height"
     }
     readiness_names = {
         "prepared": "epoch.activation_prepared",
@@ -4297,8 +4317,25 @@ def _validate_v13_transition(
     }
     for source in sources:
         activation = activations_by_source[source]
-        if dict(_mapping(activation.get("payload"), "v13 epoch activation")) != (
-            expected_activation
+        activation_payload = _mapping(
+            activation.get("payload"), "v13 epoch activation"
+        )
+        if (
+            set(activation_payload) != expected_activation_keys
+            or any(
+                activation_payload.get(key) != value
+                for key, value in expected_activation.items()
+            )
+            or _uint64(
+                activation_payload.get("certificate_apply_committed_height"),
+                "v13 certificate apply height",
+                1,
+            )
+            < _uint64(
+                identity["activation_height"],
+                "v13 scheduled activation height",
+                1,
+            )
         ):
             _error("v13 activation differs from the certified successor")
 
