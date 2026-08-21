@@ -1868,6 +1868,9 @@ namespace hotstuff
             const EpochConsensusEnvelope &envelope,
             ReplicaID authenticated_sender,
             ProposalDisposition disposition);
+        bool process_exact_proposal_catchup(
+            const EpochConsensusEnvelope &envelope,
+            const PeerId &source_peer) noexcept;
         void dispatch_exact_vote_fallback(
             const ProposalKey &key,
             std::uint64_t context_generation);

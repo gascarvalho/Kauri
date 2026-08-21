@@ -3994,3 +3994,62 @@ TEST_CASE(
               "adaptive_v2_runtime_initialization_is_referenced(") !=
           std::string::npos);
 }
+
+TEST_CASE(
+    "adaptive v3 stale proposal repair imports blocks without consensus authority",
+    "[cert13][adaptive-v3][proposal-repair][catch-up][wiring]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto catch_up = function_body(
+        implementation,
+        "bool HotStuffBase::process_exact_proposal_catchup(");
+    const auto ingress = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_propose_handler(");
+    const auto initial_repair = function_body(
+        implementation,
+        "bool HotStuffBase::broadcast_exact_proposal_fallback(");
+    const auto retry_repair = function_body(
+        implementation,
+        "bool HotStuffBase::broadcast_exact_proposal_pre_quorum_retry(");
+    const auto tail_repair = function_body(
+        implementation,
+        "bool HotStuffBase::broadcast_exact_proposal_repair_tail(");
+
+    REQUIRE_FALSE(catch_up.empty());
+    CHECK(contains_in_order(
+        catch_up,
+        {"EpochProtocolMode::adaptive_v3",
+         "EpochConsensusWireKind::proposal_repair",
+         "message.postponed_parse(this)",
+         "proposal.metadata().key() != envelope.key()",
+         "async_deliver_blk(expected_hash, source)",
+         "KAURI_PROPOSAL_CATCHUP"}));
+    CHECK(catch_up.find("on_receive_proposal") == std::string::npos);
+    CHECK(catch_up.find("do_vote") == std::string::npos);
+    CHECK(catch_up.find("relay_once") == std::string::npos);
+    CHECK(catch_up.find("admit_exact_context") == std::string::npos);
+    CHECK(catch_up.find("create_expected_vote_state") ==
+          std::string::npos);
+    CHECK(catch_up.find("start_latency_deadline") == std::string::npos);
+    CHECK(catch_up.find("start_aggregation_timer") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(ingress.empty());
+    CHECK(contains_in_order(
+        ingress,
+        {"epoch_live_binding->handle_proposal(",
+         "EpochConsensusPermission::catch_up_only",
+         "process_exact_proposal_catchup("}));
+
+    for (const auto *repair :
+         {&initial_repair, &retry_repair, &tail_repair})
+    {
+        REQUIRE_FALSE(repair->empty());
+        CHECK(contains_all(
+            *repair,
+            {"EpochProtocolMode::adaptive_v3",
+             "EpochConsensusWireKind::proposal_repair",
+             "EpochConsensusWireKind::proposal"}));
+    }
+}

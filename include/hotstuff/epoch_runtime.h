@@ -64,6 +64,7 @@ enum class EpochConsensusPermission : std::uint8_t
     accept_contribution,
     paused,
     rejected_identity,
+    catch_up_only,
 };
 
 constexpr std::uint32_t kEpochConsensusWireSchemaVersion = 1;
@@ -73,6 +74,7 @@ enum class EpochConsensusWireKind : std::uint8_t
     proposal = 1,
     vote,
     relay,
+    proposal_repair,
 };
 
 struct EpochConsensusEnvelope

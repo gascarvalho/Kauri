@@ -1112,6 +1112,106 @@ TEST_CASE("adaptive v3 shares exact periodic and timeout rotation",
     CHECK(active_root(harness.activation.active_effect()) == 2);
 }
 
+TEST_CASE("adaptive v3 stale root repair is catch-up only",
+          "[cert13][adaptive-v3][proposal-repair][catch-up][safety]")
+{
+    V2Harness harness(
+        rooted_epoch_v2_input(0, {0, 1}),
+        {2, 3},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+    const auto initial = harness.activation.active_effect();
+    REQUIRE(initial.configuration.tree_id == 0);
+    REQUIRE(initial.generation == 1);
+
+    auto current = rotation_proposal(
+        initial.configuration,
+        initial.generation,
+        0,
+        "v3-current-repair");
+    current.protocol_mode = EpochProtocolMode::adaptive_v3;
+    current.kind = EpochConsensusWireKind::proposal_repair;
+    const auto admitted = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(current),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(admitted.error == EpochIngressError::none);
+    REQUIRE(admitted.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    REQUIRE(admitted.admission_disposition ==
+            ProposalDisposition::admitted_active);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+
+    const auto rotated = harness.binding.rotate_to_tree(1);
+    REQUIRE(rotated.error == EpochIngressError::none);
+    REQUIRE(rotated.update.has_value());
+    REQUIRE(rotated.update->activation.generation == 2);
+
+    auto stale = rotation_proposal(
+        initial.configuration,
+        initial.generation,
+        0,
+        "v3-stale-repair");
+    stale.protocol_mode = EpochProtocolMode::adaptive_v3;
+    stale.kind = EpochConsensusWireKind::proposal_repair;
+    const auto catch_up = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(stale),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(catch_up.error == EpochIngressError::none);
+    REQUIRE(catch_up.permission ==
+            EpochConsensusPermission::catch_up_only);
+    REQUIRE(catch_up.decoded_envelope.has_value());
+    CHECK(catch_up.decoded_envelope->key() == stale.key());
+    CHECK_FALSE(catch_up.admission_disposition.has_value());
+    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+
+    const auto wrapped = harness.binding.rotate_to_tree(0);
+    REQUIRE(wrapped.error == EpochIngressError::none);
+    REQUIRE(wrapped.update.has_value());
+    REQUIRE(wrapped.update->activation.generation == 3);
+    const auto rejected_too_old = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(stale),
+        AuthenticatedEpochPeer::replica(0));
+    CHECK(rejected_too_old.error == EpochIngressError::state_rejected);
+    CHECK(rejected_too_old.permission ==
+          EpochConsensusPermission::rejected_identity);
+
+    auto ordinary_stale = stale;
+    ordinary_stale.kind = EpochConsensusWireKind::proposal;
+    const auto rejected_ordinary = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(ordinary_stale),
+        AuthenticatedEpochPeer::replica(0));
+    CHECK(rejected_ordinary.error == EpochIngressError::state_rejected);
+    CHECK(rejected_ordinary.permission ==
+          EpochConsensusPermission::rejected_identity);
+
+    const auto rejected_nonroot = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(stale),
+        AuthenticatedEpochPeer::replica(1));
+    CHECK(rejected_nonroot.error == EpochIngressError::state_rejected);
+    CHECK(rejected_nonroot.permission ==
+          EpochConsensusPermission::rejected_identity);
+
+    auto v2_repair = stale;
+    v2_repair.protocol_mode = EpochProtocolMode::adaptive_v2;
+    V2Harness v2(rooted_epoch_v2_input(0, {0, 1}));
+    const auto rejected_v2 = v2.binding.handle_proposal(
+        consensus_message<MsgPropose>(v2_repair),
+        AuthenticatedEpochPeer::replica(0));
+    CHECK(rejected_v2.error == EpochIngressError::wire_rejected);
+    CHECK(rejected_v2.wire_error ==
+          EpochConsensusWireError::unexpected_kind);
+}
+
 TEST_CASE("adaptive v2 activation resets cadence and excludes its predecessor key",
           "[c08][adaptive-v2][rotation-coordinator][activation]")
 {

@@ -714,6 +714,56 @@ struct HotStuffEpochRuntimeAdapter::State
             });
     }
 
+    bool repairable_generation(
+        const EpochConsensusEnvelope &envelope,
+        const AuthenticatedEpochPeer &authenticated_peer) const noexcept
+    {
+        if (mode != EpochProtocolMode::adaptive_v3 ||
+            envelope.kind != EpochConsensusWireKind::proposal_repair ||
+            !authenticated_peer.replica_id.has_value() ||
+            *authenticated_peer.replica_id != envelope.proposer ||
+            envelope.originator != envelope.proposer ||
+            envelope.view_generation == 0)
+            return false;
+
+        const auto active = activation.active_effect();
+        if (active.definition == nullptr ||
+            envelope.configuration == active.configuration ||
+            envelope.configuration.epoch_number !=
+                active.configuration.epoch_number ||
+            envelope.configuration.epoch_digest !=
+                active.configuration.epoch_digest ||
+            envelope.view_generation >= active.generation)
+            return false;
+
+        const auto packed = envelope.view_generation - 1;
+        const auto generation_epoch = static_cast<std::uint32_t>(
+            packed >> 32);
+        const auto generation_ordinal = static_cast<std::uint32_t>(packed);
+        if (generation_epoch != envelope.configuration.epoch_number ||
+            generation_ordinal >= active.rotation_ordinal)
+            return false;
+
+        const auto &trees = active.definition->trees();
+        if (trees.empty() ||
+            static_cast<std::uint64_t>(active.rotation_ordinal) -
+                    generation_ordinal >=
+                trees.size())
+            return false;
+
+        const auto tree = std::find_if(
+            trees.begin(),
+            trees.end(),
+            [&envelope](const EpochTreeDefinition &candidate) {
+                return candidate.tree_id ==
+                           envelope.configuration.tree_id &&
+                       !candidate.members_breadth_first.empty() &&
+                       candidate.members_breadth_first.front() ==
+                           envelope.proposer;
+            });
+        return tree != trees.end();
+    }
+
     bool existing_generation(
         const EpochConsensusEnvelope &envelope) const noexcept
     {
@@ -1492,17 +1542,41 @@ EpochConsensusIngressResult HotStuffEpochRuntimeAdapter::handle_proposal(
             return rejected_consensus(
                 EpochIngressError::wire_rejected, preflight);
         const auto raw = static_cast<bytearray_t>(message.serialized);
-        const auto decoded = decode_epoch_consensus_envelope(
+        auto decoded = decode_epoch_consensus_envelope(
             raw,
             EpochConsensusWireKind::proposal,
             state_->mode,
             state_->limits);
+        if (!decoded &&
+            decoded.error == EpochConsensusWireError::unexpected_kind &&
+            state_->mode == EpochProtocolMode::adaptive_v3)
+            decoded = decode_epoch_consensus_envelope(
+                raw,
+                EpochConsensusWireKind::proposal_repair,
+                state_->mode,
+                state_->limits);
         if (!decoded)
             return rejected_consensus(
                 EpochIngressError::wire_rejected, decoded.error);
         const auto &envelope = *decoded.value;
         if (!state_->admissible_generation(envelope))
-            return rejected_consensus(EpochIngressError::state_rejected);
+        {
+            if (!state_->repairable_generation(
+                    envelope, authenticated_peer))
+                return rejected_consensus(
+                    EpochIngressError::state_rejected);
+            if (!state_->validator.validate_proposal(
+                    envelope, authenticated_peer))
+                return rejected_consensus(
+                    EpochIngressError::wire_rejected,
+                    EpochConsensusWireError::invalid_body);
+            return {
+                EpochIngressError::none,
+                EpochConsensusWireError::none,
+                EpochConsensusPermission::catch_up_only,
+                envelope,
+                std::nullopt};
+        }
         if (!state_->validator.validate_proposal(
                 envelope, authenticated_peer))
             return rejected_consensus(

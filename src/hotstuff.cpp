@@ -4596,7 +4596,9 @@ namespace hotstuff
         ReplicaID authenticated_sender,
         ProposalDisposition disposition)
     {
-        if (envelope.kind != EpochConsensusWireKind::proposal ||
+        if ((envelope.kind != EpochConsensusWireKind::proposal &&
+             envelope.kind !=
+                 EpochConsensusWireKind::proposal_repair) ||
             (disposition != ProposalDisposition::admitted_active &&
              disposition != ProposalDisposition::duplicate))
             return;
@@ -4676,6 +4678,59 @@ namespace hotstuff
             }
             catch (...)
             {}
+    }
+
+    bool HotStuffBase::process_exact_proposal_catchup(
+        const EpochConsensusEnvelope &envelope,
+        const PeerId &source_peer) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            envelope.kind !=
+                EpochConsensusWireKind::proposal_repair ||
+            source_peer.is_null())
+            return false;
+        try
+        {
+            MsgPropose message(DataStream(envelope.body), true);
+            message.postponed_parse(this);
+            auto proposal = std::move(message.proposal);
+            if (proposal.metadata().key() != envelope.key() ||
+                proposal.proposer != envelope.proposer ||
+                proposal.blk == nullptr)
+                return false;
+
+            const auto expected_hash = envelope.block_hash;
+            const auto configuration = envelope.configuration;
+            const auto generation = envelope.view_generation;
+            const auto source = source_peer;
+            async_deliver_blk(expected_hash, source).then(
+                [access = exact_runtime_access,
+                 expected_hash,
+                 configuration,
+                 generation](const block_t &delivered) {
+                    auto runtime = access->acquire();
+                    if (!runtime.has_value())
+                        return;
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_PROPOSAL_CATCHUP outcome=%s replica=%u "
+                        "epoch=%u tree=%u block=%s generation=%llu",
+                        delivered != nullptr && delivered->delivered &&
+                                delivered->get_hash() == expected_hash
+                            ? "delivered"
+                            : "rejected",
+                        static_cast<unsigned>(
+                            runtime->owner().get_id()),
+                        configuration.epoch_number,
+                        configuration.tree_id,
+                        expected_hash.to_hex().c_str(),
+                        static_cast<unsigned long long>(generation));
+                });
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
     void HotStuffBase::dispatch_exact_vote_fallback(
@@ -5393,7 +5448,10 @@ namespace hotstuff
                 encoded = adaptive_epoch_consensus_message(
                     lease.key().configuration,
                     epoch_generation,
-                    EpochConsensusWireKind::proposal,
+                    epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v3
+                        ? EpochConsensusWireKind::proposal_repair
+                        : EpochConsensusWireKind::proposal,
                     lease.key(),
                     get_id(),
                     get_id(),
@@ -5639,7 +5697,10 @@ namespace hotstuff
                 encoded = adaptive_epoch_consensus_message(
                     job.key.configuration,
                     job.epoch_generation,
-                    EpochConsensusWireKind::proposal,
+                    epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v3
+                        ? EpochConsensusWireKind::proposal_repair
+                        : EpochConsensusWireKind::proposal,
                     job.key,
                     get_id(),
                     get_id(),
@@ -5809,7 +5870,10 @@ namespace hotstuff
                 encoded = adaptive_epoch_consensus_message(
                     job.key.configuration,
                     job.epoch_generation,
-                    EpochConsensusWireKind::proposal,
+                    epoch_protocol_mode ==
+                            EpochProtocolMode::adaptive_v3
+                        ? EpochConsensusWireKind::proposal_repair
+                        : EpochConsensusWireKind::proposal,
                     job.key,
                     get_id(),
                     get_id(),
@@ -9494,6 +9558,11 @@ namespace hotstuff
                 *envelope,
                 *authenticated_peer.replica_id,
                 *result.admission_disposition);
+        if (envelope != nullptr &&
+            result.permission ==
+                EpochConsensusPermission::catch_up_only)
+            static_cast<void>(process_exact_proposal_catchup(
+                *envelope, authenticated_peer.source_peer));
         const auto block = envelope != nullptr
             ? envelope->block_hash.to_hex()
             : std::string{"none"};
