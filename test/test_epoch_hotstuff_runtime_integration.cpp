@@ -15,6 +15,7 @@
 #include "hotstuff/epoch_change_inbox.h"
 #include "hotstuff/epoch_runtime_wiring.h"
 #include "hotstuff/hotstuff.h"
+#include "support/bls_fixtures.h"
 
 #if __has_include("hotstuff/epoch_live_binding.h")
 #include "hotstuff/epoch_live_binding.h"
@@ -662,7 +663,7 @@ struct V2Harness
     ProposalContextLifecycle contexts;
     ProposalEffectsSpy proposal_effects;
     ProposalAdmissionCoordinator admission;
-    EmptyFutureStore retryable_future;
+    HotStuffRetryableFutureProposalStore retryable_future;
     BodyValidatorSpy validator;
     LiveEffectsSpy live_effects;
     HotStuffEpochRuntimeTransaction transaction;
@@ -695,7 +696,10 @@ struct V2Harness
               store,
               activation.active_effect().configuration,
               future,
-              proposal_effects),
+              proposal_effects,
+              ProposalRelayPolicy::
+                  adaptive_v2_deferred_until_arm_attempt),
+          retryable_future(future, admission),
           transaction(admission, contexts, live_effects),
           adapter(
               activation,
@@ -1167,7 +1171,7 @@ TEST_CASE("adaptive v3 stale root repair is catch-up only",
     REQUIRE(catch_up.decoded_envelope.has_value());
     CHECK(catch_up.decoded_envelope->key() == stale.key());
     CHECK_FALSE(catch_up.admission_disposition.has_value());
-    CHECK(harness.proposal_effects.relay_count == 1);
+    CHECK(harness.proposal_effects.relay_count == 0);
     CHECK(harness.proposal_effects.process_count == 1);
     CHECK(harness.proposal_effects.local_vote_count == 0);
     CHECK(harness.proposal_effects.expected_vote_state_count == 0);
@@ -2194,6 +2198,173 @@ TEST_CASE("v3 runtime preparation reaches the concrete live topology",
     CHECK(harness.adapter.prepare_committed_v3(harness.epoch1) ==
           EpochIngressError::none);
     CHECK(harness.live_effects.prepare_count == 1);
+}
+
+TEST_CASE("adaptive v3 buffers a certified successor proposal until activation",
+          "[cert13][adaptive-v3][future-proposal][certified-activation]")
+{
+    // Referencing a non-inline BLS symbol retains the library initializer in
+    // this otherwise wire/runtime-only test binary.
+    REQUIRE(bls::BLS::GROUP_ORDER[0] != '\0');
+    REQUIRE_NOTHROW(bls::BLS::CheckRelicErrors());
+    V2Harness harness(
+        epoch_v2_input(0),
+        {2, 3},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+    REQUIRE(harness.adapter.prepare_committed_v3(harness.epoch1) ==
+            EpochIngressError::none);
+
+    const auto predecessor = harness.activation.active_effect();
+    const auto successor_generation = checked_activation_generation(
+        harness.epoch1.epoch_number(), 0);
+    REQUIRE(successor_generation.has_value());
+    const ConfigurationId successor{
+        harness.epoch1.epoch_number(),
+        harness.epoch1.trees().front().tree_id,
+        harness.epoch1.epoch_digest()};
+
+    AdaptiveV3ActivationSchedule schedule;
+    schedule.membership_digest = canonical_membership_digest(membership());
+    schedule.predecessor_epoch_number =
+        predecessor.configuration.epoch_number;
+    schedule.predecessor_epoch_digest =
+        predecessor.configuration.epoch_digest;
+    schedule.successor_epoch_number = successor.epoch_number;
+    schedule.successor_epoch_digest = successor.epoch_digest;
+    schedule.successor_activation_generation = *successor_generation;
+    schedule.command_payload_digest = digest("v3-buffer-command");
+    schedule.command_block_height = 10;
+    schedule.command_block_hash = digest("v3-buffer-command-block");
+    schedule.activation_delay_blocks = 1;
+    schedule.activation_height = 11;
+
+    std::vector<std::shared_ptr<const PrivKeyBLS>> private_keys;
+    std::vector<AdaptiveV3ReadinessMember> members;
+    for (const auto replica : membership())
+    {
+        auto key = std::make_shared<const PrivKeyBLS>(
+            hotstuff::test::make_bls_private_key_bytes(replica));
+        members.push_back({replica, PubKeyBLS(*key)});
+        private_keys.push_back(std::move(key));
+    }
+
+    std::vector<std::unique_ptr<AdaptiveV3CertifiedActivationGate>> gates;
+    std::vector<AdaptiveV3ActivationReadyObservation> observations;
+    const auto boundary_hash = digest("v3-buffer-boundary");
+    for (ReplicaID replica = 0; replica < membership().size(); ++replica)
+    {
+        gates.push_back(std::make_unique<
+                        AdaptiveV3CertifiedActivationGate>(
+            schedule,
+            replica,
+            private_keys.at(replica),
+            members,
+            5));
+        AdaptiveV3BoundaryResult boundary;
+        if (replica == 0)
+        {
+            const auto ingress = harness.binding.on_v3_post_block_commit(
+                *gates.back(),
+                schedule.activation_height,
+                predecessor.configuration,
+                predecessor.generation,
+                boundary_hash,
+                1,
+                1'000'000);
+            REQUIRE(ingress.error == EpochIngressError::none);
+            boundary = ingress.boundary;
+        }
+        else
+        {
+            boundary = gates.back()->observe_predecessor_commit(
+                schedule.activation_height,
+                predecessor.configuration,
+                predecessor.generation,
+                boundary_hash,
+                1,
+                1'000'000 + replica);
+        }
+        REQUIRE(boundary.disposition ==
+                AdaptiveV3BoundaryDisposition::prepared);
+        REQUIRE(boundary.observation.has_value());
+        observations.push_back(*boundary.observation);
+    }
+    REQUIRE(gates.front()->state() ==
+            AdaptiveV3CertifiedActivationState::prepared);
+
+    auto active_proposal = rotation_proposal(
+        predecessor.configuration,
+        predecessor.generation,
+        predecessor.definition->trees().front().members_breadth_first.front(),
+        "v3-paused-active-proposal");
+    active_proposal.protocol_mode = EpochProtocolMode::adaptive_v3;
+    const auto paused_active = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(active_proposal),
+        AuthenticatedEpochPeer::replica(active_proposal.proposer));
+    REQUIRE(paused_active.error == EpochIngressError::none);
+    CHECK(paused_active.permission == EpochConsensusPermission::paused);
+    CHECK(harness.future.size() == 0);
+
+    auto proposal = rotation_proposal(
+        successor,
+        *successor_generation,
+        harness.epoch1.trees().front().members_breadth_first.front(),
+        "v3-buffered-successor-proposal");
+    proposal.protocol_mode = EpochProtocolMode::adaptive_v3;
+    auto repair = proposal;
+    repair.kind = EpochConsensusWireKind::proposal_repair;
+    const auto paused_repair = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(repair),
+        AuthenticatedEpochPeer::replica(repair.proposer));
+    REQUIRE(paused_repair.error == EpochIngressError::none);
+    CHECK(paused_repair.permission == EpochConsensusPermission::paused);
+    CHECK(harness.future.size() == 0);
+
+    const auto buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(proposal),
+        AuthenticatedEpochPeer::replica(proposal.proposer));
+    REQUIRE(buffered.error == EpochIngressError::none);
+    REQUIRE(buffered.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    REQUIRE(buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    REQUIRE(harness.adapter.buffered_proposal_identity(proposal.key())
+                .has_value());
+
+    const AdaptiveV3ActivationReadinessLimits readiness_limits{
+        32 * 1024,
+        membership().size()};
+    const auto certificate =
+        make_adaptive_v3_activation_readiness_certificate(
+            observations.front().identity,
+            {observations.begin(), observations.begin() + 5},
+            readiness_limits);
+    const auto activated = harness.binding.apply_v3_readiness_certificate(
+        *gates.front(), certificate);
+    REQUIRE(activated.error == EpochIngressError::none);
+    REQUIRE(activated.disposition ==
+            AdaptiveV3CertificateDisposition::accepted);
+    REQUIRE(activated.update.has_value());
+    CHECK(activated.update->activation.configuration == successor);
+
+    const auto drained = harness.adapter.drain_activated_futures();
+    CHECK(drained.status == EpochFutureDrainStatus::complete);
+    CHECK(drained.processed == 1);
+    CHECK(drained.remaining == 0);
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.process_count == 1);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    const auto processed =
+        harness.adapter.processed_proposal_identity(proposal.key());
+    REQUIRE(processed.has_value());
+    CHECK(processed->view_generation == *successor_generation);
 }
 
 TEST_CASE("failed v2 preparation has no activation side effects",

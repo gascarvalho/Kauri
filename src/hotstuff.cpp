@@ -4987,6 +4987,11 @@ namespace hotstuff
         const auto *tree = find_exact_runtime_tree(key.configuration);
         const auto generation = find_exact_runtime_generation(
             key.configuration);
+        const auto active = adaptive_epoch_runtime != nullptr
+                                ? std::optional<EpochActivationEffect>(
+                                      adaptive_epoch_runtime->activation
+                                          .active_effect())
+                                : std::nullopt;
         const bool may_drain_exact_configuration =
             adaptive_epoch_runtime != nullptr &&
             adaptive_epoch_runtime->activation.may_drain_exact_context(
@@ -4998,6 +5003,9 @@ namespace hotstuff
             !may_drain_exact_configuration ||
             tree == nullptr ||
             !generation.has_value() || *generation != job->epoch_generation ||
+            !active.has_value() ||
+            active->configuration != key.configuration ||
+            active->generation != job->epoch_generation ||
             adaptive_epoch_runtime == nullptr ||
             !adaptive_epoch_runtime->activation.admits_new_proposals() ||
             job->proposal == nullptr)
@@ -5448,10 +5456,7 @@ namespace hotstuff
                 encoded = adaptive_epoch_consensus_message(
                     lease.key().configuration,
                     epoch_generation,
-                    epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v3
-                        ? EpochConsensusWireKind::proposal_repair
-                        : EpochConsensusWireKind::proposal,
+                    EpochConsensusWireKind::proposal,
                     lease.key(),
                     get_id(),
                     get_id(),
@@ -5697,10 +5702,7 @@ namespace hotstuff
                 encoded = adaptive_epoch_consensus_message(
                     job.key.configuration,
                     job.epoch_generation,
-                    epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v3
-                        ? EpochConsensusWireKind::proposal_repair
-                        : EpochConsensusWireKind::proposal,
+                    EpochConsensusWireKind::proposal,
                     job.key,
                     get_id(),
                     get_id(),
@@ -5867,13 +5869,20 @@ namespace hotstuff
             if (is_adaptive_epoch_mode(epoch_protocol_mode))
             {
                 const MsgPropose native(*job.proposal);
+                auto kind = EpochConsensusWireKind::proposal;
+                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+                    adaptive_epoch_runtime != nullptr)
+                {
+                    const auto active =
+                        adaptive_epoch_runtime->activation.active_effect();
+                    if (active.configuration != job.key.configuration ||
+                        active.generation != job.epoch_generation)
+                        kind = EpochConsensusWireKind::proposal_repair;
+                }
                 encoded = adaptive_epoch_consensus_message(
                     job.key.configuration,
                     job.epoch_generation,
-                    epoch_protocol_mode ==
-                            EpochProtocolMode::adaptive_v3
-                        ? EpochConsensusWireKind::proposal_repair
-                        : EpochConsensusWireKind::proposal,
+                    kind,
                     job.key,
                     get_id(),
                     get_id(),

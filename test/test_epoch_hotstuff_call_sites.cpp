@@ -4093,14 +4093,24 @@ TEST_CASE(
          "EpochConsensusPermission::catch_up_only",
          "process_exact_proposal_catchup("}));
 
-    for (const auto *repair :
-         {&initial_repair, &retry_repair, &tail_repair})
-    {
-        REQUIRE_FALSE(repair->empty());
-        CHECK(contains_all(
-            *repair,
-            {"EpochProtocolMode::adaptive_v3",
-             "EpochConsensusWireKind::proposal_repair",
-             "EpochConsensusWireKind::proposal"}));
-    }
+    REQUIRE_FALSE(initial_repair.empty());
+    CHECK(initial_repair.find("EpochConsensusWireKind::proposal") !=
+          std::string::npos);
+    CHECK(initial_repair.find("EpochConsensusWireKind::proposal_repair") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(retry_repair.empty());
+    CHECK(retry_repair.find("EpochConsensusWireKind::proposal") !=
+          std::string::npos);
+    CHECK(retry_repair.find("EpochConsensusWireKind::proposal_repair") ==
+          std::string::npos);
+
+    REQUIRE_FALSE(tail_repair.empty());
+    CHECK(contains_all(
+        tail_repair,
+        {"EpochProtocolMode::adaptive_v3",
+         "EpochConsensusWireKind::proposal_repair",
+         "EpochConsensusWireKind::proposal",
+         "active.configuration != job.key.configuration",
+         "active.generation != job.epoch_generation"}));
 }

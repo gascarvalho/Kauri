@@ -1582,14 +1582,24 @@ EpochConsensusIngressResult HotStuffEpochRuntimeAdapter::handle_proposal(
             return rejected_consensus(
                 EpochIngressError::wire_rejected,
                 EpochConsensusWireError::invalid_body);
+        const auto active = state_->activation.active_effect();
         const bool v3_prepared =
             state_->mode == EpochProtocolMode::adaptive_v3 &&
             state_->v3_gate != nullptr &&
-            (state_->v3_gate->state() ==
-                 AdaptiveV3CertifiedActivationState::prepared ||
-             state_->v3_gate->state() ==
-                 AdaptiveV3CertifiedActivationState::blocked);
-        if (!state_->activation.admits_new_proposals() || v3_prepared)
+            state_->v3_gate->state() ==
+                AdaptiveV3CertifiedActivationState::prepared;
+        const bool v3_blocked =
+            state_->mode == EpochProtocolMode::adaptive_v3 &&
+            state_->v3_gate != nullptr &&
+            state_->v3_gate->state() ==
+                AdaptiveV3CertifiedActivationState::blocked;
+        const bool certified_successor_buffer =
+            v3_prepared &&
+            envelope.kind == EpochConsensusWireKind::proposal &&
+            envelope.configuration != active.configuration;
+        if ((!state_->activation.admits_new_proposals() || v3_prepared ||
+             v3_blocked) &&
+            !certified_successor_buffer)
             return {
                 EpochIngressError::none,
                 EpochConsensusWireError::none,
