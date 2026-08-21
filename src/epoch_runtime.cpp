@@ -652,7 +652,13 @@ struct HotStuffEpochRuntimeAdapter::State
         const auto active = activation.active_effect();
         if (envelope.configuration == active.configuration)
             return envelope.view_generation == active.generation;
-        if (mode == EpochProtocolMode::adaptive_v2 &&
+        // An exact later predecessor-tree generation is safe to retain but
+        // not process: ProposalAdmissionCoordinator classifies it as future,
+        // and rotation is still the only authority that drains it.  V3 needs
+        // the same boundary so locally skewed timeout rotations cannot drop a
+        // quorum-capable proposal before peers reach its exact generation.
+        if ((mode == EpochProtocolMode::adaptive_v2 ||
+             mode == EpochProtocolMode::adaptive_v3) &&
             active.definition != nullptr &&
             envelope.configuration.epoch_number ==
                 active.configuration.epoch_number &&

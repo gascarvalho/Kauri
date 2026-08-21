@@ -1216,6 +1216,60 @@ TEST_CASE("adaptive v3 stale root repair is catch-up only",
           EpochConsensusWireError::unexpected_kind);
 }
 
+TEST_CASE("adaptive v3 buffers an exact prospective predecessor rotation",
+          "[cert13][adaptive-v3][rotation][future-proposal][safety]")
+{
+    V2Harness harness(
+        rooted_epoch_v2_input(0, {0, 1, 2}),
+        {0, 1, 2},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+    const auto initial = harness.activation.active_effect();
+    REQUIRE(initial.configuration.tree_id == 0);
+    REQUIRE(initial.generation == 1);
+
+    const ConfigurationId next_configuration{
+        initial.configuration.epoch_number,
+        1,
+        initial.configuration.epoch_digest};
+    const auto next_generation = checked_activation_generation(
+        initial.configuration.epoch_number,
+        static_cast<std::uint64_t>(initial.rotation_ordinal) + 1);
+    REQUIRE(next_generation.has_value());
+    auto prospective = rotation_proposal(
+        next_configuration,
+        *next_generation,
+        1,
+        "v3-prospective-predecessor-rotation");
+    prospective.protocol_mode = EpochProtocolMode::adaptive_v3;
+
+    const auto buffered = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(prospective),
+        AuthenticatedEpochPeer::replica(1));
+    REQUIRE(buffered.error == EpochIngressError::none);
+    REQUIRE(buffered.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    REQUIRE(buffered.admission_disposition ==
+            ProposalDisposition::buffered_future);
+    CHECK(harness.future.size() == 1);
+    CHECK(harness.proposal_effects.relay_count == 0);
+    CHECK(harness.proposal_effects.process_count == 0);
+    CHECK(harness.proposal_effects.local_vote_count == 0);
+    CHECK(harness.proposal_effects.expected_vote_state_count == 0);
+    CHECK(harness.proposal_effects.latency_deadline_count == 0);
+    CHECK(harness.proposal_effects.aggregation_timer_count == 0);
+
+    const auto rotated = harness.binding.rotate_to_tree(1);
+    REQUIRE(rotated.error == EpochIngressError::none);
+    REQUIRE(rotated.update.has_value());
+    CHECK(rotated.update->activation.configuration == next_configuration);
+    CHECK(rotated.update->activation.generation == *next_generation);
+    CHECK(harness.future.size() == 0);
+    CHECK(harness.proposal_effects.process_count == 1);
+}
+
 TEST_CASE("adaptive v2 activation resets cadence and excludes its predecessor key",
           "[c08][adaptive-v2][rotation-coordinator][activation]")
 {
