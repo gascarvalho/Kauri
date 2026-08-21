@@ -635,6 +635,25 @@ def test_v12_profiles_bind_exact_horizons_timers_and_all_candidate_capacity() ->
     )
 
 
+def test_n31_v13_inherits_the_frozen_all_candidate_guard_relations() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N31_PROFILE_V13)
+
+    plan = runtime.derive_reporter_coverage_plan(profile)
+    capacity = plan["all_candidate_reporter_coverage_capacity"]
+    assert capacity == profile.raw["topology"][
+        "all_candidate_reporter_coverage_capacity"
+    ]
+    assert len(capacity["candidates"]) == 31
+    assert capacity["minimum_topology_eligible_reporter_capacity"] == 19
+    assert capacity["maximum_guarded_cohort_size"] == 10
+
+    relations = runtime._v12_guard_relations(profile)
+    assert relations[6][28] == frozenset(
+        ((26, "direct_vote"), (27, "direct_vote"))
+    )
+
+
 def test_n7_v12_guard_relations_use_its_injected_target_capacity() -> None:
     runtime = _runtime()
     profile = runtime.load_focused_profile(N7_PROFILE_V12)

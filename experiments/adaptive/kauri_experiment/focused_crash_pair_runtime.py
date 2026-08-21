@@ -2295,7 +2295,10 @@ def derive_reporter_coverage_plan(profile: FocusedProfile) -> dict[str, object]:
         if topology.get("reporter_coverage_capacity") != capacity:
             _error("v8 reporter capacity differs from topology derivation")
         all_candidate_capacity = None
-        if profile.profile_id == "n31-f5-q21-three-crash-pair-v12":
+        if profile.profile_id in {
+            "n31-f5-q21-three-crash-pair-v12",
+            "n31-f5-q21-three-crash-pair-v13",
+        }:
             all_candidate_capacity = _all_candidate_reporter_capacity_document(
                 replica_count=replica_count,
                 quorum=profile.quorum,

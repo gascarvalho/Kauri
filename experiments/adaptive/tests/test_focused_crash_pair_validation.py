@@ -2217,6 +2217,119 @@ def test_v9_v10_v11_source_blind_replay_uses_proof_bound_guarded_relations(
     }
 
 
+def test_n31_v13_source_blind_replay_uses_all_candidate_guard_relations(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile_path = runtime_fixture.N31_PROFILE_V13
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    proof_source = runtime_fixture._topology_proof_path(profile_path, profile)
+    root = tmp_path / profile_path.stem
+    proof_path = root / profile["topology"]["proof_path"]
+    proof_path.parent.mkdir(parents=True, exist_ok=True)
+    proof_path.write_bytes(proof_source.read_bytes())
+    _write_json(root / "profile.json", profile)
+    contract = _document(validation.validation_contract_from_profile(root))
+    digest = str(contract["epoch_zero_digest"])
+    block_hash = "5a" * 32
+    prefix = list(range(20, 31)) + list(range(20))
+
+    def observation(*, outcome: str) -> dict[str, object]:
+        attempt_start_ns = 11_000 if outcome == "on_time" else 12_000
+        row: dict[str, object] = {
+            "schema_version": 3,
+            "reporter_id": 28,
+            "observed_replica_id": 6,
+            "configuration": {
+                "epoch_number": 0,
+                "tree_id": 27,
+                "epoch_digest": digest,
+            },
+            "block_hash": block_hash,
+            "expected_message_type": "direct_vote",
+            "outcome": outcome,
+            "response_duration_us": 1 if outcome == "on_time" else 0,
+            "deadline_duration_us": 1,
+            "reporter_monotonic_ns": 12_000 if outcome == "on_time" else 13_000,
+            "reporter_sequence": 1 if outcome == "on_time" else 2,
+            "attempt_start_monotonic_ns": attempt_start_ns,
+            "reporter_local_commit_monotonic_ns": 0,
+            "signer_set": [28] if outcome == "on_time" else [],
+        }
+        row["observation_id"] = validation._v6_timeout_observation_id(
+            reporter_id=28,
+            observed_replica_id=6,
+            epoch_number=0,
+            tree_id=27,
+            epoch_digest=digest,
+            block_hash=block_hash,
+            expected_message_type="direct_vote",
+            attempt_start_monotonic_ns=attempt_start_ns,
+            deadline_duration_us=1,
+        )
+        return row
+
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": 1,
+            "source_monotonic_ns": 10_000,
+            "event_type": "fault_window_armed",
+            "payload": {
+                "evidence_start_monotonic_ns": 10_000,
+                "required_tree_ids": prefix,
+            },
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": 2,
+            "source_monotonic_ns": 20_000,
+            "event_type": "evidence.observation_accepted",
+            "payload": {
+                "ingestion_sequence": 1,
+                "observation": observation(outcome="on_time"),
+            },
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "source_sequence": 3,
+            "source_monotonic_ns": 21_000,
+            "event_type": "evidence.observation_accepted",
+            "payload": {
+                "ingestion_sequence": 2,
+                "observation": observation(outcome="timeout"),
+            },
+        },
+    ]
+
+    rows, drawdowns, latest = validation._v4_replay_fault_window_anchors(
+        contract,
+        events,
+        baseline_cutoff=0,
+        current_cutoff=2,
+        audit={"source_monotonic_ns": 40_000, "source_sequence": 100},
+        guarded_targets=(6,),
+    )
+
+    assert rows == [
+        {
+            "epoch_number": 0,
+            "tree_id": 27,
+            "observed_replica_id": 6,
+            "reporter_id": 28,
+            "outcome": "timeout",
+            "compensated": False,
+            "source_monotonic_ns": 21_000,
+            "expected_message_type": "direct_vote",
+        }
+    ]
+    assert drawdowns == {"6": -1}
+    assert latest == 21_000
+
+
 def test_sealed_v6_witness_replays_profile_targets_without_contract_key_drift(
     tmp_path: Path,
 ) -> None:

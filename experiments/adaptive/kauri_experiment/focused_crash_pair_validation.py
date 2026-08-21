@@ -1972,7 +1972,10 @@ def _v4_replay_fault_window_anchors(
     proof_bound_relations: dict[int, dict[int, set[tuple[int, str]]]] = {}
     if is_v8:
         capacity_rows = coverage.get("targets")
-        if contract.get("profile_id") == "n31-f5-q21-three-crash-pair-v12":
+        if contract.get("profile_id") in {
+            "n31-f5-q21-three-crash-pair-v12",
+            "n31-f5-q21-three-crash-pair-v13",
+        }:
             capacity_rows = _mapping(
                 coverage.get("all_candidate_reporter_coverage_capacity"),
                 "all-candidate reporter capacity",
