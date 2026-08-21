@@ -2705,6 +2705,160 @@ def test_v3_raw_common_commit_accepts_zero_transaction_workload(
     assert snapshot["transaction_count"] == 0
 
 
+def test_v13_runtime_phase_commits_use_physical_observation_time() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V13)
+    physical = {
+        "block_height": 42,
+        "block_hash": "a" * 64,
+        "parent_hash": "b" * 64,
+        "transaction_count": 1000,
+        "commit_batch_index": 0,
+    }
+    observation = {
+        "source_kind": "replica",
+        "source_id": "replica-2",
+        "source_instance": "replica-2-instance",
+        "source_sequence": 9,
+        "source_monotonic_ns": 1_000,
+        "event_type": "block.commit_observed",
+        "payload": dict(physical),
+    }
+    carrier = {
+        **observation,
+        "source_sequence": 10,
+        "source_monotonic_ns": 1_004,
+        "event_type": "block.committed",
+        "payload": {
+            **physical,
+            "designated_observer": True,
+            "decision_proof": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": "c" * 64,
+                "block_hash": physical["block_hash"],
+            },
+            "view_generation": (1 << 32) + 1,
+        },
+    }
+
+    commits = runtime._runtime_authoritative_commits(
+        [observation, carrier], profile
+    )
+
+    assert len(commits) == 1
+    assert commits[0]["source_monotonic_ns"] == 1_000
+    assert commits[0]["source_sequence"] == 9
+    assert commits[0]["payload"] == carrier["payload"]
+
+
+def test_v13_runtime_phase_commit_accepts_cross_source_identity_witness() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V13)
+    physical = {
+        "block_height": 42,
+        "block_hash": "a" * 64,
+        "parent_hash": "b" * 64,
+        "transaction_count": 1000,
+        "commit_batch_index": 0,
+    }
+    authoritative = {
+        "source_kind": "replica",
+        "source_id": "replica-2",
+        "source_instance": "replica-2-instance",
+        "source_sequence": 9,
+        "source_monotonic_ns": 1_000,
+        "event_type": "block.commit_observed",
+        "payload": dict(physical),
+    }
+    witness_observation = {
+        **authoritative,
+        "source_id": "replica-3",
+        "source_instance": "replica-3-instance",
+        "source_sequence": 7,
+        "source_monotonic_ns": 999,
+        "payload": {**physical, "commit_batch_index": 1},
+    }
+    witness = {
+        **witness_observation,
+        "source_sequence": 8,
+        "source_monotonic_ns": 1_002,
+        "event_type": "block.commit_identity_witness",
+        "payload": {
+            **witness_observation["payload"],
+            "decision_proof": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": "c" * 64,
+                "block_hash": physical["block_hash"],
+            },
+            "view_generation": (1 << 32) + 1,
+        },
+    }
+
+    commits = runtime._runtime_authoritative_commits(
+        [authoritative, witness_observation, witness], profile
+    )
+
+    assert len(commits) == 1
+    assert commits[0]["source_monotonic_ns"] == 1_000
+    assert commits[0]["payload"]["commit_batch_index"] == 0
+    assert commits[0]["payload"]["decision_proof"] == witness["payload"][
+        "decision_proof"
+    ]
+
+
+@pytest.mark.parametrize("mutation", ("missing", "early", "reused"))
+def test_v13_runtime_phase_commit_identity_join_fails_closed(
+    mutation: str,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V13)
+    physical = {
+        "block_height": 42,
+        "block_hash": "a" * 64,
+        "parent_hash": "b" * 64,
+        "transaction_count": 1000,
+        "commit_batch_index": 0,
+    }
+    observation = {
+        "source_kind": "replica",
+        "source_id": "replica-2",
+        "source_instance": "replica-2-instance",
+        "source_sequence": 9,
+        "source_monotonic_ns": 1_000,
+        "event_type": "block.commit_observed",
+        "payload": dict(physical),
+    }
+    carrier = {
+        **observation,
+        "source_sequence": 10,
+        "source_monotonic_ns": 1_004,
+        "event_type": "block.committed",
+        "payload": {
+            **physical,
+            "designated_observer": True,
+            "decision_proof": {
+                "epoch_number": 1,
+                "tree_id": 0,
+                "epoch_digest": "c" * 64,
+                "block_hash": physical["block_hash"],
+            },
+            "view_generation": (1 << 32) + 1,
+        },
+    }
+    events = [observation, carrier]
+    if mutation == "missing":
+        events = [observation]
+    elif mutation == "early":
+        carrier["source_monotonic_ns"] = 999
+    else:
+        events = [observation, dict(observation), carrier]
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runtime._runtime_authoritative_commits(events, profile)
+
+
 def _v5_runtime_phase_fixture(
     *, arm: str = "adaptive"
 ) -> tuple[object, list[dict[str, object]], dict[str, object], object]:

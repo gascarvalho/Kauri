@@ -7765,13 +7765,153 @@ def _runtime_authoritative_commits(
         ),
         "authoritative replica",
     )
-    return [
+    exact = [
         event
         for event in events
         if event.get("event_type") == "block.committed"
         and event.get("source_kind") == "replica"
         and event.get("source_id") == f"replica-{observer}"
     ]
+    if not _is_v13_profile(profile):
+        return exact
+
+    source_id = f"replica-{observer}"
+    physical_keys = {
+        "block_height",
+        "block_hash",
+        "parent_hash",
+        "transaction_count",
+        "commit_batch_index",
+    }
+    exact_keys = physical_keys | {
+        "designated_observer",
+        "decision_proof",
+        "view_generation",
+    }
+    witness_keys = physical_keys | {"decision_proof", "view_generation"}
+    observations = [
+        event
+        for event in events
+        if event.get("event_type") == "block.commit_observed"
+        and event.get("source_kind") == "replica"
+    ]
+    observed_payloads: dict[int, Mapping[str, Any]] = {}
+    observed_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    for observation in observations:
+        payload = _document(
+            observation.get("payload"), "authoritative commit observation"
+        )
+        if set(payload) != physical_keys:
+            _error("authoritative commit observation schema drifted")
+        observed_payloads[id(observation)] = payload
+        observed_by_source.setdefault(str(observation.get("source_id")), []).append(
+            observation
+        )
+
+    carriers = [
+        event
+        for event in events
+        if event.get("event_type")
+        in {"block.committed", "block.commit_identity_witness"}
+        and event.get("source_kind") == "replica"
+    ]
+    carrier_rows: list[
+        tuple[Mapping[str, Any], Mapping[str, Any], int]
+    ] = []
+    for carrier in carriers:
+        carrier_payload = _document(
+            carrier.get("payload"), "authoritative commit identity carrier"
+        )
+        if carrier.get("event_type") == "block.committed":
+            if (
+                set(carrier_payload) != exact_keys
+                or carrier.get("source_id") != source_id
+                or carrier_payload.get("designated_observer") is not True
+            ):
+                _error("authoritative commit identity carrier schema drifted")
+        elif (
+            set(carrier_payload) != witness_keys
+            or carrier.get("source_id") == source_id
+        ):
+            _error("authoritative commit identity witness schema drifted")
+        local_matches = [
+            observation
+            for observation in observed_by_source.get(
+                str(carrier.get("source_id")), ()
+            )
+            if all(
+                observed_payloads[id(observation)].get(key)
+                == carrier_payload.get(key)
+                for key in physical_keys
+            )
+        ]
+        if len(local_matches) != 1:
+            _error("authoritative commit identity carrier lacks one local observation")
+        local_observation = local_matches[0]
+        if (
+            _integer(
+                carrier.get("source_sequence"), "commit identity sequence", 1
+            )
+            != _integer(
+                local_observation.get("source_sequence"),
+                "commit observation sequence",
+                1,
+            )
+            + 1
+            or _integer(
+                carrier.get("source_monotonic_ns"), "commit identity timestamp", 1
+            )
+            < _integer(
+                local_observation.get("source_monotonic_ns"),
+                "commit observation timestamp",
+                1,
+            )
+        ):
+            _error("authoritative commit identity does not follow its observation")
+        proof = _document(
+            carrier_payload.get("decision_proof"), "commit identity proof"
+        )
+        if set(proof) != {"epoch_number", "tree_id", "epoch_digest", "block_hash"}:
+            _error("authoritative commit identity proof schema drifted")
+        generation = _uint64(
+            carrier_payload.get("view_generation"), "commit identity generation", 1
+        )
+        carrier_rows.append((carrier_payload, proof, generation))
+
+    reconstructed: list[Mapping[str, Any]] = []
+    for observation in observed_by_source.get(source_id, ()):
+        observed_payload = observed_payloads[id(observation)]
+        matches = [
+            row
+            for row in carrier_rows
+            if all(
+                row[0].get(key) == observed_payload.get(key)
+                for key in (
+                    "block_height",
+                    "block_hash",
+                    "parent_hash",
+                    "transaction_count",
+                )
+            )
+        ]
+        identities = {(_canonical_json(row[1]), row[2]) for row in matches}
+        if not matches or len(identities) != 1:
+            _error("authoritative commit observation lacks one exact identity")
+        proof = matches[0][1]
+        generation = matches[0][2]
+        reconstructed.append(
+            {
+                **dict(observation),
+                "event_type": "block.committed",
+                "payload": {
+                    **dict(observed_payload),
+                    "designated_observer": True,
+                    "decision_proof": dict(proof),
+                    "view_generation": generation,
+                },
+            }
+        )
+    return reconstructed
 
 
 def _runtime_first_common_commit_anchor(
