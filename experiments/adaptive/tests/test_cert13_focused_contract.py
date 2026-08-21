@@ -145,11 +145,11 @@ def test_v13_canonical_profile_derives_independent_validation_contract(
     ("profile_id", "expected"),
     (
         ("n7-f2-q5-two-crash-pair-smoke-v13", "8.0"),
-        ("n31-f5-q21-three-crash-pair-v13", "20.0"),
+        ("n31-f5-q21-three-crash-pair-v13", "8.0"),
         ("n31-f5-q21-three-crash-pair-v12", "8.0"),
     ),
 )
-def test_validator_binds_the_n31_v13_progress_budget_only(
+def test_validator_preserves_the_frozen_progress_budget(
     profile_id: str,
     expected: str,
 ) -> None:

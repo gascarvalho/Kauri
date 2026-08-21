@@ -81,7 +81,6 @@ _FCRASH_H_V13_PROFILE_IDS = frozenset(
     }
 )
 _N31_FCRASH_H_V13_PROFILE_ID = "n31-f5-q21-three-crash-pair-v13"
-_N31_FCRASH_H_V13_LEADER_PROGRESS_TIMEOUT_S = 20.0
 _FOCUSED_LEADER_PROGRESS_TIMEOUT_S = 8.0
 _V13_MAXIMUM_OBSERVATION_ATTEMPTS = 5
 _V13_OBSERVATION_RETRY_INTERVAL_MS = 1_000
@@ -8584,15 +8583,13 @@ def _profiled_adapter(profile: FocusedProfile, pair_seed: int) -> FrozenProfile:
         minimum_positive_postfault_buckets=3,
         minimum_mean_throughput_retention=0.0,
         aggregation_timeout_s=1.0,
-        # The exact N31 v13 runtime can spend more than the historical 8s
-        # fallback horizon processing one same-host proposal callback. Keep
-        # every archived profile and the N7 smoke at 8s, while binding the
-        # frozen N31 v13 identity to the native 20s progress budget.
-        leader_progress_timeout_s=(
-            _N31_FCRASH_H_V13_LEADER_PROGRESS_TIMEOUT_S
-            if profile.profile_id == _N31_FCRASH_H_V13_PROFILE_ID
-            else _FOCUSED_LEADER_PROGRESS_TIMEOUT_S
-        ),
+        # Both frozen topologies have a two-edge deepest tree, whose native
+        # get_max_level() value is the three-level count. The fallback horizon
+        # is therefore 2 * (3 + 1) * 1s = 8s. Suspicion must remain strictly
+        # after it once the 1s activation grace is included. Keeping this
+        # bounded value also makes the frozen N31 31-tree/420s coverage
+        # contract executable; a 20s per-tree timeout cannot satisfy it.
+        leader_progress_timeout_s=_FOCUSED_LEADER_PROGRESS_TIMEOUT_S,
         leader_activation_grace_s=1.0,
         activation_delay_blocks=5,
         maximum_stall_s=float(maximum_stall),

@@ -2095,11 +2095,11 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
     ("profile_path", "expected_timeout_s"),
     (
         (N7_PROFILE_V13, 8.0),
-        (N31_PROFILE_V13, 20.0),
+        (N31_PROFILE_V13, 8.0),
         (N31_PROFILE_V12, 8.0),
     ),
 )
-def test_n31_v13_alone_uses_the_scale_safe_leader_progress_budget(
+def test_focused_profiles_use_the_frozen_leader_progress_budget(
     profile_path: Path,
     expected_timeout_s: float,
 ) -> None:

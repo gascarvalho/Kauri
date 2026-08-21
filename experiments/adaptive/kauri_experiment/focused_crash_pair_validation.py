@@ -3202,7 +3202,10 @@ def _expected_treegen_payload(contract: Mapping[str, object]) -> bytes:
 
 
 def _expected_leader_progress_timeout(profile_id: object) -> str:
-    return "20.0" if profile_id == _N31_FCRASH_H_V13_PROFILE_ID else "8.0"
+    # The profile argument is retained so legacy and v13 call sites share the
+    # same explicit source-blind binding surface.
+    del profile_id
+    return "8.0"
 
 
 def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) -> None:
