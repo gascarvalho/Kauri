@@ -4760,12 +4760,18 @@ namespace hotstuff
         exact_vote_fallback_jobs.erase(found);
         exact_root_repair_deliveries.erase(key);
 
-        const auto active = proposal_contexts->active_configuration();
         const auto generation = find_exact_runtime_generation(
             key.configuration);
         const auto metadata = exact_context_metadata(key);
-        if (!active.has_value() || *active != key.configuration ||
-            !generation.has_value() || *generation != job->epoch_generation ||
+        // The local tree may rotate after this exact vote has been verified
+        // and its immutable fallback has been armed.  The corresponding
+        // root context is deliberately allowed to keep draining late
+        // verified contributions, so active-configuration equality here
+        // would discard the fallback precisely when proposal repair is
+        // needed.  Exact generation, frozen tree metadata, admission, and
+        // the one-shot job remain the authority for this send.
+        if (!generation.has_value() ||
+            *generation != job->epoch_generation ||
             metadata == std::nullopt || metadata->tree.root != job->root ||
             metadata->tree.local_replica != get_id() ||
             std::find(

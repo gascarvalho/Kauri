@@ -815,8 +815,29 @@ TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
           std::string::npos);
     CHECK(vote_dispatch.find("contains_admitted(key)") !=
           std::string::npos);
-    CHECK(vote_dispatch.find("*active != key.configuration") !=
+    CHECK(vote_dispatch.find("active-configuration equality") !=
           std::string::npos);
+    CHECK(vote_dispatch.find("*active != key.configuration") ==
+          std::string::npos);
+    const auto fallback_generation = vote_dispatch.find(
+        "find_exact_runtime_generation(");
+    const auto fallback_generation_gate = vote_dispatch.find(
+        "*generation != job->epoch_generation");
+    const auto fallback_metadata = vote_dispatch.find(
+        "exact_context_metadata(key)");
+    const auto fallback_admission = vote_dispatch.find(
+        "contains_admitted(key)");
+    const auto fallback_send = vote_dispatch.find(
+        "send_exact_vote_to_root(");
+    REQUIRE(fallback_generation != std::string::npos);
+    REQUIRE(fallback_generation_gate != std::string::npos);
+    REQUIRE(fallback_metadata != std::string::npos);
+    REQUIRE(fallback_admission != std::string::npos);
+    REQUIRE(fallback_send != std::string::npos);
+    CHECK(fallback_generation < fallback_generation_gate);
+    CHECK(fallback_generation_gate < fallback_admission);
+    CHECK(fallback_metadata < fallback_admission);
+    CHECK(fallback_admission < fallback_send);
     CHECK(vote_send.find("ReplicaID root") != std::string::npos);
     CHECK(vote_send.find("config.get_peer_id(root)") !=
           std::string::npos);
