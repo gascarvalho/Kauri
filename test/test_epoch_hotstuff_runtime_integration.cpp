@@ -1150,6 +1150,18 @@ TEST_CASE("adaptive v3 stale root repair is catch-up only",
     CHECK(harness.proposal_effects.latency_deadline_count == 0);
     CHECK(harness.proposal_effects.aggregation_timer_count == 0);
 
+    auto ordinary_duplicate = current;
+    ordinary_duplicate.kind = EpochConsensusWireKind::proposal;
+    const auto duplicate = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(ordinary_duplicate),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(duplicate.error == EpochIngressError::none);
+    REQUIRE(duplicate.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    CHECK(duplicate.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.proposal_effects.process_count == 1);
+
     const auto rotated = harness.binding.rotate_to_tree(1);
     REQUIRE(rotated.error == EpochIngressError::none);
     REQUIRE(rotated.update.has_value());
@@ -1214,6 +1226,44 @@ TEST_CASE("adaptive v3 stale root repair is catch-up only",
     CHECK(rejected_v2.error == EpochIngressError::wire_rejected);
     CHECK(rejected_v2.wire_error ==
           EpochConsensusWireError::unexpected_kind);
+}
+
+TEST_CASE("adaptive v3 active repair matches an ordinary proposal identity",
+          "[cert13][adaptive-v3][proposal-repair][identity][safety]")
+{
+    V2Harness harness(
+        rooted_epoch_v2_input(0, {0, 1}),
+        {2, 3},
+        2,
+        2,
+        {},
+        EpochProtocolMode::adaptive_v3);
+    const auto active = harness.activation.active_effect();
+
+    auto ordinary = rotation_proposal(
+        active.configuration,
+        active.generation,
+        0,
+        "v3-ordinary-before-repair");
+    ordinary.protocol_mode = EpochProtocolMode::adaptive_v3;
+    const auto admitted = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(ordinary),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(admitted.error == EpochIngressError::none);
+    REQUIRE(admitted.admission_disposition ==
+            ProposalDisposition::admitted_active);
+
+    auto repair = ordinary;
+    repair.kind = EpochConsensusWireKind::proposal_repair;
+    const auto duplicate = harness.binding.handle_proposal(
+        consensus_message<MsgPropose>(repair),
+        AuthenticatedEpochPeer::replica(0));
+    REQUIRE(duplicate.error == EpochIngressError::none);
+    REQUIRE(duplicate.permission ==
+            EpochConsensusPermission::admit_or_buffer);
+    CHECK(duplicate.admission_disposition ==
+          ProposalDisposition::duplicate);
+    CHECK(harness.proposal_effects.process_count == 1);
 }
 
 TEST_CASE("adaptive v3 buffers an exact prospective predecessor rotation",

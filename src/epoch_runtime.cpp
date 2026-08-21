@@ -1613,15 +1613,34 @@ EpochConsensusIngressResult HotStuffEpochRuntimeAdapter::handle_proposal(
                 envelope,
                 std::nullopt};
 
+        // A repair envelope is transport authority for stale-generation
+        // catch-up, but in the exact active generation it denotes the same
+        // proposal as the ordinary envelope.  Normalize that active case
+        // before proposal-identity hashing so an ordinary first delivery and
+        // a later post-quorum repair copy cannot conflict solely because the
+        // outer wire kind differs.  The decoded envelope remains a repair so
+        // the live binding can retain its root-repair provenance.
+        auto admission_payload = raw;
+        if (state_->mode == EpochProtocolMode::adaptive_v3 &&
+            envelope.kind == EpochConsensusWireKind::proposal_repair &&
+            envelope.configuration == active.configuration &&
+            envelope.view_generation == active.generation)
+        {
+            auto ordinary = envelope;
+            ordinary.kind = EpochConsensusWireKind::proposal;
+            admission_payload = encode_epoch_consensus_envelope(
+                ordinary, state_->limits);
+        }
+
         BufferedProposal proposal{
             ProposalMetadata{
                 envelope.configuration,
                 envelope.block_hash,
                 envelope.proposer},
-            raw,
+            admission_payload,
             authenticated_peer.source_peer,
             envelope.view_generation,
-            DataStream(raw).get_hash(),
+            DataStream(admission_payload).get_hash(),
             envelope.body,
             authenticated_peer.replica_id};
         auto retryable = proposal;
