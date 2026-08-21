@@ -8604,29 +8604,66 @@ namespace hotstuff
             !adaptive_v2_epoch_change_bundle_limits.has_value() ||
             epoch_change_verifier == nullptr || exact_epochs == nullptr ||
             adaptive_epoch_runtime == nullptr)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_BUNDLE stage=precondition "
+                "outcome=rejected replica=%u",
+                static_cast<unsigned>(get_id()));
             return;
+        }
         const auto peer = conn->get_peer_id();
         const auto pinned_connection = pn.get_peer_conn(peer);
         const auto *certificate = conn->get_peer_cert();
         if (!authorize_manager_peer(peer) || pinned_connection == nullptr ||
             pinned_connection != conn || certificate == nullptr ||
             PeerId(*certificate) != peer)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_BUNDLE stage=peer_binding "
+                "outcome=rejected replica=%u authorized=%u pinned=%u "
+                "same_connection=%u certificate=%u",
+                static_cast<unsigned>(get_id()),
+                authorize_manager_peer(peer) ? 1U : 0U,
+                pinned_connection == nullptr ? 0U : 1U,
+                pinned_connection == conn ? 1U : 0U,
+                certificate == nullptr ? 0U : 1U);
             return;
+        }
         const auto decoded = decode_adaptive_v3_epoch_change_bundle(
             static_cast<bytearray_t>(message.serialized),
             *adaptive_v2_epoch_change_bundle_limits);
         if (!decoded)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_BUNDLE stage=decode "
+                "outcome=rejected replica=%u error=%u",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(decoded.error));
             return;
+        }
         const auto active =
             adaptive_epoch_runtime->activation.active_effect().configuration;
         const auto *active_epoch = exact_epochs->find_epoch(
             active.epoch_number);
         if (active_epoch == nullptr ||
             active_epoch->epoch_digest() != active.epoch_digest)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_BUNDLE stage=active_epoch "
+                "outcome=rejected replica=%u epoch=%u tree=%u",
+                static_cast<unsigned>(get_id()),
+                active.epoch_number, active.tree_id);
             return;
+        }
         const auto result = adaptive_v2_command_inbox->ingest(
             *decoded.value, *active_epoch, *epoch_change_verifier,
             *exact_epochs);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_ADAPTIVE_V3_BUNDLE stage=inbox outcome=observed "
+            "replica=%u disposition=%u has_material=%u",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(result.disposition),
+            result.material == nullptr ? 0U : 1U);
         if (result.disposition ==
             AdaptiveV2CommandIngestDisposition::internal_failure)
             HOTSTUFF_LOG_WARN(
