@@ -543,6 +543,7 @@ namespace hotstuff
             throw std::invalid_argument(
                 "published block certificate does not match the proposal key");
         }
+        on_local_proposal_constructed(prop);
         if (!admit_local(prop))
             throw std::runtime_error(
                 "failed to admit the exact leader-local proposal");

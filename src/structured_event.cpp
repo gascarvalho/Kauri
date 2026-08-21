@@ -365,6 +365,17 @@ bool payload_type(const StructuredEventPayload &payload,
             type = StructuredEventType::block_commit_identity_unavailable;
             return true;
         }
+        case 5:
+        {
+            const auto &event =
+                std::get<CommitIdentityWitnessStructuredEvent>(payload);
+            if (event.block_hash == uint256_t{} ||
+                event.decision_proof.block_hash != event.block_hash ||
+                event.view_generation == 0)
+                return false;
+            type = StructuredEventType::block_commit_identity_witness;
+            return true;
+        }
         default:
             return false;
     }
@@ -2352,6 +2363,32 @@ void append_commit_identity_unavailable_payload(
     builder.append(",\"convergence_identity_pending\":false}");
 }
 
+void append_commit_identity_witness_payload(
+    JsonLineBuilder &builder,
+    const CommitIdentityWitnessStructuredEvent &event)
+{
+    builder.append("{\"block_height\":");
+    builder.append_integer(event.block_height);
+    builder.append(",\"block_hash\":");
+    builder.append_escaped(event.block_hash.to_hex());
+    builder.append(",\"parent_hash\":");
+    if (event.parent_hash)
+        builder.append_escaped(event.parent_hash->to_hex());
+    else
+        builder.append("null");
+    builder.append(",\"transaction_count\":");
+    builder.append_integer(event.transaction_count);
+    builder.append(",\"decision_proof\":{");
+    append_configuration(builder, event.decision_proof.configuration);
+    builder.append(",\"block_hash\":");
+    builder.append_escaped(event.decision_proof.block_hash.to_hex());
+    builder.append("},\"view_generation\":");
+    builder.append_integer(event.view_generation);
+    builder.append(",\"commit_batch_index\":");
+    builder.append_integer(event.commit_batch_index);
+    builder.append('}');
+}
+
 void append_fault_contribution_opportunity_payload(
     JsonLineBuilder &builder,
     const FaultContributionOpportunityStructuredEvent &event)
@@ -3181,6 +3218,11 @@ std::string serialize_event(const StructuredEventConfig &config,
                 builder,
                 std::get<CommitIdentityUnavailableStructuredEvent>(payload));
             break;
+        case 5:
+            append_commit_identity_witness_payload(
+                builder,
+                std::get<CommitIdentityWitnessStructuredEvent>(payload));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -3796,6 +3838,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "block.commit_observed";
         case StructuredEventType::block_commit_identity_unavailable:
             return "block.commit_identity_unavailable";
+        case StructuredEventType::block_commit_identity_witness:
+            return "block.commit_identity_witness";
         case StructuredEventType::epoch_command_committed:
             return "epoch.command_committed";
         case StructuredEventType::reputation_evidence_applied:

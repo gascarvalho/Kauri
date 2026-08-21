@@ -576,11 +576,20 @@ void emit_configuration_active(StructuredEventSink &sink,
 void emit_commit_plan(StructuredEventSink &sink, const CommitPlan &plan,
                       bool designated)
 {
-    if (plan.common_witness)
-        sink.emit(StructuredEventPayload{CommitObservedStructuredEvent{
-            plan.height, plan.block_hash, plan.parent_hash,
-            plan.transaction_count, 0}});
-    if (!designated) return;
+    sink.emit(StructuredEventPayload{CommitObservedStructuredEvent{
+        plan.height, plan.block_hash, plan.parent_hash,
+        plan.transaction_count, 0}});
+    if (!designated) {
+        sink.emit(StructuredEventPayload{CommitIdentityWitnessStructuredEvent{
+            plan.height,
+            plan.block_hash,
+            plan.parent_hash,
+            plan.transaction_count,
+            plan.decision_proof,
+            plan.view_generation,
+            0}});
+        return;
+    }
     CommitStructuredEvent commit;
     commit.block_height = plan.height;
     commit.block_hash = plan.block_hash;
@@ -660,6 +669,10 @@ bytearray_t emit_replica_stream(
     constexpr std::size_t predecessor_configuration_count = 12;
     ExclusiveFileStructuredEventOutput output(path.string());
     std::vector<std::uint64_t> ticks;
+    const auto append_commit_ticks = [&ticks](const CommitPlan &plan) {
+        ticks.push_back(plan.tick);
+        ticks.push_back(plan.tick);
+    };
     ticks.push_back(1'000'000ULL + replica);
     ticks.push_back(2'000'000ULL + replica);
     if (!cycles.empty() && replica == designated_replica) {
@@ -667,7 +680,7 @@ bytearray_t emit_replica_stream(
                 cycles.size() + predecessor_configuration_count);
         REQUIRE(commit_plans.size() == (cycles.size() == 1 ? 10 : 17));
         ticks.push_back(9'000'000'000ULL);
-        ticks.push_back(commit_plans.front().tick);
+        append_commit_ticks(commit_plans.front());
         for (std::size_t tree = 1; tree < 7; ++tree)
             ticks.push_back((10'000ULL + tree) * 1'000'000ULL);
         for (std::size_t tree = 0; tree < 5; ++tree)
@@ -681,9 +694,9 @@ bytearray_t emit_replica_stream(
         const auto delivery_tick = delivery_tick_for(*cycle, replica);
         const auto cycle_base = 1U + cycle_index * 8U;
         if (replica == designated_replica) {
-            ticks.push_back(commit_plans.at(cycle_base).tick);
+            append_commit_ticks(commit_plans.at(cycle_base));
             for (std::size_t offset = 1; offset <= 5; ++offset)
-                ticks.push_back(commit_plans.at(cycle_base + offset).tick);
+                append_commit_ticks(commit_plans.at(cycle_base + offset));
         }
         ticks.insert(ticks.end(), {cycle->readiness_tick, cycle->readiness_tick,
                                    observation->signer_monotonic_raw_ns,
@@ -695,16 +708,13 @@ bytearray_t emit_replica_stream(
         }
         const auto common_index = cycle_base + 6U;
         REQUIRE(common_index < commit_plans.size());
-        ticks.push_back(commit_plans.at(common_index).tick);
-        if (replica == designated_replica) {
-            ticks.push_back(commit_plans.at(common_index).tick);
-            const auto measurement_index = cycle_base + 7U;
-            REQUIRE(measurement_index < commit_plans.size());
-            ticks.push_back(commit_plans.at(measurement_index).tick);
-        }
+        append_commit_ticks(commit_plans.at(common_index));
+        const auto measurement_index = cycle_base + 7U;
+        REQUIRE(measurement_index < commit_plans.size());
+        append_commit_ticks(commit_plans.at(measurement_index));
     }
     if (cycles.size() == 1 && replica == designated_replica)
-        ticks.push_back(commit_plans.at(9).tick);
+        append_commit_ticks(commit_plans.at(9));
     DeterministicRawClock clock(std::move(ticks));
     auto config = event_config(StructuredEventSourceKind::replica,
         "replica-" + std::to_string(replica));
@@ -1190,9 +1200,9 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
         adaptive.session.terminal_records(), e2_audit);
     write_bytes(control_client, {});
     write_bytes(adaptive_client, {});
-    REQUIRE(control_replica_count == 67);
+    REQUIRE(control_replica_count == 96);
     REQUIRE(control_manager_count > survivors.size());
-    REQUIRE(adaptive_replica_count == 105);
+    REQUIRE(adaptive_replica_count == 144);
     REQUIRE(adaptive_manager_count > control_manager_count);
     const auto control_replica_text = std::string(control_replica_bytes.begin(),
                                                    control_replica_bytes.end());
@@ -1210,9 +1220,13 @@ TEST_CASE("CERT13 v13 exporter emits verified public readiness fixtures",
     REQUIRE(event_count(control_replica_text, "process.ready") == 7);
     REQUIRE(event_count(adaptive_replica_text, "process.ready") == 7);
     REQUIRE(event_count(control_replica_text, "block.committed") == 10);
-    REQUIRE(event_count(control_replica_text, "block.commit_observed") == survivors.size());
+    REQUIRE(event_count(control_replica_text, "block.commit_observed") == 22);
+    REQUIRE(event_count(control_replica_text,
+                        "block.commit_identity_witness") == 12);
     REQUIRE(event_count(adaptive_replica_text, "block.committed") == 17);
-    REQUIRE(event_count(adaptive_replica_text, "block.commit_observed") == survivors.size() * 2);
+    REQUIRE(event_count(adaptive_replica_text, "block.commit_observed") == 33);
+    REQUIRE(event_count(adaptive_replica_text,
+                        "block.commit_identity_witness") == 16);
     const auto designated_part = root.path / "adaptive/raw/replica-2.jsonl";
     const auto designated_bytes = read_bytes(designated_part);
     const auto designated_text = std::string(

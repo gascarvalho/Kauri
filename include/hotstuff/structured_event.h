@@ -132,6 +132,25 @@ struct CommitIdentityUnavailableStructuredEvent
 };
 
 /**
+ * Non-authoritative, replica-local exact identity for a committed block.
+ *
+ * The designated observer remains the sole source of commit timing and
+ * transaction-count authority. This witness only supplies a ProposalKey and
+ * view generation that the emitting replica authenticated or constructed
+ * locally for the same physical block.
+ */
+struct CommitIdentityWitnessStructuredEvent
+{
+    std::uint64_t block_height{0};
+    uint256_t block_hash;
+    std::optional<uint256_t> parent_hash;
+    std::uint64_t transaction_count{0};
+    ProposalKey decision_proof;
+    std::uint64_t view_generation{0};
+    std::uint64_t commit_batch_index{0};
+};
+
+/**
  * Prospective ground truth for one cached experiment-only contribution
  * decision. This record is observational and grants no voting, transport,
  * fault-selection, or epoch authority.
@@ -457,7 +476,8 @@ using StructuredEventPayload = std::variant<
     EpochLifecycleEvent,
     CommitStructuredEvent,
     CommitObservedStructuredEvent,
-    CommitIdentityUnavailableStructuredEvent>;
+    CommitIdentityUnavailableStructuredEvent,
+    CommitIdentityWitnessStructuredEvent>;
 
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
@@ -576,6 +596,7 @@ enum class StructuredEventType : std::uint8_t
     pipeline_root_qc_queue_blocked,
     adaptive_v2_fault_containment_coverage_ready,
     block_commit_identity_unavailable,
+    block_commit_identity_witness,
     adaptive_v2_cross_commit_retention_ready,
     fault_window_armed,
     adaptive_v3_activation_prepared,

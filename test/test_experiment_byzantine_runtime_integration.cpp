@@ -254,6 +254,13 @@ public:
         return runtime.find_exact_runtime_generation(configuration);
     }
 
+    static void capture_local_proposal_before_admission(
+        HotStuffBase &runtime,
+        const Proposal &proposal)
+    {
+        runtime.on_local_proposal_constructed(proposal);
+    }
+
     static void seed_view_generation_without_source(
         HotStuffBase &runtime,
         const ProposalKey &key,
@@ -2451,6 +2458,55 @@ TEST_CASE(
         CHECK(fact.evidence_sequence_fence == 0);
     }
 
+    SECTION(
+        "a locally constructed proposal is retained before admission can stall")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        const auto generation =
+            Access::exact_runtime_generation(runtime, configuration);
+        REQUIRE(generation.has_value());
+        REQUIRE(*generation != 0);
+        RecordingProtocolEmitter emitter(false);
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(runtime, "v3-local-before-admit");
+        const Proposal proposal(
+            runtime.get_id(),
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            block,
+            &runtime);
+
+        Access::capture_local_proposal_before_admission(runtime, proposal);
+
+        CHECK(Access::retained_commit_event_identity_count(runtime) == 1);
+        const auto cached = Access::resolve_and_cache_commit(
+            runtime, block, {}, nullptr, true);
+        CHECK(cached.key == std::nullopt);
+        CHECK(cached.unavailable);
+        REQUIRE(cached.event_key == proposal.key());
+        REQUIRE(cached.event_generation == generation);
+
+        Access::report_and_post_commit(runtime, block);
+
+        REQUIRE(emitter.events.size() == 2);
+        REQUIRE(std::get_if<CommitObservedStructuredEvent>(
+                    &emitter.events[0]) != nullptr);
+        const auto *witness =
+            std::get_if<CommitIdentityWitnessStructuredEvent>(
+                &emitter.events[1]);
+        REQUIRE(witness != nullptr);
+        CHECK(witness->decision_proof == proposal.key());
+        CHECK(witness->view_generation == generation);
+    }
+
     SECTION("non-designated and inexact commits never become authoritative")
     {
         for (const bool designated : {false, true})
@@ -2493,9 +2549,19 @@ TEST_CASE(
 
             Access::report_and_post_commit(runtime, block);
 
-            REQUIRE(emitter.events.size() == 1);
+            REQUIRE(emitter.events.size() == (designated ? 1 : 2));
             CHECK(std::get_if<CommitObservedStructuredEvent>(
                       &emitter.events[0]) != nullptr);
+            if (!designated)
+            {
+                const auto *witness =
+                    std::get_if<CommitIdentityWitnessStructuredEvent>(
+                        &emitter.events[1]);
+                REQUIRE(witness != nullptr);
+                CHECK(witness->decision_proof ==
+                      ProposalKey{configuration, block->get_hash()});
+                CHECK(witness->view_generation == 23);
+            }
             CHECK(std::none_of(
                 emitter.events.begin(), emitter.events.end(),
                 [](const auto &event) {

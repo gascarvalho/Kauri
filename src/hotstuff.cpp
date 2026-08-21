@@ -6374,6 +6374,39 @@ namespace hotstuff
         }
     }
 
+    void HotStuffBase::emit_commit_identity_witness_event(
+        const block_t &blk,
+        const ProposalKey &key,
+        std::uint64_t view_generation,
+        std::uint64_t commit_batch_index) noexcept
+    {
+        if (structured_event_emitter == nullptr || blk == nullptr ||
+            key.block_hash != blk->get_hash() || view_generation == 0)
+            return;
+        try
+        {
+            std::optional<uint256_t> parent_hash;
+            const auto &parent_hashes = blk->get_parent_hashes();
+            if (!parent_hashes.empty())
+                parent_hash = parent_hashes.front();
+            structured_event_emitter->emit(
+                StructuredEventPayload{
+                    CommitIdentityWitnessStructuredEvent{
+                        blk->get_height(),
+                        blk->get_hash(),
+                        parent_hash,
+                        static_cast<std::uint64_t>(
+                            blk->get_cmds().size()),
+                        key,
+                        view_generation,
+                        commit_batch_index}});
+        }
+        catch (...)
+        {
+            // Evidence failure invalidates the run, never protocol behavior.
+        }
+    }
+
     void HotStuffBase::emit_epoch_command_committed_event(
         const block_t &blk,
         const AuthorizedEpochChange &command,
@@ -13449,6 +13482,26 @@ namespace hotstuff
                 lease->key().block_hash.to_hex().c_str());
     }
 
+    void HotStuffBase::on_local_proposal_constructed(
+        const Proposal &proposal)
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            adaptive_epoch_runtime == nullptr || proposal.blk == nullptr)
+            return;
+        const auto generation =
+            find_exact_runtime_generation(proposal.configuration());
+        if (!generation.has_value() || *generation == 0)
+            return;
+        static_cast<void>(observe_proposal_view_generation(
+            proposal.key(), *generation));
+        // This is evidence-only. Capture the exact locally constructed
+        // ProposalKey before admit_local or pipeline processing can block;
+        // it never grants admission, a vote, cadence, or activation authority.
+        static_cast<void>(
+            retain_authenticated_proposal_commit_event_identities(
+                proposal, *generation, nullptr, true));
+    }
+
     void HotStuffBase::on_local_proposal_processed(
         const ProposalKey &key)
     {
@@ -15223,6 +15276,15 @@ namespace hotstuff
                         blk, pending_adaptive_v2_commit->event_committed_key,
                         pending_adaptive_v2_commit->event_view_generation,
                         commit_batch_index, std::nullopt);
+                else if (
+                    disposition == CommittedProposalIdentityDisposition::exact &&
+                    pending_adaptive_v2_commit->event_committed_key.has_value() &&
+                    pending_adaptive_v2_commit->event_view_generation.has_value())
+                    emit_commit_identity_witness_event(
+                        blk,
+                        *pending_adaptive_v2_commit->event_committed_key,
+                        *pending_adaptive_v2_commit->event_view_generation,
+                        commit_batch_index);
                 else if (disposition ==
                          CommittedProposalIdentityDisposition::unavailable)
                     emit_commit_identity_unavailable_event(

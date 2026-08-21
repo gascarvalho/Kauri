@@ -4593,9 +4593,7 @@ def _validate_v13_e2_common_commit(
         return source
 
     authoritative_candidates: list[Mapping[str, object]] = []
-    for event in events:
-        if event.get("event_type") != "block.committed":
-            continue
+    for event in _v13_reconstruct_authoritative_commits(events, contract):
         payload = _mapping(event.get("payload"), "v13 authoritative commit")
         decision = payload.get("decision_proof")
         if payload.get("block_hash") == common["block_hash"] or decision == common:
@@ -4666,6 +4664,22 @@ def _validate_v13_e2_common_commit(
         or not final_ack < authoritative_time <= common_tick
     ):
         _error("v13 authoritative common commit drifted")
+    identity_carriers = _sequence(
+        authoritative_event.get("_identity_carriers"),
+        "v13 authoritative identity carriers",
+    )
+    if not identity_carriers or any(
+        _uint64(
+            _mapping(carrier, "v13 authoritative identity carrier").get(
+                "source_monotonic_ns"
+            ),
+            "v13 authoritative identity carrier time",
+            1,
+        )
+        > common_tick
+        for carrier in identity_carriers
+    ):
+        _error("v13 authoritative identity was not observed before the common tick")
 
     observed_by_source: dict[int, Mapping[str, object]] = {}
     for event in events:
@@ -4708,16 +4722,13 @@ def _validate_v13_e2_common_commit(
     if tuple(sorted(observed_by_source)) != cycle_signers:
         _error("v13 common commit observations do not cover exact R")
     designated_observation = observed_by_source[authoritative_source]
-    if _integer(
-        designated_observation.get("source_sequence"),
-        "v13 designated common observation sequence",
-        1,
-    ) >= _integer(
-        authoritative_event.get("source_sequence"),
-        "v13 authoritative commit sequence",
-        1,
+    if (
+        authoritative_event.get("source_sequence")
+        != designated_observation.get("source_sequence")
+        or authoritative_event.get("source_monotonic_ns")
+        != designated_observation.get("source_monotonic_ns")
     ):
-        _error("v13 authoritative commit does not follow its local observation")
+        _error("v13 authoritative timing is not the designated observation")
 
     return {
         "sources": tuple(sorted(observed_by_source)),
@@ -6023,6 +6034,237 @@ def _complete_phase_buckets(
     return buckets, median
 
 
+_V13_COMMIT_PHYSICAL_KEYS = {
+    "block_height",
+    "block_hash",
+    "parent_hash",
+    "transaction_count",
+    "commit_batch_index",
+}
+_V13_COMMIT_PROOF_KEYS = {
+    "epoch_number",
+    "tree_id",
+    "epoch_digest",
+    "block_hash",
+}
+
+
+def _v13_commit_physical_projection(
+    payload: Mapping[str, object], label: str
+) -> dict[str, object]:
+    if not _V13_COMMIT_PHYSICAL_KEYS.issubset(payload):
+        _error(f"{label} physical schema drifted")
+    parent = payload.get("parent_hash")
+    return {
+        "block_height": _uint64(payload.get("block_height"), f"{label} height", 1),
+        "block_hash": _digest(payload.get("block_hash"), f"{label} hash"),
+        "parent_hash": _digest(parent, f"{label} parent hash"),
+        "transaction_count": _uint64(
+            payload.get("transaction_count"), f"{label} transactions"
+        ),
+        "commit_batch_index": _uint64(
+            payload.get("commit_batch_index"), f"{label} batch"
+        ),
+    }
+
+
+def _v13_commit_identity_projection(
+    payload: Mapping[str, object], label: str
+) -> tuple[dict[str, object], int]:
+    proof = _mapping(payload.get("decision_proof"), f"{label} decision proof")
+    if set(proof) != _V13_COMMIT_PROOF_KEYS:
+        _error(f"{label} decision proof schema drifted")
+    block_hash = _digest(proof.get("block_hash"), f"{label} proof block hash")
+    identity = {
+        "epoch_number": _uint64(proof.get("epoch_number"), f"{label} epoch"),
+        "tree_id": _integer(proof.get("tree_id"), f"{label} tree"),
+        "epoch_digest": _digest(
+            proof.get("epoch_digest"), f"{label} epoch digest"
+        ),
+        "block_hash": block_hash,
+    }
+    generation = _uint64(
+        payload.get("view_generation"), f"{label} view generation", 1
+    )
+    if block_hash != payload.get("block_hash"):
+        _error(f"{label} proof does not bind its committed block")
+    return identity, generation
+
+
+def _v13_reconstruct_authoritative_commits(
+    events: Sequence[Mapping[str, Any]], contract: Mapping[str, object]
+) -> list[dict[str, Any]]:
+    """Join designated physical commits to exact, non-authoritative identities."""
+
+    authoritative_source = str(contract["authoritative_source_id"])
+    member_sources = {f"replica-{member}" for member in contract["members"]}
+    instances = {
+        source: _authoritative_lifecycle_instance(events, source)
+        for source in member_sources
+    }
+    observed = [
+        event
+        for event in events
+        if event.get("event_type") == "block.commit_observed"
+    ]
+    exact = [
+        event for event in events if event.get("event_type") == "block.committed"
+    ]
+    witnesses = [
+        event
+        for event in events
+        if event.get("event_type") == "block.commit_identity_witness"
+    ]
+    carriers = [*exact, *witnesses]
+
+    for event in [*observed, *carriers]:
+        source = str(event.get("source_id"))
+        if (
+            event.get("source_kind") != "replica"
+            or source not in member_sources
+            or event.get("source_instance") != instances[source]
+        ):
+            _error("v13 commit evidence is not member and lifecycle bound")
+
+    observed_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    observed_physical: dict[int, dict[str, object]] = {}
+    for event in observed:
+        payload = _mapping(event.get("payload"), "v13 commit observation")
+        if set(payload) != _V13_COMMIT_PHYSICAL_KEYS:
+            _error("v13 commit observation schema drifted")
+        physical = _v13_commit_physical_projection(
+            payload, "v13 commit observation"
+        )
+        observed_physical[id(event)] = physical
+        observed_by_source.setdefault(str(event["source_id"]), []).append(event)
+
+    carrier_physical: dict[int, dict[str, object]] = {}
+    carrier_identity: dict[int, tuple[dict[str, object], int]] = {}
+    for event in carriers:
+        name = str(event.get("event_type"))
+        payload = _mapping(event.get("payload"), "v13 commit identity carrier")
+        expected_keys = _V13_COMMIT_PHYSICAL_KEYS | {
+            "decision_proof",
+            "view_generation",
+        }
+        if name == "block.committed":
+            expected_keys = expected_keys | {"designated_observer"}
+            if (
+                event.get("source_id") != authoritative_source
+                or payload.get("designated_observer") is not True
+            ):
+                _error("v13 authoritative commit source or designation drifted")
+        elif name == "block.commit_identity_witness":
+            if event.get("source_id") == authoritative_source:
+                _error("v13 designated source emitted a non-authoritative witness")
+        else:  # pragma: no cover - carriers are selected by an exact allowlist
+            _error("v13 commit identity carrier type drifted")
+        if set(payload) != expected_keys:
+            _error("v13 commit identity carrier schema drifted")
+
+        physical = _v13_commit_physical_projection(
+            payload, "v13 commit identity carrier"
+        )
+        identity = _v13_commit_identity_projection(
+            payload, "v13 commit identity carrier"
+        )
+        carrier_physical[id(event)] = physical
+        carrier_identity[id(event)] = identity
+        matches = [
+            candidate
+            for candidate in observed_by_source.get(str(event["source_id"]), ())
+            if observed_physical[id(candidate)] == physical
+        ]
+        if len(matches) != 1:
+            _error("v13 commit identity carrier lacks one local observation")
+        observation = matches[0]
+        observation_sequence = _integer(
+            observation.get("source_sequence"), "v13 commit observation sequence", 1
+        )
+        carrier_sequence = _integer(
+            event.get("source_sequence"), "v13 commit identity sequence", 1
+        )
+        observation_time = _uint64(
+            observation.get("source_monotonic_ns"),
+            "v13 commit observation time",
+            1,
+        )
+        carrier_time = _uint64(
+            event.get("source_monotonic_ns"), "v13 commit identity time", 1
+        )
+        if (
+            carrier_sequence != observation_sequence + 1
+            or carrier_time < observation_time
+        ):
+            _error("v13 commit identity does not immediately follow its observation")
+
+    authoritative_observations = observed_by_source.get(authoritative_source, [])
+    if len(authoritative_observations) < 4:
+        _error("raw evidence lacks the minimum authoritative commit chain")
+    reconstructed: list[dict[str, Any]] = []
+    consumed_carriers: set[int] = set()
+    for observation in authoritative_observations:
+        physical = observed_physical[id(observation)]
+        matching = [
+            carrier
+            for carrier in carriers
+            if carrier_physical[id(carrier)] == physical
+        ]
+        if not matching:
+            _error("v13 designated commit observation lacks an exact identity")
+        if len({str(carrier["source_id"]) for carrier in matching}) != len(matching):
+            _error("v13 commit identity carrier is duplicated by one source")
+        identities = {
+            (
+                tuple(sorted(carrier_identity[id(carrier)][0].items())),
+                carrier_identity[id(carrier)][1],
+            )
+            for carrier in matching
+        }
+        if len(identities) != 1:
+            _error("v13 cross-source commit identities conflict")
+        proof_items, generation = next(iter(identities))
+        proof = dict(proof_items)
+        if proof["block_hash"] != physical["block_hash"]:
+            _error("v13 reconstructed identity changed the physical block")
+        consumed_carriers.update(id(carrier) for carrier in matching)
+        reconstructed.append(
+            {
+                **dict(observation),
+                "event_type": "block.committed",
+                "payload": {
+                    **physical,
+                    "designated_observer": True,
+                    "decision_proof": proof,
+                    "view_generation": generation,
+                },
+                "_identity_carriers": tuple(
+                    {
+                        "event_type": carrier["event_type"],
+                        "source_id": carrier["source_id"],
+                        "source_instance": carrier["source_instance"],
+                        "source_sequence": carrier["source_sequence"],
+                        "source_monotonic_ns": carrier["source_monotonic_ns"],
+                    }
+                    for carrier in sorted(
+                        matching,
+                        key=lambda value: (
+                            str(value["source_id"]),
+                            _integer(
+                                value["source_sequence"],
+                                "v13 carrier source sequence",
+                                1,
+                            ),
+                        ),
+                    )
+                ),
+            }
+        )
+    if consumed_carriers != {id(carrier) for carrier in carriers}:
+        _error("v13 commit identity carrier is orphaned")
+    return reconstructed
+
+
 def _commit_reconstruction(
     root: Path,
     events: Sequence[Mapping[str, Any]],
@@ -6030,7 +6272,13 @@ def _commit_reconstruction(
     epoch2: Any | None,
     contract: Mapping[str, object],
 ) -> tuple[list[Mapping[str, Any]], dict[str, object]]:
-    commits = [event for event in events if event["event_type"] == "block.committed"]
+    profile = _mapping(contract.get("profile"), "focused profile")
+    is_v13 = profile.get("profile_id") in _FCRASH_H_V13_PROFILE_IDS
+    commits: list[Mapping[str, Any]] = (
+        _v13_reconstruct_authoritative_commits(events, contract)
+        if is_v13
+        else [event for event in events if event["event_type"] == "block.committed"]
+    )
     authoritative_source = str(contract["authoritative_source_id"])
     member_sources = {f"replica-{member}" for member in contract["members"]}
     if any(
@@ -6043,7 +6291,6 @@ def _commit_reconstruction(
     ]
     if len(authoritative_commits) < 4:
         _error("raw evidence lacks the minimum authoritative commit chain")
-    profile = _mapping(contract.get("profile"), "focused profile")
     is_v3 = (
         profile.get("profile_id")
         in _FCRASH_H_V3_PROFILE_IDS | _FAULT_WINDOW_PROFILE_IDS
@@ -8437,6 +8684,12 @@ def _validate_sealed_v13_arm(
             "source_instance": event["source_instance"],
             "source_sequence": event["source_sequence"],
             "payload": event["payload"],
+            "identity_carriers": list(
+                _sequence(
+                    event.get("_identity_carriers"),
+                    "v13 reconstructed identity carriers",
+                )
+            ),
         }
         for event in commits
     ]

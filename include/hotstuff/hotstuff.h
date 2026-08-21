@@ -1953,6 +1953,11 @@ namespace hotstuff
         void emit_commit_identity_unavailable_event(
             const block_t &blk,
             std::uint64_t commit_batch_index) noexcept;
+        void emit_commit_identity_witness_event(
+            const block_t &blk,
+            const ProposalKey &key,
+            std::uint64_t view_generation,
+            std::uint64_t commit_batch_index) noexcept;
         void emit_epoch_command_committed_event(
             const block_t &blk,
             const AuthorizedEpochChange &command,
@@ -2025,6 +2030,8 @@ namespace hotstuff
         void do_vote(Proposal, const Vote &) override;
         bool admit_local(const Proposal &) override;
         void apply_local_vote(const Vote &) override;
+        void on_local_proposal_constructed(
+            const Proposal &proposal) override;
         void on_local_proposal_processed(
             const ProposalKey &key) override;
         void on_verified_commit_progress(

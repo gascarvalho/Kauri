@@ -299,6 +299,11 @@ namespace hotstuff
         /** Record an already-created local vote in derived runtime state. */
         virtual void apply_local_vote(const Vote &) {}
 
+        /** Observe the exact identity assigned to a locally constructed
+         * proposal before admission or pipeline processing can block. */
+        virtual void on_local_proposal_constructed(
+            const Proposal &) {}
+
         /** Report local proposal processing with an exact proposal key. */
         virtual void on_local_proposal_processed(
             const ProposalKey &) {}

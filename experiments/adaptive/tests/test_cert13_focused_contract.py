@@ -1305,7 +1305,6 @@ def test_v13_transition_accepts_delayed_certificate_application_when_available(
 @pytest.mark.parametrize(
     "mutation",
     [
-        "missing_authoritative",
         "duplicate_authoritative",
         "wrong_authoritative_source",
         "not_designated",
@@ -1352,9 +1351,7 @@ def test_v13_native_e2_common_commit_mutations_fail_closed(
     ]
     common_tick = e2["payload"]["e2_common_commit_raw_ns"]
 
-    if mutation == "missing_authoritative":
-        events.remove(authoritative)
-    elif mutation == "duplicate_authoritative":
+    if mutation == "duplicate_authoritative":
         events.append(deepcopy(authoritative))
     elif mutation == "wrong_authoritative_source":
         authoritative["source_id"] = "replica-3"
@@ -1390,6 +1387,101 @@ def test_v13_native_e2_common_commit_mutations_fail_closed(
         cycles[0]["final_ack_manager_time_ns"] += 1
     elif mutation == "wrong_e1_bundle_digest":
         e2["payload"]["e1_bundle_digest"] = "ff" * 32
+    else:  # pragma: no cover - parameter list is exhaustive
+        raise AssertionError(f"unknown mutation {mutation}")
+
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_v13_e2_common_commit(events, contract, cycles)
+
+
+def test_v13_native_e2_common_commit_uses_cross_source_identity_witnesses() -> None:
+    validation, events, contract, cycles = _native_v13_e2_common_state()
+    events = deepcopy(events)
+    e2 = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v3.e2_eligibility"
+    )
+    common = e2["payload"]["e2_common_commit"]
+    authoritative = next(
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and event["payload"]["decision_proof"] == common
+    )
+    witnesses = [
+        event
+        for event in events
+        if event["event_type"] == "block.commit_identity_witness"
+        and event["payload"]["decision_proof"] == common
+    ]
+    assert witnesses
+    events.remove(authoritative)
+
+    validation._validate_v13_e2_common_commit(events, contract, cycles)
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "missing_all_carriers",
+        "conflicting_identity",
+        "orphan_physical_block",
+        "nonadjacent_source_sequence",
+        "designated_source_witness",
+        "carrier_after_common_tick",
+    ],
+)
+def test_v13_native_cross_source_commit_witness_mutations_fail_closed(
+    mutation: str,
+) -> None:
+    validation, original_events, contract, cycles = _native_v13_e2_common_state()
+    events = deepcopy(original_events)
+    e2 = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v3.e2_eligibility"
+    )
+    common = e2["payload"]["e2_common_commit"]
+    authoritative = next(
+        event
+        for event in events
+        if event["event_type"] == "block.committed"
+        and event["payload"]["decision_proof"] == common
+    )
+    witnesses = [
+        event
+        for event in events
+        if event["event_type"] == "block.commit_identity_witness"
+        and event["payload"]["decision_proof"] == common
+    ]
+    assert witnesses
+    witness = witnesses[0]
+
+    if mutation == "missing_all_carriers":
+        events.remove(authoritative)
+        for candidate in witnesses:
+            events.remove(candidate)
+    elif mutation == "conflicting_identity":
+        witness["payload"]["decision_proof"]["epoch_number"] += 1
+    elif mutation == "orphan_physical_block":
+        replacement = "ff" * 32
+        witness["payload"]["block_hash"] = replacement
+        witness["payload"]["decision_proof"]["block_hash"] = replacement
+    elif mutation == "nonadjacent_source_sequence":
+        witness["source_sequence"] += 1
+    elif mutation == "designated_source_witness":
+        witness["source_id"] = contract["authoritative_source_id"]
+        designated = next(
+            event
+            for event in events
+            if event["source_id"] == contract["authoritative_source_id"]
+        )
+        witness["source_instance"] = designated["source_instance"]
+    elif mutation == "carrier_after_common_tick":
+        witness["source_monotonic_ns"] = (
+            e2["payload"]["e2_common_commit_raw_ns"] + 1
+        )
     else:  # pragma: no cover - parameter list is exhaustive
         raise AssertionError(f"unknown mutation {mutation}")
 

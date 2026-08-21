@@ -556,6 +556,7 @@ using hotstuff::AuditStructuredEventPayload;
 using hotstuff::CommitObservedStructuredEvent;
 using hotstuff::CommitIdentityUnavailableReason;
 using hotstuff::CommitIdentityUnavailableStructuredEvent;
+using hotstuff::CommitIdentityWitnessStructuredEvent;
 using hotstuff::CommitStructuredEvent;
 using hotstuff::ConfigurationId;
 using hotstuff::DataStream;
@@ -712,6 +713,21 @@ commit_identity_unavailable_event()
         CommitIdentityUnavailableReason::
             no_authenticated_exact_identity_source,
         false};
+}
+
+CommitIdentityWitnessStructuredEvent commit_identity_witness_event()
+{
+    const auto proof_configuration =
+        configuration(7, 3, "witness-epoch");
+    const auto block_hash = digest("witness-committed-block");
+    return CommitIdentityWitnessStructuredEvent{
+        1234,
+        block_hash,
+        digest("witness-committed-parent"),
+        7,
+        ProposalKey{proof_configuration, block_hash},
+        19,
+        2};
 }
 
 FaultContributionOpportunityStructuredEvent contribution_opportunity_event()
@@ -1653,6 +1669,41 @@ std::string expected_commit_identity_unavailable_line(
         "\"convergence_identity_pending\":false}}\n";
 }
 
+std::string expected_commit_identity_witness_line(
+    const CommitIdentityWitnessStructuredEvent &event,
+    std::uint64_t sequence,
+    std::uint64_t monotonic_ns)
+{
+    const auto &proof = event.decision_proof;
+    return
+        "{\"event_schema_version\":1,"
+        "\"run_id\":\"run-structured-event\","
+        "\"source_kind\":\"replica\","
+        "\"source_id\":\"replica-2\","
+        "\"source_instance\":\"spawn-9\","
+        "\"source_sequence\":" + std::to_string(sequence) + ","
+        "\"source_monotonic_ns\":" + std::to_string(monotonic_ns) + ","
+        "\"event_type\":\"block.commit_identity_witness\","
+        "\"payload\":{"
+        "\"block_height\":" + std::to_string(event.block_height) + ","
+        "\"block_hash\":\"" + event.block_hash.to_hex() + "\","
+        "\"parent_hash\":\"" + event.parent_hash->to_hex() + "\","
+        "\"transaction_count\":" +
+            std::to_string(event.transaction_count) + ","
+        "\"decision_proof\":{"
+        "\"epoch_number\":" +
+            std::to_string(proof.configuration.epoch_number) + ","
+        "\"tree_id\":" +
+            std::to_string(proof.configuration.tree_id) + ","
+        "\"epoch_digest\":\"" +
+            proof.configuration.epoch_digest.to_hex() + "\","
+        "\"block_hash\":\"" + proof.block_hash.to_hex() + "\"},"
+        "\"view_generation\":" +
+            std::to_string(event.view_generation) + ","
+        "\"commit_batch_index\":" +
+            std::to_string(event.commit_batch_index) + "}}\n";
+}
+
 class TemporaryDirectory final
 {
 public:
@@ -1752,8 +1803,8 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
     CHECK(KAURI_HAS_STRUCTURED_EVENT_API == 1);
     CHECK(hotstuff::kStructuredEventSchemaVersion == 1);
 
-    static_assert(std::variant_size<StructuredEventPayload>::value == 5,
-                  "protocol evidence has lifecycle and three commit payloads");
+    static_assert(std::variant_size<StructuredEventPayload>::value == 6,
+                  "protocol evidence has lifecycle and four commit payloads");
     static_assert(std::is_final<StructuredEventSink>::value,
                   "one owner controls the queue and output path");
     static_assert(!std::is_copy_constructible<StructuredEventSink>::value,
@@ -1918,6 +1969,20 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
               observed_names.end(),
               "block.commit_identity_unavailable") == observed_names.end());
 
+    const auto witness_type = hotstuff::structured_event_type(
+        StructuredEventPayload{commit_identity_witness_event()});
+    CHECK(witness_type ==
+          StructuredEventType::block_commit_identity_witness);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(witness_type)) ==
+          "block.commit_identity_witness");
+    CHECK(std::find(
+              observed_types.begin(), observed_types.end(), witness_type) ==
+          observed_types.end());
+    CHECK(std::find(
+              observed_names.begin(), observed_names.end(),
+              "block.commit_identity_witness") == observed_names.end());
+
 #if defined(HOTSTUFF_PROTO_LOG)
     INFO("the same structured contract is exercised with human logs enabled");
 #else
@@ -1941,7 +2006,7 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
             StructuredEventSink>::value,
         "the bounded sink implements the separate adaptive capability");
     static_assert(
-        std::variant_size<StructuredEventPayload>::value == 5,
+        std::variant_size<StructuredEventPayload>::value == 6,
         "adaptive aggregation evidence stays outside protocol payloads");
 
     struct Mapping
@@ -4127,6 +4192,62 @@ TEST_CASE(
     {
         event.convergence_identity_pending = true;
         FakeClock invalid_clock({1113});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            event_config(), invalid_clock, invalid_output);
+        invalid_sink.emit(StructuredEventPayload{event});
+        const auto health = invalid_sink.health();
+        CHECK_FALSE(health.healthy);
+        CHECK(health.first_failure ==
+              StructuredEventFailure::invalid_payload);
+        CHECK(invalid_output.bytes().empty());
+    }
+}
+
+TEST_CASE(
+    "exact commit identity witness is canonical and non-authoritative",
+    "[adaptive-v3][structured-event][commit-identity-witness][schema]")
+{
+    auto event = commit_identity_witness_event();
+    const auto expected =
+        expected_commit_identity_witness_line(event, 1, 1120);
+    FakeClock clock({1120});
+    MemoryOutput output;
+    StructuredEventSink sink(event_config(), clock, output);
+
+    sink.emit(StructuredEventPayload{event});
+    sink.shutdown();
+
+    CHECK(sink.health().healthy);
+    CHECK(rendered(output) == expected);
+    CHECK(rendered(output).find("\"decision_proof\":{") !=
+          std::string::npos);
+    CHECK(rendered(output).find("\"view_generation\":19") !=
+          std::string::npos);
+    CHECK(rendered(output).find("\"designated_observer\"") ==
+          std::string::npos);
+    CHECK(rendered(output).find("reporter_local_commit_monotonic_ns") ==
+          std::string::npos);
+
+    SECTION("the proof must bind the exact committed block")
+    {
+        event.decision_proof.block_hash = digest("another-block");
+        FakeClock invalid_clock({1121});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            event_config(), invalid_clock, invalid_output);
+        invalid_sink.emit(StructuredEventPayload{event});
+        const auto health = invalid_sink.health();
+        CHECK_FALSE(health.healthy);
+        CHECK(health.first_failure ==
+              StructuredEventFailure::invalid_payload);
+        CHECK(invalid_output.bytes().empty());
+    }
+
+    SECTION("a zero proposal generation is never an exact witness")
+    {
+        event.view_generation = 0;
+        FakeClock invalid_clock({1122});
         MemoryOutput invalid_output;
         StructuredEventSink invalid_sink(
             event_config(), invalid_clock, invalid_output);
