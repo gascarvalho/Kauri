@@ -14141,10 +14141,13 @@ namespace hotstuff
     {
         if (intermediate_count == 1)
             return true;
-        return intermediate_count ==
-                   maximum_proposal_commit_event_bridge_intermediates &&
-               mode == EpochProtocolMode::adaptive_v3 &&
-               alternate_configuration.epoch_number !=
+        if (intermediate_count !=
+                maximum_proposal_commit_event_bridge_intermediates ||
+            mode != EpochProtocolMode::adaptive_v3)
+            return false;
+        if (alternate_configuration == certifier_configuration)
+            return true;
+        return alternate_configuration.epoch_number !=
                    std::numeric_limits<std::uint32_t>::max() &&
                certifier_configuration.epoch_number ==
                    alternate_configuration.epoch_number + 1 &&
@@ -14348,10 +14351,11 @@ namespace hotstuff
             // certifier and exact active/draining runtimes bind the boundary
             // configuration and generation. V2 additionally requires
             // alternate ingress. V2 remains limited to one skipped physical
-            // ancestor. V3 may recover a second only across the exact
-            // adjacent activation boundary. Recovered keys never enter
-            // proposal admission, cadence, rotation, or consensus identity
-            // state.
+            // ancestor. V3 may recover a second for its exact configured
+            // pipeline stretch, either within one configuration or across
+            // the exact adjacent activation boundary. Recovered keys never
+            // enter proposal admission, cadence, rotation, or consensus
+            // identity state.
             for (std::size_t index = intermediate_count; index-- > 0;)
             {
                 const ProposalKey intermediate_key{

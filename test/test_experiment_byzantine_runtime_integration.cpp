@@ -3977,12 +3977,27 @@ TEST_CASE(
         *generation));
     CHECK(Access::has_retained_commit_event_identity(
         runtime, bounded_certifier_key.block_hash));
-    CHECK_FALSE(Access::has_retained_commit_event_identity(
+    CHECK(Access::has_retained_commit_event_identity(
         runtime, bounded_alternate_key.block_hash));
-    CHECK_FALSE(Access::has_retained_commit_event_identity(
+    CHECK(Access::has_retained_commit_event_identity(
         runtime, bounded_first_key.block_hash));
-    CHECK_FALSE(Access::has_retained_commit_event_identity(
+    CHECK(Access::has_retained_commit_event_identity(
         runtime, bounded_second_key.block_hash));
+
+    const auto bounded_first_cached =
+        Access::resolve_and_cache_unproven_commit(runtime, bounded_first);
+    CHECK(bounded_first_cached.conflicted);
+    CHECK(bounded_first_cached.event_key == bounded_first_key);
+    CHECK(bounded_first_cached.event_generation == generation);
+    CHECK_FALSE(bounded_first_cached.event_conflicted);
+
+    const auto bounded_second_cached = Access::resolve_and_cache_commit(
+        runtime, bounded_second, {}, nullptr, true);
+    CHECK(bounded_second_cached.unavailable);
+    CHECK(bounded_second_cached.event_key == bounded_second_key);
+    CHECK(bounded_second_cached.event_generation == generation);
+    CHECK_FALSE(bounded_second_cached.event_unavailable);
+    CHECK_FALSE(bounded_second_cached.event_conflicted);
 
     const auto local_alternate = Access::add_commit_rule_block(
         runtime,
@@ -4129,7 +4144,7 @@ TEST_CASE(
             predecessor,
             successor,
             2));
-    CHECK_FALSE(
+    CHECK(
         Access::has_bounded_proposal_commit_event_bridge_intermediates(
             EpochProtocolMode::adaptive_v3,
             predecessor,
