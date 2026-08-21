@@ -3,6 +3,8 @@
 #include <string>
 
 #include "catch.hpp"
+#include "hotstuff/type.h"
+#include "salticidae/buffer.h"
 
 namespace {
 
@@ -51,4 +53,24 @@ TEST_CASE(
             util_header,
             "void info(const char *fmt, ...) "
             "SALTICIDAE_PRINTF_LIKE(2, 3);") == 1);
+}
+
+TEST_CASE(
+        "Salticidae urgent messages bypass queued repair traffic",
+        "[network][salticidae][priority][regression]") {
+    salticidae::MPSCWriteBuffer buffer;
+    REQUIRE(buffer.push(salticidae::bytearray_t{1}, true));
+    REQUIRE(buffer.push_priority(salticidae::bytearray_t{2}, true));
+    REQUIRE(buffer.push_urgent(salticidae::bytearray_t{3}, true));
+
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{3});
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{2});
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{1});
+
+    REQUIRE(buffer.push_priority(salticidae::bytearray_t{4}, true));
+    REQUIRE(buffer.push_urgent(salticidae::bytearray_t{5}, true));
+    buffer.rewind(salticidae::bytearray_t{9});
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{9});
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{5});
+    CHECK(buffer.move_pop() == salticidae::bytearray_t{4});
 }

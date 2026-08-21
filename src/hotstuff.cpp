@@ -13943,7 +13943,7 @@ namespace hotstuff
                 bool enqueued = false;
                 try
                 {
-                    enqueued = pn.send_msg_priority(
+                    enqueued = pn.send_msg_urgent(
                         MsgPropose(DataStream(adaptive_payload)),
                         config.get_peer_id(member));
                 }

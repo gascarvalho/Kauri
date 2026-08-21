@@ -642,7 +642,7 @@ TEST_CASE(
     const auto assigned = broadcast.find(
         "metadata->tree.assigned_subtree", guard);
     const auto priority = broadcast.find(
-        "pn.send_msg_priority(", assigned);
+        "pn.send_msg_urgent(", assigned);
     const auto ordinary = broadcast.find(
         "metadata->tree.direct_children", priority);
     REQUIRE(claim != std::string::npos);
