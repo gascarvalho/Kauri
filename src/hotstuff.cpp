@@ -4721,16 +4721,27 @@ namespace hotstuff
                 [access = exact_runtime_access,
                  expected_hash,
                  configuration,
-                 generation](const block_t &delivered) {
+                 generation,
+                 proposal = std::move(proposal)](
+                    const block_t &delivered) mutable {
                     auto runtime = access->acquire();
                     if (!runtime.has_value())
                         return;
+                    bool processed = false;
+                    if (delivered != nullptr && delivered->delivered &&
+                        delivered->get_hash() == expected_hash)
+                    {
+                        proposal.blk = delivered;
+                        proposal.hsc = &runtime->owner();
+                        processed = runtime->owner()
+                            .on_receive_certified_proposal_catchup(
+                                proposal);
+                    }
                     HOTSTUFF_LOG_INFO(
                         "KAURI_PROPOSAL_CATCHUP outcome=%s replica=%u "
                         "epoch=%u tree=%u block=%s generation=%llu",
-                        delivered != nullptr && delivered->delivered &&
-                                delivered->get_hash() == expected_hash
-                            ? "delivered"
+                        processed
+                            ? "certified_progress"
                             : "rejected",
                         static_cast<unsigned>(
                             runtime->owner().get_id()),
@@ -13735,6 +13746,65 @@ namespace hotstuff
             LeaderProgressEvent::commit);
     }
 
+    bytearray_t
+    HotStuffBase::encode_adaptive_v3_post_commit_proposal_repair(
+        const Proposal &proposal,
+        const ProposalContextMetadata &metadata,
+        std::uint64_t generation) const noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            adaptive_epoch_runtime == nullptr || generation == 0 ||
+            metadata.tree.root != get_id() ||
+            metadata.tree.parent.has_value() ||
+            proposal.proposer != get_id())
+            return {};
+        try
+        {
+            const auto active =
+                adaptive_epoch_runtime->activation.active_effect();
+            const auto packed_generation = generation - 1;
+            const auto generation_epoch =
+                static_cast<std::uint32_t>(packed_generation >> 32);
+            const auto generation_ordinal =
+                static_cast<std::uint32_t>(packed_generation);
+            const auto tree_count = active.definition == nullptr
+                ? 0U
+                : active.definition->trees().size();
+            const bool exact_post_commit_rotation =
+                active.definition != nullptr &&
+                active.configuration != proposal.configuration() &&
+                active.configuration.epoch_number ==
+                    proposal.configuration().epoch_number &&
+                active.configuration.epoch_digest ==
+                    proposal.configuration().epoch_digest &&
+                generation_epoch ==
+                    proposal.configuration().epoch_number &&
+                generation_ordinal < active.rotation_ordinal &&
+                static_cast<std::uint64_t>(
+                    active.rotation_ordinal - generation_ordinal) <
+                    tree_count &&
+                generation < active.generation;
+            if (!exact_post_commit_rotation)
+                return {};
+
+            const MsgPropose native(proposal);
+            return adaptive_epoch_consensus_message(
+                proposal.configuration(),
+                generation,
+                EpochConsensusWireKind::proposal_repair,
+                proposal.key(),
+                proposal.proposer,
+                proposal.proposer,
+                static_cast<bytearray_t>(native.serialized),
+                epoch_wire_limits,
+                epoch_protocol_mode);
+        }
+        catch (...)
+        {
+            return {};
+        }
+    }
+
     void HotStuffBase::do_broadcast_proposal(const Proposal &prop)
     {
         HOTSTUFF_LOG_PROTO("[BROADCASTING] Broadcasting proposal of size %llu bytes in epoch_nr:%d on tid=%d.", sizeof(prop), prop.epoch_nr, prop.tid);
@@ -13850,6 +13920,7 @@ namespace hotstuff
         }
 
         bytearray_t adaptive_payload;
+        bytearray_t adaptive_v3_post_commit_repair_payload;
         std::uint64_t wire_generation = 0;
         if (is_adaptive_epoch_mode(epoch_protocol_mode))
         {
@@ -13920,6 +13991,10 @@ namespace hotstuff
                     static_cast<unsigned long long>(wire_generation));
                 return;
             }
+
+            adaptive_v3_post_commit_repair_payload =
+                encode_adaptive_v3_post_commit_proposal_repair(
+                    prop, *metadata, *generation);
             HOTSTUFF_LOG_INFO(
                 "KAURI_PROPOSAL_BROADCAST stage=payload outcome=ready "
                 "reason=none replica=%u epoch=%u tree=%u block=%s "
@@ -13947,6 +14022,43 @@ namespace hotstuff
 
         std::size_t send_attempts = 0;
         std::size_t send_successes = 0;
+        if (!adaptive_v3_post_commit_repair_payload.empty())
+        {
+            std::size_t repair_attempts = 0;
+            std::size_t repair_successes = 0;
+            for (const auto member : metadata->tree.assigned_subtree)
+            {
+                if (member == get_id())
+                    continue;
+                ++repair_attempts;
+                bool enqueued = false;
+                try
+                {
+                    enqueued = pn.send_msg_urgent(
+                        MsgPropose(DataStream(
+                            adaptive_v3_post_commit_repair_payload)),
+                        config.get_peer_id(member));
+                }
+                catch (...)
+                {
+                    // Ordinary tree dissemination and the bounded repair
+                    // scheduler remain available for failed enqueue attempts.
+                }
+                if (enqueued)
+                    ++repair_successes;
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST "
+                "stage=v3_post_commit_repair_fanout outcome=complete "
+                "root=%u epoch=%u tree=%u block=%s attempts=%zu "
+                "successes=%zu",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str(),
+                repair_attempts,
+                repair_successes);
+        }
         if (adaptive_v3_command_priority_fanout &&
             metadata->tree.root == get_id() &&
             !metadata->tree.parent.has_value())

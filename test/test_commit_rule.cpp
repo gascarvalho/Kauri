@@ -21,6 +21,44 @@ TEST_CASE("a direct certified three-chain commits its oldest block",
     CHECK(chain[0]->get_decision() == 1);
 }
 
+TEST_CASE("certified catch-up applies commits without voting",
+          "[cert13][adaptive-v3][proposal-repair][commit-rule]")
+{
+    CommitRuleCore core;
+    const auto chain = add_direct_chain(core, core.get_genesis(), 4);
+    const hotstuff::Proposal catchup(
+        0,
+        1,
+        0,
+        hotstuff::test::make_digest(0xd1),
+        chain[3],
+        &core);
+
+    REQUIRE(core.apply_certified_catchup(catchup));
+    REQUIRE(core.committed().size() == 1);
+    CHECK(core.committed()[0].hash == chain[0]->get_hash());
+    CHECK(core.vote_count() == 0);
+}
+
+TEST_CASE("uncertified catch-up cannot mutate commit state",
+          "[cert13][adaptive-v3][proposal-repair][safety]")
+{
+    CommitRuleCore core;
+    const auto chain = add_direct_chain(core, core.get_genesis(), 4);
+    core.replace_qc_with_underquorum_certificate(chain[3]);
+    const hotstuff::Proposal catchup(
+        0,
+        1,
+        0,
+        hotstuff::test::make_digest(0xd1),
+        chain[3],
+        &core);
+
+    CHECK_FALSE(core.apply_certified_catchup(catchup));
+    CHECK(core.committed().empty());
+    CHECK(core.vote_count() == 0);
+}
+
 TEST_CASE("certified height gaps commit on one pipelined ancestry branch",
           "[s03][commit-rule][pipeline][control]")
 {

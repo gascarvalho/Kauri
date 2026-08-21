@@ -4063,7 +4063,7 @@ TEST_CASE(
 }
 
 TEST_CASE(
-    "adaptive v3 stale proposal repair imports blocks without consensus authority",
+    "adaptive v3 stale proposal repair applies certified progress without votes",
     "[cert13][adaptive-v3][proposal-repair][catch-up][wiring]")
 {
     const auto implementation = source("src/hotstuff.cpp");
@@ -4091,7 +4091,18 @@ TEST_CASE(
          "message.postponed_parse(this)",
          "proposal.metadata().key() != envelope.key()",
          "async_deliver_blk(expected_hash, source)",
+         "on_receive_certified_proposal_catchup(",
          "KAURI_PROPOSAL_CATCHUP"}));
+    const auto certified_catch_up = function_body(
+        source("src/consensus.cpp"),
+        "HotStuffCore::on_receive_certified_proposal_catchup(");
+    REQUIRE_FALSE(certified_catch_up.empty());
+    CHECK(contains_all(
+        certified_catch_up,
+        {"block->qc->has_n(config.nmajority)",
+         "block->verify(this)",
+         "update(block)",
+         "on_qc_finish(block->qc_ref)"}));
     CHECK(catch_up.find("on_receive_proposal") == std::string::npos);
     CHECK(catch_up.find("do_vote") == std::string::npos);
     CHECK(catch_up.find("relay_once") == std::string::npos);
@@ -4129,4 +4140,27 @@ TEST_CASE(
          "EpochConsensusWireKind::proposal",
          "active.configuration != job.key.configuration",
          "active.generation != job.epoch_generation"}));
+
+    const auto broadcast = function_body(
+        implementation,
+        "void HotStuffBase::do_broadcast_proposal(");
+    const auto post_commit_repair = function_body(
+        implementation,
+        "HotStuffBase::encode_adaptive_v3_post_commit_proposal_repair(");
+    REQUIRE_FALSE(broadcast.empty());
+    REQUIRE_FALSE(post_commit_repair.empty());
+    CHECK(contains_all(
+        post_commit_repair,
+        {"EpochProtocolMode::adaptive_v3",
+         "active.configuration != proposal.configuration()",
+         "generation < active.generation",
+         "EpochConsensusWireKind::proposal_repair"}));
+    CHECK(contains_in_order(
+        broadcast,
+        {"adaptive_v3_post_commit_repair_payload =",
+         "encode_adaptive_v3_post_commit_proposal_repair(",
+         "if (!adaptive_v3_post_commit_repair_payload.empty())",
+         "metadata->tree.assigned_subtree",
+         "pn.send_msg_urgent(",
+         "stage=v3_post_commit_repair_fanout"}));
 }

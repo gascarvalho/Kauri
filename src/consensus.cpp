@@ -687,6 +687,30 @@ namespace hotstuff
         return opinion;
     }
 
+    bool HotStuffCore::on_receive_certified_proposal_catchup(
+        const Proposal &prop) noexcept
+    {
+        try
+        {
+            const block_t &block = prop.blk;
+            if (block == nullptr || !block->delivered ||
+                block->qc == nullptr ||
+                !block->qc->has_n(config.nmajority) ||
+                !block->verify(this))
+                return false;
+
+            sanity_check_delivered(block);
+            update(block);
+            if (block->qc_ref != nullptr)
+                on_qc_finish(block->qc_ref);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void HotStuffCore::on_receive_vote(const Vote &vote)
     {
         LOG_PROTO("y now state: %s", std::string(*this).c_str());

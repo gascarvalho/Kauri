@@ -193,6 +193,11 @@ public:
         update(block);
     }
 
+    bool apply_certified_catchup(const Proposal &proposal)
+    {
+        return on_receive_certified_proposal_catchup(proposal);
+    }
+
     const std::vector<CommittedBlock> &committed() const
     {
         return committed_;
@@ -298,7 +303,12 @@ protected:
     }
 
     void do_broadcast_proposal(const Proposal &) override {}
-    void do_vote(Proposal, const Vote &) override {}
+    void do_vote(Proposal, const Vote &) override { ++vote_count_; }
+
+public:
+    std::size_t vote_count() const noexcept { return vote_count_; }
+
+protected:
 
     void start_proposal_timer(std::size_t,
                               std::size_t,
@@ -362,6 +372,7 @@ private:
     }
 
     std::uint16_t next_marker_ = 1;
+    std::size_t vote_count_ = 0;
     std::vector<CommittedBlock> committed_;
     std::vector<CommitCallbackObservation> callbacks_;
 };

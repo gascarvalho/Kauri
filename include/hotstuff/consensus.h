@@ -203,6 +203,13 @@ namespace hotstuff
          * The block mentioned in the message should be already delivered. */
         bool on_receive_proposal(const Proposal &prop);
 
+        /** Apply an already authenticated and fully delivered proposal only
+         * for certified catch-up.  This may advance verified QC/commit state,
+         * but deliberately does not resolve proposal waiters, vote, or rotate
+         * the active tree. */
+        bool on_receive_certified_proposal_catchup(
+            const Proposal &prop) noexcept;
+
         /** Call upon the delivery of a vote message.
          * The block mentioned in the message should be already delivered. */
         void on_receive_vote(const Vote &vote);

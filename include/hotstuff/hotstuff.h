@@ -1917,6 +1917,10 @@ namespace hotstuff
             ExactProposalFallbackJob &job);
         bool broadcast_exact_proposal_repair_tail(
             ExactProposalFallbackJob &job);
+        bytearray_t encode_adaptive_v3_post_commit_proposal_repair(
+            const Proposal &proposal,
+            const ProposalContextMetadata &metadata,
+            std::uint64_t generation) const noexcept;
         void discard_exact_fallbacks(
             const ProposalKey &key,
             bool preserve_scheduled_vote_fallback = false);
