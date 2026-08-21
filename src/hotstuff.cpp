@@ -16825,11 +16825,7 @@ namespace hotstuff
         {
             if ((epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
                  epoch_protocol_mode != EpochProtocolMode::adaptive_v3) ||
-                adaptive_v2_command_inbox == nullptr ||
-                adaptive_epoch_runtime == nullptr ||
-                !committed_epoch_change_history.has_value() ||
-                committed_epoch_change_history->head == nullptr ||
-                proposal_parents.empty() || hqc.second == nullptr)
+                adaptive_v2_command_inbox == nullptr)
                 return std::nullopt;
 
             auto &command_inbox = *adaptive_v2_command_inbox;
@@ -16841,12 +16837,43 @@ namespace hotstuff
                 inbox_snapshot.material == nullptr)
                 return std::nullopt;
 
+            if (adaptive_epoch_runtime == nullptr ||
+                !committed_epoch_change_history.has_value() ||
+                committed_epoch_change_history->head == nullptr ||
+                proposal_parents.empty() || hqc.second == nullptr)
+            {
+                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_ADAPTIVE_V3_COMMAND stage=precondition "
+                        "outcome=rejected replica=%u runtime=%u history=%u "
+                        "history_head=%u parents=%zu hqc=%u",
+                        static_cast<unsigned>(get_id()),
+                        adaptive_epoch_runtime == nullptr ? 0U : 1U,
+                        committed_epoch_change_history.has_value() ? 1U : 0U,
+                        committed_epoch_change_history.has_value() &&
+                                committed_epoch_change_history->head != nullptr
+                            ? 1U
+                            : 0U,
+                        proposal_parents.size(),
+                        hqc.second == nullptr ? 0U : 1U);
+                return std::nullopt;
+            }
+
             const auto active_effect =
                 adaptive_epoch_runtime->activation.active_effect();
             const auto *active_tree = find_exact_runtime_tree(
                 active_effect.configuration);
             if (active_tree == nullptr)
+            {
+                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_ADAPTIVE_V3_COMMAND stage=active_tree "
+                        "outcome=rejected replica=%u epoch=%u tree=%u",
+                        static_cast<unsigned>(get_id()),
+                        active_effect.configuration.epoch_number,
+                        active_effect.configuration.tree_id);
                 return std::nullopt;
+            }
 
             auto exact_proposal_parents = proposal_parents;
             if (include_latest_piped_parent && !piped_queue.empty())
@@ -16875,7 +16902,16 @@ namespace hotstuff
                 epoch_change_maximum_ancestry_blocks,
                 epoch_protocol_mode);
             if (!history)
+            {
+                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                    HOTSTUFF_LOG_INFO(
+                        "KAURI_ADAPTIVE_V3_COMMAND stage=history "
+                        "outcome=rejected replica=%u error=%u wire_error=%u",
+                        static_cast<unsigned>(get_id()),
+                        static_cast<unsigned>(history.error),
+                        static_cast<unsigned>(history.wire_error));
                 return std::nullopt;
+            }
 
             const AdaptiveV2ProposalPreparation preparation{
                 active_effect.configuration,
@@ -16886,6 +16922,18 @@ namespace hotstuff
                 history.history};
             const auto prepared =
                 command_inbox.prepare_for_proposal(preparation);
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_ADAPTIVE_V3_COMMAND stage=prepare "
+                    "outcome=observed replica=%u disposition=%u reserved=%u "
+                    "epoch=%u tree=%u generation=%llu root=%u",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(prepared.disposition),
+                    prepared.reservation.has_value() ? 1U : 0U,
+                    active_effect.configuration.epoch_number,
+                    active_effect.configuration.tree_id,
+                    static_cast<unsigned long long>(active_effect.generation),
+                    static_cast<unsigned>(active_tree->get_tree().get_tree_root()));
             return prepared.reservation;
         };
 
