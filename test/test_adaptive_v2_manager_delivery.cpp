@@ -179,6 +179,14 @@ TEST_CASE(
     CHECK(transport.find("send_bundle") != std::string::npos);
     CHECK(transport.find("std::size_t send_bundle") != std::string::npos);
     CHECK(transport.find("++delivered") != std::string::npos);
+    // Replicas own the one pinned bidirectional manager connection.  A
+    // second manager-originated dial would deliver control traffic on a
+    // passive, non-pinned replica connection and every bundle/certificate
+    // would be rejected before decoding.
+    CHECK(transport.find("network_.conn_peer(replica.peer_id)") ==
+          std::string::npos);
+    CHECK(transport.find("network_.get_peer_conn(replica.peer_id)") !=
+          std::string::npos);
     CHECK(v3_manager.find(
               "transport_.send_bundle(*bundle) <\n"
               "                options_.required_release_count") !=

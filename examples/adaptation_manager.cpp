@@ -3094,8 +3094,13 @@ public:
             network_.set_peer_addr(replica.peer_id, replica.address);
         }
         network_.listen(listen_address_);
-        for (const auto &replica : replicas_)
-            network_.conn_peer(replica.peer_id);
+        // Every adaptive-v3 replica establishes the single pinned TLS
+        // connection to this manager before it can report readiness or
+        // evidence.  Reuse that bidirectional connection for bundles and
+        // certificates.  If the manager also dials each replica, Salticidae
+        // retains two connections for the same certificate identity and the
+        // manager's outbound traffic arrives on the replica's non-pinned
+        // passive connection, where the replica must reject it.
     }
 
     ~AdaptiveV3ManagerTransport() { static_cast<void>(stop()); }
