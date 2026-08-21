@@ -1802,6 +1802,8 @@ bool valid_adaptive_v3_readiness_payload(
                     event.delivery_attempt != 0 && no_collection &&
                     ((event.disposition == "queued" &&
                       event.delivery_enqueued) ||
+                     (event.disposition == "retry_scheduled" &&
+                      !event.delivery_enqueued) ||
                      event.disposition == "retry_exhausted" ||
                      event.disposition == "deadline_expired");
             }

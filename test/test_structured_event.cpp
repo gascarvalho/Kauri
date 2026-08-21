@@ -6012,6 +6012,17 @@ TEST_CASE("CERT13 M1 registers and strictly serializes readiness evidence",
     delivery_event.disposition = "queued";
     REQUIRE(emits(manager_config, delivery_event).first.healthy);
 
+    auto retry_scheduled_delivery = delivery_event;
+    retry_scheduled_delivery.delivery_enqueued = false;
+    retry_scheduled_delivery.disposition = "retry_scheduled";
+    REQUIRE(emits(manager_config, retry_scheduled_delivery).first.healthy);
+    retry_scheduled_delivery.delivery_enqueued = true;
+    CHECK_FALSE(emits(manager_config, retry_scheduled_delivery).first.healthy);
+
+    auto false_queued_delivery = delivery_event;
+    false_queued_delivery.delivery_enqueued = false;
+    CHECK_FALSE(emits(manager_config, false_queued_delivery).first.healthy);
+
     auto deadline_delivery = delivery_event;
     deadline_delivery.delivery_enqueued = false;
     deadline_delivery.disposition = "deadline_expired";

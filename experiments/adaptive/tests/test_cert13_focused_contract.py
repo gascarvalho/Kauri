@@ -893,6 +893,58 @@ def test_v13_native_exported_readiness_chain_reconstructs_when_available() -> No
             == "session_terminal"
             for cycle in cycles
         )
+        retry_only = deepcopy(events)
+        delivery_replica = next(
+            event["payload"]["replica_id"]
+            for event in retry_only
+            if event["event_type"]
+            == "adaptive_v3.readiness_certificate_delivery"
+        )
+        for event in retry_only:
+            if (
+                event["event_type"]
+                == "adaptive_v3.readiness_certificate_delivery"
+                and event["payload"]["replica_id"] == delivery_replica
+            ):
+                event["payload"]["delivery_enqueued"] = False
+                event["payload"]["disposition"] = "retry_scheduled"
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation._reconstruct_v13_certified_readiness(
+                retry_only,
+                contract,
+                expected_cycle_count=cycle_count,
+                bundle_digests=bundle_digests,
+            )
+
+        too_many_attempts = deepcopy(events)
+        first_delivery = next(
+            event
+            for event in too_many_attempts
+            if event["event_type"]
+            == "adaptive_v3.readiness_certificate_delivery"
+            and event["payload"]["replica_id"] == delivery_replica
+        )
+        first_sequence = first_delivery["source_sequence"]
+        for event in too_many_attempts:
+            if (
+                event["source_kind"] == "adaptation_manager"
+                and event["source_sequence"] > first_sequence
+            ):
+                event["source_sequence"] += 5
+        for attempt in range(2, 7):
+            retry = deepcopy(first_delivery)
+            retry["source_sequence"] = first_sequence + attempt - 1
+            retry["payload"]["delivery_attempt"] = attempt
+            retry["payload"]["delivery_enqueued"] = False
+            retry["payload"]["disposition"] = "retry_scheduled"
+            too_many_attempts.append(retry)
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation._reconstruct_v13_certified_readiness(
+                too_many_attempts,
+                contract,
+                expected_cycle_count=cycle_count,
+                bundle_digests=bundle_digests,
+            )
 
 
 def test_v13_native_certified_transition_fragment_reconstructs_when_available() -> None:
@@ -2068,6 +2120,56 @@ def _v13_readiness_wire_chain() -> tuple[dict[str, object], dict[str, object], d
         "payload_digest": validation._v13_ack_payload_digest(0x22, certificate_payload), "disposition": 1,
     }
     return identity, observations[0], certificate, acknowledgement
+
+
+def test_v13_delivery_audit_distinguishes_retry_from_enqueue() -> None:
+    validation = _validation()
+    identity, _observation, certificate, _acknowledgement = (
+        _v13_readiness_wire_chain()
+    )
+    certificate_wire = validation._v13_encode_readiness_certificate(certificate)
+    payload: dict[str, object] = {
+        key: None for key in validation._V13_READINESS_EVENT_KEYS
+    }
+    payload.update(
+        {
+            "identity": identity,
+            "replica_id": 0,
+            "observed_signers": [],
+            "e2_common_commit_sources": [],
+            "required_release_count": 0,
+            "delivery_attempt": 1,
+            "delivery_enqueued": False,
+            "canonical_wire_payload_hex": certificate_wire.hex(),
+            "certificate_digest": certificate["certificate_digest"],
+            "payload_digest": validation._v13_ack_payload_digest(
+                validation._V13_READY_CERTIFICATE_OPCODE, certificate_wire
+            ),
+            "disposition": "retry_scheduled",
+        }
+    )
+    event = {
+        "source_kind": "adaptation_manager",
+        "source_id": "adaptive-manager",
+        "event_type": "adaptive_v3.readiness_certificate_delivery",
+        "payload": payload,
+    }
+    contract = {"members": tuple(range(7)), "survivor_barrier_count": 5}
+    validation._validate_v13_readiness_event_payload(event, contract)
+
+    inconsistent_retry = deepcopy(event)
+    inconsistent_retry["payload"]["delivery_enqueued"] = True
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_v13_readiness_event_payload(
+            inconsistent_retry, contract
+        )
+
+    inconsistent_queue = deepcopy(event)
+    inconsistent_queue["payload"]["disposition"] = "queued"
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_v13_readiness_event_payload(
+            inconsistent_queue, contract
+        )
 
 
 def test_v13_readiness_wire_is_independently_canonical_and_cross_bound() -> None:

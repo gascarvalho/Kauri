@@ -415,6 +415,9 @@ TEST_CASE(
           std::string::npos);
     CHECK(deliveries.find("transport_.send_certificate") !=
           std::string::npos);
+    CHECK(deliveries.find(
+              "event.disposition = enqueued ? \"queued\" : \"retry_scheduled\"") !=
+          std::string::npos);
     CHECK(deliveries.find("AdaptiveV3ManagerSessionStatus::terminal") !=
           std::string::npos);
     CHECK(deliveries.find("emit_new_session_terminals()") !=

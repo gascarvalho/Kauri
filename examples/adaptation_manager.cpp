@@ -3716,7 +3716,7 @@ private:
                 manager_tick_ns());
             if (disposition ==
                 hotstuff::AdaptiveV3CertificateDeliveryDisposition::queued)
-                event.disposition = "queued";
+                event.disposition = enqueued ? "queued" : "retry_scheduled";
             else if (disposition ==
                 hotstuff::AdaptiveV3CertificateDeliveryDisposition::retry_exhausted)
                 event.disposition = "retry_exhausted";

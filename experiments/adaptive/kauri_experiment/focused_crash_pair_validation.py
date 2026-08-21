@@ -52,6 +52,7 @@ _V13_READY_ACK_PAYLOAD_DIGEST_DOMAIN = b"kauri-adaptive-v3-activation-readiness-
 _V13_READY_OBSERVATION_OPCODE = 0x21
 _V13_READY_CERTIFICATE_OPCODE = 0x22
 _V13_MAX_REPLICA_MESSAGE_BYTES = 4 << 20
+_V13_MAXIMUM_DELIVERY_ATTEMPTS = 5
 _V13_READINESS_MEMBERSHIP_DOMAIN = (
     b"kauri-adaptive-v3-activation-readiness-membership-v1"
 )
@@ -3600,14 +3601,21 @@ def _validate_v13_readiness_event_payload(
                 _error("v13 readiness certificate assembly drifted")
         elif name == "adaptive_v3.readiness_certificate_delivery":
             replica = _integer(payload.get("replica_id"), "v13 delivery replica")
+            delivery_enqueued = payload.get("delivery_enqueued")
+            disposition = payload.get("disposition")
             if (
                 replica not in members
                 or not no_collection
                 or _integer(payload.get("delivery_attempt"), "v13 delivery attempt", 1) < 1
-                or payload.get("delivery_enqueued") is not True
-                or payload.get("disposition") != "queued"
+                or not (
+                    (disposition == "queued" and delivery_enqueued is True)
+                    or (
+                        disposition == "retry_scheduled"
+                        and delivery_enqueued is False
+                    )
+                )
             ):
-                _error("v13 successful certificate delivery drifted")
+                _error("v13 bounded certificate delivery drifted")
         elif (
             not no_collection
             or payload.get("delivery_attempt") != 0
@@ -3760,7 +3768,11 @@ def _validate_v13_sources(root: Path, contract: Mapping[str, object]) -> tuple[l
             _error("v13 readiness event name is unknown")
         if name in readiness_names:
             _validate_v13_readiness_event_payload(event, contract)
-            if name in forbidden or (name == "adaptive_v3.readiness_certificate_delivery" and event["payload"].get("disposition") != "queued"):
+            if name in forbidden or (
+                name == "adaptive_v3.readiness_certificate_delivery"
+                and event["payload"].get("disposition")
+                not in {"queued", "retry_scheduled"}
+            ):
                 _error("v13 PASS readiness event is unsuccessful")
     return events, inventory
 
@@ -3998,12 +4010,35 @@ def _reconstruct_v13_certified_readiness(
                 _integer(row.get("source_sequence"), "v13 delivery sequence", 1)
                 for row in deliveries[replica]
             ]
+            delivery_payloads = [
+                _mapping(row["payload"], "v13 certificate delivery")
+                for row in deliveries[replica]
+            ]
+            delivery_attempts = [
+                _integer(
+                    payload.get("delivery_attempt"),
+                    "v13 delivery attempt",
+                    1,
+                )
+                for payload in delivery_payloads
+            ]
+            queued_deliveries = [
+                payload
+                for payload in delivery_payloads
+                if payload.get("disposition") == "queued"
+                and payload.get("delivery_enqueued") is True
+            ]
             ack_sequence = _integer(
                 acknowledgements[replica].get("source_sequence"),
                 "v13 ACK manager sequence", 1,
             )
             if (
-                min(delivery_sequences) <= assembled_sequence
+                not queued_deliveries
+                or delivery_attempts != list(range(1, len(delivery_attempts) + 1))
+                or len(delivery_attempts) > _V13_MAXIMUM_DELIVERY_ATTEMPTS
+                or delivery_sequences != sorted(delivery_sequences)
+                or len(delivery_sequences) != len(set(delivery_sequences))
+                or min(delivery_sequences) <= assembled_sequence
                 or max(delivery_sequences) >= ack_sequence
                 or ack_sequence >= terminal_sequence
             ):

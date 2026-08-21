@@ -229,6 +229,9 @@ TEST_CASE(
     CHECK(delivery_payload_copy < delivery_result);
     CHECK(v3_manager.find("disposition ==\n                hotstuff::AdaptiveV3CertificateDeliveryDisposition::queued") !=
           std::string::npos);
+    CHECK(v3_manager.find(
+              "event.disposition = enqueued ? \"queued\" : \"retry_scheduled\"") !=
+          std::string::npos);
     CHECK(v3_manager.find("event.disposition = \"deadline_expired\"") !=
           std::string::npos);
     CHECK(v3_manager.find("event.delivery_enqueued = enqueued") !=
