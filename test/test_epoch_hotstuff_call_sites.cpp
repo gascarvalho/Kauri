@@ -4133,13 +4133,17 @@ TEST_CASE(
           std::string::npos);
 
     REQUIRE_FALSE(tail_repair.empty());
-    CHECK(contains_all(
+    CHECK(contains_in_order(
         tail_repair,
-        {"EpochProtocolMode::adaptive_v3",
+        {"job.tail_armed",
+         "epoch_protocol_mode == EpochProtocolMode::adaptive_v3",
          "EpochConsensusWireKind::proposal_repair",
          "EpochConsensusWireKind::proposal",
-         "active.configuration != job.key.configuration",
-         "active.generation != job.epoch_generation"}));
+         "adaptive_epoch_consensus_message("}));
+    CHECK(tail_repair.find("active.configuration != job.key.configuration") ==
+          std::string::npos);
+    CHECK(tail_repair.find("active.generation != job.epoch_generation") ==
+          std::string::npos);
 
     const auto broadcast = function_body(
         implementation,

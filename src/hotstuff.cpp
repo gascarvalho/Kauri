@@ -5901,16 +5901,17 @@ namespace hotstuff
             if (is_adaptive_epoch_mode(epoch_protocol_mode))
             {
                 const MsgPropose native(*job.proposal);
-                auto kind = EpochConsensusWireKind::proposal;
-                if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
-                    adaptive_epoch_runtime != nullptr)
-                {
-                    const auto active =
-                        adaptive_epoch_runtime->activation.active_effect();
-                    if (active.configuration != job.key.configuration ||
-                        active.generation != job.epoch_generation)
-                        kind = EpochConsensusWireKind::proposal_repair;
-                }
+                // The tail is armed only after the exact proposal has Q
+                // verified signers.  Mark every adaptive-v3 tail delivery as
+                // repair-capable so a healthy member that independently
+                // rotated ahead can apply the certified ancestry without
+                // voting in the stale view.  A member still in the exact
+                // generation follows the ordinary admission path.  Pre-QC
+                // first-pass and retry traffic remains an ordinary proposal.
+                const auto kind =
+                    epoch_protocol_mode == EpochProtocolMode::adaptive_v3
+                    ? EpochConsensusWireKind::proposal_repair
+                    : EpochConsensusWireKind::proposal;
                 encoded = adaptive_epoch_consensus_message(
                     job.key.configuration,
                     job.epoch_generation,
