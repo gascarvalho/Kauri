@@ -7168,12 +7168,7 @@ def _validate_v13_redacted_launch_arguments(
         "--idx", "0",
         "--iter", "-1",
         "--max-async",
-        str(
-            _integer(contract["pipeline_stretch"], "v13 client pipeline", 1)
-            * _integer(
-                contract["transactions_per_block"], "v13 client block size", 1
-            )
-        ),
+        str(_integer(contract["transactions_per_block"], "v13 client block size", 1)),
         "--epoch-protocol-mode", "adaptive_v3",
     )
     if (

@@ -437,6 +437,9 @@ def test_v13_materializes_exact_replica_client_and_public_launch_boundary(
         "--epoch-protocol-mode",
         "adaptive_v3",
     )
+    assert configuration["client_command"][
+        configuration["client_command"].index("--max-async") + 1
+    ] == "1000"
     launch = json.loads(
         (run_directory / "runtime/launch-arguments.json").read_bytes()
     )

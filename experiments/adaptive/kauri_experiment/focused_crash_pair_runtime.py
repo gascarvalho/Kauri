@@ -9633,7 +9633,12 @@ class FocusedLaunchBackend:
             _v13_client_argv(
                 client_binary=Path(binaries["client"]),
                 run_directory=run_directory,
-                maximum_async=max(1, adapter.pipeline_depth * adapter.block_size),
+                # Keep one complete block available without maintaining a
+                # second block-sized client backlog on the same host as all
+                # replicas.  The previous pipeline_depth * block_size value
+                # made timeout evidence describe host queueing rather than
+                # the injected replica crashes in focused v13 runs.
+                maximum_async=max(1, adapter.block_size),
             )
             if readiness is not None
             else (
