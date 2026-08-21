@@ -261,11 +261,15 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     const auto acceptance_if = active.find(
         "if(proposal_accepted)", normal);
     const auto acceptance_body = active.find('{', acceptance_if);
+    const auto certified_modes = active.find(
+        "constboolcertified_adaptive_mode="
+        "owner.epoch_protocol_mode==EpochProtocolMode::adaptive_v2||"
+        "owner.epoch_protocol_mode==EpochProtocolMode::adaptive_v3;",
+        admit);
     const auto still_open = active.find(
         "acquire_open_context(metadata.key)", normal);
-    const auto non_v2_timing_block = active.find(
-        "if(owner.epoch_protocol_mode!="
-        "EpochProtocolMode::adaptive_v2)"
+    const auto non_certified_timing_block = active.find(
+        "if(!certified_adaptive_mode)"
         "{owner.create_expected_vote_state(metadata.key);"
         "static_cast<void>(owner.start_latency_deadline(metadata.key));"
         "owner.start_aggregation_timer(metadata.key);}",
@@ -289,13 +293,14 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     REQUIRE(normal != std::string::npos);
     REQUIRE(acceptance_if != std::string::npos);
     REQUIRE(acceptance_body != std::string::npos);
+    REQUIRE(certified_modes != std::string::npos);
     CHECK(assigned_protocol_result <= normal);
     CHECK(normal < acceptance_if);
     CHECK(acceptance_if < acceptance_body);
     CHECK(occurrence_count(
               active, "owner.on_receive_proposal(parsed)") == 1);
     REQUIRE(still_open != std::string::npos);
-    REQUIRE(non_v2_timing_block != std::string::npos);
+    REQUIRE(non_certified_timing_block != std::string::npos);
     REQUIRE(expected != std::string::npos);
     REQUIRE(latency != std::string::npos);
     REQUIRE(timer != std::string::npos);
@@ -303,9 +308,10 @@ TEST_CASE("active proposal timing starts after protocol acceptance before drain"
     CHECK(delivery < admit);
     CHECK(admit < remote_origin);
     CHECK(remote_origin < normal);
+    CHECK(certified_modes < normal);
     CHECK(normal < still_open);
-    CHECK(still_open < non_v2_timing_block);
-    CHECK(non_v2_timing_block < expected);
+    CHECK(still_open < non_certified_timing_block);
+    CHECK(non_certified_timing_block < expected);
     CHECK(still_open < expected);
     CHECK(expected < latency);
     CHECK(latency < timer);

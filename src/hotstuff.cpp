@@ -9186,7 +9186,9 @@ namespace hotstuff
     }
 
     void HotStuffBase::process_adaptive_v3_post_block_commit(
-        const block_t &block) noexcept
+        const block_t &block,
+        const std::optional<ProposalKey> &committed_key,
+        std::optional<std::uint64_t> committed_generation) noexcept
     {
         if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
             !adaptive_v3_config || block == nullptr ||
@@ -9349,11 +9351,36 @@ namespace hotstuff
                 adaptive_v3_boundary_block = block;
             const auto active =
                 adaptive_epoch_runtime->activation.active_effect();
+            auto predecessor_configuration = active.configuration;
+            auto predecessor_generation = active.generation;
             auto source_sequence = std::uint64_t{0};
             if (scheduled && block->get_height() == *scheduled &&
                 !adaptive_v3_signed_observation &&
                 !adaptive_v3_deferred_observation)
             {
+                if (!committed_key.has_value() ||
+                    !committed_generation.has_value() ||
+                    committed_key->block_hash != block->get_hash() ||
+                    committed_key->configuration.epoch_number !=
+                        active.configuration.epoch_number ||
+                    committed_key->configuration.epoch_digest !=
+                        active.configuration.epoch_digest ||
+                    *committed_generation > active.generation ||
+                    (*committed_generation == active.generation &&
+                     committed_key->configuration !=
+                         active.configuration) ||
+                    exact_epochs->find_tree(
+                        committed_key->configuration.epoch_number,
+                        committed_key->configuration.tree_id) == nullptr)
+                {
+                    emit_adaptive_v3_command_terminal(
+                        AdaptiveV3CommandTerminalReason::
+                            readiness_boundary_rejected);
+                    return;
+                }
+                predecessor_configuration =
+                    committed_key->configuration;
+                predecessor_generation = *committed_generation;
                 if (adaptive_v3_readiness_source_sequence ==
                     std::numeric_limits<std::uint64_t>::max())
                 {
@@ -9369,8 +9396,8 @@ namespace hotstuff
                 epoch_live_binding->on_v3_post_block_commit(
                     *adaptive_v3_activation_gate,
                     block->get_height(),
-                    active.configuration,
-                    active.generation,
+                    predecessor_configuration,
+                    predecessor_generation,
                     block->get_hash(),
                     source_sequence,
                     adaptive_evidence_monotonic_now_ns());
@@ -15306,8 +15333,14 @@ namespace hotstuff
                     pending_adaptive_v2_commit->block_hash == blk->get_hash()
                 ? pending_adaptive_v2_commit->committed_key
                 : std::optional<ProposalKey>{};
+            const auto committed_generation =
+                pending_adaptive_v2_commit &&
+                    pending_adaptive_v2_commit->block_hash == blk->get_hash()
+                ? pending_adaptive_v2_commit->view_generation
+                : std::optional<std::uint64_t>{};
             pending_adaptive_v2_commit.reset();
-            process_adaptive_v3_post_block_commit(blk);
+            process_adaptive_v3_post_block_commit(
+                blk, committed_key, committed_generation);
             rotate_adaptive_v2_after_commit(committed_key);
             return;
         }

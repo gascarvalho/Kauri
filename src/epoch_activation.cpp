@@ -860,10 +860,22 @@ ReplicaEpochActivation::preview_v3_certified_activation(
         : checked_activation_generation(
               predecessor_configuration.epoch_number,
               static_cast<std::uint32_t>(predecessor_generation - 1));
+    const bool same_predecessor_epoch =
+        current.configuration.epoch_number ==
+            predecessor_configuration.epoch_number &&
+        current.configuration.epoch_digest ==
+            predecessor_configuration.epoch_digest;
+    const bool exact_current_generation =
+        current.generation == predecessor_generation;
     if (state_->permanent_block || !predecessor_packed ||
         *predecessor_packed != predecessor_generation ||
-        current.configuration != predecessor_configuration ||
-        current.generation != predecessor_generation ||
+        !same_predecessor_epoch ||
+        predecessor_generation > current.generation ||
+        (exact_current_generation &&
+         current.configuration != predecessor_configuration) ||
+        state_->store.find_tree(
+            predecessor_configuration.epoch_number,
+            predecessor_configuration.tree_id) == nullptr ||
         predecessor_configuration.epoch_number ==
             std::numeric_limits<std::uint32_t>::max() ||
         successor_configuration.epoch_number !=
@@ -1608,8 +1620,7 @@ AdaptiveV3CertifiedActivationGate::observe_predecessor_commit(
                 state_->schedule.predecessor_epoch_number ||
             configuration.epoch_digest !=
                 state_->schedule.predecessor_epoch_digest ||
-            generation == 0 || zero_digest(block_hash) ||
-            !state_->matches_latched_predecessor(configuration, generation))
+            generation == 0 || zero_digest(block_hash))
             return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
         const auto packed_generation = generation - 1;
         if (static_cast<std::uint32_t>(packed_generation >> 32) !=
@@ -1622,18 +1633,39 @@ AdaptiveV3CertifiedActivationGate::observe_predecessor_commit(
                 AdaptiveV3BoundaryDisposition::already_prepared,
                 std::nullopt};
 
-        state_->latch_predecessor(configuration, generation);
-        state_->latest_predecessor_commit_height = committed_height;
-        if (committed_height < state_->schedule.activation_height)
-            return {AdaptiveV3BoundaryDisposition::waiting, std::nullopt};
         if (state_->activation_state ==
             AdaptiveV3CertifiedActivationState::prepared)
+        {
+            if (committed_height >= state_->schedule.activation_height)
+                state_->latest_predecessor_commit_height = committed_height;
             return {
                 AdaptiveV3BoundaryDisposition::already_prepared,
                 std::nullopt};
+        }
+
+        if (committed_height < state_->schedule.activation_height)
+        {
+            if (!state_->matches_latched_predecessor(
+                    configuration, generation))
+                return {
+                    AdaptiveV3BoundaryDisposition::rejected,
+                    std::nullopt};
+            state_->latch_predecessor(configuration, generation);
+            state_->latest_predecessor_commit_height = committed_height;
+            return {AdaptiveV3BoundaryDisposition::waiting, std::nullopt};
+        }
         if (committed_height != state_->schedule.activation_height ||
             source_sequence == 0)
             return {AdaptiveV3BoundaryDisposition::rejected, std::nullopt};
+
+        // The exact committed boundary proposal may belong to an older
+        // predecessor tree/generation that was already in the pipeline when
+        // the transition command committed.  Bind the signed identity to
+        // that proposal, while retaining the locally active predecessor
+        // solely for the pre-fence vote-authority check.
+        if (!state_->predecessor_latched)
+            state_->latch_predecessor(configuration, generation);
+        state_->latest_predecessor_commit_height = committed_height;
 
         AdaptiveV3ActivationReadyIdentity identity;
         identity.membership_digest = state_->readiness_membership_digest;
@@ -1773,9 +1805,6 @@ AdaptiveV3CertifiedActivationGate::observe_certificate(
         if (state_->activation_state ==
             AdaptiveV3CertifiedActivationState::awaiting_boundary)
         {
-            state_->latch_predecessor(
-                certificate.identity.predecessor_boundary_configuration,
-                certificate.identity.predecessor_boundary_generation);
             state_->buffered_certificate = certificate;
             return AdaptiveV3CertificateDisposition::buffered_early;
         }

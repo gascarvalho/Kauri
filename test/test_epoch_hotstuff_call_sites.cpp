@@ -2865,6 +2865,9 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
         implementation, "void HotStuffBase::start(");
     const auto post_commit = function_body(
         implementation, "void HotStuffBase::do_post_block_commit(");
+    const auto v3_post_commit = function_body(
+        implementation,
+        "void HotStuffBase::process_adaptive_v3_post_block_commit(");
     const auto periodic = function_body(
         implementation,
         "void HotStuffBase::rotate_adaptive_v2_after_commit(");
@@ -2916,8 +2919,20 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
         post_commit,
         {"EpochProtocolMode::adaptive_v3",
          "committed_key =",
-         "process_adaptive_v3_post_block_commit(blk)",
+         "committed_generation =",
+         "process_adaptive_v3_post_block_commit(",
+         "blk, committed_key, committed_generation",
          "rotate_adaptive_v2_after_commit(committed_key)"}));
+
+    REQUIRE_FALSE(v3_post_commit.empty());
+    CHECK(contains_in_order(
+        v3_post_commit,
+        {"committed_key->block_hash != block->get_hash()",
+         "*committed_generation > active.generation",
+         "exact_epochs->find_tree(",
+         "predecessor_configuration =",
+         "committed_key->configuration",
+         "predecessor_generation = *committed_generation"}));
 
     REQUIRE_FALSE(periodic.empty());
     CHECK(contains_in_order(

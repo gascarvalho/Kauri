@@ -2944,6 +2944,16 @@ TEST_CASE(
     const auto valid = fixture.certificate(observations);
 
     auto late_replica = fixture.gate(6);
+    const auto predecessor_commit =
+        late_replica->observe_predecessor_commit(
+            Cert13N7Fixture::activation_height - 1,
+            fixture.predecessor,
+            Cert13N7Fixture::predecessor_generation,
+            fixture_digest("cert13-early-certificate-predecessor"),
+            0,
+            4'500'006);
+    REQUIRE(predecessor_commit.disposition ==
+            AdaptiveV3BoundaryDisposition::waiting);
     CHECK(late_replica->observe_certificate(valid) ==
           AdaptiveV3CertificateDisposition::buffered_early);
     CHECK(late_replica->state() ==
@@ -2976,6 +2986,149 @@ TEST_CASE(
     CHECK(late_replica->may_authorize_vote(
         fixture.successor,
         Cert13N7Fixture::successor_generation));
+}
+
+TEST_CASE(
+    "CERT13 readiness binds the exact pipelined boundary proposal",
+    "[cert13][adaptive-v3][boundary][rotation][unit]")
+{
+    Cert13N7Fixture fixture;
+    auto replica = fixture.gate(2);
+    const ConfigurationId locally_active{
+        fixture.predecessor.epoch_number,
+        fixture.predecessor.tree_id + 1,
+        fixture.predecessor.epoch_digest};
+    const auto locally_active_generation =
+        hotstuff::checked_activation_generation(
+            locally_active.epoch_number, 4);
+    REQUIRE(locally_active_generation.has_value());
+    REQUIRE(*locally_active_generation >
+            Cert13N7Fixture::predecessor_generation);
+
+    const auto command_commit = replica->observe_predecessor_commit(
+        Cert13N7Fixture::activation_height - 1,
+        locally_active,
+        *locally_active_generation,
+        fixture_digest("cert13-rotated-command-commit"),
+        0,
+        9'000'000);
+    REQUIRE(command_commit.disposition ==
+            AdaptiveV3BoundaryDisposition::waiting);
+    CHECK(replica->active_configuration() == locally_active);
+    CHECK(replica->active_generation() == *locally_active_generation);
+    CHECK(replica->may_authorize_vote(
+        locally_active, *locally_active_generation));
+
+    const auto boundary = replica->observe_predecessor_commit(
+        Cert13N7Fixture::activation_height,
+        fixture.predecessor,
+        Cert13N7Fixture::predecessor_generation,
+        fixture.boundary_hash,
+        1,
+        9'000'001);
+    REQUIRE(boundary.disposition ==
+            AdaptiveV3BoundaryDisposition::prepared);
+    REQUIRE(boundary.observation.has_value());
+    CHECK(boundary.observation->identity
+              .predecessor_boundary_configuration == fixture.predecessor);
+    CHECK(boundary.observation->identity
+              .predecessor_boundary_generation ==
+          Cert13N7Fixture::predecessor_generation);
+    CHECK(boundary.observation->identity.activation_boundary_block_hash ==
+          fixture.boundary_hash);
+    CHECK(replica->active_configuration() == locally_active);
+    CHECK_FALSE(replica->may_authorize_vote(
+        locally_active, *locally_active_generation));
+}
+
+TEST_CASE(
+    "CERT13 activation accepts an exact older boundary generation in the active epoch",
+    "[cert13][adaptive-v3][boundary][rotation][activation][unit]")
+{
+    EpochV2Fixture epochs;
+    const auto &predecessor = stage_v2_successor(epochs);
+    const auto staged_successor = epochs.store.stage_available_v2(
+        successor_v2_input(predecessor), predecessor);
+    REQUIRE(staged_successor.disposition ==
+            hotstuff::DefinitionAvailabilityDisposition::staged);
+    REQUIRE(staged_successor.definition != nullptr);
+    const auto &successor = *staged_successor.definition;
+
+    constexpr std::uint32_t boundary_rotation_ordinal = 3;
+    constexpr std::uint32_t current_rotation_ordinal = 4;
+    const auto boundary_generation =
+        hotstuff::checked_activation_generation(
+            predecessor.epoch_number(), boundary_rotation_ordinal);
+    const auto current_generation =
+        hotstuff::checked_activation_generation(
+            predecessor.epoch_number(), current_rotation_ordinal);
+    const auto successor_generation =
+        hotstuff::checked_activation_generation(
+            successor.epoch_number(), 0);
+    REQUIRE(boundary_generation.has_value());
+    REQUIRE(current_generation.has_value());
+    REQUIRE(successor_generation.has_value());
+    REQUIRE(*boundary_generation < *current_generation);
+
+    const ConfigurationId boundary_configuration{
+        predecessor.epoch_number(), 0, predecessor.epoch_digest()};
+    const ConfigurationId current_configuration{
+        predecessor.epoch_number(), 1, predecessor.epoch_digest()};
+    const ConfigurationId successor_configuration{
+        successor.epoch_number(), 0, successor.epoch_digest()};
+    ReplicaEpochActivation replica(
+        epochs.store,
+        predecessor,
+        0,
+        current_configuration.tree_id,
+        current_rotation_ordinal);
+    check_effect(
+        replica.active_effect(),
+        predecessor,
+        current_configuration.tree_id,
+        current_rotation_ordinal);
+
+    const auto preview = replica.preview_v3_certified_activation(
+        boundary_configuration,
+        *boundary_generation,
+        successor_configuration,
+        *successor_generation);
+    REQUIRE(preview.transition == ActivationTransition::activated);
+    REQUIRE(preview.effect.has_value());
+    check_effect(*preview.effect, successor, 0, 0);
+
+    const auto same_generation_wrong_tree =
+        replica.preview_v3_certified_activation(
+            boundary_configuration,
+            *current_generation,
+            successor_configuration,
+            *successor_generation);
+    CHECK(same_generation_wrong_tree.transition ==
+          ActivationTransition::blocked);
+    CHECK(same_generation_wrong_tree.blocked_reason ==
+          ActivationBlockReason::conflicting_activation_record);
+
+    const auto future_generation =
+        hotstuff::checked_activation_generation(
+            predecessor.epoch_number(), current_rotation_ordinal + 1);
+    REQUIRE(future_generation.has_value());
+    const auto future = replica.preview_v3_certified_activation(
+        boundary_configuration,
+        *future_generation,
+        successor_configuration,
+        *successor_generation);
+    CHECK(future.transition == ActivationTransition::blocked);
+    CHECK(future.blocked_reason ==
+          ActivationBlockReason::conflicting_activation_record);
+
+    const auto applied = replica.apply_v3_certified_activation(
+        boundary_configuration,
+        *boundary_generation,
+        successor_configuration,
+        *successor_generation);
+    REQUIRE(applied.transition == ActivationTransition::activated);
+    REQUIRE(applied.effect.has_value());
+    check_effect(*applied.effect, successor, 0, 0);
 }
 
 TEST_CASE(

@@ -1586,7 +1586,10 @@ namespace hotstuff
             const AdaptiveV3ActivationReadinessCertificate &certificate,
             const bytearray_t &canonical_payload) noexcept;
         void process_adaptive_v3_post_block_commit(
-            const block_t &block) noexcept;
+            const block_t &block,
+            const std::optional<ProposalKey> &committed_key = std::nullopt,
+            std::optional<std::uint64_t> committed_generation =
+                std::nullopt) noexcept;
         void publish_adaptive_v3_activation(
             const EpochRuntimeUpdate &update,
             std::unique_ptr<AdaptiveV3RetiredActivationReceipt>
