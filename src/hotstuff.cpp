@@ -14288,6 +14288,65 @@ namespace hotstuff
             alternate_configuration, *alternate_runtime_generation};
     }
 
+    bool HotStuffBase::
+    preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+        const ProposalKey &inferred_predecessor_key,
+        std::uint64_t predecessor_generation,
+        const ConfigurationId &successor_configuration,
+        std::uint64_t successor_generation,
+        std::uint32_t last_live_epoch) noexcept
+    {
+        const auto &predecessor_configuration =
+            inferred_predecessor_key.configuration;
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            predecessor_generation == 0 || successor_generation == 0 ||
+            predecessor_configuration.epoch_number ==
+                std::numeric_limits<std::uint32_t>::max() ||
+            successor_configuration.epoch_number !=
+                predecessor_configuration.epoch_number + 1 ||
+            successor_configuration.tree_id != 0 ||
+            successor_configuration.epoch_digest ==
+                predecessor_configuration.epoch_digest ||
+            last_live_epoch != successor_configuration.epoch_number)
+            return false;
+        try
+        {
+            const auto retained = retained_commit_event_identities.find(
+                inferred_predecessor_key.block_hash);
+            if (retained == retained_commit_event_identities.end())
+            {
+                // A physical intermediate at an activation boundary may
+                // belong to either epoch. The certifier QC authenticates the
+                // predecessor alternate, but it does not identify every
+                // intervening block. Preserve completeness only when an
+                // independently authenticated exact proposal was already
+                // retained; never invent the intermediate configuration.
+                return true;
+            }
+            auto &identity = retained->second;
+            if (!identity.key.has_value() ||
+                !identity.view_generation.has_value())
+                return false;
+            const bool exact_predecessor =
+                *identity.key == inferred_predecessor_key &&
+                *identity.view_generation == predecessor_generation;
+            const bool exact_successor =
+                identity.key->block_hash ==
+                    inferred_predecessor_key.block_hash &&
+                identity.key->configuration == successor_configuration &&
+                *identity.view_generation == successor_generation;
+            if (!exact_predecessor && !exact_successor)
+                return false;
+            identity.max_observed_epoch = std::max(
+                identity.max_observed_epoch, last_live_epoch);
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(
         const Proposal &proposal,
         std::uint64_t generation,
@@ -14441,6 +14500,18 @@ namespace hotstuff
                 const ProposalKey intermediate_key{
                     bridged_configuration->first,
                     intermediates[index]->get_hash()};
+                if (bridged_configuration->first !=
+                    certifier_key.configuration)
+                {
+                    if (!preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+                            intermediate_key,
+                            bridged_configuration->second,
+                            certifier_key.configuration,
+                            generation,
+                            certifier_key.configuration.epoch_number))
+                        return false;
+                    continue;
+                }
                 if (!retain_owned(
                         intermediate_key,
                         bridged_configuration->second,

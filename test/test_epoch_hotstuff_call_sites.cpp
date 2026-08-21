@@ -2370,6 +2370,9 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     const auto retain_proposal_bridge = function_body(
         implementation,
         "bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(");
+    const auto preserve_cross_epoch_intermediate = function_body(
+        implementation,
+        "preserve_adaptive_v3_cross_epoch_bridge_intermediate(");
     const auto rollback_proposal_bridge = function_body(
         implementation,
         "void HotStuffBase::rollback_retained_commit_event_identity_mutations(");
@@ -2547,8 +2550,18 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "alternate_key.configuration",
          "certifier_key.configuration",
          "certifier_key.configuration.epoch_number",
+         "preserve_adaptive_v3_cross_epoch_bridge_intermediate(",
          "bridged_configuration->first",
          "bridged_configuration->second"}));
+    REQUIRE_FALSE(preserve_cross_epoch_intermediate.empty());
+    CHECK(contains_all(
+        preserve_cross_epoch_intermediate,
+        {"EpochProtocolMode::adaptive_v3",
+         "retained_commit_event_identities.find(",
+         "return true",
+         "exact_predecessor",
+         "exact_successor",
+         "identity.max_observed_epoch"}));
     REQUIRE_FALSE(bridge_heights.empty());
     CHECK(contains_all(
         bridge_heights,

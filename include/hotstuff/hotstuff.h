@@ -1755,6 +1755,12 @@ namespace hotstuff
             std::optional<std::uint64_t> alternate_ingress_generation,
             std::optional<std::uint64_t> certifier_ingress_generation)
             noexcept;
+        bool preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+            const ProposalKey &inferred_predecessor_key,
+            std::uint64_t predecessor_generation,
+            const ConfigurationId &successor_configuration,
+            std::uint64_t successor_generation,
+            std::uint32_t last_live_epoch) noexcept;
         bool retain_authenticated_proposal_commit_event_identities(
             const Proposal &proposal,
             std::uint64_t generation,

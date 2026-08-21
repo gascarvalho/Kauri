@@ -91,6 +91,23 @@ public:
             key, generation, last_live_epoch);
     }
 
+    static bool preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+        HotStuffBase &runtime,
+        const ProposalKey &inferred_predecessor_key,
+        std::uint64_t predecessor_generation,
+        const ConfigurationId &successor_configuration,
+        std::uint64_t successor_generation,
+        std::uint32_t last_live_epoch)
+    {
+        return runtime.
+            preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+                inferred_predecessor_key,
+                predecessor_generation,
+                successor_configuration,
+                successor_generation,
+                last_live_epoch);
+    }
+
     static std::optional<std::uint32_t>
     retained_commit_event_identity_last_live_epoch(
         const HotStuffBase &runtime,
@@ -4347,6 +4364,42 @@ TEST_CASE(
         successor.epoch_number + 1));
     CHECK_FALSE(Access::has_retained_commit_event_identity(
         runtime, overextended_intermediate.block_hash));
+
+    // A successor proposal may be authenticated before a later certifier
+    // exposes a QC bridge whose physical intermediate spans activation. The
+    // bridge cannot relabel that already exact successor proposal as a
+    // predecessor block merely because the predecessor is the QC alternate.
+    const auto shared_hash = digest("v3-boundary-successor-intermediate");
+    const ProposalKey inferred_predecessor{predecessor, shared_hash};
+    const ProposalKey exact_successor{successor, shared_hash};
+    REQUIRE(Access::retain_commit_event_identity(
+        runtime, exact_successor, successor_generation));
+    REQUIRE(
+        Access::preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+            runtime,
+            inferred_predecessor,
+            predecessor_generation,
+            successor,
+            successor_generation,
+            successor.epoch_number));
+    CHECK(Access::retained_commit_event_identity_is_exact(
+        runtime, exact_successor, successor_generation));
+    CHECK(
+        Access::retained_commit_event_identity_last_live_epoch(
+            runtime, shared_hash) == successor.epoch_number);
+
+    const ProposalKey unknown_intermediate{
+        predecessor, digest("v3-boundary-unknown-intermediate")};
+    REQUIRE(
+        Access::preserve_adaptive_v3_cross_epoch_bridge_intermediate(
+            runtime,
+            unknown_intermediate,
+            predecessor_generation,
+            successor,
+            successor_generation,
+            successor.epoch_number));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, unknown_intermediate.block_hash));
 }
 
 TEST_CASE(
