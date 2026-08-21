@@ -459,6 +459,14 @@ public:
         return runtime.adaptive_v2_convergence_evidence_healthy;
     }
 
+    static std::optional<std::pair<ProposalKey, std::uint64_t>>
+    adaptive_v3_observational_commit_identity(
+        const HotStuffBase &runtime,
+        const block_t &block)
+    {
+        return runtime.adaptive_v3_observational_commit_identity(block);
+    }
+
     static void seed_pending_commit(
         HotStuffBase &runtime,
         const uint256_t &block_hash,
@@ -2524,6 +2532,58 @@ TEST_CASE(
         CHECK(witness->view_generation == generation);
     }
 
+    SECTION(
+        "a retained exact repair identity feeds only v3 observation and readiness")
+    {
+        EventContext event_context;
+        TestHotStuff runtime(
+            1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+            new ActiveRuntimePaceMaker(1), event_context, 0,
+            HotStuffBase::Net::Config(), NetAddr(),
+            EpochProtocolMode::adaptive_v3,
+            adaptive_v3_runtime_config(1));
+        const auto configuration = Access::initialize_active_runtime(runtime);
+        auto &outbox = Access::reset_reporting_outbox(runtime, 4);
+        RecordingProtocolEmitter emitter(false);
+        runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
+        const auto block = indirect_commit_block(
+            runtime, "v3-retained-repair-boundary");
+        const ProposalKey key{configuration, block->get_hash()};
+        REQUIRE(Access::retain_commit_event_identity(runtime, key, 31));
+
+        const auto cached =
+            Access::resolve_and_cache_unproven_commit(runtime, block);
+        CHECK_FALSE(cached.key.has_value());
+        REQUIRE(cached.event_key == key);
+        REQUIRE(cached.event_generation == 31);
+        const auto observational =
+            Access::adaptive_v3_observational_commit_identity(runtime, block);
+        REQUIRE(observational.has_value());
+        CHECK(observational->first == key);
+        CHECK(observational->second == 31);
+
+        Access::report_committed(runtime, observational->first);
+        REQUIRE(outbox.front() != nullptr);
+        const auto decoded = decode_proposal_lifecycle_notice(
+            outbox.front()->canonical_payload, ProposalLifecycleWireLimits{});
+        REQUIRE(decoded);
+        REQUIRE(std::holds_alternative<ProposalCommitted>(
+            decoded.notice->fact));
+        CHECK(std::get<ProposalCommitted>(decoded.notice->fact).proposal ==
+              key);
+
+        Access::report_and_post_commit(runtime, block);
+        REQUIRE(emitter.events.size() == 2);
+        CHECK(std::get_if<CommitObservedStructuredEvent>(
+                  &emitter.events[0]) != nullptr);
+        const auto *witness =
+            std::get_if<CommitIdentityWitnessStructuredEvent>(
+                &emitter.events[1]);
+        REQUIRE(witness != nullptr);
+        CHECK(witness->decision_proof == key);
+        CHECK(witness->view_generation == 31);
+    }
+
     SECTION("non-designated and inexact commits never become authoritative")
     {
         for (const bool designated : {false, true})
@@ -2610,6 +2670,8 @@ TEST_CASE(
             Access::resolve_and_cache_commit(runtime, block, {}, nullptr, true);
         CHECK(cached.unavailable);
         CHECK(cached.event_unavailable);
+        CHECK_FALSE(Access::adaptive_v3_observational_commit_identity(
+            runtime, block).has_value());
 
         Access::report_and_post_commit(runtime, block);
 

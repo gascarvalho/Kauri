@@ -15546,6 +15546,49 @@ namespace hotstuff
                 std::nullopt});
     }
 
+    std::optional<std::pair<ProposalKey, std::uint64_t>>
+    HotStuffBase::adaptive_v3_observational_commit_identity(
+        const block_t &blk) const noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            blk == nullptr || !pending_adaptive_v2_commit ||
+            pending_adaptive_v2_commit->block_hash != blk->get_hash())
+            return std::nullopt;
+
+        const auto exact = [](
+            const std::optional<ProposalKey> &key,
+            const std::optional<std::uint64_t> &generation,
+            CommittedProposalIdentityDisposition disposition,
+            const uint256_t &block_hash)
+            -> std::optional<std::pair<ProposalKey, std::uint64_t>> {
+            if (disposition != CommittedProposalIdentityDisposition::exact ||
+                !key.has_value() || !generation.has_value() ||
+                *generation == 0 || key->block_hash != block_hash)
+                return std::nullopt;
+            return std::pair<ProposalKey, std::uint64_t>{*key, *generation};
+        };
+
+        if (const auto protocol = exact(
+                pending_adaptive_v2_commit->committed_key,
+                pending_adaptive_v2_commit->view_generation,
+                pending_adaptive_v2_commit->identity_disposition,
+                blk->get_hash()))
+            return protocol;
+
+        // A lagging survivor can commit a repaired batch after its ordinary
+        // proposal context has retired. The retained identity is accepted
+        // only after the authenticated proposal path has bound the exact key
+        // and generation, and any conflict permanently tombstones it. It may
+        // therefore support v3's observational lifecycle and exact readiness
+        // boundary, but never cadence, rotation, admission, voting, or QC
+        // authority.
+        return exact(
+            pending_adaptive_v2_commit->event_committed_key,
+            pending_adaptive_v2_commit->event_view_generation,
+            pending_adaptive_v2_commit->event_identity_disposition,
+            blk->get_hash());
+    }
+
     std::optional<uint256_t>
     HotStuffBase::adaptive_v2_committed_epoch_change_payload_digest(
         const block_t &blk) const noexcept
@@ -15641,9 +15684,14 @@ namespace hotstuff
             blk,
             identity,
             verified_direct_certifier != nullptr);
+        const auto v3_observational_commit =
+            adaptive_v3_observational_commit_identity(blk);
         report_adaptive_v2_committed(
             epoch_protocol_mode == EpochProtocolMode::adaptive_v3
-                ? authoritative_key
+                ? v3_observational_commit.has_value()
+                    ? std::optional<ProposalKey>{
+                          v3_observational_commit->first}
+                    : std::nullopt
                 : pending_adaptive_v2_commit.has_value()
                 ? pending_adaptive_v2_commit->committed_key
                 : std::nullopt,
@@ -15741,9 +15789,18 @@ namespace hotstuff
                     pending_adaptive_v2_commit->block_hash == blk->get_hash()
                 ? pending_adaptive_v2_commit->view_generation
                 : std::optional<std::uint64_t>{};
+            const auto observational_commit =
+                adaptive_v3_observational_commit_identity(blk);
             pending_adaptive_v2_commit.reset();
             process_adaptive_v3_post_block_commit(
-                blk, committed_key, committed_generation);
+                blk,
+                observational_commit.has_value()
+                    ? std::optional<ProposalKey>{observational_commit->first}
+                    : committed_key,
+                observational_commit.has_value()
+                    ? std::optional<std::uint64_t>{
+                          observational_commit->second}
+                    : committed_generation);
             rotate_adaptive_v2_after_commit(committed_key);
             return;
         }

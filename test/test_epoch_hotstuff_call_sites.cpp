@@ -2987,8 +2987,9 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
         {"EpochProtocolMode::adaptive_v3",
          "committed_key =",
          "committed_generation =",
+         "observational_commit =",
          "process_adaptive_v3_post_block_commit(",
-         "blk, committed_key, committed_generation",
+         "observational_commit.has_value()",
          "rotate_adaptive_v2_after_commit(committed_key)"}));
 
     REQUIRE_FALSE(v3_post_commit.empty());

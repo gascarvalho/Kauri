@@ -1794,6 +1794,9 @@ namespace hotstuff
             const block_t &blk,
             const CommittedProposalIdentityResolution &identity,
             bool allow_runtime_generation_recovery) noexcept;
+        std::optional<std::pair<ProposalKey, std::uint64_t>>
+        adaptive_v3_observational_commit_identity(
+            const block_t &blk) const noexcept;
         void do_consensus_with_identity_provenance(
             const block_t &blk,
             const quorum_cert_bt &verified_direct_certifier,
