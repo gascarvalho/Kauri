@@ -1755,7 +1755,8 @@ namespace hotstuff
         bool retain_authenticated_proposal_commit_event_identities(
             const Proposal &proposal,
             std::uint64_t generation,
-            RetainedCommitEventIdentityRollback *rollback = nullptr) noexcept;
+            RetainedCommitEventIdentityRollback *rollback = nullptr,
+            bool locally_constructed_certifier = false) noexcept;
         void rollback_retained_commit_event_identity_mutations(
             const RetainedCommitEventIdentityRollback &rollback) noexcept;
         void forget_retained_commit_event_identities_before_epoch(

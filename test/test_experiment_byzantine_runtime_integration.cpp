@@ -107,10 +107,14 @@ public:
         HotStuffBase &runtime,
         const Proposal &proposal,
         std::uint64_t generation,
-        RetainedIdentityRollback *rollback = nullptr)
+        RetainedIdentityRollback *rollback = nullptr,
+        bool locally_constructed_certifier = false)
     {
         return runtime.retain_authenticated_proposal_commit_event_identities(
-            proposal, generation, rollback);
+            proposal,
+            generation,
+            rollback,
+            locally_constructed_certifier);
     }
 
     static void rollback_retained_commit_event_identity_mutations(
@@ -3979,6 +3983,49 @@ TEST_CASE(
         runtime, bounded_first_key.block_hash));
     CHECK_FALSE(Access::has_retained_commit_event_identity(
         runtime, bounded_second_key.block_hash));
+
+    const auto local_alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        certifier,
+        certifier,
+        "v3-local-certified-bridge-alternate");
+    const auto local_skipped = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        local_alternate,
+        certifier,
+        "v3-local-certified-bridge-skipped");
+    const auto local_certifier = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        local_skipped,
+        local_alternate,
+        "v3-local-certified-bridge-certifier");
+    const ProposalKey local_alternate_key{
+        configuration, local_alternate->get_hash()};
+    const ProposalKey local_skipped_key{
+        configuration, local_skipped->get_hash()};
+    const ProposalKey local_certifier_key{
+        configuration, local_certifier->get_hash()};
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        Proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            local_certifier,
+            nullptr),
+        *generation,
+        nullptr,
+        true));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, local_alternate_key.block_hash));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, local_skipped_key.block_hash));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, local_certifier_key.block_hash));
 
     const auto drift_alternate = Access::add_commit_rule_block(
         runtime,

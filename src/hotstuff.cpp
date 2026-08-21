@@ -13678,8 +13678,9 @@ namespace hotstuff
                 // commit chain when its own proposal later commits.
                 static_cast<void>(observe_proposal_view_generation(
                     prop.key(), *generation));
-                static_cast<void>(retain_commit_event_identity(
-                    prop.key(), *generation));
+                static_cast<void>(
+                    retain_authenticated_proposal_commit_event_identities(
+                        prop, *generation, nullptr, true));
             }
         }
 
@@ -14207,7 +14208,8 @@ namespace hotstuff
     bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(
         const Proposal &proposal,
         std::uint64_t generation,
-        RetainedCommitEventIdentityRollback *rollback) noexcept
+        RetainedCommitEventIdentityRollback *rollback,
+        bool locally_constructed_certifier) noexcept
     {
         if (!is_adaptive_epoch_mode(epoch_protocol_mode) ||
             generation == 0 || proposal.blk == nullptr ||
@@ -14297,6 +14299,13 @@ namespace hotstuff
                 authenticated_proposal_ingress.find(alternate_key);
             const auto certifier_ingress =
                 authenticated_proposal_ingress.find(certifier_key);
+            const auto certifier_authority_generation =
+                locally_constructed_certifier
+                    ? std::optional<std::uint64_t>{generation}
+                    : certifier_ingress == authenticated_proposal_ingress.end()
+                        ? std::optional<std::uint64_t>{}
+                        : std::optional<std::uint64_t>{
+                              certifier_ingress->second.view_generation};
             const auto bridged_configuration =
                 authenticated_proposal_commit_event_bridge_configuration(
                     epoch_protocol_mode,
@@ -14311,10 +14320,7 @@ namespace hotstuff
                         ? std::optional<std::uint64_t>{}
                         : std::optional<std::uint64_t>{
                               alternate_ingress->second.view_generation},
-                    certifier_ingress == authenticated_proposal_ingress.end()
-                        ? std::optional<std::uint64_t>{}
-                        : std::optional<std::uint64_t>{
-                              certifier_ingress->second.view_generation});
+                    certifier_authority_generation);
             if (!bridged_configuration.has_value())
                 return true;
 

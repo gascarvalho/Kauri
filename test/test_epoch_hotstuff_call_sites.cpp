@@ -2507,10 +2507,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "observe_proposal_view_generation(",
          "prop.key()",
          "*generation",
-         "retain_commit_event_identity(",
-         "prop.key(), *generation"}));
+         "retain_authenticated_proposal_commit_event_identities(",
+         "prop, *generation, nullptr, true"}));
     CHECK(count_occurrences(
-              local_proposal, "retain_commit_event_identity(") == 1);
+              local_proposal,
+              "retain_authenticated_proposal_commit_event_identities(") ==
+          1);
     REQUIRE_FALSE(local_admission.empty());
     CHECK(local_admission.find(
               "retain_authenticated_proposal_commit_event_identities(") ==
@@ -2538,6 +2540,8 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "const auto certifier_ingress",
          "authenticated_proposal_ingress.find(alternate_key)",
          "authenticated_proposal_ingress.find(certifier_key)",
+         "locally_constructed_certifier",
+         "certifier_authority_generation",
          "authenticated_proposal_commit_event_bridge_configuration(",
          "find_exact_runtime_generation(",
          "alternate_key.configuration",
