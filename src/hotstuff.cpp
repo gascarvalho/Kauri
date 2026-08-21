@@ -14095,6 +14095,58 @@ namespace hotstuff
                certifier_height == skipped_height + 1;
     }
 
+    std::optional<std::pair<ConfigurationId, std::uint64_t>>
+    HotStuffBase::
+    authenticated_proposal_commit_event_bridge_configuration(
+        EpochProtocolMode mode,
+        const ConfigurationId &alternate_configuration,
+        const ConfigurationId &certifier_configuration,
+        std::uint64_t certifier_generation,
+        std::optional<std::uint64_t> alternate_runtime_generation,
+        std::optional<std::uint64_t> certifier_runtime_generation,
+        std::optional<std::uint64_t> alternate_ingress_generation,
+        std::optional<std::uint64_t> certifier_ingress_generation) noexcept
+    {
+        if (certifier_generation == 0 ||
+            certifier_ingress_generation != certifier_generation)
+            return std::nullopt;
+
+        if (alternate_configuration == certifier_configuration)
+        {
+            if (alternate_ingress_generation.has_value())
+                return *alternate_ingress_generation == certifier_generation
+                    ? std::optional<
+                          std::pair<ConfigurationId, std::uint64_t>>{
+                          {certifier_configuration, certifier_generation}}
+                    : std::nullopt;
+            return mode == EpochProtocolMode::adaptive_v3 &&
+                    certifier_runtime_generation == certifier_generation
+                ? std::optional<
+                      std::pair<ConfigurationId, std::uint64_t>>{
+                      {certifier_configuration, certifier_generation}}
+                : std::nullopt;
+        }
+
+        const bool adjacent_v3_activation_boundary =
+            mode == EpochProtocolMode::adaptive_v3 &&
+            alternate_configuration.epoch_number !=
+                std::numeric_limits<std::uint32_t>::max() &&
+            certifier_configuration.epoch_number ==
+                alternate_configuration.epoch_number + 1 &&
+            certifier_configuration.tree_id == 0 &&
+            certifier_configuration.epoch_digest !=
+                alternate_configuration.epoch_digest;
+        if (!adjacent_v3_activation_boundary ||
+            !alternate_runtime_generation.has_value() ||
+            certifier_runtime_generation != certifier_generation ||
+            *alternate_runtime_generation == certifier_generation ||
+            (alternate_ingress_generation.has_value() &&
+             alternate_ingress_generation != alternate_runtime_generation))
+            return std::nullopt;
+        return std::pair<ConfigurationId, std::uint64_t>{
+            alternate_configuration, *alternate_runtime_generation};
+    }
+
     bool HotStuffBase::retain_authenticated_proposal_commit_event_identities(
         const Proposal &proposal,
         std::uint64_t generation,
@@ -14105,12 +14157,13 @@ namespace hotstuff
             proposal.key().block_hash != proposal.blk->get_hash())
             return false;
 
-        const auto retain_owned = [this, generation, rollback](
-            const ProposalKey &key) noexcept {
+        const auto retain_owned = [this, rollback](
+            const ProposalKey &key,
+            std::uint64_t retained_generation) noexcept {
             const bool absent_before =
                 retained_commit_event_identities.find(key.block_hash) ==
                 retained_commit_event_identities.end();
-            if (!retain_commit_event_identity(key, generation))
+            if (!retain_commit_event_identity(key, retained_generation))
                 return false;
             if (absent_before && rollback != nullptr &&
                 rollback->owned_mutation_count <
@@ -14118,11 +14171,11 @@ namespace hotstuff
                 rollback->owned_mutations[
                     rollback->owned_mutation_count++] =
                     RetainedCommitEventIdentityOwnedMutation{
-                        key.block_hash, key, generation};
+                        key.block_hash, key, retained_generation};
             return true;
         };
 
-        if (!retain_owned(proposal.key()))
+        if (!retain_owned(proposal.key(), generation))
             return false;
 
         try
@@ -14149,49 +14202,55 @@ namespace hotstuff
                 authenticated_proposal_ingress.find(alternate_key);
             const auto certifier_ingress =
                 authenticated_proposal_ingress.find(certifier_key);
-            if (certifier_ingress == authenticated_proposal_ingress.end() ||
-                alternate_key.configuration !=
-                    certifier_key.configuration ||
-                certifier_ingress->second.view_generation != generation)
+            const auto bridged_configuration =
+                authenticated_proposal_commit_event_bridge_configuration(
+                    epoch_protocol_mode,
+                    alternate_key.configuration,
+                    certifier_key.configuration,
+                    generation,
+                    find_exact_runtime_generation(
+                        alternate_key.configuration),
+                    find_exact_runtime_generation(
+                        certifier_key.configuration),
+                    alternate_ingress == authenticated_proposal_ingress.end()
+                        ? std::optional<std::uint64_t>{}
+                        : std::optional<std::uint64_t>{
+                              alternate_ingress->second.view_generation},
+                    certifier_ingress == authenticated_proposal_ingress.end()
+                        ? std::optional<std::uint64_t>{}
+                        : std::optional<std::uint64_t>{
+                              certifier_ingress->second.view_generation});
+            if (!bridged_configuration.has_value())
                 return true;
 
             if (alternate_ingress == authenticated_proposal_ingress.end())
             {
-                if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
-                    return true;
-                const auto runtime_generation =
-                    find_exact_runtime_generation(
-                        certifier_key.configuration);
-                if (!runtime_generation.has_value() ||
-                    *runtime_generation != generation)
-                    return true;
-
                 // The quorum certificate has already been verified by
                 // has_verified_legal_qc_skip and carries alternate_key.  V3
                 // may activate while predecessor blocks are still draining,
                 // so the designated observer can first see the certified
-                // successor chain at this authenticated certifier.  Retain
+                // successor chain at this authenticated certifier. Retain
                 // both the QC-authenticated alternate and its single
-                // adjacent physical successor under the same exact active
-                // configuration/generation.  This is evidence-only and does
-                // not enter proposal admission, voting, rotation, or cadence.
-                if (!retain_owned(alternate_key))
+                // adjacent physical successor under the exact predecessor
+                // configuration/generation authorized above. This is
+                // evidence-only and does not enter proposal admission,
+                // voting, rotation, or cadence.
+                if (!retain_owned(
+                        alternate_key, bridged_configuration->second))
                     return false;
             }
-            else if (
-                alternate_ingress->second.view_generation != generation)
-                return true;
 
             const ProposalKey skipped_key{
-                certifier_key.configuration,
+                bridged_configuration->first,
                 skipped->get_hash()};
             // This bridge is deliberately evidence-only. The verified QC
             // carries the alternate's exact key, while the authenticated
-            // certifier and exact runtime bind its configuration and
-            // generation. V2 additionally requires alternate ingress. The
-            // recovered key never enters proposal admission, cadence,
-            // rotation, or consensus identity state.
-            return retain_owned(skipped_key);
+            // certifier and exact active/draining runtimes bind the boundary
+            // configuration and generation. V2 additionally requires
+            // alternate ingress. The recovered key never enters proposal
+            // admission, cadence, rotation, or consensus identity state.
+            return retain_owned(
+                skipped_key, bridged_configuration->second);
         }
         catch (...)
         {

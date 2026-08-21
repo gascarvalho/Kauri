@@ -2376,6 +2376,9 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
     const auto bridge_heights = function_body(
         implementation,
         "bool HotStuffBase::has_adjacent_proposal_commit_event_bridge_heights(");
+    const auto bridge_configuration = function_body(
+        implementation,
+        "authenticated_proposal_commit_event_bridge_configuration(");
     const auto do_consensus = hotstuff_consensus_body(implementation);
     const auto retire_before_epoch = function_body(
         implementation,
@@ -2517,7 +2520,7 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
         {"is_adaptive_epoch_mode(epoch_protocol_mode)",
          "generation == 0",
          "proposal.key().block_hash != proposal.blk->get_hash()",
-         "retain_owned(proposal.key())",
+         "retain_owned(proposal.key(), generation)",
          "certifier->parents.size() != 1",
          "skipped->parents.size() != 1",
          "certifier->qc_ref != alternate",
@@ -2528,11 +2531,12 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "const auto certifier_ingress",
          "authenticated_proposal_ingress.find(alternate_key)",
          "authenticated_proposal_ingress.find(certifier_key)",
-         "alternate_key.configuration !=",
+         "authenticated_proposal_commit_event_bridge_configuration(",
+         "find_exact_runtime_generation(",
+         "alternate_key.configuration",
          "certifier_key.configuration",
-         "alternate_ingress->second.view_generation != generation",
-         "certifier_ingress->second.view_generation != generation",
-         "return retain_owned(skipped_key)"}));
+         "bridged_configuration->first",
+         "bridged_configuration->second"}));
     REQUIRE_FALSE(bridge_heights.empty());
     CHECK(contains_all(
         bridge_heights,
@@ -2541,6 +2545,21 @@ TEST_CASE("adaptive v2 emits exact structured commit and command evidence",
          "skipped_height == alternate_height + 1",
          "skipped_height !=",
          "certifier_height == skipped_height + 1"}));
+    REQUIRE_FALSE(bridge_configuration.empty());
+    CHECK(contains_all(
+        bridge_configuration,
+        {"certifier_generation == 0",
+         "certifier_ingress_generation != certifier_generation",
+         "alternate_configuration == certifier_configuration",
+         "mode == EpochProtocolMode::adaptive_v3",
+         "alternate_configuration.epoch_number + 1",
+         "certifier_configuration.tree_id == 0",
+         "certifier_configuration.epoch_digest !=",
+         "alternate_runtime_generation.has_value()",
+         "certifier_runtime_generation != certifier_generation",
+         "*alternate_runtime_generation == certifier_generation",
+         "alternate_ingress_generation != alternate_runtime_generation",
+         "alternate_configuration, *alternate_runtime_generation"}));
     CHECK(retain_proposal_bridge.find("observe_proposal_view_generation(") ==
           std::string::npos);
     CHECK(retain_proposal_bridge.find("proposal_view_generations") ==

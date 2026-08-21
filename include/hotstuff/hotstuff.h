@@ -1728,6 +1728,18 @@ namespace hotstuff
             std::uint32_t alternate_height,
             std::uint32_t skipped_height,
             std::uint32_t certifier_height) noexcept;
+        static std::optional<
+            std::pair<ConfigurationId, std::uint64_t>>
+        authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode mode,
+            const ConfigurationId &alternate_configuration,
+            const ConfigurationId &certifier_configuration,
+            std::uint64_t certifier_generation,
+            std::optional<std::uint64_t> alternate_runtime_generation,
+            std::optional<std::uint64_t> certifier_runtime_generation,
+            std::optional<std::uint64_t> alternate_ingress_generation,
+            std::optional<std::uint64_t> certifier_ingress_generation)
+            noexcept;
         bool retain_authenticated_proposal_commit_event_identities(
             const Proposal &proposal,
             std::uint64_t generation,

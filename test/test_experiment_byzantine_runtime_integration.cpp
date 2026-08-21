@@ -166,6 +166,29 @@ public:
                 certifier_height);
     }
 
+    static std::optional<std::pair<ConfigurationId, std::uint64_t>>
+    authenticated_proposal_commit_event_bridge_configuration(
+        EpochProtocolMode mode,
+        const ConfigurationId &alternate_configuration,
+        const ConfigurationId &certifier_configuration,
+        std::uint64_t certifier_generation,
+        std::optional<std::uint64_t> alternate_runtime_generation,
+        std::optional<std::uint64_t> certifier_runtime_generation,
+        std::optional<std::uint64_t> alternate_ingress_generation,
+        std::optional<std::uint64_t> certifier_ingress_generation)
+    {
+        return HotStuffBase::
+            authenticated_proposal_commit_event_bridge_configuration(
+                mode,
+                alternate_configuration,
+                certifier_configuration,
+                certifier_generation,
+                alternate_runtime_generation,
+                certifier_runtime_generation,
+                alternate_ingress_generation,
+                certifier_ingress_generation);
+    }
+
     static void forget_retained_commit_event_identities_before_epoch(
         HotStuffBase &runtime,
         std::uint32_t first_live_epoch)
@@ -2914,6 +2937,7 @@ TEST_CASE(
     "[adaptive-v2][evidence][commit][identity-unavailable][retained][runtime-integration]")
 {
     using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
 
     SECTION("v3 recovers an authenticated ancestor in a commit batch")
     {
@@ -2925,6 +2949,8 @@ TEST_CASE(
             EpochProtocolMode::adaptive_v3,
             adaptive_v3_runtime_config(1));
         const auto configuration = Access::initialize_active_runtime(runtime);
+        Access::replace_aggregation_scheduler(
+            runtime, std::make_unique<ThrowingAggregationScheduler>());
         RecordingProtocolEmitter emitter;
         runtime.bind_structured_event_emitters(&emitter, nullptr, nullptr);
         const auto block = indirect_commit_block(runtime, "v3-unproven-retained");
@@ -3907,6 +3933,106 @@ TEST_CASE(
         runtime, drift_alternate_key.block_hash));
     CHECK_FALSE(Access::has_retained_commit_event_identity(
         runtime, drift_skipped_key.block_hash));
+}
+
+TEST_CASE(
+    "adaptive-v3 bridge preserves predecessor configuration at activation",
+    "[adaptive-v3][evidence][commit][qc-skip][activation-boundary]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    const ConfigurationId predecessor{
+        7, 4, digest("v3-certified-bridge-predecessor")};
+    const ConfigurationId successor{
+        8, 0, digest("v3-certified-bridge-successor")};
+    constexpr std::uint64_t predecessor_generation = 125;
+    constexpr std::uint64_t successor_generation = 4'294'967'297ULL;
+
+    const auto without_predecessor_ingress =
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            std::nullopt,
+            successor_generation);
+    REQUIRE(without_predecessor_ingress.has_value());
+    CHECK(without_predecessor_ingress->first == predecessor);
+    CHECK(without_predecessor_ingress->second == predecessor_generation);
+
+    const auto with_predecessor_ingress =
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            predecessor_generation,
+            successor_generation);
+    REQUIRE(with_predecessor_ingress.has_value());
+    CHECK(with_predecessor_ingress->first == predecessor);
+    CHECK(with_predecessor_ingress->second == predecessor_generation);
+
+    CHECK_FALSE(
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v2,
+            predecessor,
+            successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            predecessor_generation,
+            successor_generation)
+            .has_value());
+    CHECK_FALSE(
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            successor_generation,
+            std::nullopt,
+            successor_generation,
+            std::nullopt,
+            successor_generation)
+            .has_value());
+    CHECK_FALSE(
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            predecessor_generation + 1,
+            successor_generation)
+            .has_value());
+    CHECK_FALSE(
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            predecessor_generation,
+            std::nullopt)
+            .has_value());
+
+    const ConfigurationId noncanonical_successor{
+        successor.epoch_number, 1, successor.epoch_digest};
+    CHECK_FALSE(
+        Access::authenticated_proposal_commit_event_bridge_configuration(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            noncanonical_successor,
+            successor_generation,
+            predecessor_generation,
+            successor_generation,
+            predecessor_generation,
+            successor_generation)
+            .has_value());
 }
 
 TEST_CASE(
