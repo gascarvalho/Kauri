@@ -48,6 +48,7 @@ N31_PROFILE_V11 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v11.json"
 N7_PROFILE_V12 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v12.json"
 N31_PROFILE_V12 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v12.json"
 N7_PROFILE_V13 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v13.json"
+N31_PROFILE_V13 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v13.json"
 
 
 def _synthetic_v13_profile() -> SimpleNamespace:
@@ -2088,6 +2089,25 @@ def test_focused_adapter_leaves_the_full_fallback_horizon_before_suspicion(
     assert fallback_horizon < (
         adapter.leader_activation_grace_s + adapter.leader_progress_timeout_s
     )
+
+
+@pytest.mark.parametrize(
+    ("profile_path", "expected_timeout_s"),
+    (
+        (N7_PROFILE_V13, 8.0),
+        (N31_PROFILE_V13, 20.0),
+        (N31_PROFILE_V12, 8.0),
+    ),
+)
+def test_n31_v13_alone_uses_the_scale_safe_leader_progress_budget(
+    profile_path: Path,
+    expected_timeout_s: float,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(profile_path)
+    adapter = runtime._profiled_adapter(profile, 41_720)
+
+    assert adapter.leader_progress_timeout_s == expected_timeout_s
 
 
 @pytest.mark.parametrize(

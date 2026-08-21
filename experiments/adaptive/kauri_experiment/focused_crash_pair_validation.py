@@ -156,6 +156,7 @@ _FCRASH_H_V12_PROFILE_IDS = frozenset(
 _FCRASH_H_V13_PROFILE_IDS = frozenset(
     {"n7-f2-q5-two-crash-pair-smoke-v13", "n31-f5-q21-three-crash-pair-v13"}
 )
+_N31_FCRASH_H_V13_PROFILE_ID = "n31-f5-q21-three-crash-pair-v13"
 _FCRASH_H_V13_IDENTITIES = {
     "n7-f2-q5-two-crash-pair-smoke-v13": (
         "3aa61c80d1c777db1469658532c978afc6fb52291cc6859cb5a889810541bd03",
@@ -3189,8 +3190,15 @@ def _expected_treegen_payload(contract: Mapping[str, object]) -> bytes:
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
+def _expected_leader_progress_timeout(profile_id: object) -> str:
+    return "20.0" if profile_id == _N31_FCRASH_H_V13_PROFILE_ID else "8.0"
+
+
 def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) -> None:
-    is_v13 = _mapping(contract.get("profile"), "focused profile").get("profile_id") in _FCRASH_H_V13_PROFILE_IDS
+    profile_id = _mapping(contract.get("profile"), "focused profile").get(
+        "profile_id"
+    )
+    is_v13 = profile_id in _FCRASH_H_V13_PROFILE_IDS
     treegen_path = root / "treegen.conf"
     if treegen_path.is_symlink() or not treegen_path.is_file():
         _error("client tree configuration is absent")
@@ -3232,7 +3240,7 @@ def _validate_runtime_configuration(root: Path, contract: Mapping[str, object]) 
         "fan-out": str(contract["fanout"]),
         "async_blocks": str(contract["pipeline_stretch"]),
         "aggregation-timeout": "1.0",
-        "leader-progress-timeout": "8.0",
+        "leader-progress-timeout": _expected_leader_progress_timeout(profile_id),
         "leader-activation-grace": "1.0",
         "tree-generation": "default",
         "tree-switch-period": str(
