@@ -1585,14 +1585,17 @@ TEST_CASE("pipelined leaders admit the exact local proposal before broadcast",
         source,
         "void HotStuffBase::beat()",
         "void HotStuffBase::print_pipe_queues");
+    const auto compact_beat = without_whitespace(beat);
     const auto piped_branch = without_whitespace(source_slice(
         beat,
         "block_t piped_block;",
         "piped_submitted = false;"));
 
-    const auto configuration = piped_branch.find(
+    const auto configuration = compact_beat.find(
         "constautoconfiguration=exact_configuration("
         "get_cur_epoch_nr(),get_tree_id());");
+    const auto authority = compact_beat.find(
+        "if(!may_begin_local_proposal(configuration))");
     const auto queued = piped_branch.find(
         "piped_queue.push_back(piped_block->hash);");
     const auto local_delivery =
@@ -1609,6 +1612,7 @@ TEST_CASE("pipelined leaders admit the exact local proposal before broadcast",
          "enqueue before processing, deliver locally, create the proposal "
          "through process_block, mark it delivered, and only then broadcast");
     CHECK(configuration != std::string::npos);
+    CHECK(authority != std::string::npos);
     CHECK(queued != std::string::npos);
     CHECK(local_delivery != std::string::npos);
     CHECK(exact_admission != std::string::npos);
@@ -1618,13 +1622,14 @@ TEST_CASE("pipelined leaders admit the exact local proposal before broadcast",
          "constructed Proposal");
     CHECK(piped_branch.find("Proposalprop(") == std::string::npos);
     if (configuration != std::string::npos &&
+        authority != std::string::npos &&
         queued != std::string::npos &&
         local_delivery != std::string::npos &&
         exact_admission != std::string::npos &&
         marked_delivered != std::string::npos &&
         broadcast != std::string::npos)
     {
-        CHECK(configuration < local_delivery);
+        CHECK(configuration < authority);
         CHECK(queued < exact_admission);
         CHECK(local_delivery < exact_admission);
         CHECK(exact_admission < marked_delivered);

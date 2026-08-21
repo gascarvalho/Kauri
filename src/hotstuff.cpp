@@ -13433,22 +13433,39 @@ namespace hotstuff
         return adaptive_v2_response_evidence->flush();
     }
 
+    bool HotStuffBase::may_begin_local_proposal(
+        const ConfigurationId &configuration) const noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v2 &&
+            epoch_protocol_mode != EpochProtocolMode::adaptive_v3)
+            return true;
+        if (adaptive_epoch_runtime == nullptr ||
+            proposal_contexts == nullptr ||
+            !adaptive_epoch_runtime->activation.admits_new_proposals())
+            return false;
+        const auto active =
+            adaptive_epoch_runtime->activation.active_effect();
+        if (active.configuration != configuration)
+            return false;
+        const auto proposal_configuration =
+            proposal_contexts->active_configuration();
+        if (!proposal_configuration.has_value() ||
+            *proposal_configuration != configuration)
+            return false;
+        const auto *tree = find_exact_runtime_tree(configuration);
+        if (tree == nullptr ||
+            tree->get_tree().get_tree_root() != get_id())
+            return false;
+        return epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+               adaptive_v3_activation_gate == nullptr ||
+               adaptive_v3_activation_gate->may_authorize_vote(
+                   active.configuration, active.generation);
+    }
+
     bool HotStuffBase::admit_local(const Proposal &prop)
     {
-        if ((epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
-             epoch_protocol_mode == EpochProtocolMode::adaptive_v3) &&
-            (adaptive_epoch_runtime == nullptr ||
-             !adaptive_epoch_runtime->activation.admits_new_proposals()))
+        if (!may_begin_local_proposal(prop.configuration()))
             return false;
-        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
-            adaptive_v3_activation_gate != nullptr)
-        {
-            const auto active =
-                adaptive_epoch_runtime->activation.active_effect();
-            if (!adaptive_v3_activation_gate->may_authorize_vote(
-                    active.configuration, active.generation))
-                return false;
-        }
         const auto metadata = exact_context_metadata(prop.key());
         if (!metadata.has_value() || metadata->tree.root != get_id())
             return false;
@@ -16835,6 +16852,17 @@ namespace hotstuff
         // HOTSTUFF_LOG_PROTO("[INSIDE] get_id: %d", get_id());
 
         if (proposer == get_id()) {
+            const auto configuration = exact_configuration(
+                get_cur_epoch_nr(), get_tree_id());
+            if (!may_begin_local_proposal(configuration))
+            {
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_LOCAL_PROPOSAL stage=beat_callback_exit "
+                    "replica=%u proposer=%u reason=authority_fenced",
+                    static_cast<unsigned>(get_id()),
+                    static_cast<unsigned>(proposer));
+                return;
+            }
             HOTSTUFF_LOG_PROTO("[BEAT] Proposer ID: %d, Current Replica ID: %d", proposer, get_id());
             struct timeval timeStart, timeEnd;
             gettimeofday(&timeStart, NULL);
@@ -16886,8 +16914,6 @@ namespace hotstuff
                             parents[0]->height + 1,
                             current,
                             nullptr));
-                        const auto configuration = exact_configuration(
-                            get_cur_epoch_nr(), get_tree_id());
                         piped_queue.push_back(piped_block->hash);
                         HOTSTUFF_LOG_PROTO("[PIPELINING] Pushed piped block into queue: %.10s", piped_block->hash.to_hex().c_str());
                         print_pipe_queues(true, false);

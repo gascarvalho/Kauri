@@ -1519,6 +1519,8 @@ namespace hotstuff
         std::optional<ProposalContextLease> admit_exact_context(
             const ProposalContextMetadata &metadata,
             ProposalContextOrigin origin);
+        bool may_begin_local_proposal(
+            const ConfigurationId &configuration) const noexcept;
         void activate_proposal_configuration(
             const ConfigurationId &configuration);
         void activate_initial_leader_view();

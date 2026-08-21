@@ -1278,6 +1278,59 @@ TEST_CASE("adaptive v2 exposes one fail-closed pre-vote semantic gate",
          "return result;"}));
 }
 
+TEST_CASE("adaptive proposal beats stop before construction while fenced",
+          "[adaptive-v3][activation-readiness][leader-local-admission]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto authority = function_body(
+        implementation, "bool HotStuffBase::may_begin_local_proposal(");
+    const auto local = function_body(
+        implementation, "bool HotStuffBase::admit_local(");
+    const auto beat = function_body(
+        implementation, "void HotStuffBase::beat()");
+
+    REQUIRE_FALSE(authority.empty());
+    CHECK(contains_all(
+        authority,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "activation.admits_new_proposals()",
+         "activation.active_effect()",
+         "proposal_contexts->active_configuration()",
+         "find_exact_runtime_tree(configuration)",
+         "tree->get_tree().get_tree_root() != get_id()",
+         "adaptive_v3_activation_gate->may_authorize_vote("}));
+
+    REQUIRE_FALSE(local.empty());
+    CHECK(contains_in_order(
+        local,
+        {"may_begin_local_proposal(prop.configuration())",
+         "exact_context_metadata(prop.key())",
+         "pre_vote_epoch_change_gate(prop)",
+         "admit_exact_context("}));
+
+    REQUIRE_FALSE(beat.empty());
+    const auto authority_check = beat.find(
+        "if (!may_begin_local_proposal(configuration))");
+    const auto command_reservation = beat.find(
+        "reserve_adaptive_v2_command(parents, false)");
+    const auto consume_commands = beat.find(
+        "auto cmds = std::move(final_buffer)");
+    const auto create_block = beat.find(
+        "piped_block = storage->add_blk(new Block(");
+    const auto local_delivery = beat.find("on_deliver_blk(piped_block)");
+    REQUIRE(authority_check != std::string::npos);
+    REQUIRE(command_reservation != std::string::npos);
+    REQUIRE(consume_commands != std::string::npos);
+    REQUIRE(create_block != std::string::npos);
+    REQUIRE(local_delivery != std::string::npos);
+    CHECK(authority_check < command_reservation);
+    CHECK(authority_check < consume_commands);
+    CHECK(authority_check < create_block);
+    CHECK(authority_check < local_delivery);
+    CHECK(beat.find("reason=authority_fenced") != std::string::npos);
+}
+
 TEST_CASE("active proposals pass the semantic gate before protocol mutation",
           "[c08][epoch-change][pre-vote][integration][intentional-red]")
 {
@@ -2293,9 +2346,7 @@ TEST_CASE("adaptive v2 activates only from the matching post-block command",
     REQUIRE_FALSE(admit_local.empty());
     CHECK(contains_in_order(
         admit_local,
-        {"EpochProtocolMode::adaptive_v2",
-         "adaptive_epoch_runtime",
-         "activation.admits_new_proposals()",
+        {"may_begin_local_proposal(prop.configuration())",
          "return false"}));
     REQUIRE_FALSE(finish_commit.empty());
     CHECK(contains_in_order(
