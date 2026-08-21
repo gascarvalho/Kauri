@@ -4068,6 +4068,14 @@ def _reconstruct_v13_certified_readiness(
             ):
                 _error("v13 replica activation certificate binding drifted")
 
+        ordered_acknowledgements = sorted(
+            acknowledgements.values(),
+            key=lambda row: _integer(
+                row.get("source_sequence"), "v13 ACK manager sequence", 1
+            ),
+        )
+        if len(ordered_acknowledgements) < 2:
+            _error("v13 certified cycle has fewer than two ACK observations")
         results.append({
             "cycle_ordinal": ordinal,
             "identity": identity,
@@ -4080,9 +4088,15 @@ def _reconstruct_v13_certified_readiness(
                 _integer(row.get("source_sequence"), "v13 final ACK sequence", 1)
                 for row in acknowledgements.values()
             ),
-            "final_ack_manager_time_ns": max(
-                _uint64(row.get("source_monotonic_ns"), "v13 final ACK time", 1)
-                for row in acknowledgements.values()
+            "pre_final_ack_manager_time_ns": _uint64(
+                ordered_acknowledgements[-2].get("source_monotonic_ns"),
+                "v13 pre-final ACK envelope time",
+                1,
+            ),
+            "final_ack_manager_time_ns": _uint64(
+                ordered_acknowledgements[-1].get("source_monotonic_ns"),
+                "v13 final ACK envelope time",
+                1,
             ),
         })
 
@@ -4527,11 +4541,17 @@ def _validate_v13_e2_common_commit(
         _error("v13 E2 audit does not bind the certified E1 bundle")
 
     final_ack = _uint64(e2_payload.get("e2_final_ack_raw_ns"), "v13 E2 final ACK", 1)
-    if final_ack != _uint64(
-        readiness_cycles[0].get("final_ack_manager_time_ns"),
-        "v13 certified E1 final ACK time",
+    prior_ack_envelope = _uint64(
+        readiness_cycles[0].get("pre_final_ack_manager_time_ns"),
+        "v13 certified E1 pre-final ACK envelope time",
         1,
-    ):
+    )
+    final_ack_envelope = _uint64(
+        readiness_cycles[0].get("final_ack_manager_time_ns"),
+        "v13 certified E1 final ACK envelope time",
+        1,
+    )
+    if not prior_ack_envelope <= final_ack <= final_ack_envelope:
         _error("v13 E2 final ACK anchor differs from the certified E1 chain")
     common_tick = _uint64(
         e2_payload.get("e2_common_commit_raw_ns"), "v13 E2 common commit tick", 1
@@ -6091,6 +6111,25 @@ def _v13_commit_identity_projection(
     return identity, generation
 
 
+def _v13_commit_cross_source_projection(
+    physical: Mapping[str, object],
+) -> tuple[object, object, object, object]:
+    """Project only fields that are invariant across replica-local commits.
+
+    ``commit_batch_index`` is the position within one replica's local decide
+    batch.  It remains exact for the adjacent observation/carrier check, but
+    it is not a physical block identity and can legitimately differ between
+    replicas committing the same block.
+    """
+
+    return (
+        physical["block_height"],
+        physical["block_hash"],
+        physical["parent_hash"],
+        physical["transaction_count"],
+    )
+
+
 def _v13_reconstruct_authoritative_commits(
     events: Sequence[Mapping[str, Any]], contract: Mapping[str, object]
 ) -> list[dict[str, Any]]:
@@ -6208,7 +6247,10 @@ def _v13_reconstruct_authoritative_commits(
         matching = [
             carrier
             for carrier in carriers
-            if carrier_physical[id(carrier)] == physical
+            if _v13_commit_cross_source_projection(
+                carrier_physical[id(carrier)]
+            )
+            == _v13_commit_cross_source_projection(physical)
         ]
         if not matching:
             _error("v13 designated commit observation lacks an exact identity")
@@ -6260,8 +6302,42 @@ def _v13_reconstruct_authoritative_commits(
                 ),
             }
         )
-    if consumed_carriers != {id(carrier) for carrier in carriers}:
-        _error("v13 commit identity carrier is orphaned")
+    orphaned = [
+        carrier for carrier in carriers if id(carrier) not in consumed_carriers
+    ]
+    if orphaned:
+        # Coordinated shutdown is source-local: a non-designated replica may
+        # commit a strict canonical suffix after the designated observer's
+        # last durable row.  Such rows cannot contribute to throughput or
+        # transition claims, but rejecting them would make a valid sealed run
+        # depend on shutdown scheduling.  Admit only one conflict-free,
+        # contiguous extension of the designated tip; any orphan at or below
+        # the authoritative height, gap, fork, or parent mismatch fails.
+        tip = max(
+            authoritative_observations,
+            key=lambda event: observed_physical[id(event)]["block_height"],
+        )
+        tip_physical = observed_physical[id(tip)]
+        tip_height = int(tip_physical["block_height"])
+        suffix_by_height: dict[int, tuple[object, object, object, object]] = {}
+        for carrier in orphaned:
+            physical = carrier_physical[id(carrier)]
+            height = int(physical["block_height"])
+            projection = _v13_commit_cross_source_projection(physical)
+            if height <= tip_height:
+                _error("v13 commit identity carrier is orphaned")
+            prior = suffix_by_height.setdefault(height, projection)
+            if prior != projection:
+                _error("v13 commit identity carrier suffix conflicts")
+        heights = sorted(suffix_by_height)
+        if heights != list(range(tip_height + 1, heights[-1] + 1)):
+            _error("v13 commit identity carrier suffix is not contiguous")
+        parent_hash = tip_physical["block_hash"]
+        for height in heights:
+            projection = suffix_by_height[height]
+            if projection[2] != parent_hash:
+                _error("v13 commit identity carrier suffix parent drifted")
+            parent_hash = projection[1]
     return reconstructed
 
 

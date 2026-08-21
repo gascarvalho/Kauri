@@ -1384,7 +1384,9 @@ def test_v13_native_e2_common_commit_mutations_fail_closed(
     elif mutation == "audit_before_atomic_begin":
         e2["source_monotonic_ns"] = e2["payload"]["e2_actual_begin_raw_ns"] - 1
     elif mutation == "wrong_final_ack_anchor":
-        cycles[0]["final_ack_manager_time_ns"] += 1
+        e2["payload"]["e2_final_ack_raw_ns"] = (
+            cycles[0]["final_ack_manager_time_ns"] + 1
+        )
     elif mutation == "wrong_e1_bundle_digest":
         e2["payload"]["e1_bundle_digest"] = "ff" * 32
     else:  # pragma: no cover - parameter list is exhaustive
@@ -1419,6 +1421,95 @@ def test_v13_native_e2_common_commit_uses_cross_source_identity_witnesses() -> N
     events.remove(authoritative)
 
     validation._validate_v13_e2_common_commit(events, contract, cycles)
+
+
+def test_v13_commit_reconstruction_accepts_replica_local_batch_skew() -> None:
+    validation, original_events, contract, _cycles = _native_v13_e2_common_state()
+    events = deepcopy(original_events)
+    witness = next(
+        event
+        for event in events
+        if event["event_type"] == "block.commit_identity_witness"
+    )
+    observation = next(
+        event
+        for event in events
+        if event["event_type"] == "block.commit_observed"
+        and event["source_id"] == witness["source_id"]
+        and event["payload"]["block_hash"] == witness["payload"]["block_hash"]
+        and event["payload"]["block_height"]
+        == witness["payload"]["block_height"]
+    )
+    observation["payload"]["commit_batch_index"] += 1
+    witness["payload"]["commit_batch_index"] += 1
+
+    validation._v13_reconstruct_authoritative_commits(events, contract)
+
+
+@pytest.mark.parametrize(
+    ("orphan_height_delta", "parent_matches", "accepted"),
+    [
+        (1, True, True),
+        (0, True, False),
+        (2, True, False),
+        (1, False, False),
+    ],
+)
+def test_v13_commit_reconstruction_bounds_shutdown_suffix(
+    orphan_height_delta: int,
+    parent_matches: bool,
+    accepted: bool,
+) -> None:
+    validation, original_events, contract, _cycles = _native_v13_e2_common_state()
+    events = deepcopy(original_events)
+    authoritative = [
+        event
+        for event in events
+        if event["event_type"] == "block.commit_observed"
+        and event["source_id"] == contract["authoritative_source_id"]
+    ]
+    tip = max(authoritative, key=lambda event: event["payload"]["block_height"])
+    witness_template = next(
+        event
+        for event in events
+        if event["event_type"] == "block.commit_identity_witness"
+    )
+    observation_template = next(
+        event
+        for event in events
+        if event["event_type"] == "block.commit_observed"
+        and event["source_id"] == witness_template["source_id"]
+        and event["source_sequence"] + 1 == witness_template["source_sequence"]
+    )
+    observation = deepcopy(observation_template)
+    witness = deepcopy(witness_template)
+    source_events = [
+        event for event in events if event["source_id"] == witness["source_id"]
+    ]
+    next_sequence = max(event["source_sequence"] for event in source_events) + 1
+    next_time = max(event["source_monotonic_ns"] for event in source_events) + 1
+    block_hash = "ef" * 32
+    height = tip["payload"]["block_height"] + orphan_height_delta
+    for event, sequence, timestamp in (
+        (observation, next_sequence, next_time),
+        (witness, next_sequence + 1, next_time + 1),
+    ):
+        event["source_sequence"] = sequence
+        event["source_monotonic_ns"] = timestamp
+        event["payload"]["block_height"] = height
+        event["payload"]["block_hash"] = block_hash
+        event["payload"]["parent_hash"] = (
+            tip["payload"]["block_hash"] if parent_matches else "ab" * 32
+        )
+        event["payload"]["commit_batch_index"] = 0
+    witness["payload"]["decision_proof"]["block_hash"] = block_hash
+    events.extend((observation, witness))
+
+    if accepted:
+        validation._v13_reconstruct_authoritative_commits(events, contract)
+    else:
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation._v13_reconstruct_authoritative_commits(events, contract)
 
 
 @pytest.mark.parametrize(

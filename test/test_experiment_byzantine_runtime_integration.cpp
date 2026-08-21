@@ -4321,6 +4321,23 @@ TEST_CASE(
         runtime, successor.epoch_number + 1);
     CHECK_FALSE(Access::has_retained_commit_event_identity(
         runtime, predecessor_intermediate.block_hash));
+
+    // A predecessor proposal authenticated before activation may remain in
+    // the bounded commit pipeline after the successor becomes active. Its
+    // evidence identity survives exactly that adjacent epoch and no further.
+    const ProposalKey preactivation_pending{
+        predecessor, digest("v3-preactivation-pending-commit")};
+    REQUIRE(Access::retain_commit_event_identity(
+        runtime, preactivation_pending, predecessor_generation));
+    Access::forget_retained_commit_event_identities_before_epoch(
+        runtime, successor.epoch_number);
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, preactivation_pending.block_hash));
+    Access::forget_retained_commit_event_identities_before_epoch(
+        runtime, successor.epoch_number + 1);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, preactivation_pending.block_hash));
+
     const ProposalKey overextended_intermediate{
         predecessor, digest("v3-boundary-overextended-intermediate")};
     CHECK_FALSE(Access::retain_commit_event_identity_through_epoch(

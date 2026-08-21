@@ -14471,7 +14471,18 @@ namespace hotstuff
                      retained_commit_event_identities.begin();
                  retained != retained_commit_event_identities.end();)
             {
-                if (retained->second.max_observed_epoch < first_live_epoch)
+                const auto retained_epoch =
+                    retained->second.max_observed_epoch;
+                const bool preserve_adjacent_v3_predecessor =
+                    epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+                    retained->second.key.has_value() &&
+                    retained->second.key->configuration.epoch_number ==
+                        retained_epoch &&
+                    retained_epoch !=
+                        std::numeric_limits<std::uint32_t>::max() &&
+                    retained_epoch + 1 == first_live_epoch;
+                if (retained_epoch < first_live_epoch &&
+                    !preserve_adjacent_v3_predecessor)
                     retained = retained_commit_event_identities.erase(
                         retained);
                 else
