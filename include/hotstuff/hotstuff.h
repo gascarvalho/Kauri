@@ -1358,6 +1358,12 @@ namespace hotstuff
             adaptive_v2_command_inbox;
         std::optional<std::uint64_t>
             adaptive_v2_pending_command_reservation;
+        // A successfully bound adaptive-v3 epoch command gets one bounded
+        // root-to-member exposure while its exact predecessor context is
+        // still admissible.  This is liveness-only: every recipient still
+        // authenticates and validates the ordinary proposal envelope.
+        std::optional<ProposalKey>
+            adaptive_v3_pending_command_priority_fanout;
         std::size_t epoch_change_maximum_block_extra_bytes{0};
         std::size_t epoch_change_maximum_ancestry_blocks{0};
         struct CommittedEpochChangeHistoryState

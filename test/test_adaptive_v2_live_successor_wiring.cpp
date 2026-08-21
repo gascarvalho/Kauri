@@ -610,6 +610,61 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "adaptive v3 epoch commands receive one pre-QC priority exposure",
+    "[we08][adaptive-v3][live-successor][proposal-wiring][liveness]")
+{
+    const auto header = source("include/hotstuff/hotstuff.h");
+    const auto implementation = code_without_comments_or_literals(
+        source("src/hotstuff.cpp"));
+    const auto local_hook = function_body(
+        implementation,
+        "void HotStuffBase::on_local_proposal_processed(");
+    const auto broadcast = function_body(
+        implementation,
+        "void HotStuffBase::do_broadcast_proposal(");
+
+    REQUIRE_FALSE(local_hook.empty());
+    REQUIRE_FALSE(broadcast.empty());
+    CHECK(header.find("adaptive_v3_pending_command_priority_fanout") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        local_hook,
+        {".mark_proposed(",
+         "epoch_protocol_mode == EpochProtocolMode::adaptive_v3",
+         "adaptive_v3_pending_command_priority_fanout = key"}));
+
+    const auto claim = broadcast.find(
+        "*adaptive_v3_pending_command_priority_fanout == prop.key()");
+    const auto consume = broadcast.find(
+        "adaptive_v3_pending_command_priority_fanout.reset()", claim);
+    const auto guard = broadcast.find(
+        "if (adaptive_v3_command_priority_fanout", consume);
+    const auto assigned = broadcast.find(
+        "metadata->tree.assigned_subtree", guard);
+    const auto priority = broadcast.find(
+        "pn.send_msg_priority(", assigned);
+    const auto ordinary = broadcast.find(
+        "metadata->tree.direct_children", priority);
+    REQUIRE(claim != std::string::npos);
+    REQUIRE(consume != std::string::npos);
+    REQUIRE(guard != std::string::npos);
+    REQUIRE(assigned != std::string::npos);
+    REQUIRE(priority != std::string::npos);
+    REQUIRE(ordinary != std::string::npos);
+    CHECK(claim < consume);
+    CHECK(consume < guard);
+    CHECK(guard < assigned);
+    CHECK(assigned < priority);
+    CHECK(priority < ordinary);
+    CHECK(contains_all(
+        broadcast.substr(guard, ordinary - guard),
+        {"metadata->tree.root == get_id()",
+         "!metadata->tree.parent.has_value()",
+         "member == get_id()",
+         "MsgPropose(DataStream(adaptive_payload))"}));
+}
+
+TEST_CASE(
     "commit and activation wiring retires live successor material exactly",
     "[we08][adaptive-v2][live-successor][commit][activation]"
     "[wiring][intentional-red]")

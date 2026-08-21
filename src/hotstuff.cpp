@@ -13703,7 +13703,10 @@ namespace hotstuff
             static_cast<void>(command_inbox.release(reservation_token));
             HOTSTUFF_LOG_WARN(
                 "[EPOCH] Failed to bind successor command to exact proposal");
+            return;
         }
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+            adaptive_v3_pending_command_priority_fanout = key;
     }
 
     void HotStuffBase::on_verified_commit_progress(
@@ -13724,6 +13727,13 @@ namespace hotstuff
             prop.configuration().epoch_number,
             prop.configuration().tree_id,
             prop.key().block_hash.to_hex().c_str());
+
+        const bool adaptive_v3_command_priority_fanout =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            adaptive_v3_pending_command_priority_fanout.has_value() &&
+            *adaptive_v3_pending_command_priority_fanout == prop.key();
+        if (adaptive_v3_command_priority_fanout)
+            adaptive_v3_pending_command_priority_fanout.reset();
 
         const auto *tree = find_exact_runtime_tree(prop.configuration());
         if (tree == nullptr)
@@ -13919,6 +13929,44 @@ namespace hotstuff
 
         std::size_t send_attempts = 0;
         std::size_t send_successes = 0;
+        if (adaptive_v3_command_priority_fanout &&
+            metadata->tree.root == get_id() &&
+            !metadata->tree.parent.has_value())
+        {
+            std::size_t priority_attempts = 0;
+            std::size_t priority_successes = 0;
+            for (const auto member : metadata->tree.assigned_subtree)
+            {
+                if (member == get_id())
+                    continue;
+                ++priority_attempts;
+                bool enqueued = false;
+                try
+                {
+                    enqueued = pn.send_msg_priority(
+                        MsgPropose(DataStream(adaptive_payload)),
+                        config.get_peer_id(member));
+                }
+                catch (...)
+                {
+                    // This optimization can only improve exposure. The
+                    // ordinary tree broadcast and bounded repair path remain
+                    // authoritative when an individual enqueue fails.
+                }
+                if (enqueued)
+                    ++priority_successes;
+            }
+            HOTSTUFF_LOG_INFO(
+                "KAURI_PROPOSAL_BROADCAST stage=v3_command_priority_fanout "
+                "outcome=complete root=%u epoch=%u tree=%u block=%s "
+                "attempts=%zu successes=%zu",
+                static_cast<unsigned>(get_id()),
+                prop.configuration().epoch_number,
+                prop.configuration().tree_id,
+                prop.key().block_hash.to_hex().c_str(),
+                priority_attempts,
+                priority_successes);
+        }
         for (const auto child : metadata->tree.direct_children)
         {
             bool enqueued = false;
