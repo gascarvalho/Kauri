@@ -2133,6 +2133,53 @@ def test_n31_v13_alone_uses_the_scale_safe_timeout_streak(
     assert policy["maximum_timeout_rate_ppm"] == 250_000
 
 
+def test_n31_v13_raw_ranking_replay_uses_the_scale_safe_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N31_PROFILE_V13)
+    source = object.__new__(runtime.FocusedRawEvidenceSource)
+    source._profile = profile
+    source._bundle = lambda _epoch: (
+        b"",
+        SimpleNamespace(epoch_digest="11" * 32, generation_seed=41_719),
+    )
+    events = [
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "event_type": "adaptive_v2_evidence_snapshot",
+            "payload": {
+                "predecessor_epoch_number": 0,
+                "predecessor_epoch_digest": profile.raw["topology"][
+                    "epoch_zero_digest"
+                ],
+                "baseline_cutoff": 1,
+                "current_cutoff": 2,
+            },
+        },
+        {
+            "source_kind": "adaptation_manager",
+            "source_id": "adaptive-manager",
+            "event_type": "fault_window_armed",
+            "payload": {"evidence_start_monotonic_ns": 1},
+        },
+    ]
+
+    def reject_after_policy_check(_events: object, **kwargs: object) -> object:
+        assert kwargs["policy"]["attempt_window"] == 32
+        assert kwargs["policy"]["trailing_timeout_streak"] == 32
+        raise runtime.factorial_validation.FactorialValidationError("test stop")
+
+    monkeypatch.setattr(
+        runtime.factorial_validation,
+        "replay_native_adaptation_snapshot",
+        reject_after_policy_check,
+    )
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError, match="ranking replay"):
+        source._ranking(events, predecessor_epoch=0)
+
+
 @pytest.mark.parametrize(
     ("profile_path", "expected"),
     (

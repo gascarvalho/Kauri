@@ -5036,7 +5036,7 @@ class FocusedRawEvidenceSource:
                 current_evidence_cutoff=_integer(
                     audit.get("current_cutoff"), "ranking current cutoff", 1
                 ),
-                policy=_NATIVE_RESPONSIVENESS_POLICY,
+                policy=_native_responsiveness_policy(self._profile.profile_id),
                 seed=_integer(epoch1.generation_seed, "ranking seed"),
                 suffix_only=predecessor == 1,
                 allowed_schema_versions=(
