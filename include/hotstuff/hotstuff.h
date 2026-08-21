@@ -1726,6 +1726,10 @@ namespace hotstuff
         bool retain_commit_event_identity(
             const ProposalKey &key,
             std::uint64_t generation) noexcept;
+        bool retain_commit_event_identity_through_epoch(
+            const ProposalKey &key,
+            std::uint64_t generation,
+            std::uint32_t last_live_epoch) noexcept;
         static bool has_adjacent_proposal_commit_event_bridge_heights(
             std::uint32_t alternate_height,
             std::uint32_t skipped_height,

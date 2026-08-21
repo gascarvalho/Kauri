@@ -14082,6 +14082,42 @@ namespace hotstuff
         }
     }
 
+    bool HotStuffBase::retain_commit_event_identity_through_epoch(
+        const ProposalKey &key,
+        std::uint64_t generation,
+        std::uint32_t last_live_epoch) noexcept
+    {
+        const auto identity_epoch = key.configuration.epoch_number;
+        const bool adjacent_v3_retention =
+            epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            identity_epoch != std::numeric_limits<std::uint32_t>::max() &&
+            last_live_epoch == identity_epoch + 1;
+        if (last_live_epoch < identity_epoch ||
+            (last_live_epoch != identity_epoch &&
+             !adjacent_v3_retention) ||
+            !retain_commit_event_identity(key, generation))
+            return false;
+        try
+        {
+            const auto retained =
+                retained_commit_event_identities.find(key.block_hash);
+            if (retained == retained_commit_event_identities.end() ||
+                retained->second.key != key ||
+                retained->second.view_generation != generation)
+                return false;
+            retained->second.max_observed_epoch = std::max(
+                retained->second.max_observed_epoch, last_live_epoch);
+            return true;
+        }
+        catch (...)
+        {
+            // Extending evidence retention can only preserve an already
+            // authenticated exact identity. Failure leaves the original
+            // bounded lifetime unchanged and cannot affect consensus.
+            return false;
+        }
+    }
+
     bool HotStuffBase::has_adjacent_proposal_commit_event_bridge_heights(
         std::uint32_t alternate_height,
         std::uint32_t skipped_height,
@@ -14180,11 +14216,13 @@ namespace hotstuff
 
         const auto retain_owned = [this, rollback](
             const ProposalKey &key,
-            std::uint64_t retained_generation) noexcept {
+            std::uint64_t retained_generation,
+            std::uint32_t last_live_epoch) noexcept {
             const bool absent_before =
                 retained_commit_event_identities.find(key.block_hash) ==
                 retained_commit_event_identities.end();
-            if (!retain_commit_event_identity(key, retained_generation))
+            if (!retain_commit_event_identity_through_epoch(
+                    key, retained_generation, last_live_epoch))
                 return false;
             if (absent_before && rollback != nullptr &&
                 rollback->owned_mutation_count <
@@ -14196,7 +14234,10 @@ namespace hotstuff
             return true;
         };
 
-        if (!retain_owned(proposal.key(), generation))
+        if (!retain_owned(
+                proposal.key(),
+                generation,
+                proposal.key().configuration.epoch_number))
             return false;
 
         try
@@ -14290,7 +14331,9 @@ namespace hotstuff
                 // evidence-only and does not enter proposal admission,
                 // voting, rotation, or cadence.
                 if (!retain_owned(
-                        alternate_key, bridged_configuration->second))
+                        alternate_key,
+                        bridged_configuration->second,
+                        certifier_key.configuration.epoch_number))
                     return false;
             }
 
@@ -14310,7 +14353,8 @@ namespace hotstuff
                     intermediates[index]->get_hash()};
                 if (!retain_owned(
                         intermediate_key,
-                        bridged_configuration->second))
+                        bridged_configuration->second,
+                        certifier_key.configuration.epoch_number))
                     return false;
             }
             return true;

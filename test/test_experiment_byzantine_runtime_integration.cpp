@@ -81,6 +81,28 @@ public:
         return runtime.retain_commit_event_identity(key, generation);
     }
 
+    static bool retain_commit_event_identity_through_epoch(
+        HotStuffBase &runtime,
+        const ProposalKey &key,
+        std::uint64_t generation,
+        std::uint32_t last_live_epoch)
+    {
+        return runtime.retain_commit_event_identity_through_epoch(
+            key, generation, last_live_epoch);
+    }
+
+    static std::optional<std::uint32_t>
+    retained_commit_event_identity_last_live_epoch(
+        const HotStuffBase &runtime,
+        const uint256_t &block_hash)
+    {
+        const auto retained =
+            runtime.retained_commit_event_identities.find(block_hash);
+        if (retained == runtime.retained_commit_event_identities.end())
+            return std::nullopt;
+        return retained->second.max_observed_epoch;
+    }
+
     static bool retain_authenticated_proposal_commit_event_identities(
         HotStuffBase &runtime,
         const Proposal &proposal,
@@ -4137,6 +4159,49 @@ TEST_CASE(
             predecessor_generation,
             successor_generation)
             .has_value());
+
+    ScopedSigpipeIgnore sigpipe_ignore;
+    EventContext event_context;
+    TestHotStuff runtime(
+        1,
+        1,
+        bytearray_t{},
+        NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1),
+        event_context,
+        0,
+        HotStuffBase::Net::Config(),
+        NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+    const ProposalKey predecessor_intermediate{
+        predecessor, digest("v3-boundary-retained-intermediate")};
+    REQUIRE(Access::retain_commit_event_identity_through_epoch(
+        runtime,
+        predecessor_intermediate,
+        predecessor_generation,
+        successor.epoch_number));
+    CHECK(
+        Access::retained_commit_event_identity_last_live_epoch(
+            runtime, predecessor_intermediate.block_hash) ==
+        successor.epoch_number);
+    Access::forget_retained_commit_event_identities_before_epoch(
+        runtime, successor.epoch_number);
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, predecessor_intermediate.block_hash));
+    Access::forget_retained_commit_event_identities_before_epoch(
+        runtime, successor.epoch_number + 1);
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, predecessor_intermediate.block_hash));
+    const ProposalKey overextended_intermediate{
+        predecessor, digest("v3-boundary-overextended-intermediate")};
+    CHECK_FALSE(Access::retain_commit_event_identity_through_epoch(
+        runtime,
+        overextended_intermediate,
+        predecessor_generation,
+        successor.epoch_number + 1));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, overextended_intermediate.block_hash));
 }
 
 TEST_CASE(
