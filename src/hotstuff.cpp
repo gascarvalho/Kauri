@@ -14095,6 +14095,27 @@ namespace hotstuff
                certifier_height == skipped_height + 1;
     }
 
+    bool HotStuffBase::
+    has_bounded_proposal_commit_event_bridge_intermediates(
+        EpochProtocolMode mode,
+        const ConfigurationId &alternate_configuration,
+        const ConfigurationId &certifier_configuration,
+        std::size_t intermediate_count) noexcept
+    {
+        if (intermediate_count == 1)
+            return true;
+        return intermediate_count ==
+                   maximum_proposal_commit_event_bridge_intermediates &&
+               mode == EpochProtocolMode::adaptive_v3 &&
+               alternate_configuration.epoch_number !=
+                   std::numeric_limits<std::uint32_t>::max() &&
+               certifier_configuration.epoch_number ==
+                   alternate_configuration.epoch_number + 1 &&
+               certifier_configuration.tree_id == 0 &&
+               certifier_configuration.epoch_digest !=
+                   alternate_configuration.epoch_digest;
+    }
+
     std::optional<std::pair<ConfigurationId, std::uint64_t>>
     HotStuffBase::
     authenticated_proposal_commit_event_bridge_configuration(
@@ -14181,23 +14202,56 @@ namespace hotstuff
         try
         {
             const auto &certifier = proposal.blk;
-            if (certifier->parents.size() != 1)
+            if (certifier->parents.size() != 1 ||
+                certifier->qc_ref == nullptr)
                 return true;
-            const auto &skipped = certifier->parents.front();
-            if (skipped == nullptr || skipped->parents.size() != 1)
+            const auto &alternate = certifier->qc_ref;
+            std::array<block_t,
+                       maximum_proposal_commit_event_bridge_intermediates>
+                intermediates{};
+            std::size_t intermediate_count = 0;
+            auto cursor = certifier->parents.front();
+            while (cursor != alternate)
+            {
+                if (cursor == nullptr ||
+                    intermediate_count == intermediates.size() ||
+                    cursor->parents.size() != 1 ||
+                    !has_verified_legal_qc_skip(certifier, cursor))
+                    return true;
+                intermediates[intermediate_count++] = cursor;
+                cursor = cursor->parents.front();
+            }
+            if (intermediate_count == 0)
                 return true;
-            const auto &alternate = skipped->parents.front();
-            if (alternate == nullptr || certifier->qc_ref != alternate ||
-                !has_adjacent_proposal_commit_event_bridge_heights(
-                    alternate->height,
-                    skipped->height,
-                    certifier->height) ||
-                !has_verified_legal_qc_skip(certifier, skipped))
+
+            auto physical_predecessor = alternate;
+            for (std::size_t index = intermediate_count; index-- > 0;)
+            {
+                const auto &intermediate = intermediates[index];
+                if (physical_predecessor == nullptr ||
+                    physical_predecessor->height ==
+                        std::numeric_limits<std::uint32_t>::max() ||
+                    intermediate->height !=
+                        physical_predecessor->height + 1 ||
+                    intermediate->parents.front() != physical_predecessor)
+                    return true;
+                physical_predecessor = intermediate;
+            }
+            if (physical_predecessor->height ==
+                    std::numeric_limits<std::uint32_t>::max() ||
+                certifier->height != physical_predecessor->height + 1 ||
+                certifier->parents.front() != physical_predecessor)
                 return true;
 
             const auto &alternate_key =
                 certifier->qc->get_proposal_key();
             const auto &certifier_key = proposal.key();
+            if (!has_bounded_proposal_commit_event_bridge_intermediates(
+                    epoch_protocol_mode,
+                    alternate_key.configuration,
+                    certifier_key.configuration,
+                    intermediate_count))
+                return true;
             const auto alternate_ingress =
                 authenticated_proposal_ingress.find(alternate_key);
             const auto certifier_ingress =
@@ -14230,9 +14284,9 @@ namespace hotstuff
                 // may activate while predecessor blocks are still draining,
                 // so the designated observer can first see the certified
                 // successor chain at this authenticated certifier. Retain
-                // both the QC-authenticated alternate and its single
-                // adjacent physical successor under the exact predecessor
-                // configuration/generation authorized above. This is
+                // the QC-authenticated alternate and its bounded physical
+                // successors under the exact predecessor configuration and
+                // generation authorized above. This is
                 // evidence-only and does not enter proposal admission,
                 // voting, rotation, or cadence.
                 if (!retain_owned(
@@ -14240,17 +14294,26 @@ namespace hotstuff
                     return false;
             }
 
-            const ProposalKey skipped_key{
-                bridged_configuration->first,
-                skipped->get_hash()};
             // This bridge is deliberately evidence-only. The verified QC
             // carries the alternate's exact key, while the authenticated
             // certifier and exact active/draining runtimes bind the boundary
             // configuration and generation. V2 additionally requires
-            // alternate ingress. The recovered key never enters proposal
-            // admission, cadence, rotation, or consensus identity state.
-            return retain_owned(
-                skipped_key, bridged_configuration->second);
+            // alternate ingress. V2 remains limited to one skipped physical
+            // ancestor. V3 may recover a second only across the exact
+            // adjacent activation boundary. Recovered keys never enter
+            // proposal admission, cadence, rotation, or consensus identity
+            // state.
+            for (std::size_t index = intermediate_count; index-- > 0;)
+            {
+                const ProposalKey intermediate_key{
+                    bridged_configuration->first,
+                    intermediates[index]->get_hash()};
+                if (!retain_owned(
+                        intermediate_key,
+                        bridged_configuration->second))
+                    return false;
+            }
+            return true;
         }
         catch (...)
         {

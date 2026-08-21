@@ -166,6 +166,20 @@ public:
                 certifier_height);
     }
 
+    static bool has_bounded_proposal_commit_event_bridge_intermediates(
+        EpochProtocolMode mode,
+        const ConfigurationId &alternate_configuration,
+        const ConfigurationId &certifier_configuration,
+        std::size_t intermediate_count)
+    {
+        return HotStuffBase::
+            has_bounded_proposal_commit_event_bridge_intermediates(
+                mode,
+                alternate_configuration,
+                certifier_configuration,
+                intermediate_count);
+    }
+
     static std::optional<std::pair<ConfigurationId, std::uint64_t>>
     authenticated_proposal_commit_event_bridge_configuration(
         EpochProtocolMode mode,
@@ -3891,6 +3905,59 @@ TEST_CASE(
     CHECK(skipped_event->decision_proof == skipped_key);
     CHECK(skipped_event->view_generation == generation);
 
+    const auto bounded_alternate = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        certifier,
+        certifier,
+        "v3-bounded-bridge-alternate");
+    const auto bounded_first = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        bounded_alternate,
+        certifier,
+        "v3-bounded-bridge-first");
+    const auto bounded_second = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        bounded_first,
+        certifier,
+        "v3-bounded-bridge-second");
+    const auto bounded_certifier = Access::add_commit_rule_block(
+        runtime,
+        configuration,
+        bounded_second,
+        bounded_alternate,
+        "v3-bounded-bridge-certifier");
+    const ProposalKey bounded_alternate_key{
+        configuration, bounded_alternate->get_hash()};
+    const ProposalKey bounded_first_key{
+        configuration, bounded_first->get_hash()};
+    const ProposalKey bounded_second_key{
+        configuration, bounded_second->get_hash()};
+    const ProposalKey bounded_certifier_key{
+        configuration, bounded_certifier->get_hash()};
+    Access::seed_view_generation(
+        runtime, bounded_certifier_key, *generation, 3);
+    REQUIRE(Access::retain_authenticated_proposal_commit_event_identities(
+        runtime,
+        Proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            bounded_certifier,
+            nullptr),
+        *generation));
+    CHECK(Access::has_retained_commit_event_identity(
+        runtime, bounded_certifier_key.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, bounded_alternate_key.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, bounded_first_key.block_hash));
+    CHECK_FALSE(Access::has_retained_commit_event_identity(
+        runtime, bounded_second_key.block_hash));
+
     const auto drift_alternate = Access::add_commit_rule_block(
         runtime,
         configuration,
@@ -3974,6 +4041,43 @@ TEST_CASE(
     REQUIRE(with_predecessor_ingress.has_value());
     CHECK(with_predecessor_ingress->first == predecessor);
     CHECK(with_predecessor_ingress->second == predecessor_generation);
+
+    CHECK(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            1));
+    CHECK(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            2));
+    CHECK_FALSE(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v2,
+            predecessor,
+            successor,
+            2));
+    CHECK_FALSE(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            predecessor,
+            2));
+    CHECK_FALSE(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            0));
+    CHECK_FALSE(
+        Access::has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode::adaptive_v3,
+            predecessor,
+            successor,
+            3));
 
     CHECK_FALSE(
         Access::authenticated_proposal_commit_event_bridge_configuration(

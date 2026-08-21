@@ -1459,10 +1459,12 @@ namespace hotstuff
         };
         struct RetainedCommitEventIdentityRollback
         {
-            std::array<RetainedCommitEventIdentityOwnedMutation, 3>
+            std::array<RetainedCommitEventIdentityOwnedMutation, 4>
                 owned_mutations{};
             std::size_t owned_mutation_count{0};
         };
+        static constexpr std::size_t
+            maximum_proposal_commit_event_bridge_intermediates{2};
         // Evidence-only block-hash projection captured after proposal
         // authentication. A disengaged key/generation is a permanent
         // conflict tombstone and is never usable by protocol state.
@@ -1728,6 +1730,12 @@ namespace hotstuff
             std::uint32_t alternate_height,
             std::uint32_t skipped_height,
             std::uint32_t certifier_height) noexcept;
+        static bool
+        has_bounded_proposal_commit_event_bridge_intermediates(
+            EpochProtocolMode mode,
+            const ConfigurationId &alternate_configuration,
+            const ConfigurationId &certifier_configuration,
+            std::size_t intermediate_count) noexcept;
         static std::optional<
             std::pair<ConfigurationId, std::uint64_t>>
         authenticated_proposal_commit_event_bridge_configuration(
