@@ -112,6 +112,20 @@ _NATIVE_RESPONSIVENESS_POLICY = {
     "latency_percentile_basis_points": 5_000,
 }
 
+
+def _native_responsiveness_policy(profile_id: object) -> dict[str, object]:
+    """Return the exact manager responsiveness policy for one frozen profile."""
+
+    policy = dict(_NATIVE_RESPONSIVENESS_POLICY)
+    if profile_id == _N31_FCRASH_H_V13_PROFILE_ID:
+        # The 31-replica same-host runtime can produce a short burst of
+        # collateral timeouts while retaining a healthy rate over the exact
+        # bounded window.  Let the unchanged rate gates classify that burst;
+        # a full-window timeout streak remains independently nonresponsive.
+        policy["trailing_timeout_streak"] = policy["attempt_window"]
+    return policy
+
+
 _RUNTIME_EVENT_KEYS = {
     "event_schema_version",
     "run_id",
@@ -8865,7 +8879,7 @@ def _focused_manager_command(
     if v13:
         _v13_certified_activation_contract(profile)
     count = len(profile.replica_ids)
-    policy = _NATIVE_RESPONSIVENESS_POLICY
+    policy = _native_responsiveness_policy(profile.profile_id)
     command = [
         str(manager_binary),
         "--listen",

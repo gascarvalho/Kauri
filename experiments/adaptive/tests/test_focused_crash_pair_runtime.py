@@ -2111,6 +2111,29 @@ def test_n31_v13_alone_uses_the_scale_safe_leader_progress_budget(
 
 
 @pytest.mark.parametrize(
+    ("profile_path", "expected_streak"),
+    (
+        (N7_PROFILE_V13, 2),
+        (N31_PROFILE_V13, 32),
+        (N31_PROFILE_V12, 2),
+    ),
+)
+def test_n31_v13_alone_uses_the_scale_safe_timeout_streak(
+    profile_path: Path,
+    expected_streak: int,
+) -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(profile_path)
+
+    policy = runtime._native_responsiveness_policy(profile.profile_id)
+
+    assert policy["attempt_window"] == 32
+    assert policy["trailing_timeout_streak"] == expected_streak
+    assert policy["minimum_response_rate_ppm"] == 750_000
+    assert policy["maximum_timeout_rate_ppm"] == 250_000
+
+
+@pytest.mark.parametrize(
     ("profile_path", "expected"),
     (
         (

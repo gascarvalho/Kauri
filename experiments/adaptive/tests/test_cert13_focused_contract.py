@@ -158,6 +158,28 @@ def test_validator_binds_the_n31_v13_progress_budget_only(
     assert validation._expected_leader_progress_timeout(profile_id) == expected
 
 
+@pytest.mark.parametrize(
+    ("profile_id", "expected_streak"),
+    (
+        ("n7-f2-q5-two-crash-pair-smoke-v13", 2),
+        ("n31-f5-q21-three-crash-pair-v13", 32),
+        ("n31-f5-q21-three-crash-pair-v12", 2),
+    ),
+)
+def test_validator_binds_the_n31_v13_timeout_streak_only(
+    profile_id: str,
+    expected_streak: int,
+) -> None:
+    validation = _validation()
+
+    policy = validation._native_responsiveness_policy(profile_id)
+
+    assert policy["attempt_window"] == 32
+    assert policy["trailing_timeout_streak"] == expected_streak
+    assert policy["minimum_response_rate_ppm"] == 750_000
+    assert policy["maximum_timeout_rate_ppm"] == 250_000
+
+
 def _n7_v13_fault_receipt(validation: Any) -> dict[str, Any]:
     targets = (0, 1)
     plan = {

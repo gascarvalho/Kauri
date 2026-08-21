@@ -259,6 +259,17 @@ _NATIVE_RESPONSIVENESS_POLICY = {
     "trailing_timeout_streak": 2,
     "latency_percentile_basis_points": 5_000,
 }
+
+
+def _native_responsiveness_policy(profile_id: object) -> dict[str, object]:
+    """Return the exact sealed manager policy for one frozen profile."""
+
+    policy = dict(_NATIVE_RESPONSIVENESS_POLICY)
+    if profile_id == _N31_FCRASH_H_V13_PROFILE_ID:
+        policy["trailing_timeout_streak"] = policy["attempt_window"]
+    return policy
+
+
 _MAIN_CONFIG_KEYS = {
     "aggregation-timeout",
     "async_blocks",
@@ -5508,6 +5519,9 @@ def _ranking(
             audit.get("current_cutoff"), "ranking current cutoff", 1
         )
         causal_start_ns = v7_arm_start_ns if audited_epoch == 0 else None
+        responsiveness_policy = _native_responsiveness_policy(
+            _mapping(contract.get("profile"), "focused profile").get("profile_id")
+        )
         replay = reconstruct_focused_ranking(
             manager_events,
             membership_replica_ids=members,
@@ -5515,7 +5529,7 @@ def _ranking(
             predecessor_epoch_digest=replay_digest,
             baseline_evidence_cutoff=baseline_cutoff,
             current_evidence_cutoff=current_cutoff,
-            policy=_NATIVE_RESPONSIVENESS_POLICY,
+            policy=responsiveness_policy,
             seed=_integer(epoch1.generation_seed, "Epoch 1 generation seed"),
             suffix_only=suffix_only,
             allowed_schema_versions=(
@@ -5565,7 +5579,7 @@ def _ranking(
                     "ranking current cutoff",
                     1,
                 ),
-                policy=_NATIVE_RESPONSIVENESS_POLICY,
+                policy=responsiveness_policy,
                 seed=_integer(epoch1.generation_seed, "Epoch 1 generation seed"),
                 suffix_only=other_epoch == 1,
                 allowed_schema_versions=(
@@ -6804,11 +6818,35 @@ def _validate_manager_boundary(
         _error("manager launch boundary repeats a singleton option")
     if is_v13:
         transitions = _mapping(_mapping(contract["profile"], "focused profile").get("transitions"), "v13 transitions")
+        responsiveness = _native_responsiveness_policy(
+            _mapping(contract["profile"], "focused profile").get("profile_id")
+        )
         expected = {
             "--protocol-mode": "adaptive_v3",
             "--activation-readiness-release-count": str(transitions.get("survivor_barrier_count")),
             "--activation-readiness-maximum-delivery-attempts": "5",
             "--activation-readiness-retry-interval-ticks": "1000000000",
+            "--responsiveness-policy-version": str(
+                responsiveness["policy_version"]
+            ),
+            "--responsiveness-attempt-window": str(
+                responsiveness["attempt_window"]
+            ),
+            "--responsiveness-minimum-attempts": str(
+                responsiveness["minimum_attempts"]
+            ),
+            "--responsiveness-minimum-response-rate-ppm": str(
+                responsiveness["minimum_response_rate_ppm"]
+            ),
+            "--responsiveness-maximum-timeout-rate-ppm": str(
+                responsiveness["maximum_timeout_rate_ppm"]
+            ),
+            "--responsiveness-trailing-timeout-streak": str(
+                responsiveness["trailing_timeout_streak"]
+            ),
+            "--responsiveness-latency-percentile-basis-points": str(
+                responsiveness["latency_percentile_basis_points"]
+            ),
         }
         values = {arguments[index]: arguments[index + 1] for index in range(1, len(arguments), 2)}
         if any(counts.get(key) != 1 or values.get(key) != value for key, value in expected.items()):
