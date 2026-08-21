@@ -2706,12 +2706,26 @@ namespace hotstuff
         if (!committed_epoch_change_history ||
             pending_committed_epoch_change)
         {
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_ADAPTIVE_V3_COMMAND stage=committed_history "
+                    "outcome=reset reason=missing_state_or_pending "
+                    "replica=%u history=%u pending=%u",
+                    static_cast<unsigned>(get_id()),
+                    committed_epoch_change_history.has_value() ? 1U : 0U,
+                    pending_committed_epoch_change.has_value() ? 1U : 0U);
             pending_committed_epoch_change.reset();
             committed_epoch_change_history.reset();
             return;
         }
 
-        const auto fail_closed = [this]() noexcept {
+        const auto fail_closed = [this](const char *reason) noexcept {
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_ADAPTIVE_V3_COMMAND stage=committed_history "
+                    "outcome=reset reason=%s replica=%u",
+                    reason,
+                    static_cast<unsigned>(get_id()));
             pending_committed_epoch_change.reset();
             committed_epoch_change_history.reset();
         };
@@ -2726,7 +2740,7 @@ namespace hotstuff
                 previous.snapshot.committed_head_height !=
                     previous.head->get_height())
             {
-                fail_closed();
+                fail_closed("invalid_state");
                 return;
             }
 
@@ -2736,7 +2750,7 @@ namespace hotstuff
                 parents.front() != previous.head ||
                 parent_hashes.front() != previous.head->get_hash())
             {
-                fail_closed();
+                fail_closed("noncontiguous_parent");
                 return;
             }
 
@@ -2757,14 +2771,14 @@ namespace hotstuff
                 if (epoch_change_verifier == nullptr ||
                     exact_epochs == nullptr || proposal_contexts == nullptr)
                 {
-                    fail_closed();
+                    fail_closed("missing_verifier_state");
                     return;
                 }
                 const auto active_configuration =
                     proposal_contexts->active_configuration();
                 if (!active_configuration.has_value())
                 {
-                    fail_closed();
+                    fail_closed("missing_active_configuration");
                     return;
                 }
                 const auto *const active_epoch = exact_epochs->find_epoch(
@@ -2773,7 +2787,7 @@ namespace hotstuff
                     active_epoch->epoch_digest() !=
                         active_configuration->epoch_digest)
                 {
-                    fail_closed();
+                    fail_closed("wrong_active_epoch");
                     return;
                 }
 
@@ -2823,7 +2837,7 @@ namespace hotstuff
                     validation.envelope_digest !=
                         *extracted.envelope_digest)
                 {
-                    fail_closed();
+                    fail_closed("command_validation_failed");
                     return;
                 }
                 command = EpochChangeCommittedHistoryEntry{
@@ -2833,7 +2847,7 @@ namespace hotstuff
             else if (extracted.disposition !=
                          EpochChangeExtraDisposition::absent)
             {
-                fail_closed();
+                fail_closed("malformed_block_extra");
                 return;
             }
 
@@ -2853,7 +2867,7 @@ namespace hotstuff
         }
         catch (...)
         {
-            fail_closed();
+            fail_closed("internal_failure");
         }
     }
 
