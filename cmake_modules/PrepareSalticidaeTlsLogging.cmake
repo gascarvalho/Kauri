@@ -163,6 +163,7 @@ extern Logger logger;]=])
     find_program(KAURI_PATCH_EXECUTABLE patch REQUIRED)
     execute_process(
         COMMAND "${KAURI_PATCH_EXECUTABLE}" --dry-run --batch --forward
+            --ignore-whitespace
             -p1 -i "${priority_send_patch}"
         WORKING_DIRECTORY "${overlay_dir}"
         RESULT_VARIABLE priority_patch_check
@@ -175,6 +176,7 @@ extern Logger logger;]=])
     endif()
     execute_process(
         COMMAND "${KAURI_PATCH_EXECUTABLE}" --batch --forward
+            --ignore-whitespace
             -p1 -i "${priority_send_patch}"
         WORKING_DIRECTORY "${overlay_dir}"
         RESULT_VARIABLE priority_patch_result
