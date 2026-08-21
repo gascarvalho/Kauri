@@ -3481,10 +3481,27 @@ private:
     void emit_readiness(
         hotstuff::AdaptiveV3ReadinessStructuredEvent event) noexcept
     {
+        const auto transition = static_cast<unsigned>(event.transition);
+        const auto replica = event.replica_id.has_value()
+            ? static_cast<unsigned>(*event.replica_id)
+            : std::numeric_limits<unsigned>::max();
+        const auto source_count = event.observed_signers.size();
+        const auto release_count = event.required_release_count;
+        const auto terminal_reason = event.terminal_reason.has_value()
+            ? static_cast<unsigned>(*event.terminal_reason)
+            : 0;
         event_sink_.emit_audit(
             hotstuff::AuditStructuredEventPayload{std::move(event)});
         if (!event_sink_.health().healthy)
+        {
+            HOTSTUFF_LOG_WARN(
+                "KAURI_ADAPTIVE_V3_MANAGER readiness audit rejected "
+                "transition=%u replica=%u source_count=%zu "
+                "release_count=%zu terminal_reason=%u",
+                transition, replica, source_count, release_count,
+                terminal_reason);
             fail("readiness_audit_unhealthy");
+        }
     }
 
     // A TLS-authenticated peer can still send malformed v3 readiness wire.
