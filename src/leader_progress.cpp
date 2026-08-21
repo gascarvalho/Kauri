@@ -244,6 +244,7 @@ struct LeaderProgressMonitor::State
     LeaderProgressScheduler *scheduler{nullptr};
     std::shared_ptr<ScheduledCancellation> deadline;
     std::shared_ptr<EffectDispatch> effect_dispatch;
+    bool bounded_epoch_command_window_granted{false};
 
     void settle_effect(
         const std::shared_ptr<EffectDispatch> &effect)
@@ -366,6 +367,7 @@ bool LeaderProgressMonitor::activate(
             state->last_view_generation = view.view_generation;
             state->active = view;
             state->phase = State::Phase::activation_grace;
+            state->bounded_epoch_command_window_granted = false;
             state->deadline_generation = generation;
             state->deadline = deadline;
             previous_effect = state->effect_dispatch;
@@ -452,6 +454,91 @@ bool LeaderProgressMonitor::record_verified_progress(
             state->deadline_generation == previous_generation &&
             state->deadline == previous_deadline)
         {
+            state->deadline_generation = generation;
+            state->deadline = deadline;
+            committed = true;
+        }
+    }
+
+    if (!committed)
+    {
+        deadline->cancel();
+        return false;
+    }
+    if (previous_deadline)
+        previous_deadline->cancel();
+    dispatch->arm();
+    return true;
+}
+
+bool LeaderProgressMonitor::grant_bounded_epoch_command_window(
+    const LeaderViewId &view,
+    LeaderProgressScheduler &scheduler)
+{
+    const auto state = state_;
+    if (state->config.progress_timeout >
+        LeaderProgressConfig::Duration::max() / 2)
+        return false;
+    const auto delay = state->config.progress_timeout * 2;
+
+    std::shared_ptr<ScheduledCancellation> previous_deadline;
+    State::Phase previous_phase;
+    std::uint64_t previous_generation;
+    std::uint64_t generation;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (state->stopped || state->active != view ||
+            state->scheduler != &scheduler ||
+            state->bounded_epoch_command_window_granted ||
+            (state->phase != State::Phase::activation_grace &&
+             state->phase != State::Phase::progress_timeout) ||
+            state->deadline_generation ==
+                std::numeric_limits<std::uint64_t>::max())
+        {
+            return false;
+        }
+        previous_phase = state->phase;
+        previous_generation = state->deadline_generation;
+        generation = previous_generation + 1;
+        previous_deadline = state->deadline;
+    }
+
+    std::weak_ptr<State> weak_state = state;
+    auto dispatch = std::make_shared<ScheduledDispatch>(
+        [weak_state, view, generation]() {
+            if (const auto current = weak_state.lock())
+            {
+                static_cast<void>(dispatch_timeout_for_state(
+                    current, view, generation));
+            }
+        });
+    auto deadline = std::make_shared<ScheduledCancellation>();
+    try
+    {
+        auto cancellation = scheduler.schedule_after(
+            delay, [dispatch]() { dispatch->fire(); });
+        deadline->install(bind_cancellation(
+            dispatch, std::move(cancellation)));
+    }
+    catch (...)
+    {
+        dispatch->cancel();
+        deadline->cancel();
+        throw;
+    }
+
+    bool committed = false;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        if (!state->stopped && state->active == view &&
+            state->scheduler == &scheduler &&
+            !state->bounded_epoch_command_window_granted &&
+            state->phase == previous_phase &&
+            state->deadline_generation == previous_generation &&
+            state->deadline == previous_deadline)
+        {
+            state->phase = State::Phase::progress_timeout;
+            state->bounded_epoch_command_window_granted = true;
             state->deadline_generation = generation;
             state->deadline = deadline;
             committed = true;

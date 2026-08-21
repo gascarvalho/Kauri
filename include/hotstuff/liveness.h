@@ -93,6 +93,11 @@ namespace hotstuff
         {
             return false;
         }
+        virtual bool grant_bounded_epoch_command_window(
+            const ConfigurationId &)
+        {
+            return false;
+        }
         virtual std::optional<LeaderViewId> active_leader_view() const
         {
             return std::nullopt;
@@ -687,6 +692,26 @@ namespace hotstuff
                 return false;
             return leader_progress->record_verified_progress(
                 *active, event, leader_progress_scheduler);
+        }
+
+        bool grant_bounded_epoch_command_window(
+            const ConfigurationId &configuration) override
+        {
+            if (leader_progress == nullptr)
+                return false;
+            const auto active = leader_progress->active_view();
+            if (!active.has_value() ||
+                active->configuration != configuration)
+                return false;
+            try
+            {
+                return leader_progress->grant_bounded_epoch_command_window(
+                    *active, leader_progress_scheduler);
+            }
+            catch (...)
+            {
+                return false;
+            }
         }
 
         std::optional<LeaderViewId> active_leader_view() const override

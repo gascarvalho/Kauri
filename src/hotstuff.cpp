@@ -13706,7 +13706,25 @@ namespace hotstuff
             return;
         }
         if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
+        {
+            // This is not a leader-progress observation.  A manager-authorized
+            // command can reach its designated root one full view before the
+            // remaining replicas activate and replay it.  Grant that root one
+            // additional, one-shot settlement interval; verified proposal,
+            // QC, and commit progress still restore the ordinary timeout, and
+            // a silent root still rotates after the bounded extension.
+            const bool settlement_window =
+                pmaker->grant_bounded_epoch_command_window(
+                    key.configuration);
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V3_COMMAND stage=leader_window "
+                "outcome=%s epoch=%u tree=%u block=%s",
+                settlement_window ? "granted" : "unavailable",
+                key.configuration.epoch_number,
+                key.configuration.tree_id,
+                key.block_hash.to_hex().c_str());
             adaptive_v3_pending_command_priority_fanout = key;
+        }
     }
 
     void HotStuffBase::on_verified_commit_progress(

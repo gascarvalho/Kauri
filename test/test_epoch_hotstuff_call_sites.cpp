@@ -2935,6 +2935,9 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
     const auto periodic = function_body(
         implementation,
         "void HotStuffBase::rotate_adaptive_v2_after_commit(");
+    const auto local_command = function_body(
+        implementation,
+        "void HotStuffBase::on_local_proposal_processed(");
     const auto timeout = function_body(
         implementation,
         "HotStuffBase::rotate_tree_on_leader_timeout(");
@@ -3011,6 +3014,13 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
          "adaptive_v2_rotation_coordinator->on_commit("}));
     CHECK(periodic.find("adaptive_v2_command_inbox->snapshot()") <
           periodic.find("adaptive_epoch_runtime->activation.active_effect()"));
+
+    REQUIRE_FALSE(local_command.empty());
+    CHECK(contains_in_order(
+        local_command,
+        {"EpochProtocolMode::adaptive_v3",
+         "pmaker->grant_bounded_epoch_command_window(",
+         "adaptive_v3_pending_command_priority_fanout = key"}));
 
     REQUIRE_FALSE(timeout.empty());
     CHECK(contains_in_order(

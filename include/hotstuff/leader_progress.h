@@ -79,6 +79,9 @@ public:
     bool record_verified_progress(const LeaderViewId &view,
                                   LeaderProgressEvent event,
                                   LeaderProgressScheduler &scheduler);
+    bool grant_bounded_epoch_command_window(
+        const LeaderViewId &view,
+        LeaderProgressScheduler &scheduler);
 
     bool dispatch_grace(const LeaderViewId &view,
                         std::uint64_t deadline_generation,

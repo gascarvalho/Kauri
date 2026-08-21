@@ -739,6 +739,148 @@ TEST_CASE("activation grace always precedes leader suspicion",
     CHECK(harness.scheduler.pending_count() == 0);
 }
 
+TEST_CASE("one bounded epoch command window preserves exact view liveness",
+          "[l07][leader-progress][epoch-command][bounded]")
+{
+    MonitorHarness harness;
+    const auto active = view(configuration(8, 6, "command"), 12, 6);
+    REQUIRE(harness.monitor.activate(active, harness.scheduler));
+
+    harness.scheduler.advance_by(Duration(50));
+    REQUIRE(harness.monitor.grant_bounded_epoch_command_window(
+        active, harness.scheduler));
+    CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+        active, harness.scheduler));
+    CHECK(harness.scheduler.pending_count() == 1);
+    CHECK(harness.scheduler.pending_deadline() ==
+          harness.scheduler.now() + Duration(400));
+
+    harness.scheduler.advance_by(Duration(399));
+    CHECK(harness.rotations.empty());
+    harness.scheduler.advance_by(Duration(1));
+    REQUIRE(harness.rotations.size() == 1);
+    CHECK(harness.rotations.front() == active);
+}
+
+TEST_CASE("verified command-view progress restores the normal timeout",
+          "[l07][leader-progress][epoch-command][progress]")
+{
+    MonitorHarness harness;
+    const auto active = view(configuration(8, 7, "command-progress"), 13, 7);
+    REQUIRE(harness.monitor.activate(active, harness.scheduler));
+    REQUIRE(harness.monitor.grant_bounded_epoch_command_window(
+        active, harness.scheduler));
+
+    harness.scheduler.advance_by(Duration(250));
+    REQUIRE(harness.monitor.record_verified_progress(
+        active,
+        LeaderProgressEvent::quorum_certificate,
+        harness.scheduler));
+    CHECK(harness.scheduler.pending_count() == 1);
+    CHECK(harness.scheduler.pending_deadline() ==
+          harness.scheduler.now() + Duration(200));
+
+    harness.scheduler.advance_by(Duration(199));
+    CHECK(harness.rotations.empty());
+    harness.scheduler.advance_by(Duration(1));
+    REQUIRE(harness.rotations.size() == 1);
+    CHECK(harness.rotations.front() == active);
+}
+
+TEST_CASE("bounded command windows reject stale foreign and expired views",
+          "[l07][leader-progress][epoch-command][exact-view]")
+{
+    MonitorHarness harness;
+    FakeLeaderProgressScheduler foreign;
+    const auto active =
+        view(configuration(8, 8, "command-exact"), 14, 1);
+    const auto stale =
+        view(active.configuration, active.view_generation - 1, 1);
+    REQUIRE(harness.monitor.activate(active, harness.scheduler));
+    const auto original_deadline = harness.scheduler.pending_deadline();
+
+    CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+        stale, harness.scheduler));
+    CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+        active, foreign));
+    CHECK(harness.scheduler.pending_deadline() == original_deadline);
+    CHECK(foreign.scheduled_count() == 0);
+
+    harness.scheduler.advance_by(Duration(100));
+    harness.scheduler.advance_by(Duration(200));
+    REQUIRE(harness.rotations == std::vector<LeaderViewId>{active});
+    CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+        active, harness.scheduler));
+    CHECK(harness.scheduler.pending_count() == 0);
+}
+
+TEST_CASE("bounded command window scheduling is atomic and retryable",
+          "[l07][leader-progress][epoch-command][schedule-failure]")
+{
+    MonitorHarness harness;
+    const auto active =
+        view(configuration(8, 9, "command-retry"), 15, 2);
+    REQUIRE(harness.monitor.activate(active, harness.scheduler));
+    const auto original_deadline = harness.scheduler.pending_deadline();
+
+    harness.scheduler.fail_next_schedule();
+    CHECK_THROWS_AS(
+        harness.monitor.grant_bounded_epoch_command_window(
+            active, harness.scheduler),
+        std::runtime_error);
+    CHECK(harness.monitor.active_view() == active);
+    CHECK(harness.scheduler.pending_count() == 1);
+    CHECK(harness.scheduler.pending_deadline() == original_deadline);
+
+    REQUIRE(harness.monitor.grant_bounded_epoch_command_window(
+        active, harness.scheduler));
+    CHECK(harness.scheduler.pending_count() == 1);
+    CHECK(harness.scheduler.pending_deadline() ==
+          harness.scheduler.now() + Duration(400));
+}
+
+TEST_CASE("bounded command window is overflow safe and resets per activation",
+          "[l07][leader-progress][epoch-command][overflow][activation]")
+{
+    SECTION("overflow leaves the active deadline unchanged")
+    {
+        const auto excessive = Duration::max() / 2 + Duration(1);
+        MonitorHarness harness(LeaderProgressConfig{
+            Duration(1), excessive, Duration(1),
+            {LeaderProgressEvent::quorum_certificate}});
+        const auto active =
+            view(configuration(8, 10, "command-overflow"), 16, 3);
+        REQUIRE(harness.monitor.activate(active, harness.scheduler));
+        const auto original_deadline = harness.scheduler.pending_deadline();
+
+        CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+            active, harness.scheduler));
+        CHECK(harness.scheduler.pending_count() == 1);
+        CHECK(harness.scheduler.pending_deadline() == original_deadline);
+    }
+
+    SECTION("a newer exact activation receives its own one-shot window")
+    {
+        MonitorHarness harness;
+        const auto first =
+            view(configuration(8, 11, "command-first"), 17, 4);
+        const auto second =
+            view(configuration(8, 12, "command-second"), 18, 5);
+        REQUIRE(harness.monitor.activate(first, harness.scheduler));
+        REQUIRE(harness.monitor.grant_bounded_epoch_command_window(
+            first, harness.scheduler));
+        CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+            first, harness.scheduler));
+
+        REQUIRE(harness.monitor.activate(second, harness.scheduler));
+        REQUIRE(harness.monitor.grant_bounded_epoch_command_window(
+            second, harness.scheduler));
+        CHECK_FALSE(harness.monitor.grant_bounded_epoch_command_window(
+            second, harness.scheduler));
+        CHECK(harness.scheduler.pending_count() == 1);
+    }
+}
+
 TEST_CASE("only configured verified active progress resets timeout",
           "[l07][leader-progress][policy][exact-view][intentional-red]")
 {
