@@ -15,6 +15,7 @@
 #include "hotstuff/configuration.h"
 #include "hotstuff/promise.hpp"
 #include "hotstuff/type.h"
+#include "salticidae/buffer.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #define KAURI_PROJECT_SOURCE_DIR "."
@@ -22,6 +23,35 @@
 
 namespace
 {
+
+TEST_CASE("priority write buffer preserves frame boundaries and overtakes backlog",
+          "[fallback][transport][priority][framing]")
+{
+    salticidae::MPSCWriteBuffer buffer;
+    salticidae::bytearray_t ordinary_one{1, 2, 3};
+    salticidae::bytearray_t ordinary_two{4, 5, 6};
+    salticidae::bytearray_t priority_one{7, 8, 9};
+    CHECK(buffer.push(std::move(ordinary_one), true));
+    CHECK(buffer.push(std::move(ordinary_two), true));
+    CHECK(buffer.push_priority(std::move(priority_one), true));
+
+    const salticidae::bytearray_t expected_priority_one{7, 8, 9};
+    const salticidae::bytearray_t expected_ordinary_one{1, 2, 3};
+    CHECK(buffer.move_pop() == expected_priority_one);
+    CHECK(buffer.move_pop() == expected_ordinary_one);
+
+    buffer.rewind(salticidae::bytearray_t{2, 3});
+    salticidae::bytearray_t priority_two{10, 11};
+    CHECK(buffer.push_priority(std::move(priority_two), true));
+    INFO("a partial frame must complete before priority traffic");
+    const salticidae::bytearray_t expected_partial{2, 3};
+    const salticidae::bytearray_t expected_priority_two{10, 11};
+    const salticidae::bytearray_t expected_ordinary_two{4, 5, 6};
+    CHECK(buffer.move_pop() == expected_partial);
+    CHECK(buffer.move_pop() == expected_priority_two);
+    CHECK(buffer.move_pop() == expected_ordinary_two);
+    CHECK(buffer.move_pop().empty());
+}
 
 std::string read_source(const std::string &relative_path)
 {
@@ -721,7 +751,7 @@ TEST_CASE("exact fallback stages repair and fast-returns root repair votes",
     const auto skip_verified = proposal_send.find(
         "snapshot->verified_signers.count(member) != 0");
     const auto proposal_send_attempt = proposal_send.find(
-        "pn.send_msg(");
+        "pn.send_msg_priority(");
     const auto record_attempt = proposal_send.find(
         "attempted_targets.push_back(member)");
     const auto charge_attempt = proposal_send.find(
@@ -1019,7 +1049,7 @@ TEST_CASE("confirmation repair tail shares the original send budget and cancels"
           std::string::npos);
     const auto tail_charge = tail_send.find(
         "++job.total_send_attempts");
-    const auto tail_enqueue = tail_send.find("pn.send_msg(");
+    const auto tail_enqueue = tail_send.find("pn.send_msg_priority(");
     REQUIRE(tail_charge != std::string::npos);
     REQUIRE(tail_enqueue != std::string::npos);
     CHECK(tail_charge < tail_enqueue);
@@ -1284,7 +1314,8 @@ TEST_CASE("pre-QC repair preserves live paths and dispatches by peer identity",
         "std::move(job.pending_pre_quorum_refresh_batch)");
     const auto pending_loop = retry_send.find(
         "for (const auto &pending : pending_batch)", pending_move);
-    const auto enqueue = retry_send.find("pn.send_msg(", pending_loop);
+    const auto enqueue = retry_send.find(
+        "pn.send_msg_priority(", pending_loop);
     REQUIRE(pending_move != std::string::npos);
     REQUIRE(pending_loop != std::string::npos);
     REQUIRE(enqueue != std::string::npos);

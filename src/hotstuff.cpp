@@ -4825,7 +4825,8 @@ namespace hotstuff
                     epoch_protocol_mode);
                 if (encoded.empty())
                     return false;
-                return pn.send_msg(MsgVote(DataStream(encoded)), peer);
+                return pn.send_msg_priority(
+                    MsgVote(DataStream(encoded)), peer);
             }
             return pn.send_msg(MsgVote(vote), peer);
         }
@@ -5517,7 +5518,7 @@ namespace hotstuff
                 ++send_attempts;
                 ++total_send_attempts;
                 const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
-                    ? pn.send_msg(
+                    ? pn.send_msg_priority(
                           MsgPropose(DataStream(encoded)), peer)
                     : pn.send_msg(MsgPropose(proposal), peer);
                 if (sent)
@@ -5779,7 +5780,7 @@ namespace hotstuff
                 }
                 const bool sent =
                     is_adaptive_epoch_mode(epoch_protocol_mode)
-                        ? pn.send_msg(
+                        ? pn.send_msg_priority(
                               MsgPropose(DataStream(encoded)), peer)
                         : pn.send_msg(MsgPropose(*job.proposal), peer);
                 ++send_attempts;
@@ -5933,7 +5934,7 @@ namespace hotstuff
                 ++send_attempts;
                 ++job.total_send_attempts;
                 const bool sent = is_adaptive_epoch_mode(epoch_protocol_mode)
-                    ? pn.send_msg(
+                    ? pn.send_msg_priority(
                           MsgPropose(DataStream(encoded)), peer)
                     : pn.send_msg(MsgPropose(*job.proposal), peer);
                 if (sent)

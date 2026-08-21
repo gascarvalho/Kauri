@@ -6,13 +6,24 @@ function(
     output_include_dir)
     set(conn_source "${salticidae_source_dir}/src/conn.cpp")
     set(util_header "${salticidae_source_dir}/include/salticidae/util.h")
+    set(buffer_header "${salticidae_source_dir}/include/salticidae/buffer.h")
+    set(conn_header "${salticidae_source_dir}/include/salticidae/conn.h")
+    set(network_header "${salticidae_source_dir}/include/salticidae/network.h")
+    set(priority_send_patch
+        "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SalticidaePrioritySend.patch")
     set_property(
         DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
         "${conn_source}"
-        "${util_header}")
-    if(NOT EXISTS "${conn_source}" OR NOT EXISTS "${util_header}")
+        "${util_header}"
+        "${buffer_header}"
+        "${conn_header}"
+        "${network_header}"
+        "${priority_send_patch}")
+    if(NOT EXISTS "${conn_source}" OR NOT EXISTS "${util_header}" OR
+       NOT EXISTS "${buffer_header}" OR NOT EXISTS "${conn_header}" OR
+       NOT EXISTS "${network_header}" OR NOT EXISTS "${priority_send_patch}")
         message(FATAL_ERROR
-            "Pinned Salticidae TLS logging sources are unavailable")
+            "Pinned Salticidae overlay sources are unavailable")
     endif()
 
     file(SHA256 "${conn_source}" conn_sha256)
@@ -26,6 +37,24 @@ function(
        "cd59f6851c189dbbc55ef15cb6fcdc116e14ef4db7d5cb3cdf57cbb72a1aa046")
         message(FATAL_ERROR
             "Pinned Salticidae util.h changed; audit the format-check overlay")
+    endif()
+    file(SHA256 "${buffer_header}" buffer_sha256)
+    if(NOT buffer_sha256 STREQUAL
+       "16d4f209e4f7aefa58a6cc04cc05c4edc2be1af93627011c0f251c041b73e18c")
+        message(FATAL_ERROR
+            "Pinned Salticidae buffer.h changed; audit the priority-send overlay")
+    endif()
+    file(SHA256 "${conn_header}" conn_header_sha256)
+    if(NOT conn_header_sha256 STREQUAL
+       "6cb9c8f46104dd84367cc9d3b99841c94275f0b14a497ffff8e2a3264a13ae62")
+        message(FATAL_ERROR
+            "Pinned Salticidae conn.h changed; audit the priority-send overlay")
+    endif()
+    file(SHA256 "${network_header}" network_sha256)
+    if(NOT network_sha256 STREQUAL
+       "4610fb0474e328ce3d7cbbe78e33bc2d18a04a6e20f58c5f7065e13130bf45da")
+        message(FATAL_ERROR
+            "Pinned Salticidae network.h changed; audit the priority-send overlay")
     endif()
 
     file(READ "${conn_source}" conn_contents)
@@ -99,6 +128,9 @@ extern Logger logger;]=])
 
     set(overlay_conn "${overlay_dir}/src/conn.cpp")
     set(overlay_util "${overlay_dir}/include/salticidae/util.h")
+    set(overlay_buffer "${overlay_dir}/include/salticidae/buffer.h")
+    set(overlay_conn_header "${overlay_dir}/include/salticidae/conn.h")
+    set(overlay_network "${overlay_dir}/include/salticidae/network.h")
     file(MAKE_DIRECTORY
         "${overlay_dir}/src"
         "${overlay_dir}/include/salticidae")
@@ -123,6 +155,35 @@ extern Logger logger;]=])
     endif()
     if(write_util)
         file(WRITE "${overlay_util}" "${patched_util_contents}")
+    endif()
+
+    file(COPY_FILE "${buffer_header}" "${overlay_buffer}" ONLY_IF_DIFFERENT)
+    file(COPY_FILE "${conn_header}" "${overlay_conn_header}" ONLY_IF_DIFFERENT)
+    file(COPY_FILE "${network_header}" "${overlay_network}" ONLY_IF_DIFFERENT)
+    find_program(KAURI_PATCH_EXECUTABLE patch REQUIRED)
+    execute_process(
+        COMMAND "${KAURI_PATCH_EXECUTABLE}" --dry-run --batch --forward
+            -p1 -i "${priority_send_patch}"
+        WORKING_DIRECTORY "${overlay_dir}"
+        RESULT_VARIABLE priority_patch_check
+        OUTPUT_VARIABLE priority_patch_check_out
+        ERROR_VARIABLE priority_patch_check_err)
+    if(NOT priority_patch_check EQUAL 0)
+        message(FATAL_ERROR
+            "Pinned Salticidae priority-send patch check failed: "
+            "${priority_patch_check_out}${priority_patch_check_err}")
+    endif()
+    execute_process(
+        COMMAND "${KAURI_PATCH_EXECUTABLE}" --batch --forward
+            -p1 -i "${priority_send_patch}"
+        WORKING_DIRECTORY "${overlay_dir}"
+        RESULT_VARIABLE priority_patch_result
+        OUTPUT_VARIABLE priority_patch_out
+        ERROR_VARIABLE priority_patch_err)
+    if(NOT priority_patch_result EQUAL 0)
+        message(FATAL_ERROR
+            "Pinned Salticidae priority-send patch failed: "
+            "${priority_patch_out}${priority_patch_err}")
     endif()
 
     set(${output_conn_source} "${overlay_conn}" PARENT_SCOPE)

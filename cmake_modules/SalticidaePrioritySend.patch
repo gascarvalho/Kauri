@@ -1,0 +1,116 @@
+diff --git a/include/salticidae/buffer.h b/include/salticidae/buffer.h
+index 6d3f97a..df3f880 100644
+--- a/include/salticidae/buffer.h
++++ b/include/salticidae/buffer.h
+@@ -123,0 +124,2 @@ struct MPSCWriteBuffer {
++    queue_t priority_buffer;
++    SegBuffer partial_buffer;
+@@ -130 +132,4 @@ struct MPSCWriteBuffer {
+-    void set_capacity(size_t capacity) { buffer.set_capacity(capacity); }
++    void set_capacity(size_t capacity) {
++        buffer.set_capacity(capacity);
++        priority_buffer.set_capacity(capacity);
++    }
+@@ -133 +138,4 @@ struct MPSCWriteBuffer {
+-        buffer.rewind(buffer_entry_t(std::move(data)));
++        // A partially written message must finish before a priority message;
++        // otherwise bytes from two framed messages could be interleaved on
++        // the stream. Only the connection worker calls rewind/move_pop.
++        partial_buffer.rewind(std::move(data));
+@@ -139,0 +148,5 @@ struct MPSCWriteBuffer {
++    bool push_priority(bytearray_t &&data, bool unbounded) {
++        return priority_buffer.enqueue(
++            buffer_entry_t(std::move(data)), unbounded);
++    }
++
+@@ -142 +155,4 @@ struct MPSCWriteBuffer {
+-        buffer.try_dequeue(res);
++        if (!partial_buffer.empty())
++            return partial_buffer.move_pop();
++        if (!priority_buffer.try_dequeue(res))
++            buffer.try_dequeue(res);
+@@ -146,0 +163 @@ struct MPSCWriteBuffer {
++    queue_t &get_priority_queue() { return priority_buffer; }
+diff --git a/include/salticidae/conn.h b/include/salticidae/conn.h
+index 30c8ca6..7f67579 100644
+--- a/include/salticidae/conn.h
++++ b/include/salticidae/conn.h
+@@ -154,0 +155,13 @@ class ConnPool {
++
++        /** Queue one complete framed message ahead of ordinary queued
++         * messages. A partially written frame is still completed first. */
++        bool write_priority(bytearray_t &&data) {
++            SALTICIDAE_LOG_DEBUG(
++                "write to priority buffer: %d", data.size());
++            const bool push =
++                send_buffer.push_priority(std::move(data), true);
++            if (!push)
++                SALTICIDAE_LOG_DEBUG(
++                    "Failed to push data to priority send buffer!");
++            return push;
++        }
+@@ -199,0 +213 @@ class ConnPool {
++        conn->send_buffer.get_priority_queue().unreg_handler();
+@@ -280,2 +294 @@ class ConnPool {
+-            conn->send_buffer.get_queue()
+-                    .reg_handler(this->ec, [conn, client_fd]
++            const auto handler = [conn, client_fd]
+@@ -291 +304,4 @@ class ConnPool {
+-            });
++            };
++            conn->send_buffer.get_queue().reg_handler(this->ec, handler);
++            conn->send_buffer.get_priority_queue().reg_handler(
++                this->ec, handler);
+diff --git a/include/salticidae/network.h b/include/salticidae/network.h
+index 5aaa3bf..d99daf8 100644
+--- a/include/salticidae/network.h
++++ b/include/salticidae/network.h
+@@ -261,0 +262,3 @@ class MsgNetwork: public ConnPool {
++    inline bool send_msg_priority(const MsgType &msg, const conn_t &conn);
++    inline bool _send_msg_priority(const Msg &msg, const conn_t &conn);
++    template<typename MsgType>
+@@ -304,0 +308 @@ class ClientNetwork: public MsgNetwork<OpcodeType> {
++    using MsgNet::send_msg_priority;
+@@ -628,0 +633 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
++    using MsgNet::send_msg_priority;
+@@ -632,0 +638,3 @@ class PeerNetwork: public MsgNetwork<OpcodeType> {
++    inline bool send_msg_priority(const MsgType &msg, const PeerId &peer);
++    inline bool _send_msg_priority(const Msg &msg, const PeerId &peer);
++    template<typename MsgType>
+@@ -741,0 +750,21 @@ inline bool MsgNetwork<OpcodeType>::_send_msg(const Msg &msg, const conn_t &conn
++template<typename OpcodeType>
++template<typename MsgType>
++inline bool MsgNetwork<OpcodeType>::send_msg_priority(
++        const MsgType &msg, const conn_t &conn) {
++    return _send_msg_priority(Msg(msg, msg_magic), conn);
++}
++
++template<typename OpcodeType>
++inline bool MsgNetwork<OpcodeType>::_send_msg_priority(
++        const Msg &msg, const conn_t &conn) {
++    bytearray_t msg_data = msg.serialize();
++    SALTICIDAE_LOG_DEBUG("wrote priority message %s to %s",
++                std::string(msg).c_str(),
++                std::string(*conn).c_str());
++#ifdef SALTICIDAE_MSG_STAT
++    conn->nsent++;
++    conn->nsentb += msg.get_length();
++#endif
++    return conn->write_priority(std::move(msg_data));
++}
++
+@@ -1341,0 +1371,14 @@ inline bool PeerNetwork<O, _, __>::_send_msg(const Msg &msg, const PeerId &pid)
++template<typename O, O _, O __>
++template<typename MsgType>
++inline bool PeerNetwork<O, _, __>::send_msg_priority(
++        const MsgType &msg, const PeerId &pid) {
++    return _send_msg_priority(Msg(msg, this->msg_magic), pid);
++}
++
++template<typename O, O _, O __>
++inline bool PeerNetwork<O, _, __>::_send_msg_priority(
++        const Msg &msg, const PeerId &pid) {
++    pinfo_slock_t _g(known_peers_lock);
++    return MsgNet::_send_msg_priority(msg, _get_peer_conn(pid));
++}
++
