@@ -537,6 +537,16 @@ inline CompletedReadinessArtifacts complete_readiness_capture(
     const auto *certificate = fixture.session.certificate();
     REQUIRE(certificate != nullptr);
     REQUIRE(certificate->observations.size() == survivors.size());
+    // A retry already in flight when R releases must remain observable as an
+    // exact duplicate while delivery is active.  It must not degrade into a
+    // digest-less invalid observation merely because the collector advanced
+    // to the distributing phase.
+    const auto duplicate = fixture.session.observe_readiness(
+        survivors.back(), tick, artifacts.observation_payloads.back());
+    REQUIRE(duplicate.disposition ==
+            AdaptiveV3ManagerReadinessDisposition::duplicate);
+    REQUIRE(duplicate.observation_digest.has_value());
+    REQUIRE_FALSE(duplicate.certificate_assembled);
     artifacts.identity_bytes = encode_activation_ready_identity_v1(
         certificate->identity, fixture.config.wire_limits);
     artifacts.certificate_bytes = encode_activation_readiness_certificate(

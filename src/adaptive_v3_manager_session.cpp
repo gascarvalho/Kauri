@@ -256,14 +256,24 @@ bool AdaptiveV3ManagerSession::begin_readiness(std::uint64_t tick) noexcept {
 }
 AdaptiveV3ManagerObservationResult AdaptiveV3ManagerSession::observe_readiness(ReplicaID peer,std::uint64_t tick,const bytearray_t &payload) noexcept {
     AdaptiveV3ManagerObservationResult r; auto &s=*state_;
-    if (s.expire_hard_deadline(tick) || s.phase != AdaptiveV3ManagerSessionStatus::collecting || !s.collector || tick < s.last_tick || tick >= s.readiness_deadline) return r;
+    const bool collecting =
+        s.phase == AdaptiveV3ManagerSessionStatus::collecting;
+    const bool distributing =
+        s.phase == AdaptiveV3ManagerSessionStatus::distributing;
+    const auto observation_deadline =
+        collecting ? s.readiness_deadline : s.delivery_deadline;
+    if (s.expire_hard_deadline(tick) ||
+        (!collecting && !distributing) || !s.collector ||
+        tick < s.last_tick || tick >= observation_deadline)
+        return r;
     s.last_tick=tick;
     const auto decoded=decode_activation_ready_observation(payload,s.config.wire_limits); r.wire_error=decoded.error; if(!decoded) return r;
     r.observation_digest=activation_ready_observation_digest(*decoded.value); r.disposition=s.collector->ingest(peer,*decoded.value);
     // A signer conflict is quarantined by the collector. Other authenticated
     // sources remain eligible to form Q/R; only bounded capacity or a clock
     // deadline can terminate this cycle.
-    if (r.disposition == AdaptiveV3ManagerReadinessDisposition::released) {
+    if (collecting &&
+        r.disposition == AdaptiveV3ManagerReadinessDisposition::released) {
         const auto *certificate=s.collector->certificate(); if(!certificate) return r;
         try { std::vector<ReplicaID> recipients; recipients.reserve(certificate->observations.size()); for(const auto &o:certificate->observations) recipients.push_back(o.signer_replica_id);
           s.outbox=std::make_unique<AdaptiveV3CertificateOutbox>(*certificate,AdaptiveV3CertificateDeliveryConfig{std::move(recipients),s.config.maximum_delivery_attempts,s.config.retry_interval_ticks,s.config.wire_limits});
