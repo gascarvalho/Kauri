@@ -15916,6 +15916,30 @@ namespace hotstuff
              adaptive_v3_activation_gate != nullptr))
             return;
 
+        if (epoch_protocol_mode == EpochProtocolMode::adaptive_v3 &&
+            adaptive_v2_command_inbox != nullptr)
+        {
+            const auto command = adaptive_v2_command_inbox->snapshot();
+            if (command.state == AdaptiveV2CommandInboxState::available ||
+                command.state == AdaptiveV2CommandInboxState::reserved ||
+                command.state == AdaptiveV2CommandInboxState::in_flight)
+            {
+                // A validated v3 command can be physically ahead of the
+                // current QC chain.  Rotating on an earlier commit would
+                // abandon that exact predecessor view before the ordinary
+                // three-chain rule can decide the command.  Pause only the
+                // commit-count cadence; the independently authenticated
+                // leader-timeout rotation remains available and can move an
+                // unavailable root to the next exact view, where the same
+                // immutable command may be proposed again.
+                HOTSTUFF_LOG_INFO(
+                    "KAURI_ADAPTIVE_V3_COMMAND stage=rotation "
+                    "outcome=deferred state=%u",
+                    static_cast<unsigned>(command.state));
+                return;
+            }
+        }
+
         const auto active =
             adaptive_epoch_runtime->activation.active_effect();
         const auto rotation =

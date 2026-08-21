@@ -3004,7 +3004,13 @@ TEST_CASE("adaptive v3 uses the exact serialized rotation owner",
         {"EpochProtocolMode::adaptive_v2",
          "EpochProtocolMode::adaptive_v3",
          "adaptive_v3_activation_gate",
+         "adaptive_v2_command_inbox->snapshot()",
+         "AdaptiveV2CommandInboxState::available",
+         "AdaptiveV2CommandInboxState::reserved",
+         "AdaptiveV2CommandInboxState::in_flight",
          "adaptive_v2_rotation_coordinator->on_commit("}));
+    CHECK(periodic.find("adaptive_v2_command_inbox->snapshot()") <
+          periodic.find("adaptive_epoch_runtime->activation.active_effect()"));
 
     REQUIRE_FALSE(timeout.empty());
     CHECK(contains_in_order(
