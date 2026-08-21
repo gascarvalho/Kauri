@@ -3545,6 +3545,7 @@ private:
                     controller->controller_failure->epoch_factory_status.has_value()
                 ? static_cast<unsigned>(
                     *controller->controller_failure->epoch_factory_status) : 0;
+            const auto event_health = event_sink_.health();
             HOTSTUFF_LOG_WARN(
                 "KAURI_ADAPTIVE_V3_MANAGER fatal reason=%s status=%u "
                 "next_policy=%zu ready_members=%zu total_members=%zu "
@@ -3553,7 +3554,9 @@ private:
                 "controller_failure_stage=%u selection_status=%u "
                 "factory_status=%u terminal_count=%zu terminal_cycle=%llu "
                 "terminal_reason=%u fault_window_armed=%d "
-                "fault_window_arm_timer_pending=%d",
+                "fault_window_arm_timer_pending=%d event_failure=%u "
+                "event_queued=%zu event_queued_bytes=%zu "
+                "event_dropped=%llu",
                 reason,
                 status.has_value() ? static_cast<unsigned>(*status) : 0,
                 next_policy_, readiness.ready_members, readiness.total_members,
@@ -3569,7 +3572,10 @@ private:
                 terminal_count,
                 static_cast<unsigned long long>(terminal_cycle), terminal_reason,
                 fault_window_armed_ ? 1 : 0,
-                fault_window_arm_timer_pending_ ? 1 : 0);
+                fault_window_arm_timer_pending_ ? 1 : 0,
+                static_cast<unsigned>(event_health.first_failure),
+                event_health.queued_events, event_health.queued_bytes,
+                static_cast<unsigned long long>(event_health.dropped_records));
         }
         failed_ = true;
         event_context_.stop();
