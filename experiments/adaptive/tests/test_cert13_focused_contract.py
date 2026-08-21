@@ -1607,7 +1607,7 @@ def test_v13_commit_reconstruction_bounds_shutdown_suffix(
     "mutation",
     [
         "missing_all_carriers",
-        "conflicting_identity",
+        "conflicting_fallback_identity",
         "orphan_physical_block",
         "nonadjacent_source_sequence",
         "designated_source_witness",
@@ -1644,7 +1644,8 @@ def test_v13_native_cross_source_commit_witness_mutations_fail_closed(
         events.remove(authoritative)
         for candidate in witnesses:
             events.remove(candidate)
-    elif mutation == "conflicting_identity":
+    elif mutation == "conflicting_fallback_identity":
+        events.remove(authoritative)
         witness["payload"]["decision_proof"]["epoch_number"] += 1
     elif mutation == "orphan_physical_block":
         replacement = "ff" * 32
@@ -1669,6 +1670,35 @@ def test_v13_native_cross_source_commit_witness_mutations_fail_closed(
 
     with pytest.raises(validation.FocusedCrashPairValidationError):
         validation._validate_v13_e2_common_commit(events, contract, cycles)
+
+
+def test_v13_native_designated_commit_precedes_conflicting_witness() -> None:
+    validation, events, contract, _cycles = _native_v13_e2_common_state()
+    e2 = next(
+        event
+        for event in events
+        if event["event_type"] == "adaptive_v3.e2_eligibility"
+    )
+    common = e2["payload"]["e2_common_commit"]
+    witness = next(
+        event
+        for event in events
+        if event["event_type"] == "block.commit_identity_witness"
+        and event["payload"]["decision_proof"] == common
+    )
+    witness["payload"]["decision_proof"] = {
+        **witness["payload"]["decision_proof"],
+        "tree_id": witness["payload"]["decision_proof"]["tree_id"] + 1,
+    }
+
+    commits = validation._v13_reconstruct_authoritative_commits(events, contract)
+    reconstructed = next(
+        event
+        for event in commits
+        if event["payload"]["block_hash"] == common["block_hash"]
+    )
+
+    assert reconstructed["payload"]["decision_proof"] == common
 
 
 @pytest.mark.parametrize(
@@ -1780,6 +1810,69 @@ def _canonical_json(value: object) -> bytes:
     ).encode("ascii") + b"\n"
 
 
+def test_v13_observation_retry_after_assembly_remains_causal() -> None:
+    validation = _validation()
+    rows = [
+        {
+            "source_sequence": 10,
+            "source_monotonic_ns": 1_001,
+            "payload": {"disposition": "accepted"},
+        },
+        {
+            "source_sequence": 12,
+            "source_monotonic_ns": 1_010,
+            "payload": {"disposition": "duplicate"},
+        },
+    ]
+
+    validation._validate_v13_observation_acceptance_causality(
+        rows,
+        signer_raw_ns=1_000,
+        assembled_sequence=11,
+        terminal_sequence=13,
+    )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("primary-after-assembly", "duplicate-before-primary", "after-terminal", "missing-primary"),
+)
+def test_v13_observation_acceptance_causality_mutations_fail_closed(
+    mutation: str,
+) -> None:
+    validation = _validation()
+    rows = [
+        {
+            "source_sequence": 10,
+            "source_monotonic_ns": 1_001,
+            "payload": {"disposition": "accepted"},
+        },
+        {
+            "source_sequence": 12,
+            "source_monotonic_ns": 1_010,
+            "payload": {"disposition": "duplicate"},
+        },
+    ]
+    if mutation == "primary-after-assembly":
+        rows[0]["source_sequence"] = 11
+    elif mutation == "duplicate-before-primary":
+        rows[1]["source_sequence"] = 9
+    elif mutation == "after-terminal":
+        rows[1]["source_sequence"] = 13
+    elif mutation == "missing-primary":
+        rows[0]["payload"]["disposition"] = "duplicate"
+    else:  # pragma: no cover - parameter list is exhaustive
+        raise AssertionError(f"unknown mutation {mutation}")
+
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_v13_observation_acceptance_causality(
+            rows,
+            signer_raw_ns=1_000,
+            assembled_sequence=11,
+            terminal_sequence=13,
+        )
+
+
 def _v13_parent_authorization_tree(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     """Write the smallest canonical child tree accepted by the v13 helper."""
     root = tmp_path / "pair-01" / "control"
@@ -1844,6 +1937,25 @@ def test_v13_parent_authorization_projection_is_directly_callable(tmp_path: Path
         "membership_digest": "50" * 32,
         "member_count": 7,
     }
+
+
+def test_v13_parent_authorization_accepts_rfc3339_z_utc(tmp_path: Path) -> None:
+    root, contract = _v13_parent_authorization_tree(tmp_path)
+    request = json.loads(
+        (root / "runtime" / "parent-authorization-request.json").read_text()
+    )
+    request_bytes = _canonical_json(request)
+    receipt = {
+        **request,
+        "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+        "approval_reference": "CERT13 approval",
+        "approved_utc": "2026-08-21T10:49:24Z",
+    }
+    _write_v13_parent_authorization(root, request, receipt=receipt)
+
+    assert _validation()._validate_v13_parent_authorization_projection(
+        root, contract
+    )["member_count"] == 7
 
 
 def test_v13_parent_authorization_projection_binds_campaign_slot_path(

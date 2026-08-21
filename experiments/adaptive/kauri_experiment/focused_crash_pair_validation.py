@@ -3811,6 +3811,41 @@ def _v13_event_successor_epoch(event: Mapping[str, object]) -> int | None:
     return value if type(value) is int else None
 
 
+def _validate_v13_observation_acceptance_causality(
+    rows: Sequence[Mapping[str, object]],
+    *,
+    signer_raw_ns: int,
+    assembled_sequence: int,
+    terminal_sequence: int,
+) -> None:
+    """Bind the one collector admission while allowing in-flight retries."""
+    primary_sequences: list[int] = []
+    duplicate_sequences: list[int] = []
+    for row in rows:
+        payload = _mapping(row.get("payload"), "v13 accepted observation")
+        sequence = _integer(
+            row.get("source_sequence"), "v13 observation manager sequence", 1
+        )
+        if _uint64(
+            row.get("source_monotonic_ns"),
+            "v13 observation acceptance time",
+        ) < signer_raw_ns or sequence >= terminal_sequence:
+            _error("v13 manager observation acceptance is not causal")
+        disposition = payload.get("disposition")
+        if disposition in {"accepted", "released"}:
+            if sequence >= assembled_sequence:
+                _error("v13 manager observation acceptance is not causal")
+            primary_sequences.append(sequence)
+        elif disposition == "duplicate":
+            duplicate_sequences.append(sequence)
+        else:
+            _error("v13 manager observation acceptance is not causal")
+    if len(primary_sequences) != 1 or any(
+        sequence <= primary_sequences[0] for sequence in duplicate_sequences
+    ):
+        _error("v13 manager observation acceptance is not causal")
+
+
 def _reconstruct_v13_certified_readiness(
     events: Sequence[Mapping[str, object]],
     contract: Mapping[str, object],
@@ -4002,19 +4037,17 @@ def _reconstruct_v13_certified_readiness(
                 if (
                     _v13_readiness_wire(observed_payload, "v13 accepted observation")
                     != signed_wire
-                    or _uint64(
-                        observed_event.get("source_monotonic_ns"),
-                        "v13 observation acceptance time",
-                    ) < _uint64(
-                        signed_payload.get("signer_monotonic_raw_ns"),
-                        "v13 signer time",
-                    )
-                    or _integer(
-                        observed_event.get("source_sequence"),
-                        "v13 observation manager sequence", 1,
-                    ) >= assembled_sequence
                 ):
                     _error("v13 manager observation acceptance is not causal")
+            _validate_v13_observation_acceptance_causality(
+                observations[replica],
+                signer_raw_ns=_uint64(
+                    signed_payload.get("signer_monotonic_raw_ns"),
+                    "v13 signer time",
+                ),
+                assembled_sequence=assembled_sequence,
+                terminal_sequence=terminal_sequence,
+            )
             accepted_payload = _mapping(accepted[replica]["payload"], "v13 certificate acceptance")
             if _v13_readiness_wire(accepted_payload, "v13 accepted certificate") != certificate_wire:
                 _error("v13 replica accepted a different certificate")
@@ -5708,33 +5741,46 @@ def _ranking(
     )
 
 
+def _common_commit_key(
+    payload: Mapping[str, Any], contract: Mapping[str, object]
+) -> tuple[object, ...]:
+    fields = (
+        "block_height",
+        "block_hash",
+        "parent_hash",
+        "transaction_count",
+    )
+    profile = _mapping(contract.get("profile"), "focused profile")
+    if profile.get("profile_id") not in _FCRASH_H_V13_PROFILE_IDS:
+        fields = (*fields, "commit_batch_index")
+    return tuple(payload.get(field) for field in fields)
+
+
 def _select_latest_common_commit(
     commits: Sequence[Mapping[str, Any]],
     observations: Sequence[Mapping[str, Any]],
     contract: Mapping[str, object],
 ) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
     survivor_sources = {f"replica-{replica}" for replica in contract["survivors"]}
+    observations_by_commit: dict[
+        tuple[object, ...], list[Mapping[str, Any]]
+    ] = {}
+    for event in observations:
+        if (
+            event.get("source_kind") != "replica"
+            or event.get("source_id") not in survivor_sources
+        ):
+            continue
+        payload = _mapping(event.get("payload"), "common commit observation")
+        observations_by_commit.setdefault(
+            _common_commit_key(payload, contract), []
+        ).append(event)
     eligible: list[tuple[Mapping[str, Any], list[Mapping[str, Any]]]] = []
     for commit in commits:
         payload = _mapping(commit["payload"], "authoritative commit")
-        identity = {
-            key: payload.get(key)
-            for key in (
-                "block_height",
-                "block_hash",
-                "parent_hash",
-                "transaction_count",
-                "commit_batch_index",
-            )
-        }
-        matching = [
-            event
-            for event in observations
-            if event["source_kind"] == "replica"
-            and event["source_id"] in survivor_sources
-            and dict(_mapping(event["payload"], "common commit observation"))
-            == identity
-        ]
+        matching = observations_by_commit.get(
+            _common_commit_key(payload, contract), []
+        )
         if len({str(event["source_id"]) for event in matching}) >= int(
             contract["quorum"]
         ):
@@ -5775,6 +5821,26 @@ def _first_common_commit_anchor(
     contract: Mapping[str, object],
 ) -> int:
     survivor_sources = {f"replica-{replica}" for replica in contract["survivors"]}
+    earliest_by_commit: dict[tuple[object, ...], dict[str, int]] = {}
+    for observation in observations:
+        source = str(observation.get("source_id"))
+        if observation.get("source_kind") != "replica" or source not in survivor_sources:
+            continue
+        timestamp = _integer(
+            observation.get("source_monotonic_ns"),
+            "phase commit observation timestamp",
+        )
+        if timestamp <= after_ns:
+            continue
+        payload = _mapping(
+            observation.get("payload"), "phase commit observation"
+        )
+        by_source = earliest_by_commit.setdefault(
+            _common_commit_key(payload, contract), {}
+        )
+        previous = by_source.get(source)
+        if previous is None or timestamp < previous:
+            by_source[source] = timestamp
     candidates = sorted(
         (
             event
@@ -5794,37 +5860,8 @@ def _first_common_commit_anchor(
     )
     for commit in candidates:
         payload = _mapping(commit.get("payload"), "phase commit")
-        identity = {
-            key: payload.get(key)
-            for key in (
-                "block_height",
-                "block_hash",
-                "parent_hash",
-                "transaction_count",
-                "commit_batch_index",
-            )
-        }
-        earliest_by_source: dict[str, int] = {}
-        for observation in observations:
-            source = str(observation.get("source_id"))
-            if (
-                observation.get("source_kind") != "replica"
-                or source not in survivor_sources
-                or dict(
-                    _mapping(observation.get("payload"), "phase commit observation")
-                )
-                != identity
-            ):
-                continue
-            timestamp = _integer(
-                observation.get("source_monotonic_ns"),
-                "phase commit observation timestamp",
-            )
-            if timestamp <= after_ns:
-                continue
-            previous = earliest_by_source.get(source)
-            if previous is None or timestamp < previous:
-                earliest_by_source[source] = timestamp
+        commit_key = _common_commit_key(payload, contract)
+        earliest_by_source = earliest_by_commit.get(commit_key, {})
         if len(earliest_by_source) < int(contract["quorum"]):
             continue
         quorum_times = sorted(earliest_by_source.values())[: int(contract["quorum"])]
@@ -6226,6 +6263,10 @@ def _v13_reconstruct_authoritative_commits(
             _error("v13 commit evidence is not member and lifecycle bound")
 
     observed_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    observed_by_source_physical: dict[
+        tuple[str, tuple[object, object, object, object, object]],
+        list[Mapping[str, Any]],
+    ] = {}
     observed_physical: dict[int, dict[str, object]] = {}
     for event in observed:
         payload = _mapping(event.get("payload"), "v13 commit observation")
@@ -6235,10 +6276,19 @@ def _v13_reconstruct_authoritative_commits(
             payload, "v13 commit observation"
         )
         observed_physical[id(event)] = physical
-        observed_by_source.setdefault(str(event["source_id"]), []).append(event)
+        source = str(event["source_id"])
+        observed_by_source.setdefault(source, []).append(event)
+        local_key = (
+            *_v13_commit_cross_source_projection(physical),
+            physical["commit_batch_index"],
+        )
+        observed_by_source_physical.setdefault((source, local_key), []).append(event)
 
     carrier_physical: dict[int, dict[str, object]] = {}
     carrier_identity: dict[int, tuple[dict[str, object], int]] = {}
+    carriers_by_physical: dict[
+        tuple[object, object, object, object], list[Mapping[str, Any]]
+    ] = {}
     for event in carriers:
         name = str(event.get("event_type"))
         payload = _mapping(event.get("payload"), "v13 commit identity carrier")
@@ -6269,11 +6319,12 @@ def _v13_reconstruct_authoritative_commits(
         )
         carrier_physical[id(event)] = physical
         carrier_identity[id(event)] = identity
-        matches = [
-            candidate
-            for candidate in observed_by_source.get(str(event["source_id"]), ())
-            if observed_physical[id(candidate)] == physical
-        ]
+        source = str(event["source_id"])
+        local_key = (
+            *_v13_commit_cross_source_projection(physical),
+            physical["commit_batch_index"],
+        )
+        matches = observed_by_source_physical.get((source, local_key), ())
         if len(matches) != 1:
             _error("v13 commit identity carrier lacks one local observation")
         observation = matches[0]
@@ -6296,6 +6347,9 @@ def _v13_reconstruct_authoritative_commits(
             or carrier_time < observation_time
         ):
             _error("v13 commit identity does not immediately follow its observation")
+        carriers_by_physical.setdefault(
+            _v13_commit_cross_source_projection(physical), []
+        ).append(event)
 
     authoritative_observations = observed_by_source.get(authoritative_source, [])
     if len(authoritative_observations) < 4:
@@ -6304,24 +6358,27 @@ def _v13_reconstruct_authoritative_commits(
     consumed_carriers: set[int] = set()
     for observation in authoritative_observations:
         physical = observed_physical[id(observation)]
-        matching = [
-            carrier
-            for carrier in carriers
-            if _v13_commit_cross_source_projection(
-                carrier_physical[id(carrier)]
+        matching = list(
+            carriers_by_physical.get(
+                _v13_commit_cross_source_projection(physical), ()
             )
-            == _v13_commit_cross_source_projection(physical)
-        ]
+        )
         if not matching:
             _error("v13 designated commit observation lacks an exact identity")
         if len({str(carrier["source_id"]) for carrier in matching}) != len(matching):
             _error("v13 commit identity carrier is duplicated by one source")
+        designated = [
+            carrier
+            for carrier in matching
+            if carrier.get("event_type") == "block.committed"
+        ]
+        identity_carriers = designated if designated else matching
         identities = {
             (
                 tuple(sorted(carrier_identity[id(carrier)][0].items())),
                 carrier_identity[id(carrier)][1],
             )
-            for carrier in matching
+            for carrier in identity_carriers
         }
         if len(identities) != 1:
             _error("v13 cross-source commit identities conflict")
@@ -6977,6 +7034,7 @@ def _validate_v13_redacted_launch_arguments(
 ) -> None:
     """Bind the sealed public replica/client argv without recovering secrets."""
 
+    sealed_root = root.resolve(strict=True)
     if set(launch) != {
         "manager_argv",
         "manager_checkpoint",
@@ -7068,8 +7126,8 @@ def _validate_v13_redacted_launch_arguments(
         if not source_instance:
             _error("v13 replica argv source instance is absent")
         expected_tail = (
-            "--conf", str(root / "config" / "main.conf"),
-            "--conf", str(root / "config" / f"replica-{replica}.conf"),
+            "--conf", str(sealed_root / "config" / "main.conf"),
+            "--conf", str(sealed_root / "config" / f"replica-{replica}.conf"),
             "--privkey", "<redacted>",
             "--epoch-protocol-mode", "adaptive_v3",
             "--epoch-change-issuer-id", "1",
@@ -7085,16 +7143,25 @@ def _validate_v13_redacted_launch_arguments(
             "--activation-readiness-observation-retry-interval-ms", "1000",
             "--structured-event-run-id", run_id,
             "--structured-event-source-instance", source_instance,
-            "--structured-event-output", str(root / "raw" / f"replica-{replica}.jsonl"),
+            "--structured-event-output", str(sealed_root / "raw" / f"replica-{replica}.jsonl"),
             "--structured-event-commit-observer-id", observer_id,
             "--structured-event-commit-observer-instance", observer_instance,
         )
-        if Path(arguments[0]).name != "hotstuff-app" or arguments[1:] != expected_tail:
-            _error("v13 redacted replica argv drifted")
+        if Path(arguments[0]).name != "hotstuff-app":
+            _error(f"v13 redacted replica {replica} executable drifted")
+        if len(arguments[1:]) != len(expected_tail):
+            _error(f"v13 redacted replica {replica} argv cardinality drifted")
+        for index, (actual, expected) in enumerate(
+            zip(arguments[1:], expected_tail, strict=True), start=1
+        ):
+            if actual != expected:
+                _error(
+                    f"v13 redacted replica {replica} argv drifted at position {index}"
+                )
 
     client = tuple(_sequence(launch.get("client_argv"), "v13 client argv"))
     expected_client_tail = (
-        "--conf", str(root / "config" / "main.conf"),
+        "--conf", str(sealed_root / "config" / "main.conf"),
         "--idx", "0",
         "--iter", "-1",
         "--max-async",
@@ -7141,6 +7208,22 @@ def _validate_v13_parent_readiness_projection(
                            "membership_digest": membership,
                            "member_count": count}
     return result
+
+
+def _parse_utc_approval_time(value: str, label: str) -> datetime:
+    # Python 3.10's fromisoformat predates RFC 3339's common ``Z`` spelling.
+    # Normalize only that exact UTC suffix; offset validation remains strict.
+    candidate = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise FocusedCrashPairValidationError(
+            f"{label} approval time is invalid"
+        ) from exc
+    offset = parsed.utcoffset()
+    if offset is None or offset.total_seconds() != 0:
+        _error(f"{label} approval time is not UTC")
+    return parsed
 
 
 def _validate_v13_parent_authorization_projection(
@@ -7196,15 +7279,7 @@ def _validate_v13_parent_authorization_projection(
         or any(not 32 <= ord(character) <= 126 for character in approved_utc)
     ):
         _error("v13 parent authorization approval metadata drifted")
-    try:
-        parsed_approved = datetime.fromisoformat(approved_utc)
-    except ValueError as exc:
-        raise FocusedCrashPairValidationError(
-            "v13 parent authorization approval time is invalid"
-        ) from exc
-    offset = parsed_approved.utcoffset()
-    if offset is None or offset.total_seconds() != 0:
-        _error("v13 parent authorization approval time is not UTC")
+    _parse_utc_approval_time(approved_utc, "v13 parent authorization")
     pair_receipt = _mapping(
         _read_json(root / "pair-receipt.json", "pair receipt"), "pair receipt"
     )
@@ -8079,15 +8154,7 @@ def _validate_fault_window_arm(
         or any(not 32 <= ord(character) <= 126 for character in approved_utc)
     ):
         _error("parent authorization approval metadata drifted")
-    try:
-        parsed_approved = datetime.fromisoformat(approved_utc)
-    except ValueError as exc:
-        raise FocusedCrashPairValidationError(
-            "parent authorization approval time is invalid"
-        ) from exc
-    offset = parsed_approved.utcoffset()
-    if offset is None or offset.total_seconds() != 0:
-        _error("parent authorization approval time is not UTC")
+    _parse_utc_approval_time(approved_utc, "parent authorization")
     pair_receipt = _read_json(root / "pair-receipt.json", "pair receipt")
     pair_id = pair_receipt.get("pair_id")
     if (
@@ -8109,7 +8176,7 @@ def _validate_fault_window_arm(
         # binds it to the public manifest without reopening authorization.
         selected_projection = v13_selected_projection
     historical_arm_path = (
-        root / "runtime" / _FAULT_WINDOW_ARM_FILENAME
+        path
         if is_v13
         else Path(parent_request["output_root"])
         / pair_id
