@@ -7813,6 +7813,9 @@ def _runtime_authoritative_commits(
     ]
     observed_payloads: dict[int, Mapping[str, Any]] = {}
     observed_by_source: dict[str, list[Mapping[str, Any]]] = {}
+    observed_by_source_physical: dict[
+        tuple[str, tuple[Any, ...]], list[Mapping[str, Any]]
+    ] = {}
     for observation in observations:
         payload = _document(
             observation.get("payload"), "authoritative commit observation"
@@ -7820,9 +7823,15 @@ def _runtime_authoritative_commits(
         if set(payload) != physical_keys:
             _error("authoritative commit observation schema drifted")
         observed_payloads[id(observation)] = payload
-        observed_by_source.setdefault(str(observation.get("source_id")), []).append(
-            observation
-        )
+        observation_source = str(observation.get("source_id"))
+        observed_by_source.setdefault(observation_source, []).append(observation)
+        observed_by_source_physical.setdefault(
+            (
+                observation_source,
+                tuple(payload.get(key) for key in physical_keys),
+            ),
+            [],
+        ).append(observation)
 
     carriers = [
         event
@@ -7831,9 +7840,10 @@ def _runtime_authoritative_commits(
         in {"block.committed", "block.commit_identity_witness"}
         and event.get("source_kind") == "replica"
     ]
-    carrier_rows: list[
-        tuple[Mapping[str, Any], Mapping[str, Any], int]
-    ] = []
+    carrier_rows_by_commit: dict[
+        tuple[Any, ...],
+        list[tuple[Mapping[str, Any], Mapping[str, Any], int, bool]],
+    ] = {}
     for carrier in carriers:
         carrier_payload = _document(
             carrier.get("payload"), "authoritative commit identity carrier"
@@ -7850,17 +7860,13 @@ def _runtime_authoritative_commits(
             or carrier.get("source_id") == source_id
         ):
             _error("authoritative commit identity witness schema drifted")
-        local_matches = [
-            observation
-            for observation in observed_by_source.get(
-                str(carrier.get("source_id")), ()
-            )
-            if all(
-                observed_payloads[id(observation)].get(key)
-                == carrier_payload.get(key)
-                for key in physical_keys
-            )
-        ]
+        local_matches = observed_by_source_physical.get(
+            (
+                str(carrier.get("source_id")),
+                tuple(carrier_payload.get(key) for key in physical_keys),
+            ),
+            (),
+        )
         if len(local_matches) != 1:
             _error("authoritative commit identity carrier lacks one local observation")
         local_observation = local_matches[0]
@@ -7892,24 +7898,50 @@ def _runtime_authoritative_commits(
         generation = _uint64(
             carrier_payload.get("view_generation"), "commit identity generation", 1
         )
-        carrier_rows.append((carrier_payload, proof, generation))
-
-    reconstructed: list[Mapping[str, Any]] = []
-    for observation in observed_by_source.get(source_id, ()):
-        observed_payload = observed_payloads[id(observation)]
-        matches = [
-            row
-            for row in carrier_rows
-            if all(
-                row[0].get(key) == observed_payload.get(key)
+        row = (
+            carrier_payload,
+            proof,
+            generation,
+            carrier.get("event_type") == "block.committed",
+        )
+        carrier_rows_by_commit.setdefault(
+            tuple(
+                carrier_payload.get(key)
                 for key in (
                     "block_height",
                     "block_hash",
                     "parent_hash",
                     "transaction_count",
                 )
+            ),
+            [],
+        ).append(row)
+
+    reconstructed: list[Mapping[str, Any]] = []
+    for observation in observed_by_source.get(source_id, ()):
+        observed_payload = observed_payloads[id(observation)]
+        matches = list(
+            carrier_rows_by_commit.get(
+                tuple(
+                    observed_payload.get(key)
+                    for key in (
+                        "block_height",
+                        "block_hash",
+                        "parent_hash",
+                        "transaction_count",
+                    )
+                ),
+                (),
             )
-        ]
+        )
+        # The frozen profile names one designated authoritative commit
+        # observer.  Cross-source witnesses are a fail-closed fallback for a
+        # physical observation whose designated identity carrier is absent;
+        # they must not override or make ambiguous a present designated
+        # block.committed carrier.
+        designated_matches = [row for row in matches if row[3]]
+        if designated_matches:
+            matches = designated_matches
         identities = {(_canonical_json(row[1]), row[2]) for row in matches}
         if not matches or len(identities) != 1:
             _error("authoritative commit observation lacks one exact identity")

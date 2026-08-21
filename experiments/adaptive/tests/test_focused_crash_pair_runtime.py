@@ -2898,6 +2898,78 @@ def test_v13_runtime_phase_commit_accepts_cross_source_identity_witness() -> Non
     ]
 
 
+def test_v13_runtime_phase_commit_prefers_designated_identity_over_witness() -> None:
+    runtime = _runtime()
+    profile = runtime.load_focused_profile(N7_PROFILE_V13)
+    physical = {
+        "block_height": 42,
+        "block_hash": "a" * 64,
+        "parent_hash": "b" * 64,
+        "transaction_count": 1000,
+        "commit_batch_index": 0,
+    }
+    observation = {
+        "source_kind": "replica",
+        "source_id": "replica-2",
+        "source_instance": "replica-2-instance",
+        "source_sequence": 9,
+        "source_monotonic_ns": 1_000,
+        "event_type": "block.commit_observed",
+        "payload": dict(physical),
+    }
+    designated = {
+        **observation,
+        "source_sequence": 10,
+        "source_monotonic_ns": 1_001,
+        "event_type": "block.committed",
+        "payload": {
+            **physical,
+            "designated_observer": True,
+            "decision_proof": {
+                "epoch_number": 1,
+                "tree_id": 3,
+                "epoch_digest": "c" * 64,
+                "block_hash": physical["block_hash"],
+            },
+            "view_generation": (1 << 32) + 3,
+        },
+    }
+    witness_observation = {
+        **observation,
+        "source_id": "replica-3",
+        "source_instance": "replica-3-instance",
+        "source_sequence": 4,
+    }
+    witness = {
+        **witness_observation,
+        "source_sequence": 5,
+        "source_monotonic_ns": 1_002,
+        "event_type": "block.commit_identity_witness",
+        "payload": {
+            **physical,
+            "decision_proof": {
+                "epoch_number": 1,
+                "tree_id": 6,
+                "epoch_digest": "c" * 64,
+                "block_hash": physical["block_hash"],
+            },
+            "view_generation": (1 << 32) + 6,
+        },
+    }
+
+    commits = runtime._runtime_authoritative_commits(
+        [observation, designated, witness_observation, witness], profile
+    )
+
+    assert len(commits) == 1
+    assert commits[0]["payload"]["decision_proof"] == designated["payload"][
+        "decision_proof"
+    ]
+    assert commits[0]["payload"]["view_generation"] == designated["payload"][
+        "view_generation"
+    ]
+
+
 @pytest.mark.parametrize("mutation", ("missing", "early", "reused"))
 def test_v13_runtime_phase_commit_identity_join_fails_closed(
     mutation: str,
