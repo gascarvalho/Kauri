@@ -133,20 +133,12 @@ AdaptiveV3CertificateOutbox::result(
     }
 
     entry->in_flight = false;
-    if (entry->attempts >= state.config.maximum_attempts)
-    {
-        if (!enqueued)
-            return AdaptiveV3CertificateDeliveryDisposition::retry_exhausted;
-        // The final successful enqueue still needs a bounded interval in
-        // which its authenticated ACK may arrive.  Without this deadline a
-        // lost final ACK leaves the manager distributing forever.
-        entry->due = checked_retry_tick(
-            logical_tick, state.config.retry_interval_ticks);
-        return AdaptiveV3CertificateDeliveryDisposition::queued;
-    }
+    if (!enqueued && entry->attempts >= state.config.maximum_attempts)
+        return AdaptiveV3CertificateDeliveryDisposition::retry_exhausted;
 
-    // A successful enqueue is not an authenticated application ACK. Schedule
-    // the same immutable payload for a bounded retry if that ACK is lost.
+    // Every nonterminal result opens a bounded ACK/retry interval. The final
+    // successful enqueue still needs this interval because transport success
+    // is not an authenticated application ACK.
     entry->due = checked_retry_tick(
         logical_tick, state.config.retry_interval_ticks);
     return AdaptiveV3CertificateDeliveryDisposition::queued;
@@ -206,7 +198,8 @@ bool AdaptiveV3CertificateOutbox::retry_exhausted(
     std::uint64_t logical_tick) noexcept
 {
     auto &state = *state_;
-    if (state.exhausted || logical_tick < state.last_tick) return state.exhausted;
+    if (state.exhausted || logical_tick < state.last_tick)
+        return state.exhausted;
     state.last_tick = logical_tick;
     for (const auto &entry : state.entries)
     {
@@ -214,7 +207,8 @@ bool AdaptiveV3CertificateOutbox::retry_exhausted(
             entry.attempts >= state.config.maximum_attempts &&
             logical_tick >= entry.due)
         {
-            state.exhausted = true; return true;
+            state.exhausted = true;
+            return true;
         }
     }
     return false;

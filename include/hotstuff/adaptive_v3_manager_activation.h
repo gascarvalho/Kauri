@@ -31,17 +31,6 @@ enum class AdaptiveV3ManagerActivationStatus : std::uint8_t
     terminal,
 };
 
-struct AdaptiveV3ManagerObservationResult
-{
-    ActivationReadinessWireError wire_error{
-        ActivationReadinessWireError::none};
-    AdaptiveV3ManagerReadinessDisposition disposition{
-        AdaptiveV3ManagerReadinessDisposition::
-            rejected_invalid_observation};
-    std::optional<uint256_t> observation_digest;
-    bool certificate_assembled{false};
-};
-
 /**
  * Transport-independent manager owner for one exact adaptive-v3 activation.
  *

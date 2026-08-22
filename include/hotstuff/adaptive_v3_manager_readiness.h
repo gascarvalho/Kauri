@@ -11,13 +11,15 @@
 #include "hotstuff/activation_readiness_wire.h"
 #include "hotstuff/epoch_change_bundle.h"
 
-namespace hotstuff {
+namespace hotstuff
+{
 
 /** Immutable, non-dynamic portion of a v3 readiness identity.  Command
  * commit/boundary facts, including the active predecessor tree/generation,
  * are deliberately absent: only matching signed observations can establish
  * those values. */
-struct AdaptiveV3TransitionProjection {
+struct AdaptiveV3TransitionProjection
+{
     std::uint32_t predecessor_epoch_number{0};
     uint256_t predecessor_epoch_digest;
     std::vector<std::uint32_t> predecessor_tree_ids;
@@ -39,21 +41,40 @@ make_adaptive_v3_transition_projection(
     std::uint64_t cycle_ordinal,
     const std::vector<std::pair<ReplicaID, PubKeyBLS>> &readiness_membership) noexcept;
 
-struct AdaptiveV3ManagerReadinessConfig {
+struct AdaptiveV3ManagerReadinessConfig
+{
     std::vector<std::pair<ReplicaID, PubKeyBLS>> membership;
     std::size_t required_release_count{0};
     std::optional<AdaptiveV3TransitionProjection> projection;
 };
 
-enum class AdaptiveV3ManagerReadinessDisposition : std::uint8_t {
-    accepted = 1, duplicate, quarantined, rejected_peer_binding,
-    rejected_nonmember, rejected_invalid_observation, rejected_wrong_identity,
-    rejected_conflict, released,
+enum class AdaptiveV3ManagerReadinessDisposition : std::uint8_t
+{
+    accepted = 1,
+    duplicate,
+    quarantined,
+    rejected_peer_binding,
+    rejected_nonmember,
+    rejected_invalid_observation,
+    rejected_wrong_identity,
+    rejected_conflict,
+    released,
+};
+
+struct AdaptiveV3ManagerObservationResult
+{
+    ActivationReadinessWireError wire_error{
+        ActivationReadinessWireError::none};
+    AdaptiveV3ManagerReadinessDisposition disposition{
+        AdaptiveV3ManagerReadinessDisposition::rejected_invalid_observation};
+    std::optional<uint256_t> observation_digest;
+    bool certificate_assembled{false};
 };
 
 /** Manager-only availability collector. R controls release only; the W1
  * verifier remains the sole owner of Q derivation. Calls are single-writer. */
-class AdaptiveV3ManagerReadinessCollector final {
+class AdaptiveV3ManagerReadinessCollector final
+{
 public:
     AdaptiveV3ManagerReadinessCollector(ActivationReadyIdentityV1 expected,
                                         AdaptiveV3ManagerReadinessConfig config);
@@ -63,17 +84,22 @@ public:
         AdaptiveV3TransitionProjection projection,
         AdaptiveV3ManagerReadinessConfig config);
     ~AdaptiveV3ManagerReadinessCollector();
-    AdaptiveV3ManagerReadinessCollector(const AdaptiveV3ManagerReadinessCollector &) = delete;
-    AdaptiveV3ManagerReadinessCollector &operator=(const AdaptiveV3ManagerReadinessCollector &) = delete;
-    AdaptiveV3ManagerReadinessDisposition ingest(ReplicaID tls_peer,
-                                                   const ActivationReadyObservationV1 &observation) noexcept;
+    AdaptiveV3ManagerReadinessCollector(
+        const AdaptiveV3ManagerReadinessCollector &) = delete;
+    AdaptiveV3ManagerReadinessCollector &operator=(
+        const AdaptiveV3ManagerReadinessCollector &) = delete;
+    AdaptiveV3ManagerReadinessDisposition ingest(
+        ReplicaID tls_peer,
+        const ActivationReadyObservationV1 &observation) noexcept;
     const ActivationReadinessCertificateV1 *certificate() const noexcept;
     bool released() const noexcept;
     std::size_t accepted_count() const noexcept;
     bool quarantined(ReplicaID source) const noexcept;
 private:
-    struct State; std::unique_ptr<State> state_;
+    struct State;
+    std::unique_ptr<State> state_;
 };
 
 } // namespace hotstuff
+
 #endif

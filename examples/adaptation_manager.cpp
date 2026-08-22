@@ -55,7 +55,6 @@
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/adaptive_v2_selection.h"
-#include "hotstuff/adaptive_v3_manager_activation.h"
 #include "hotstuff/adaptive_v3_manager_session.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"

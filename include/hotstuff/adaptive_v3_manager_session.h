@@ -7,13 +7,14 @@
 
 #include "hotstuff/adaptive_v2_manager_controller.h"
 #include "hotstuff/adaptive_v2_manager_session.h"
-#include "hotstuff/adaptive_v3_manager_activation.h"
 #include "hotstuff/adaptive_v3_manager_readiness.h"
 #include "hotstuff/adaptive_v3_reporting_outbox.h"
 
-namespace hotstuff {
+namespace hotstuff
+{
 
-struct AdaptiveV3ManagerSessionConfig {
+struct AdaptiveV3ManagerSessionConfig
+{
     std::uint32_t active_tree_id{0};
     std::uint64_t activation_generation{0};
     AdaptiveV2ManagerIngressLimits ingress_limits;
@@ -35,16 +36,30 @@ struct AdaptiveV3ManagerSessionConfig {
     ActivationReadinessWireLimits wire_limits;
 };
 
-enum class AdaptiveV3ManagerSessionStatus : std::uint8_t {
-    idle = 1, selecting, successor_available, collecting, distributing, residency, terminal,
+enum class AdaptiveV3ManagerSessionStatus : std::uint8_t
+{
+    idle = 1,
+    selecting,
+    successor_available,
+    collecting,
+    distributing,
+    residency,
+    terminal,
 };
-enum class AdaptiveV3ManagerSessionTerminalReason : std::uint8_t {
-    acknowledgements_complete = 1, pre_certificate_deadline,
-    delivery_deadline, delivery_retry_exhausted, collector_conflict,
-    invalid_rotation, common_commit_missing, hard_deadline_unarmed,
+enum class AdaptiveV3ManagerSessionTerminalReason : std::uint8_t
+{
+    acknowledgements_complete = 1,
+    pre_certificate_deadline,
+    delivery_deadline,
+    delivery_retry_exhausted,
+    collector_conflict,
+    invalid_rotation,
+    common_commit_missing,
+    hard_deadline_unarmed,
     hard_deadline_exhausted,
 };
-struct AdaptiveV3ManagerSessionTerminalRecord {
+struct AdaptiveV3ManagerSessionTerminalRecord
+{
     std::uint64_t cycle_ordinal{0};
     AdaptiveV3ManagerSessionTerminalReason reason{
         AdaptiveV3ManagerSessionTerminalReason::invalid_rotation};
@@ -55,7 +70,8 @@ struct AdaptiveV3ManagerSessionTerminalRecord {
 };
 
 /** Immutable, allocation-safe copy of the E1 facts which authorize E2. */
-struct AdaptiveV3E2EligibilityAuditSnapshot {
+struct AdaptiveV3E2EligibilityAuditSnapshot
+{
     std::uint64_t cycle_ordinal{0};
     std::optional<ActivationReadyIdentityV1> e1_identity;
     uint256_t e1_bundle_digest;
@@ -72,7 +88,8 @@ struct AdaptiveV3E2EligibilityAuditSnapshot {
 /** Transport-independent recurring v3 manager. It owns no voting state and
  * derives a readiness identity only from an immutable emitted v3 bundle plus
  * authenticated signed observations. */
-class AdaptiveV3ManagerSession final {
+class AdaptiveV3ManagerSession final
+{
 public:
     AdaptiveV3ManagerSession(std::vector<ReplicaID>, EpochDefinitionInput,
                              AdaptiveV3ManagerSessionConfig);
@@ -82,7 +99,8 @@ public:
 
     const AdaptiveV2ManagerIngress &ingress() const noexcept;
     AdaptiveV2ManagerReadinessResult ingest_readiness(
-        const AuthenticatedReporter &, const MsgAdaptiveV2ReadinessNotice &) noexcept;
+        const AuthenticatedReporter &,
+        const MsgAdaptiveV2ReadinessNotice &) noexcept;
     AdaptiveV2ManagerReadinessResult ingest_readiness(
         const AuthenticatedReporter &, const bytearray_t &) noexcept;
     AdaptiveV2ManagerLifecycleResult ingest_lifecycle(
@@ -104,8 +122,10 @@ public:
     AdaptiveV2ManagerControllerStatus evaluate() noexcept;
     std::optional<AdaptiveV2ManagerControllerAuditSnapshot>
     controller_audit() const noexcept;
-    const AdaptiveV2ManagerControllerFailureDetail *controller_failure_detail() const noexcept;
-    const AdaptiveV3EpochChangeBundle *successor_bundle() const noexcept;
+    const AdaptiveV2ManagerControllerFailureDetail *
+    controller_failure_detail() const noexcept;
+    const AdaptiveV3EpochChangeBundle *
+    successor_bundle() const noexcept;
     bool begin_readiness(std::uint64_t logical_tick) noexcept;
     AdaptiveV3ManagerObservationResult observe_readiness(
         ReplicaID tls_peer, std::uint64_t logical_tick, const bytearray_t &) noexcept;
@@ -123,10 +143,17 @@ public:
                 const AdaptiveV2TransitionPolicy &) noexcept;
     void advance(std::uint64_t logical_tick) noexcept;
     AdaptiveV3ManagerSessionStatus status() const noexcept;
-    const AdaptiveV3ManagerSessionTerminalRecord *terminal_audit() const noexcept;
-    const std::vector<AdaptiveV3ManagerSessionTerminalRecord> &terminal_records() const noexcept;
-    const ActivationReadinessCertificateV1 *certificate() const noexcept;
-private: struct State; std::unique_ptr<State> state_;
+    const AdaptiveV3ManagerSessionTerminalRecord *
+    terminal_audit() const noexcept;
+    const std::vector<AdaptiveV3ManagerSessionTerminalRecord> &
+    terminal_records() const noexcept;
+    const ActivationReadinessCertificateV1 *
+    certificate() const noexcept;
+
+private:
+    struct State;
+    std::unique_ptr<State> state_;
 };
 } // namespace hotstuff
+
 #endif
