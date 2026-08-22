@@ -279,7 +279,7 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         color="#0f766e",
         marker="s",
         linewidth=1.3,
-        label="Optimized / matched control",
+        label="Paired ratio of ratios",
     )
     right.set_xticks(pair_x, [f"P{value}" for value in pair_x])
     right.set_ylim(0.90, 1.13)
