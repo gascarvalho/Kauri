@@ -53,6 +53,46 @@ _V13_READY_OBSERVATION_OPCODE = 0x21
 _V13_READY_CERTIFICATE_OPCODE = 0x22
 _V13_MAX_REPLICA_MESSAGE_BYTES = 4 << 20
 _V13_MAXIMUM_DELIVERY_ATTEMPTS = 5
+_V13_CONFIGURATION_KEYS = {"epoch_number", "tree_id", "epoch_digest"}
+_V13_IDENTITY_KEYS = {
+    "schema_version",
+    "membership_digest",
+    "predecessor_boundary_configuration",
+    "predecessor_boundary_generation",
+    "successor_configuration",
+    "successor_activation_generation",
+    "command_payload_digest",
+    "command_block_height",
+    "command_block_hash",
+    "activation_delay_blocks",
+    "activation_height",
+    "activation_boundary_block_hash",
+}
+_V13_OBSERVATION_KEYS = {
+    "identity",
+    "signer_replica_id",
+    "signer_source_sequence",
+    "signer_monotonic_raw_ns",
+    "vote_fence_engaged",
+    "signature_hex",
+}
+_V13_CERTIFICATE_KEYS = {
+    "schema_version",
+    "identity",
+    "observations",
+    "certificate_digest",
+}
+_V13_ACK_KEYS = {
+    "schema_version",
+    "acknowledged_opcode",
+    "recipient_replica_id",
+    "identity",
+    "certificate_digest",
+    "payload_digest",
+    "disposition",
+}
+_V13_IDENTITY_BODY_BYTES = 252
+_V13_OBSERVATION_BODY_BYTES = _V13_IDENTITY_BODY_BYTES + 2 + 8 + 8 + 1 + 96
 _V13_READINESS_MEMBERSHIP_DOMAIN = (
     b"kauri-adaptive-v3-activation-readiness-membership-v1"
 )
@@ -2575,6 +2615,48 @@ def _validate_prefault_active_configuration(
             _error("FCRASH-H pre-fault active configuration drifted")
 
 
+def _v13_certified_activation_contract(
+    profile: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate the frozen public v13 activation contract."""
+
+    protocol = _mapping(profile.get("protocol"), "v13 protocol")
+    transitions = _mapping(profile.get("transitions"), "v13 transitions")
+    contract = _mapping(
+        transitions.get("activation_readiness_contract"),
+        "v13 activation readiness contract",
+    )
+    expected = {
+        "schema_version": 1,
+        "domain": "kauri-focused-v13-certified-activation-v1",
+        "certificate_quorum": protocol.get("Q"),
+        "required_reporter_count": transitions.get("survivor_barrier_count"),
+        "epoch1_common_commit_anchor_deadline_seconds": 5,
+        "containment_stabilization_seconds": 30,
+        "containment_measurement_seconds": 30,
+        "minimum_predecessor_residency_ms": 65_000,
+        "optimization_activation_budget_seconds": 90,
+        "deadline_semantics": "half_open_monotonic_v1",
+        "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
+    }
+    if (
+        profile.get("profile_id") not in _FCRASH_H_V13_PROFILE_IDS
+        or protocol.get("epoch_protocol_mode") != "adaptive_v3"
+        or transitions.get("adaptive") != ["epoch1", "epoch2"]
+        or contract != expected
+        or _integer(
+            expected["certificate_quorum"], "v13 certificate quorum", 1
+        )
+        > _integer(
+            expected["required_reporter_count"],
+            "v13 required reporter count",
+            1,
+        )
+    ):
+        _error("v13 certified activation contract drifted")
+    return dict(contract)
+
+
 def validation_contract_from_profile(root: Path) -> dict[str, object]:
     """Derive the independent N7/N31 contract from sealed frozen inputs."""
 
@@ -3426,6 +3508,16 @@ _V13_READINESS_SUCCESS_EVENTS = {
     "adaptive_v3.e2_eligibility",
     "adaptive_v3.readiness_terminal",
 }
+_V13_READINESS_FAILURE_EVENTS = {
+    "adaptive_v3.readiness_observation_rejected",
+    "adaptive_v3.readiness_source_quarantined",
+    "adaptive_v3.readiness_certificate_rejected",
+    "adaptive_v3.readiness_wire_rejected",
+    "adaptive_v3.command_terminal",
+}
+_V13_READINESS_EVENT_NAMES = (
+    _V13_READINESS_SUCCESS_EVENTS | _V13_READINESS_FAILURE_EVENTS
+)
 
 
 def _v13_readiness_wire(payload: Mapping[str, object], label: str) -> bytes:
@@ -3440,8 +3532,8 @@ def _v13_readiness_wire(payload: Mapping[str, object], label: str) -> bytes:
     return bytes.fromhex(value)
 
 
-def _v13_readiness_replica_source(
-    event: Mapping[str, object], payload: Mapping[str, object]
+def _v13_replica_event_source(
+    event: Mapping[str, object], label: str
 ) -> int:
     source_id = event.get("source_id")
     if (
@@ -3449,13 +3541,22 @@ def _v13_readiness_replica_source(
         or not isinstance(source_id, str)
         or not source_id.startswith("replica-")
     ):
-        _error("v13 readiness event source kind drifted")
+        _error(f"{label} source is not a replica")
     try:
         source = int(source_id.removeprefix("replica-"))
     except ValueError as exc:
         raise FocusedCrashPairValidationError(
-            "v13 readiness event source ID drifted"
+            f"{label} source ID drifted"
         ) from exc
+    if source_id != f"replica-{source}":
+        _error(f"{label} source ID is not canonical")
+    return source
+
+
+def _v13_readiness_replica_source(
+    event: Mapping[str, object], payload: Mapping[str, object]
+) -> int:
+    source = _v13_replica_event_source(event, "v13 readiness event")
     if payload.get("replica_id") != source:
         _error("v13 readiness event replica/source binding drifted")
     return source
@@ -3769,36 +3870,43 @@ def _validate_v13_readiness_event_payload(
         _error("v13 successful readiness terminal drifted")
 
 
-def _validate_v13_sources(root: Path, contract: Mapping[str, object]) -> tuple[list[dict[str, Any]], list[list[str]]]:
+def _validate_v13_sources(
+    root: Path, contract: Mapping[str, object]
+) -> tuple[list[dict[str, Any]], list[list[str]]]:
     """V13-only source route; archived event/source rules remain unmodified."""
+
     events, inventory = _validate_sources(root)
-    replicas = {str(event["source_id"]) for event in events if event["source_kind"] == "replica"}
-    managers = {str(event["source_id"]) for event in events if event["source_kind"] == "adaptation_manager"}
+    replicas = {
+        str(event["source_id"])
+        for event in events
+        if event["source_kind"] == "replica"
+    }
+    managers = {
+        str(event["source_id"])
+        for event in events
+        if event["source_kind"] == "adaptation_manager"
+    }
     expected_replicas = {f"replica-{replica}" for replica in contract["members"]}
     if replicas != expected_replicas or len(managers) != 1:
         _error("v13 source inventory lacks exact replica or manager envelopes")
-    readiness_names = {"epoch.activation_prepared", "epoch.activation_ready_signed",
-        "adaptive_v3.readiness_observation_retry_exhausted",
-        "adaptive_v3.readiness_observation_accepted", "adaptive_v3.readiness_observation_rejected",
-        "adaptive_v3.readiness_source_quarantined", "adaptive_v3.readiness_certificate_assembled", "adaptive_v3.readiness_certificate_delivery",
-        "adaptive_v3.readiness_certificate_accepted", "adaptive_v3.readiness_certificate_rejected", "adaptive_v3.readiness_certificate_acknowledged",
-        "adaptive_v3.e2_eligibility", "adaptive_v3.readiness_terminal", "adaptive_v3.readiness_wire_rejected",
-        "adaptive_v3.command_terminal"}
-    forbidden = {"adaptive_v3.readiness_observation_rejected", "adaptive_v3.readiness_source_quarantined",
-                 "adaptive_v3.readiness_certificate_rejected", "adaptive_v3.readiness_wire_rejected", "adaptive_v3.command_terminal"}
+
     for event in events:
         name = str(event["event_type"])
-        if (name.startswith("adaptive_v3.readiness_") or
-                name.startswith("adaptive_v3_readiness_")) and name not in readiness_names:
+        looks_like_readiness = name.startswith(
+            "adaptive_v3.readiness_"
+        ) or name.startswith("adaptive_v3_readiness_")
+        if looks_like_readiness and name not in _V13_READINESS_EVENT_NAMES:
             _error("v13 readiness event name is unknown")
-        if name in readiness_names:
+        if name in _V13_READINESS_SUCCESS_EVENTS:
             _validate_v13_readiness_event_payload(event, contract)
-            if name in forbidden or (
+            if (
                 name == "adaptive_v3.readiness_certificate_delivery"
                 and event["payload"].get("disposition")
                 not in {"queued", "retry_scheduled"}
             ):
                 _error("v13 PASS readiness event is unsuccessful")
+        elif name in _V13_READINESS_FAILURE_EVENTS:
+            _error("v13 PASS readiness event is unsuccessful")
     return events, inventory
 
 
@@ -4254,22 +4362,6 @@ def _validate_v13_transition(
     certificate_digest = _digest(
         certificate.get("certificate_digest"), "v13 transition certificate digest"
     )
-    def replica_source(event: Mapping[str, object], label: str) -> int:
-        source_id = event.get("source_id")
-        if event.get("source_kind") != "replica" or not isinstance(source_id, str):
-            _error(f"{label} source is not a replica")
-        prefix = "replica-"
-        if not source_id.startswith(prefix):
-            _error(f"{label} source ID drifted")
-        try:
-            source = int(source_id.removeprefix(prefix))
-        except ValueError as exc:
-            raise FocusedCrashPairValidationError(
-                f"{label} source ID drifted"
-            ) from exc
-        if source_id != f"replica-{source}":
-            _error(f"{label} source ID is not canonical")
-        return source
 
     command_height = _uint64(
         identity.get("command_block_height"), "v13 certified command height", 1
@@ -4320,7 +4412,10 @@ def _validate_v13_transition(
     if (
         not isinstance(expected_authoritative_source, str)
         or authoritative_event.get("source_id") != expected_authoritative_source
-        or replica_source(authoritative_event, "v13 command decision") not in sources
+        or _v13_replica_event_source(
+            authoritative_event, "v13 command decision"
+        )
+        not in sources
         or authoritative.get("designated_observer") is not True
         or _uint64(
             authoritative.get("block_height"), "v13 authoritative command height", 1
@@ -4386,7 +4481,10 @@ def _validate_v13_transition(
     )
     if (
         boundary_event.get("source_id") != expected_authoritative_source
-        or replica_source(boundary_event, "v13 activation boundary") not in sources
+        or _v13_replica_event_source(
+            boundary_event, "v13 activation boundary"
+        )
+        not in sources
         or boundary.get("designated_observer") is not True
         or _uint64(
             boundary.get("block_height"), "v13 authoritative activation height", 1
@@ -4469,7 +4567,7 @@ def _validate_v13_transition(
     ) -> dict[int, Mapping[str, object]]:
         result: dict[int, Mapping[str, object]] = {}
         for row in rows:
-            source = replica_source(row, label)
+            source = _v13_replica_event_source(row, label)
             if source in result:
                 _error(f"{label} duplicates a replica")
             result[source] = row
@@ -4687,24 +4785,6 @@ def _validate_v13_e2_common_commit(
     if not isinstance(expected_authoritative_source, str):
         _error("v13 authoritative commit source is absent")
 
-    def replica_source(event: Mapping[str, object], label: str) -> int:
-        source_id = event.get("source_id")
-        if (
-            event.get("source_kind") != "replica"
-            or not isinstance(source_id, str)
-            or not source_id.startswith("replica-")
-        ):
-            _error(f"{label} source is not a replica")
-        try:
-            source = int(source_id.removeprefix("replica-"))
-        except ValueError as exc:
-            raise FocusedCrashPairValidationError(
-                f"{label} replica source ID drifted"
-            ) from exc
-        if source_id != f"replica-{source}":
-            _error(f"{label} replica source ID is not canonical")
-        return source
-
     authoritative_candidates: list[Mapping[str, object]] = []
     for event in _v13_reconstruct_authoritative_commits(events, contract):
         payload = _mapping(event.get("payload"), "v13 authoritative commit")
@@ -4728,7 +4808,7 @@ def _validate_v13_e2_common_commit(
         "commit_batch_index",
     }:
         _error("v13 authoritative commit payload schema drifted")
-    authoritative_source = replica_source(
+    authoritative_source = _v13_replica_event_source(
         authoritative_event, "v13 authoritative commit"
     )
     decision = _mapping(
@@ -4809,7 +4889,9 @@ def _validate_v13_e2_common_commit(
             "commit_batch_index",
         }:
             _error("v13 common commit observation payload schema drifted")
-        source = replica_source(event, "v13 common commit observation")
+        source = _v13_replica_event_source(
+            event, "v13 common commit observation"
+        )
         if source in observed_by_source:
             _error("v13 common commit observation duplicates a source")
         observed_time = _uint64(
@@ -7709,7 +7791,8 @@ def _validate_v13_certified_readiness_crypto(
 
 class _V13ReadinessReader:
     def __init__(self, payload: bytes) -> None:
-        self.payload, self.offset = payload, 0
+        self.payload = payload
+        self.offset = 0
 
     def take(self, size: int) -> bytes:
         if size < 0 or self.offset + size > len(self.payload):
@@ -7733,6 +7816,16 @@ class _V13ReadinessReader:
         return len(self.payload) - self.offset
 
 
+def _v13_readiness_reader(
+    payload: bytes, domain: bytes, label: str
+) -> _V13ReadinessReader:
+    reader = _V13ReadinessReader(payload)
+    reader.domain(domain)
+    if reader.integer(1) != 0:
+        _error(f"{label} flags drifted")
+    return reader
+
+
 def _v13_ready_digest(value: object, label: str) -> bytes:
     return bytes.fromhex(_digest(value, label))
 
@@ -7743,9 +7836,11 @@ def _v13_ready_u(value: object, bits: int, label: str) -> bytes:
     return value.to_bytes(bits // 8, "big")
 
 
-def _v13_ready_configuration(value: object, label: str) -> tuple[dict[str, object], bytes]:
+def _v13_ready_configuration(
+    value: object, label: str
+) -> tuple[dict[str, object], bytes]:
     item = _mapping(value, label)
-    if set(item) != {"epoch_number", "tree_id", "epoch_digest"}:
+    if set(item) != _V13_CONFIGURATION_KEYS:
         _error(f"{label} schema drifted")
     epoch = _v13_ready_u(item.get("epoch_number"), 32, f"{label} epoch")
     tree = _v13_ready_u(item.get("tree_id"), 32, f"{label} tree")
@@ -7757,58 +7852,117 @@ def _v13_ready_configuration(value: object, label: str) -> tuple[dict[str, objec
 
 def _v13_ready_identity_bytes(value: object) -> tuple[dict[str, object], bytes]:
     item = _mapping(value, "v13 readiness identity")
-    expected = {"schema_version", "membership_digest", "predecessor_boundary_configuration",
-                "predecessor_boundary_generation", "successor_configuration",
-                "successor_activation_generation", "command_payload_digest", "command_block_height",
-                "command_block_hash", "activation_delay_blocks", "activation_height",
-                "activation_boundary_block_hash"}
-    if set(item) != expected or item.get("schema_version") != 1:
+    if set(item) != _V13_IDENTITY_KEYS or item.get("schema_version") != 1:
         _error("v13 readiness identity schema drifted")
-    membership = _v13_ready_digest(item.get("membership_digest"), "v13 readiness membership digest")
-    predecessor, predecessor_bytes = _v13_ready_configuration(item.get("predecessor_boundary_configuration"), "v13 predecessor configuration")
-    successor, successor_bytes = _v13_ready_configuration(item.get("successor_configuration"), "v13 successor configuration")
+
+    membership = _v13_ready_digest(
+        item.get("membership_digest"), "v13 readiness membership digest"
+    )
+    predecessor, predecessor_bytes = _v13_ready_configuration(
+        item.get("predecessor_boundary_configuration"),
+        "v13 predecessor configuration",
+    )
+    successor, successor_bytes = _v13_ready_configuration(
+        item.get("successor_configuration"), "v13 successor configuration"
+    )
     predecessor_generation = item.get("predecessor_boundary_generation")
     successor_generation = item.get("successor_activation_generation")
-    predecessor_epoch, successor_epoch = predecessor["epoch_number"], successor["epoch_number"]
-    if (membership == bytes(32) or predecessor_epoch == 0xFFFFFFFF or successor_epoch != predecessor_epoch + 1
-        or successor["tree_id"] != 0 or type(predecessor_generation) is not int or predecessor_generation == 0
-        or predecessor_generation > (1 << 64) - 1 or (predecessor_generation - 1) >> 32 != predecessor_epoch
-        or successor_generation != (successor_epoch << 32) + 1):
+    predecessor_epoch = predecessor["epoch_number"]
+    successor_epoch = successor["epoch_number"]
+    if (
+        membership == bytes(32)
+        or predecessor_epoch == 0xFFFFFFFF
+        or successor_epoch != predecessor_epoch + 1
+        or successor["tree_id"] != 0
+        or type(predecessor_generation) is not int
+        or predecessor_generation == 0
+        or predecessor_generation > (1 << 64) - 1
+        or (predecessor_generation - 1) >> 32 != predecessor_epoch
+        or successor_generation != (successor_epoch << 32) + 1
+    ):
         _error("v13 readiness identity generation or epoch drifted")
-    command_digest = _v13_ready_digest(item.get("command_payload_digest"), "v13 command payload digest")
+
+    command_digest = _v13_ready_digest(
+        item.get("command_payload_digest"), "v13 command payload digest"
+    )
     command_height = item.get("command_block_height")
-    command_hash = _v13_ready_digest(item.get("command_block_hash"), "v13 command block hash")
-    delay, activation = item.get("activation_delay_blocks"), item.get("activation_height")
-    boundary = _v13_ready_digest(item.get("activation_boundary_block_hash"), "v13 activation boundary hash")
-    if (command_digest == bytes(32) or command_hash == bytes(32) or boundary == bytes(32)
-        or type(command_height) is not int or command_height <= 0 or type(delay) is not int or delay <= 0
-        or command_height > (1 << 64) - 1 - delay or activation != command_height + delay
-        or predecessor["epoch_digest"] == successor["epoch_digest"]):
+    command_hash = _v13_ready_digest(
+        item.get("command_block_hash"), "v13 command block hash"
+    )
+    delay = item.get("activation_delay_blocks")
+    activation = item.get("activation_height")
+    boundary = _v13_ready_digest(
+        item.get("activation_boundary_block_hash"),
+        "v13 activation boundary hash",
+    )
+    if (
+        command_digest == bytes(32)
+        or command_hash == bytes(32)
+        or boundary == bytes(32)
+        or type(command_height) is not int
+        or command_height <= 0
+        or type(delay) is not int
+        or delay <= 0
+        or command_height > (1 << 64) - 1 - delay
+        or activation != command_height + delay
+        or predecessor["epoch_digest"] == successor["epoch_digest"]
+    ):
         _error("v13 readiness identity transition drifted")
-    encoded = (b"\x00\x00\x00\x01" + membership + predecessor_bytes + _v13_ready_u(predecessor_generation, 64, "predecessor generation")
-               + successor_bytes + _v13_ready_u(successor_generation, 64, "successor generation") + command_digest
-               + _v13_ready_u(command_height, 64, "command height") + command_hash + _v13_ready_u(delay, 64, "activation delay")
-               + _v13_ready_u(activation, 64, "activation height") + boundary)
+
+    encoded = b"".join(
+        (
+            b"\x00\x00\x00\x01",
+            membership,
+            predecessor_bytes,
+            _v13_ready_u(
+                predecessor_generation, 64, "predecessor generation"
+            ),
+            successor_bytes,
+            _v13_ready_u(successor_generation, 64, "successor generation"),
+            command_digest,
+            _v13_ready_u(command_height, 64, "command height"),
+            command_hash,
+            _v13_ready_u(delay, 64, "activation delay"),
+            _v13_ready_u(activation, 64, "activation height"),
+            boundary,
+        )
+    )
     return dict(item), encoded
 
 
 def _v13_decode_ready_identity(payload: bytes) -> dict[str, object]:
-    reader = _V13ReadinessReader(payload); reader.domain(_V13_READY_IDENTITY_DOMAIN)
-    if reader.integer(1) != 0: _error("v13 readiness identity flags drifted")
-    value = _v13_decode_identity_body(reader); reader.eof()
-    if _v13_encode_ready_identity(value) != payload: _error("v13 readiness identity is noncanonical")
+    reader = _v13_readiness_reader(
+        payload, _V13_READY_IDENTITY_DOMAIN, "v13 readiness identity"
+    )
+    value = _v13_decode_identity_body(reader)
+    reader.eof()
+    if _v13_encode_ready_identity(value) != payload:
+        _error("v13 readiness identity is noncanonical")
     return value
 
 
 def _v13_decode_identity_body(reader: _V13ReadinessReader) -> dict[str, object]:
     def configuration() -> dict[str, object]:
-        return {"epoch_number": reader.integer(4), "tree_id": reader.integer(4), "epoch_digest": reader.take(32).hex()}
-    value = {"schema_version": reader.integer(4), "membership_digest": reader.take(32).hex(),
-             "predecessor_boundary_configuration": configuration(), "predecessor_boundary_generation": reader.integer(8),
-             "successor_configuration": configuration(), "successor_activation_generation": reader.integer(8),
-             "command_payload_digest": reader.take(32).hex(), "command_block_height": reader.integer(8),
-             "command_block_hash": reader.take(32).hex(), "activation_delay_blocks": reader.integer(8),
-             "activation_height": reader.integer(8), "activation_boundary_block_hash": reader.take(32).hex()}
+        return {
+            "epoch_number": reader.integer(4),
+            "tree_id": reader.integer(4),
+            "epoch_digest": reader.take(32).hex(),
+        }
+
+    value = {
+        "schema_version": reader.integer(4),
+        "membership_digest": reader.take(32).hex(),
+        "predecessor_boundary_configuration": configuration(),
+        "predecessor_boundary_generation": reader.integer(8),
+        "successor_configuration": configuration(),
+        "successor_activation_generation": reader.integer(8),
+        "command_payload_digest": reader.take(32).hex(),
+        "command_block_height": reader.integer(8),
+        "command_block_hash": reader.take(32).hex(),
+        "activation_delay_blocks": reader.integer(8),
+        "activation_height": reader.integer(8),
+        "activation_boundary_block_hash": reader.take(32).hex(),
+    }
     _v13_ready_identity_bytes(value)
     return value
 
@@ -7820,20 +7974,39 @@ def _v13_encode_ready_identity(value: object) -> bytes:
 
 def _v13_observation_body(value: object) -> tuple[dict[str, object], bytes]:
     item = _mapping(value, "v13 readiness observation")
-    if set(item) != {"identity", "signer_replica_id", "signer_source_sequence", "signer_monotonic_raw_ns", "vote_fence_engaged", "signature_hex"}:
+    if set(item) != _V13_OBSERVATION_KEYS:
         _error("v13 readiness observation schema drifted")
     identity, identity_bytes = _v13_ready_identity_bytes(item.get("identity"))
     signature = item.get("signature_hex")
-    if item.get("vote_fence_engaged") is not True or not isinstance(signature, str) or len(signature) != 192 or any(c not in "0123456789abcdef" for c in signature):
+    if (
+        item.get("vote_fence_engaged") is not True
+        or not isinstance(signature, str)
+        or len(signature) != 192
+        or any(character not in "0123456789abcdef" for character in signature)
+    ):
         _error("v13 readiness observation fence or signature drifted")
     sequence = item.get("signer_source_sequence")
-    if type(sequence) is not int or sequence == 0: _error("v13 readiness observation sequence drifted")
-    encoded = identity_bytes + _v13_ready_u(item.get("signer_replica_id"), 16, "observation signer") + _v13_ready_u(sequence, 64, "observation sequence") + _v13_ready_u(item.get("signer_monotonic_raw_ns"), 64, "observation tick") + b"\x01" + bytes.fromhex(signature)
+    if type(sequence) is not int or sequence == 0:
+        _error("v13 readiness observation sequence drifted")
+    encoded = b"".join(
+        (
+            identity_bytes,
+            _v13_ready_u(
+                item.get("signer_replica_id"), 16, "observation signer"
+            ),
+            _v13_ready_u(sequence, 64, "observation sequence"),
+            _v13_ready_u(
+                item.get("signer_monotonic_raw_ns"), 64, "observation tick"
+            ),
+            b"\x01",
+            bytes.fromhex(signature),
+        )
+    )
     return {**dict(item), "identity": identity}, encoded
 
 
 def _v13_observation_signing_digest(value: object) -> str:
-    item, body = _v13_observation_body(value)
+    _item, body = _v13_observation_body(value)
     return _sha_bytes(_V13_READY_OBSERVATION_DOMAIN + body[:-96])
 
 
@@ -7843,44 +8016,100 @@ def _v13_encode_ready_observation(value: object) -> bytes:
 
 
 def _v13_decode_ready_observation(payload: bytes) -> dict[str, object]:
-    reader = _V13ReadinessReader(payload); reader.domain(_V13_READY_OBSERVATION_DOMAIN)
-    if reader.integer(1) != 0: _error("v13 readiness observation flags drifted")
-    value = _v13_decode_observation_body(reader); reader.eof()
-    if _v13_encode_ready_observation(value) != payload: _error("v13 readiness observation is noncanonical")
+    reader = _v13_readiness_reader(
+        payload, _V13_READY_OBSERVATION_DOMAIN, "v13 readiness observation"
+    )
+    value = _v13_decode_observation_body(reader)
+    reader.eof()
+    if _v13_encode_ready_observation(value) != payload:
+        _error("v13 readiness observation is noncanonical")
     return value
 
 
-def _v13_decode_observation_body(reader: _V13ReadinessReader) -> dict[str, object]:
-    value = {"identity": _v13_decode_identity_body(reader), "signer_replica_id": reader.integer(2), "signer_source_sequence": reader.integer(8), "signer_monotonic_raw_ns": reader.integer(8), "vote_fence_engaged": reader.integer(1) == 1, "signature_hex": reader.take(96).hex()}
+def _v13_decode_observation_body(
+    reader: _V13ReadinessReader,
+) -> dict[str, object]:
+    value = {
+        "identity": _v13_decode_identity_body(reader),
+        "signer_replica_id": reader.integer(2),
+        "signer_source_sequence": reader.integer(8),
+        "signer_monotonic_raw_ns": reader.integer(8),
+        "vote_fence_engaged": reader.integer(1) == 1,
+        "signature_hex": reader.take(96).hex(),
+    }
     _v13_observation_body(value)
     return value
 
 
+def _v13_certificate_digest_from_parts(
+    identity_bytes: bytes, observation_bodies: Sequence[bytes]
+) -> str:
+    return _sha_bytes(
+        b"".join(
+            (
+                _V13_READY_CERTIFICATE_DIGEST_DOMAIN,
+                b"\0\0\0\1",
+                identity_bytes,
+                _v13_ready_u(
+                    len(observation_bodies),
+                    32,
+                    "certificate observation count",
+                ),
+                *observation_bodies,
+            )
+        )
+    )
+
+
 def _v13_certificate_digest(identity: object, observations: Sequence[object]) -> str:
     _identity, identity_bytes = _v13_ready_identity_bytes(identity)
-    bodies = [_v13_observation_body(observation)[1] for observation in observations]
-    return _sha_bytes(_V13_READY_CERTIFICATE_DIGEST_DOMAIN + b"\0\0\0\1" + identity_bytes + _v13_ready_u(len(bodies), 32, "certificate observation count") + b"".join(bodies))
+    observation_bodies = [
+        _v13_observation_body(observation)[1] for observation in observations
+    ]
+    return _v13_certificate_digest_from_parts(identity_bytes, observation_bodies)
 
 
 def _v13_certificate_body(value: object) -> tuple[dict[str, object], bytes]:
     item = _mapping(value, "v13 readiness certificate")
-    if set(item) != {"schema_version", "identity", "observations", "certificate_digest"} or item.get("schema_version") != 1:
+    if set(item) != _V13_CERTIFICATE_KEYS or item.get("schema_version") != 1:
         _error("v13 readiness certificate schema drifted")
     observations_value = item.get("observations")
     if not isinstance(observations_value, list) or not observations_value:
         _error("v13 readiness certificate observations drifted")
     identity, identity_bytes = _v13_ready_identity_bytes(item.get("identity"))
-    observations = [_v13_observation_body(value)[0] for value in observations_value]
-    if any(observation["identity"] != identity for observation in observations) or any(
-        observations[index - 1]["signer_replica_id"] >= observations[index]["signer_replica_id"]
+    observation_parts = [
+        _v13_observation_body(observation) for observation in observations_value
+    ]
+    observations = [observation for observation, _body in observation_parts]
+    observation_bodies = [body for _observation, body in observation_parts]
+    if any(
+        observation["identity"] != identity for observation in observations
+    ) or any(
+        observations[index - 1]["signer_replica_id"]
+        >= observations[index]["signer_replica_id"]
         for index in range(1, len(observations))
     ):
         _error("v13 readiness certificate signer ordering or identity drifted")
-    digest = _v13_certificate_digest(identity, observations)
+    digest = _v13_certificate_digest_from_parts(identity_bytes, observation_bodies)
     if _digest(item.get("certificate_digest"), "v13 certificate digest") != digest:
         _error("v13 readiness certificate digest drifted")
-    encoded = b"\0\0\0\1" + identity_bytes + _v13_ready_u(len(observations), 32, "certificate observation count") + b"".join(_v13_observation_body(value)[1] for value in observations) + bytes.fromhex(digest)
-    return {"schema_version": 1, "identity": identity, "observations": observations, "certificate_digest": digest}, encoded
+    encoded = b"".join(
+        (
+            b"\0\0\0\1",
+            identity_bytes,
+            _v13_ready_u(
+                len(observations), 32, "certificate observation count"
+            ),
+            *observation_bodies,
+            bytes.fromhex(digest),
+        )
+    )
+    return {
+        "schema_version": 1,
+        "identity": identity,
+        "observations": observations,
+        "certificate_digest": digest,
+    }, encoded
 
 
 def _v13_encode_readiness_certificate(value: object) -> bytes:
@@ -7888,43 +8117,96 @@ def _v13_encode_readiness_certificate(value: object) -> bytes:
     return _V13_READY_CERTIFICATE_DOMAIN + b"\0" + body
 
 
-def _v13_decode_readiness_certificate(payload: bytes, *, maximum_members: int,
-                                      maximum_payload_bytes: int) -> dict[str, object]:
-    if type(maximum_members) is not int or maximum_members < 1 or type(maximum_payload_bytes) is not int or maximum_payload_bytes < 1:
+def _v13_decode_readiness_certificate(
+    payload: bytes, *, maximum_members: int, maximum_payload_bytes: int
+) -> dict[str, object]:
+    if (
+        type(maximum_members) is not int
+        or maximum_members < 1
+        or type(maximum_payload_bytes) is not int
+        or maximum_payload_bytes < 1
+    ):
         _error("v13 readiness certificate limits are invalid")
     if len(payload) > maximum_payload_bytes:
         _error("v13 readiness certificate exceeds byte limit")
-    reader = _V13ReadinessReader(payload); reader.domain(_V13_READY_CERTIFICATE_DOMAIN)
-    if reader.integer(1) != 0: _error("v13 readiness certificate flags drifted")
-    schema, identity, count = reader.integer(4), _v13_decode_identity_body(reader), reader.integer(4)
+    reader = _v13_readiness_reader(
+        payload,
+        _V13_READY_CERTIFICATE_DOMAIN,
+        "v13 readiness certificate",
+    )
+    schema = reader.integer(4)
+    identity = _v13_decode_identity_body(reader)
+    count = reader.integer(4)
     # Each encoded observation is fixed-width once its identity is present.
     # Reject hostile counts before allocating/ranging, as native does.
-    minimum_observation_bytes = 4 + 32 + 40 + 8 + 40 + 8 + 32 + 8 + 32 + 8 + 8 + 32 + 2 + 8 + 8 + 1 + 96
-    if schema != 1 or count == 0 or count > maximum_members or count > reader.remaining() // minimum_observation_bytes:
+    if (
+        schema != 1
+        or count == 0
+        or count > maximum_members
+        or count > reader.remaining() // _V13_OBSERVATION_BODY_BYTES
+    ):
         _error("v13 readiness certificate schema or count drifted")
     observations = [_v13_decode_observation_body(reader) for _ in range(count)]
-    value = {"schema_version": schema, "identity": identity, "observations": observations, "certificate_digest": reader.take(32).hex()}
-    reader.eof(); _v13_certificate_body(value)
-    if _v13_encode_readiness_certificate(value) != payload: _error("v13 readiness certificate is noncanonical")
+    value = {
+        "schema_version": schema,
+        "identity": identity,
+        "observations": observations,
+        "certificate_digest": reader.take(32).hex(),
+    }
+    reader.eof()
+    _v13_certificate_body(value)
+    if _v13_encode_readiness_certificate(value) != payload:
+        _error("v13 readiness certificate is noncanonical")
     return value
 
 
 def _v13_ack_payload_digest(opcode: object, payload: bytes) -> str:
     if opcode not in {_V13_READY_OBSERVATION_OPCODE, _V13_READY_CERTIFICATE_OPCODE}:
         _error("v13 readiness acknowledgement opcode drifted")
-    return _sha_bytes(_V13_READY_ACK_PAYLOAD_DIGEST_DOMAIN + _v13_ready_u(opcode, 8, "acknowledged opcode") + _v13_ready_u(len(payload), 64, "acknowledged payload size") + payload)
+    return _sha_bytes(
+        b"".join(
+            (
+                _V13_READY_ACK_PAYLOAD_DIGEST_DOMAIN,
+                _v13_ready_u(opcode, 8, "acknowledged opcode"),
+                _v13_ready_u(
+                    len(payload), 64, "acknowledged payload size"
+                ),
+                payload,
+            )
+        )
+    )
 
 
 def _v13_ack_body(value: object) -> tuple[dict[str, object], bytes]:
     item = _mapping(value, "v13 readiness acknowledgement")
-    expected = {"schema_version", "acknowledged_opcode", "recipient_replica_id", "identity", "certificate_digest", "payload_digest", "disposition"}
-    if set(item) != expected or item.get("schema_version") != 1 or item.get("acknowledged_opcode") not in {_V13_READY_OBSERVATION_OPCODE, _V13_READY_CERTIFICATE_OPCODE} or item.get("disposition") not in {1, 2}:
+    if (
+        set(item) != _V13_ACK_KEYS
+        or item.get("schema_version") != 1
+        or item.get("acknowledged_opcode")
+        not in {_V13_READY_OBSERVATION_OPCODE, _V13_READY_CERTIFICATE_OPCODE}
+        or item.get("disposition") not in {1, 2}
+    ):
         _error("v13 readiness acknowledgement schema, opcode, or disposition drifted")
     identity, identity_bytes = _v13_ready_identity_bytes(item.get("identity"))
-    certificate = _v13_ready_digest(item.get("certificate_digest"), "ack certificate digest")
+    certificate = _v13_ready_digest(
+        item.get("certificate_digest"), "ack certificate digest"
+    )
     payload = _v13_ready_digest(item.get("payload_digest"), "ack payload digest")
-    if certificate == bytes(32) or payload == bytes(32): _error("v13 readiness acknowledgement digest is zero")
-    body = b"\0\0\0\1" + _v13_ready_u(item.get("acknowledged_opcode"), 8, "ack opcode") + _v13_ready_u(item.get("recipient_replica_id"), 16, "ack recipient") + identity_bytes + certificate + payload + _v13_ready_u(item.get("disposition"), 8, "ack disposition")
+    if certificate == bytes(32) or payload == bytes(32):
+        _error("v13 readiness acknowledgement digest is zero")
+    body = b"".join(
+        (
+            b"\0\0\0\1",
+            _v13_ready_u(item.get("acknowledged_opcode"), 8, "ack opcode"),
+            _v13_ready_u(
+                item.get("recipient_replica_id"), 16, "ack recipient"
+            ),
+            identity_bytes,
+            certificate,
+            payload,
+            _v13_ready_u(item.get("disposition"), 8, "ack disposition"),
+        )
+    )
     return {**dict(item), "identity": identity}, body
 
 
@@ -7934,34 +8216,69 @@ def _v13_encode_readiness_ack(value: object) -> bytes:
 
 
 def _v13_decode_readiness_ack(payload: bytes) -> dict[str, object]:
-    reader = _V13ReadinessReader(payload); reader.domain(_V13_READY_ACK_DOMAIN)
-    if reader.integer(1) != 0: _error("v13 readiness acknowledgement flags drifted")
-    value = {"schema_version": reader.integer(4), "acknowledged_opcode": reader.integer(1), "recipient_replica_id": reader.integer(2), "identity": _v13_decode_identity_body(reader), "certificate_digest": reader.take(32).hex(), "payload_digest": reader.take(32).hex(), "disposition": reader.integer(1)}
-    reader.eof(); _v13_ack_body(value)
-    if _v13_encode_readiness_ack(value) != payload: _error("v13 readiness acknowledgement is noncanonical")
+    reader = _v13_readiness_reader(
+        payload, _V13_READY_ACK_DOMAIN, "v13 readiness acknowledgement"
+    )
+    value = {
+        "schema_version": reader.integer(4),
+        "acknowledged_opcode": reader.integer(1),
+        "recipient_replica_id": reader.integer(2),
+        "identity": _v13_decode_identity_body(reader),
+        "certificate_digest": reader.take(32).hex(),
+        "payload_digest": reader.take(32).hex(),
+        "disposition": reader.integer(1),
+    }
+    reader.eof()
+    _v13_ack_body(value)
+    if _v13_encode_readiness_ack(value) != payload:
+        _error("v13 readiness acknowledgement is noncanonical")
     return value
 
 
 def _validate_v13_readiness_wire_chain(
-    identity_payload: bytes, observation_payload: bytes, certificate_payload: bytes, ack_payload: bytes,
-    *, maximum_members: int, maximum_payload_bytes: int
+    identity_payload: bytes,
+    observation_payload: bytes,
+    certificate_payload: bytes,
+    ack_payload: bytes,
+    *,
+    maximum_members: int,
+    maximum_payload_bytes: int,
 ) -> Mapping[str, object]:
     identity = _v13_decode_ready_identity(identity_payload)
     observation = _v13_decode_ready_observation(observation_payload)
-    certificate = _v13_decode_readiness_certificate(certificate_payload, maximum_members=maximum_members,
-                                                     maximum_payload_bytes=maximum_payload_bytes)
+    certificate = _v13_decode_readiness_certificate(
+        certificate_payload,
+        maximum_members=maximum_members,
+        maximum_payload_bytes=maximum_payload_bytes,
+    )
     acknowledgement = _v13_decode_readiness_ack(ack_payload)
-    if (observation["identity"] != identity or certificate["identity"] != identity or acknowledgement["identity"] != identity
-        or acknowledgement["certificate_digest"] != certificate["certificate_digest"]
-        or acknowledgement["acknowledged_opcode"] != _V13_READY_CERTIFICATE_OPCODE
+    if (
+        observation["identity"] != identity
+        or certificate["identity"] != identity
+        or acknowledgement["identity"] != identity
+        or acknowledgement["certificate_digest"]
+        != certificate["certificate_digest"]
+        or acknowledgement["acknowledged_opcode"]
+        != _V13_READY_CERTIFICATE_OPCODE
         or acknowledgement["disposition"] != 1
-        or not any(candidate == observation for candidate in certificate["observations"])
-        or acknowledgement["payload_digest"] != _v13_ack_payload_digest(_V13_READY_CERTIFICATE_OPCODE, certificate_payload)):
+        or observation not in certificate["observations"]
+        or acknowledgement["payload_digest"]
+        != _v13_ack_payload_digest(
+            _V13_READY_CERTIFICATE_OPCODE, certificate_payload
+        )
+    ):
         _error("v13 readiness wire chain binding drifted")
-    return {"identity": identity, "observation": observation, "certificate": certificate, "acknowledgement": acknowledgement,
-            "observation_signing_digest": _v13_observation_signing_digest(observation),
-            "certificate_payload_digest": _sha_bytes(certificate_payload),
-            "ack_payload_digest": acknowledgement["payload_digest"]}
+    return {
+        "identity": identity,
+        "observation": observation,
+        "certificate": certificate,
+        "acknowledgement": acknowledgement,
+        "observation_signing_digest": _v13_observation_signing_digest(
+            observation
+        ),
+        "certificate_payload_digest": _sha_bytes(certificate_payload),
+        "ack_payload_digest": acknowledgement["payload_digest"],
+    }
 
 
 def _validate_fault_window_arm(
@@ -9656,80 +9973,3 @@ __all__ = [
     "validate_sealed_campaign",
     "validate_sealed_pair",
 ]
-def _reconstruct_v13_activation_readiness(*, profile, events, forbidden_context=None):
-    """Source-blind v13 readiness reconstruction; receipt data is forbidden."""
-    if forbidden_context:
-        # Deliberately do not inspect values: callers may supply poison objects.
-        tuple(forbidden_context.keys())
-    contract = profile["transitions"]["activation_readiness_contract"]
-    required = int(contract["required_reporter_count"])
-    quorum = int(contract["certificate_quorum"])
-    rows = []
-    for epoch in (1, 2):
-        certificates = [e for e in events
-            if e.get("event_type") == "manager.activation_readiness_certificate_assembled"
-            and e.get("payload", {}).get("identity", {}).get("successor_configuration", {}).get("epoch_number") == epoch]
-        if len(certificates) != 1:
-            raise FocusedCrashPairValidationError("v13 requires one certificate per successor")
-        certificate = certificates[0]["payload"]
-        identity = certificate.get("identity")
-        signers = sorted(certificate.get("signer_replica_ids", []))
-        if len(signers) != required or len(set(signers)) != required or certificate.get("certificate_quorum") != quorum or certificate.get("required_reporter_count") != required:
-            raise FocusedCrashPairValidationError("v13 certificate cardinality drifted")
-        accepted = [e.get("payload", {}) for e in events
-            if e.get("event_type") == "manager.activation_readiness_accepted"
-            and e.get("payload", {}).get("identity") == identity]
-        reporters = sorted({p.get("signer_replica_id") for p in accepted
-            if p.get("authenticated_replica_id") == p.get("signer_replica_id")})
-        activated = sorted({e.get("source_replica_id") for e in events
-            if e.get("event_type") == "epoch.activated" and e.get("payload", {}).get("identity") == identity
-            and e.get("payload", {}).get("certificate_digest") == certificate.get("certificate_digest")})
-        if reporters != signers or activated != signers:
-            raise FocusedCrashPairValidationError("v13 readiness signer/apply set drifted")
-        rows.append({"successor_epoch_number": epoch, "identity": identity,
-                     "certificate_digest": certificate.get("certificate_digest"),
-                     "observed_reporter_ids": reporters, "activated_replica_ids": activated})
-    canonical = {"profile_id": profile["profile_id"], "transitions": rows}
-    if rows[0]["observed_reporter_ids"] != rows[1]["observed_reporter_ids"]:
-        raise FocusedCrashPairValidationError("v13 E1/E2 reporter sets differ")
-    digest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    return {"observed_reporter_ids": rows[0]["observed_reporter_ids"],
-            "transitions": rows, "reconstruction_digest": digest}
-
-
-def _join_v13_fault_receipt(*, reconstruction, fault_receipt):
-    expected = sorted(fault_receipt["survivor_replica_ids"])
-    observed = reconstruction["observed_reporter_ids"]
-    transitions = reconstruction.get("transitions", ())
-    if len(transitions) != 2 or any(
-        row.get("observed_reporter_ids") != expected for row in transitions
-    ):
-        raise FocusedCrashPairValidationError("v13 fault receipt does not match both readiness cycles")
-    return {"expected_survivor_ids": expected, "observed_survivor_ids": observed,
-            "exact_survivor_set_match": expected == observed,
-            "source_blind_reconstruction_digest": reconstruction["reconstruction_digest"]}
-
-
-def _v13_certified_activation_contract(profile):
-    """Validate the public frozen v13 policy without sealed-evidence claims."""
-    protocol = profile["protocol"]
-    contract = profile["transitions"]["activation_readiness_contract"]
-    expected = {
-        "schema_version": 1,
-        "domain": "kauri-focused-v13-certified-activation-v1",
-        "certificate_quorum": protocol["Q"],
-        "required_reporter_count": profile["transitions"]["survivor_barrier_count"],
-        "epoch1_common_commit_anchor_deadline_seconds": 5,
-        "containment_stabilization_seconds": 30,
-        "containment_measurement_seconds": 30,
-        "minimum_predecessor_residency_ms": 65000,
-        "optimization_activation_budget_seconds": 90,
-        "deadline_semantics": "half_open_monotonic_v1",
-        "readiness_ledger_schema": "kauri-focused-readiness-ledger-v1",
-    }
-    if (profile.get("profile_id") not in _FCRASH_H_V13_PROFILE_IDS or
-        protocol.get("epoch_protocol_mode") != "adaptive_v3" or
-        profile["transitions"].get("adaptive") != ["epoch1", "epoch2"] or
-        contract != expected or expected["certificate_quorum"] > expected["required_reporter_count"]):
-        raise FocusedCrashPairValidationError("v13 certified activation contract drifted")
-    return dict(contract)

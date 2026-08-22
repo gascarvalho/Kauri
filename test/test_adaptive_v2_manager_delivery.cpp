@@ -146,20 +146,25 @@ TEST_CASE(
     // divided to milliseconds would admit a sub-millisecond early boundary.
     CHECK(source.find("CLOCK_MONOTONIC_RAW") != std::string::npos);
     CHECK(source.find("manager_tick_ns") != std::string::npos);
-    CHECK(source.find("1000000000ULL") != std::string::npos);
+    CHECK(source.find(
+              "kNanosecondsPerSecond = 1'000'000'000ULL") !=
+          std::string::npos);
     CHECK(source.find("now.tv_nsec") != std::string::npos);
     CHECK(source.find("/ 1000000ULL") == std::string::npos);
-    CHECK(source.find("100'000'000ULL") != std::string::npos);
-    CHECK(source.find("5'000'000'000ULL") != std::string::npos);
-    CHECK(source.find("60'000'000'000ULL") != std::string::npos);
-    CHECK(source.find("65'000'000'000ULL") != std::string::npos);
-    CHECK(source.find("90'000'000'000ULL") != std::string::npos);
+    CHECK(source.find("kNanosecondsPerDecisecond = 100'000'000ULL") !=
+          std::string::npos);
+    CHECK(source.find("kAdaptiveV3CommonCommitWindowNs") != std::string::npos);
+    CHECK(source.find("kAdaptiveV3CommonCommitStabilizationNs") !=
+          std::string::npos);
+    CHECK(source.find("kAdaptiveV3ResidencyNs") != std::string::npos);
+    CHECK(source.find("kAdaptiveV3E2ReserveNs") != std::string::npos);
     // CLI retry interval is milliseconds, unlike direct session fixture
     // defaults.  The live path must check then convert it to raw ns.
-    CHECK(v3_config.find(
-              "std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL") !=
+    CHECK(v3_config.find("std::numeric_limits<std::uint64_t>::max()") !=
           std::string::npos);
-    CHECK(v3_config.find("options.retry_interval_ticks * 1'000'000ULL") !=
+    CHECK(v3_config.find("kNanosecondsPerMillisecond") != std::string::npos);
+    CHECK(v3_config.find(
+              "options.retry_interval_ticks * kNanosecondsPerMillisecond") !=
           std::string::npos);
     CHECK(source.find("v3_ingest_timed_lifecycle") != std::string::npos);
     CHECK(source.find("v3_arm_hard_deadline") != std::string::npos);

@@ -114,7 +114,18 @@ constexpr std::uint32_t kConvergenceMaximumAttempts = 5;
 constexpr std::uint64_t kConvergenceTicksPerSecond = 10;
 constexpr std::uint64_t kConvergenceDefaultDeadlineTicks = 120;
 constexpr double kConvergenceTimerSeconds = 0.1;
-// AdaptiveV3ManagerSession uses half-open monotonic millisecond deadlines.
+constexpr std::uint64_t kNanosecondsPerMillisecond = 1'000'000ULL;
+constexpr std::uint64_t kNanosecondsPerDecisecond = 100'000'000ULL;
+constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
+constexpr std::uint64_t kAdaptiveV3CommonCommitWindowNs =
+    5 * kNanosecondsPerSecond;
+constexpr std::uint64_t kAdaptiveV3CommonCommitStabilizationNs =
+    60 * kNanosecondsPerSecond;
+constexpr std::uint64_t kAdaptiveV3ResidencyNs =
+    65 * kNanosecondsPerSecond;
+constexpr std::uint64_t kAdaptiveV3E2ReserveNs =
+    90 * kNanosecondsPerSecond;
+// AdaptiveV3ManagerSession uses half-open CLOCK_MONOTONIC_RAW nanoseconds.
 constexpr double kAdaptiveV3TickSeconds = 0.001;
 // Bound isolated-ingress latency while batching a burst at one fixed deadline.
 constexpr double kEvaluationCoalescingSeconds = 0.05;
@@ -2946,25 +2957,8 @@ ManagerOptions parse_options(int argc, char **argv)
     return options;
 }
 
-ManagerNetwork::Config network_config(const ManagerOptions &options)
-{
-    ManagerNetwork::Config config;
-    config.max_msg_size(4 << 20);
-    config.nworker(1);
-    config.enable_tls(true)
-        .tls_key(new salticidae::PKey(
-            salticidae::PKey::create_privkey_from_der(
-                options.tls_private_key_der)))
-        .tls_cert(new salticidae::X509(
-            salticidae::X509::create_from_der(
-                options.tls_certificate_der)));
-    config.allow_unknown_peer(false);
-    config.id_mode(ManagerNetwork::IdentityMode::CERT_BASED);
-    return config;
-}
-
-ManagerNetwork::Config network_config(
-    const AdaptiveV3ManagerOptions &options)
+template <typename Options>
+ManagerNetwork::Config network_config(const Options &options)
 {
     ManagerNetwork::Config config;
     config.max_msg_size(4 << 20);
@@ -2995,23 +2989,26 @@ hotstuff::AdaptiveV3ManagerSessionConfig adaptive_v3_session_config(
     config.required_release_count = options.required_release_count;
     config.maximum_delivery_attempts = options.maximum_delivery_attempts;
     if (options.retry_interval_ticks >
-        std::numeric_limits<std::uint64_t>::max() / 1'000'000ULL)
+        std::numeric_limits<std::uint64_t>::max() /
+            kNanosecondsPerMillisecond)
         throw std::invalid_argument("adaptive-v3 retry interval overflows nanoseconds");
     config.retry_interval_ticks =
-        options.retry_interval_ticks * 1'000'000ULL;
+        options.retry_interval_ticks * kNanosecondsPerMillisecond;
     // The common CLI stores its historical v2 deadline in deciseconds.  V3
     // session timing is absolute CLOCK_MONOTONIC_RAW nanoseconds.
     if (options.manager.convergence_deadline_ticks >
-        std::numeric_limits<std::uint64_t>::max() / 100'000'000ULL)
+        std::numeric_limits<std::uint64_t>::max() /
+            kNanosecondsPerDecisecond)
         throw std::invalid_argument("adaptive-v3 deadline overflows nanoseconds");
     const auto deadline_ns =
-        options.manager.convergence_deadline_ticks * 100'000'000ULL;
+        options.manager.convergence_deadline_ticks * kNanosecondsPerDecisecond;
     config.pre_certificate_window_ticks = deadline_ns;
     config.delivery_window_ticks = deadline_ns;
-    config.residency_ticks = 65'000'000'000ULL;
-    config.common_commit_window_ticks = 5'000'000'000ULL;
-    config.common_commit_stabilization_ticks = 60'000'000'000ULL;
-    config.e2_reserve_ticks = 90'000'000'000ULL;
+    config.residency_ticks = kAdaptiveV3ResidencyNs;
+    config.common_commit_window_ticks = kAdaptiveV3CommonCommitWindowNs;
+    config.common_commit_stabilization_ticks =
+        kAdaptiveV3CommonCommitStabilizationNs;
+    config.e2_reserve_ticks = kAdaptiveV3E2ReserveNs;
     const auto policies = transition_policies(options.manager);
     if (policies.empty() || policies.size() > 2 ||
         policies.front().intent != TreePolicyKind::fault_containment ||
@@ -3204,6 +3201,18 @@ private:
         catch (...) { report_fatal(); }
     }
 
+    template <typename Message, typename Callback>
+    void handle_authenticated_message(
+        Message &&message, const ManagerNetwork::conn_t &connection,
+        Callback &&callback)
+    {
+        const auto source = authenticated_source(connection);
+        if (!source.has_value() || !callback)
+            return;
+        try { callback(std::move(message), *source); }
+        catch (...) { report_fatal(); }
+    }
+
     void report_fatal() noexcept
     {
         try { if (callbacks_.fatal) callbacks_.fatal(); }
@@ -3236,22 +3245,14 @@ private:
         network_.reg_handler(
             [this](MsgActivationReadyObservation &&message,
                    const ManagerNetwork::conn_t &connection) {
-                const auto source = authenticated_source(connection);
-                if (source.has_value() && callbacks_.observation)
-                {
-                    try { callbacks_.observation(std::move(message), *source); }
-                    catch (...) { report_fatal(); }
-                }
+                handle_authenticated_message(
+                    std::move(message), connection, callbacks_.observation);
             });
         network_.reg_handler(
             [this](MsgActivationReadinessAck &&message,
                    const ManagerNetwork::conn_t &connection) {
-                const auto source = authenticated_source(connection);
-                if (source.has_value() && callbacks_.ack)
-                {
-                    try { callbacks_.ack(std::move(message), *source); }
-                    catch (...) { report_fatal(); }
-                }
+                handle_authenticated_message(
+                    std::move(message), connection, callbacks_.ack);
             });
         network_.reg_error_handler(
             [this](const std::exception_ptr, bool fatal, std::int32_t) {
@@ -4104,7 +4105,6 @@ private:
         try
         {
             const auto &document = *read.document;
-            constexpr std::uint64_t kNanosecondsPerSecond = 1'000'000'000ULL;
             if (bindings.deadline_seconds >
                     std::numeric_limits<std::uint64_t>::max() /
                         kNanosecondsPerSecond)
@@ -4501,9 +4501,10 @@ private:
         timespec now{};
         if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) != 0 || now.tv_sec < 0 ||
             static_cast<std::uint64_t>(now.tv_sec) >
-                std::numeric_limits<std::uint64_t>::max() / 1000000000ULL)
+                std::numeric_limits<std::uint64_t>::max() /
+                    kNanosecondsPerSecond)
             return std::numeric_limits<std::uint64_t>::max();
-        return static_cast<std::uint64_t>(now.tv_sec) * 1000000000ULL +
+        return static_cast<std::uint64_t>(now.tv_sec) * kNanosecondsPerSecond +
             static_cast<std::uint64_t>(now.tv_nsec);
     }
 

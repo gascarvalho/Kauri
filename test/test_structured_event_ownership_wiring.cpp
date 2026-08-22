@@ -272,6 +272,8 @@ TEST_CASE(
     REQUIRE(transport_begin != std::string::npos);
     const auto transport = manager.substr(transport_begin, v3_begin - transport_begin);
     const auto handlers = function_body(transport, "void register_handlers()");
+    const auto authenticated_handler = function_body(
+        transport, "void handle_authenticated_message(");
     const auto transport_start = function_body(transport, "void start()");
     const auto transport_stop = function_body(transport, "bool stop() noexcept");
     const auto observation = function_body(v3, "void handle_observation(");
@@ -298,6 +300,7 @@ TEST_CASE(
     REQUIRE_FALSE(stop_runtime.empty());
     REQUIRE_FALSE(completed.empty());
     REQUIRE_FALSE(handlers.empty());
+    REQUIRE_FALSE(authenticated_handler.empty());
     REQUIRE_FALSE(observation.empty());
     REQUIRE_FALSE(acknowledgement.empty());
     REQUIRE_FALSE(deliveries.empty());
@@ -332,12 +335,13 @@ TEST_CASE(
           std::string::npos);
     CHECK(compact_handlers.find("authenticated_source(peer_connection)") !=
           std::string::npos);
-    const auto observation_auth = handlers.find(
+    const auto observation_auth = authenticated_handler.find(
         "authenticated_source(connection)");
     const auto observation_owner = observation.find(
         "facade_.v3_observe_readiness(");
     REQUIRE(observation_auth != std::string::npos);
     REQUIRE(observation_owner != std::string::npos);
+    CHECK(handlers.find("handle_authenticated_message(") != std::string::npos);
     CHECK(handlers.find("callbacks_.observation") != std::string::npos);
     CHECK(without_whitespace(acknowledgement).find(
               "facade_.v3_acknowledge(source,manager_tick_ns(),payload)") !=
@@ -607,7 +611,7 @@ TEST_CASE(
     {
         CHECK(v3.find("AdaptiveV3ManagerSession") !=
               std::string::npos);
-    CHECK(manager.find("manager_controller_config") != std::string::npos);
+        CHECK(manager.find("manager_controller_config") != std::string::npos);
         CHECK(v3.find("required_release_count") != std::string::npos);
         CHECK(v3.find("certificate_assembled") != std::string::npos);
         CHECK(v3.find("quarantine") != std::string::npos);
@@ -620,7 +624,7 @@ TEST_CASE(
               std::string::npos);
         CHECK(manager.find("residency_ticks") !=
               std::string::npos);
-        CHECK(manager.find("65'000") != std::string::npos);
+        CHECK(manager.find("kAdaptiveV3ResidencyNs") != std::string::npos);
         CHECK(v3.find("begin_next_transition_cycle") !=
               std::string::npos);
         CHECK(v3.find("AdaptiveV3ManagerSessionStatus::terminal") != std::string::npos);
