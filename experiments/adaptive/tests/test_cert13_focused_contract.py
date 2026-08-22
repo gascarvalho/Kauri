@@ -1982,6 +1982,22 @@ def test_v13_parent_authorization_projection_binds_campaign_slot_path(
         "member_count": 7,
     }
 
+    isolated = tmp_path / "isolated" / "opaque-child"
+    shutil.copytree(root, isolated)
+    with pytest.raises(_validation().FocusedCrashPairValidationError):
+        _validation()._validate_v13_parent_authorization_projection(
+            isolated, contract
+        )
+    assert _validation()._validate_v13_parent_authorization_projection(
+        isolated,
+        contract,
+        authorized_child_path=root,
+    ) == {
+        "manifest_sha256": "40" * 32,
+        "membership_digest": "50" * 32,
+        "member_count": 7,
+    }
+
 
 def test_archived_parent_authorization_schema_one_stays_accepted(tmp_path: Path) -> None:
     root, contract = _v13_parent_authorization_tree(tmp_path)

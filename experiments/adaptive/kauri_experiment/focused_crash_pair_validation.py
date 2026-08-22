@@ -7034,10 +7034,14 @@ def _validate_v13_redacted_launch_arguments(
     events: Sequence[Mapping[str, object]],
     readiness_manifest: Mapping[str, object],
     issuer_public_key: object,
+    *,
+    authorized_child_path: Path | None = None,
 ) -> None:
     """Bind the sealed public replica/client argv without recovering secrets."""
 
-    sealed_root = root.resolve(strict=True)
+    sealed_root = (
+        root if authorized_child_path is None else Path(authorized_child_path)
+    ).resolve(strict=True)
     if set(launch) != {
         "manager_argv",
         "manager_checkpoint",
@@ -7225,7 +7229,10 @@ def _parse_utc_approval_time(value: str, label: str) -> datetime:
 
 
 def _validate_v13_parent_authorization_projection(
-    root: Path, contract: Mapping[str, object]
+    root: Path,
+    contract: Mapping[str, object],
+    *,
+    authorized_child_path: Path | None = None,
 ) -> Mapping[str, object]:
     """Validate and select the child-bound v13 public approval projection."""
     profile = _mapping(contract["profile"], "focused profile")
@@ -7284,17 +7291,19 @@ def _validate_v13_parent_authorization_projection(
     pair = pair_receipt.get("pair_id")
     slot = pair_receipt.get("slot_id")
     output_root = Path(str(request["output_root"]))
+    bound_child = root if authorized_child_path is None else Path(authorized_child_path)
     if request.get("mode") == "campaign":
         child_path_valid = (
             isinstance(slot, str)
             and slot.startswith("slot-")
             and slot[5:].isdigit()
-            and root.resolve() == (output_root / "children" / slot).resolve()
+            and bound_child.resolve() == (output_root / "children" / slot).resolve()
         )
     else:
         child_path_valid = (
-            root.name in {"control", "adaptive"}
-            and root.resolve() == (output_root / str(pair) / root.name).resolve()
+            bound_child.name in {"control", "adaptive"}
+            and bound_child.resolve()
+            == (output_root / str(pair) / bound_child.name).resolve()
         )
     if not isinstance(pair, str) or pair not in projection or not child_path_valid:
         _error("v13 parent authorization child pair binding drifted")
@@ -7302,12 +7311,19 @@ def _validate_v13_parent_authorization_projection(
 
 
 def _validate_parent_authorization_projection(
-    root: Path, contract: Mapping[str, object]
+    root: Path,
+    contract: Mapping[str, object],
+    *,
+    authorized_child_path: Path | None = None,
 ) -> Mapping[str, object] | None:
     """Route parent authorization by frozen profile schema without sniffing."""
     profile = _mapping(contract["profile"], "focused profile")
     if profile.get("profile_id") in _FCRASH_H_V13_PROFILE_IDS:
-        return _validate_v13_parent_authorization_projection(root, contract)
+        return _validate_v13_parent_authorization_projection(
+            root,
+            contract,
+            authorized_child_path=authorized_child_path,
+        )
     request_path = root / "runtime" / "parent-authorization-request.json"
     receipt_path = root / "runtime" / "parent-authorization-receipt.json"
     request = _read_json(request_path, "parent authorization request")
@@ -7957,6 +7973,7 @@ def _validate_fault_window_arm(
     events: Sequence[Mapping[str, Any]],
     *,
     snapshot_audit_ns: int | None,
+    authorized_child_path: Path | None = None,
 ) -> Mapping[str, object] | None:
     """Independently bind the persisted v4 arm; it is never evidence itself."""
 
@@ -8055,7 +8072,11 @@ def _validate_fault_window_arm(
     ):
         _digest(arm.get(key), f"fault-window {key}")
     profile = _mapping(contract["profile"], "focused profile")
-    v13_selected_projection = _validate_parent_authorization_projection(root, contract)
+    v13_selected_projection = _validate_parent_authorization_projection(
+        root,
+        contract,
+        authorized_child_path=authorized_child_path,
+    )
     coverage = _mapping(contract["reporter_coverage_plan"], "reporter coverage plan")
     parent_request_path = root / "runtime" / "parent-authorization-request.json"
     parent_receipt_path = root / "runtime" / "parent-authorization-receipt.json"
@@ -8174,7 +8195,15 @@ def _validate_fault_window_arm(
         # binds it to the public manifest without reopening authorization.
         selected_projection = v13_selected_projection
     historical_arm_path = (
-        path
+        (
+            (
+                root
+                if authorized_child_path is None
+                else Path(authorized_child_path)
+            )
+            / "runtime"
+            / _FAULT_WINDOW_ARM_FILENAME
+        ).resolve()
         if is_v13
         else Path(parent_request["output_root"])
         / pair_id
@@ -8686,6 +8715,7 @@ def _validate_sealed_v13_arm(
     contract: Mapping[str, object],
     trusted_provenance: Mapping[str, object],
     readiness_verifier_path: Path | None,
+    authorized_child_path: Path | None,
 ) -> dict[str, object]:
     """Validate one exact v13 arm without entering archived validation paths."""
 
@@ -8849,7 +8879,9 @@ def _validate_sealed_v13_arm(
     if launch.get("manager_argv") != observed.get("argv"):
         _error("requested and observed v13 manager argv differ")
     selected_projection = _validate_v13_parent_authorization_projection(
-        root, contract
+        root,
+        contract,
+        authorized_child_path=authorized_child_path,
     )
     public_manifest = _validate_v13_readiness_public_manifest(
         root, contract, selected_projection
@@ -8861,6 +8893,7 @@ def _validate_sealed_v13_arm(
         events,
         public_manifest,
         transition_state["issuer_public_key"],
+        authorized_child_path=authorized_child_path,
     )
     _validate_manager_boundary(
         contract,
@@ -8878,6 +8911,7 @@ def _validate_sealed_v13_arm(
         _mapping(fault_join.get("confirmations"), "v13 fault confirmations"),
         events,
         snapshot_audit_ns=epoch1_audit_ns,
+        authorized_child_path=authorized_child_path,
     )
     if dict(_mapping(armed_projection, "v13 armed readiness projection")) != dict(
         selected_projection
@@ -8987,11 +9021,12 @@ def _validate_sealed_v13_arm(
     }
 
 
-def validate_sealed_arm(
+def _validate_sealed_arm(
     run_directory: Path,
     *,
     trusted_provenance: object,
     readiness_verifier_path: Path | None = None,
+    authorized_child_path: Path | None = None,
 ) -> dict[str, object]:
     """Reconstruct one sealed arm from raw sources before joining fault truth."""
 
@@ -9012,6 +9047,7 @@ def validate_sealed_arm(
             contract=contract,
             trusted_provenance=trusted_provenance,
             readiness_verifier_path=readiness_verifier_path,
+            authorized_child_path=authorized_child_path,
         )
     profile_sha = str(contract["profile_sha256"])
     proof_sha = str(contract["topology_proof_sha256"])
@@ -9399,6 +9435,21 @@ def validate_sealed_arm(
     }
 
 
+def validate_sealed_arm(
+    run_directory: Path,
+    *,
+    trusted_provenance: object,
+    readiness_verifier_path: Path | None = None,
+) -> dict[str, object]:
+    """Reconstruct one sealed arm from raw sources before joining fault truth."""
+
+    return _validate_sealed_arm(
+        run_directory,
+        trusted_provenance=trusted_provenance,
+        readiness_verifier_path=readiness_verifier_path,
+    )
+
+
 def validate_sealed_pair(
     pair_directory: Path,
     *,
@@ -9536,15 +9587,30 @@ def validate_sealed_campaign(
         )
     try:
 
+        authorized_children = {
+            (
+                str(child["child_tree_sha256"]),
+                str(child["child_seal_sha256"]),
+            ): Path(child["sealed_child_directory"])
+            for child in children
+        }
+
         def validate_isolated_child(
             directory: Path, *, trusted_provenance: object
         ) -> Mapping[str, Any]:
-            return validate_sealed_arm(
+            isolated_seal = verify_evidence_seal(directory)
+            authorized_child_path = authorized_children.get(
+                (isolated_seal.tree_sha256, isolated_seal.seal_sha256)
+            )
+            if authorized_child_path is None:
+                _error("isolated v13 child lacks its authorized campaign path")
+            return _validate_sealed_arm(
                 directory,
                 trusted_provenance=_aggregate_child_provenance(
                     trusted_provenance, directory
                 ),
                 readiness_verifier_path=readiness_verifier_path,
+                authorized_child_path=authorized_child_path,
             )
 
         source_blind = campaign_contracts.validate_campaign_source_blind(
