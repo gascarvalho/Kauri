@@ -353,10 +353,15 @@ def test_default_cli_executes_the_injectable_focused_launch_backend(
     assert captured[0]["trusted_provenance_required"] is True
     assert pair_calls == []
     assert campaign_calls == []
+    aggregate_validations = (
+        [captured[0]["campaign_validation"]]
+        if command == "campaign"
+        else captured[0]["pair_validations"]
+    )
     assert all(
         validation["trusted_provenance_supplied"] is False
         and validation["pending_external_provenance"]["children"]
-        for validation in captured[0]["pair_validations"]
+        for validation in aggregate_validations
     )
 
 
@@ -387,11 +392,8 @@ def test_default_execution_writes_one_canonical_sealed_parent_evidence_tree(
         },
         backend=backend,
     )
-    for ordinal in range(1, pair_count + 1):
-        pair_root = output / f"pair-{ordinal:02d}"
-        assert (pair_root / "pair-receipt.json").is_file()
-        assert (pair_root / "evidence-seal.json").is_file()
     if mode == "campaign":
+        assert not tuple(output.glob("pair-*"))
         assert (output / "plan.json").is_file()
         assert (output / "campaign-ledger.jsonl").is_file()
         assert (output / "campaign-summary.json").is_file()
@@ -399,6 +401,9 @@ def test_default_execution_writes_one_canonical_sealed_parent_evidence_tree(
         assert not any(path.is_dir() for path in output.glob("*ledger*"))
         assert result["campaign_validation"]["verdict"] == "PROVISIONAL"
     else:
+        pair_root = output / "pair-01"
+        assert (pair_root / "pair-receipt.json").is_file()
+        assert (pair_root / "evidence-seal.json").is_file()
         assert result["pair_validations"][0]["verdict"] == "PROVISIONAL"
     assert result["validation_status"] == "PROVISIONAL"
     assert pair_calls == []

@@ -736,63 +736,57 @@ def _execute_focused(
         arm_records.setdefault(pair_id, []).append(record)
 
     pair_validations: list[dict[str, object]] = []
-    for pair_id, children in sorted(arm_records.items()):
-        pair_root = output_root / pair_id
-        pair_root.mkdir(parents=True, exist_ok=True)
-        entries: list[dict[str, object]] = []
-        for child in children:
-            seal = child["seal"]
-            configuration = child["configuration"]
-            child_root = configuration.get("run_directory")
-            relative = str(child["arm"])
-            if plan is not None:
-                relative = f"children/{child['arm']}"
-                destination = pair_root / relative
-                if isinstance(child_root, (str, Path)) and Path(child_root).is_dir():
-                    shutil.copytree(Path(child_root), destination)
-                else:
-                    destination.mkdir(parents=True, exist_ok=False)
-            elif isinstance(child_root, (str, Path)):
-                candidate = Path(child_root)
-                try:
-                    relative = str(candidate.relative_to(pair_root))
-                except ValueError:
-                    relative = str(child["arm"])
-            tree_sha = seal.get("tree_sha256") or _digest(
-                {"pair_id": pair_id, "arm": child["arm"], "kind": "tree"}
-            )
-            seal_sha = seal.get("seal_sha256") or _digest(
-                {"pair_id": pair_id, "arm": child["arm"], "kind": "seal"}
-            )
-            entries.append(
+    if plan is None:
+        for pair_id, children in sorted(arm_records.items()):
+            pair_root = output_root / pair_id
+            pair_root.mkdir(parents=True, exist_ok=True)
+            entries: list[dict[str, object]] = []
+            for child in children:
+                seal = child["seal"]
+                configuration = child["configuration"]
+                child_root = configuration.get("run_directory")
+                relative = str(child["arm"])
+                if isinstance(child_root, (str, Path)):
+                    candidate = Path(child_root)
+                    try:
+                        relative = str(candidate.relative_to(pair_root))
+                    except ValueError:
+                        relative = str(child["arm"])
+                tree_sha = seal.get("tree_sha256") or _digest(
+                    {"pair_id": pair_id, "arm": child["arm"], "kind": "tree"}
+                )
+                seal_sha = seal.get("seal_sha256") or _digest(
+                    {"pair_id": pair_id, "arm": child["arm"], "kind": "seal"}
+                )
+                entries.append(
+                    {
+                        "arm": child["arm"],
+                        "path": relative,
+                        "tree_sha256": tree_sha,
+                        "seal_sha256": seal_sha,
+                    }
+                )
+            _write_exclusive_json(
+                pair_root / "pair-receipt.json",
                 {
-                    "arm": child["arm"],
-                    "path": relative,
-                    "tree_sha256": tree_sha,
-                    "seal_sha256": seal_sha,
+                    "schema_version": 1,
+                    "pair_id": pair_id,
+                    "automatic_retries": 0,
+                    "replacement_policy": "none",
+                    "children": entries,
+                },
+            )
+            pair_seal = create_evidence_seal(pair_root)
+            pair_validations.append(
+                {
+                    "pair_id": pair_id,
+                    **_pending_external_provenance(
+                        pair_root,
+                        seal=pair_seal,
+                        children=entries,
+                    ),
                 }
             )
-        _write_exclusive_json(
-            pair_root / "pair-receipt.json",
-            {
-                "schema_version": 1,
-                "pair_id": pair_id,
-                "automatic_retries": 0,
-                "replacement_policy": "none",
-                "children": entries,
-            },
-        )
-        pair_seal = create_evidence_seal(pair_root)
-        pair_validations.append(
-            {
-                "pair_id": pair_id,
-                **_pending_external_provenance(
-                    pair_root,
-                    seal=pair_seal,
-                    children=entries,
-                ),
-            }
-        )
 
     campaign_validation: Mapping[str, object] | None = None
     if plan is not None:
@@ -850,13 +844,13 @@ def _execute_focused(
             seal=campaign_seal,
             children=[
                 {
-                    "pair_id": validation["pair_id"],
-                    "verdict": validation["verdict"],
-                    "pending_external_provenance": validation[
-                        "pending_external_provenance"
-                    ],
+                    "slot_id": record["slot_id"],
+                    "pair_id": record["pair_id"],
+                    "arm": record["arm"],
+                    "evidence_tree_sha256": record["seal"].get("tree_sha256"),
+                    "evidence_seal_sha256": record["seal"].get("seal_sha256"),
                 }
-                for validation in pair_validations
+                for record in records
             ],
         )
 
