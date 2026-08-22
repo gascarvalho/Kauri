@@ -34,7 +34,10 @@ TEST_CASE("certified catch-up applies commits without voting",
         chain[3],
         &core);
 
-    REQUIRE(core.apply_certified_catchup(catchup));
+    REQUIRE(core.apply_certified_catchup(catchup, 37));
+    CHECK(core.certified_catchup_hook_count() == 1);
+    CHECK(core.certified_catchup_hook_generation() == 37);
+    CHECK(core.certified_catchup_hook_committed_count() == 0);
     REQUIRE(core.committed().size() == 1);
     CHECK(core.committed()[0].hash == chain[0]->get_hash());
     CHECK(core.vote_count() == 0);
@@ -55,6 +58,7 @@ TEST_CASE("uncertified catch-up cannot mutate commit state",
         &core);
 
     CHECK_FALSE(core.apply_certified_catchup(catchup));
+    CHECK(core.certified_catchup_hook_count() == 0);
     CHECK(core.committed().empty());
     CHECK(core.vote_count() == 0);
 }

@@ -208,7 +208,8 @@ namespace hotstuff
          * but deliberately does not resolve proposal waiters, vote, or rotate
          * the active tree. */
         bool on_receive_certified_proposal_catchup(
-            const Proposal &prop) noexcept;
+            const Proposal &prop,
+            std::uint64_t view_generation = 0) noexcept;
 
         /** Call upon the delivery of a vote message.
          * The block mentioned in the message should be already delivered. */
@@ -316,6 +317,14 @@ namespace hotstuff
             const ProposalKey &) {}
         virtual void on_verified_commit_progress(
             const ProposalKey &) {}
+        /** Observe a proposal only after certified catch-up has verified its
+         * delivered block and quorum certificate, but before update() can
+         * expose any resulting commit callbacks. Derived implementations may
+         * retain evidence-only provenance; this hook grants no consensus,
+         * voting, or topology authority. */
+        virtual void on_verified_certified_proposal_catchup(
+            const Proposal &,
+            std::uint64_t) noexcept {}
 
         /**
          * Increment timer to mark receival.

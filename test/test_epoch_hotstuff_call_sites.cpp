@@ -4092,16 +4092,18 @@ TEST_CASE(
          "message.postponed_parse(this)",
          "proposal.metadata().key() != envelope.key()",
          "async_deliver_blk(expected_hash, source)",
-         "on_receive_certified_proposal_catchup(",
+         "on_receive_certified_proposal_catchup(\n"
+         "                                proposal, generation)",
          "KAURI_PROPOSAL_CATCHUP"}));
     const auto certified_catch_up = function_body(
         source("src/consensus.cpp"),
         "HotStuffCore::on_receive_certified_proposal_catchup(");
     REQUIRE_FALSE(certified_catch_up.empty());
-    CHECK(contains_all(
+    CHECK(contains_in_order(
         certified_catch_up,
         {"block->qc->has_n(config.nmajority)",
          "block->verify(this)",
+         "on_verified_certified_proposal_catchup(",
          "update(block)",
          "on_qc_finish(block->qc_ref)"}));
     CHECK(catch_up.find("on_receive_proposal") == std::string::npos);

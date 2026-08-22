@@ -1882,6 +1882,9 @@ namespace hotstuff
         bool process_exact_proposal_catchup(
             const EpochConsensusEnvelope &envelope,
             const PeerId &source_peer) noexcept;
+        void on_verified_certified_proposal_catchup(
+            const Proposal &proposal,
+            std::uint64_t view_generation) noexcept override;
         void dispatch_exact_vote_fallback(
             const ProposalKey &key,
             std::uint64_t context_generation);

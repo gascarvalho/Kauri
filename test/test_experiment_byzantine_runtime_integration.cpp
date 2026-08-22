@@ -1117,6 +1117,15 @@ public:
         runtime.update(block);
     }
 
+    static bool apply_certified_catchup(
+        HotStuffBase &runtime,
+        const Proposal &proposal,
+        std::uint64_t view_generation)
+    {
+        return runtime.on_receive_certified_proposal_catchup(
+            proposal, view_generation);
+    }
+
     static void compatibility_consensus_and_post(
         HotStuffBase &runtime,
         const block_t &block,
@@ -2722,6 +2731,66 @@ TEST_CASE(
         CHECK_FALSE(Access::lifecycle_reporting_suppressed(runtime));
         CHECK(Access::convergence_evidence_healthy(runtime));
     }
+}
+
+TEST_CASE(
+    "certified catch-up retains only an exact adaptive-v3 proposal identity",
+    "[cert13][adaptive-v3][proposal-repair][identity][integration][mutation]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+
+    const auto exercise = [](EpochProtocolMode mode,
+                             std::uint64_t generation_offset) {
+        EventContext event_context;
+        auto runtime = mode == EpochProtocolMode::adaptive_v3
+            ? std::make_unique<TestHotStuff>(
+                  1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+                  new ActiveRuntimePaceMaker(1), event_context, 0,
+                  HotStuffBase::Net::Config(), NetAddr(), mode,
+                  adaptive_v3_runtime_config(1))
+            : std::make_unique<TestHotStuff>(
+                  1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+                  new ActiveRuntimePaceMaker(1), event_context, 0,
+                  HotStuffBase::Net::Config(), NetAddr(), mode);
+        const auto configuration =
+            Access::initialize_active_runtime(*runtime);
+        const auto generation =
+            Access::exact_runtime_generation(*runtime, configuration);
+        REQUIRE(generation.has_value());
+        REQUIRE(*generation !=
+                std::numeric_limits<std::uint64_t>::max());
+
+        const auto genesis = runtime->get_genesis();
+        auto certificate = Access::direct_certifier(
+            *runtime,
+            genesis_certification_key(genesis->get_hash()));
+        const auto block = Access::add_custom_commit_rule_block(
+            *runtime,
+            genesis,
+            genesis,
+            std::move(certificate),
+            "certified-catchup-identity",
+            genesis->get_height() + 1);
+        const Proposal proposal(
+            0,
+            configuration.epoch_number,
+            configuration.tree_id,
+            configuration.epoch_digest,
+            block,
+            runtime.get());
+
+        CHECK_FALSE(Access::has_retained_commit_event_identity(
+            *runtime, proposal.key().block_hash));
+        REQUIRE(Access::apply_certified_catchup(
+            *runtime, proposal, *generation + generation_offset));
+        return Access::retained_commit_event_identity_is_exact(
+            *runtime, proposal.key(), *generation);
+    };
+
+    CHECK(exercise(EpochProtocolMode::adaptive_v3, 0));
+    CHECK_FALSE(exercise(EpochProtocolMode::adaptive_v3, 1));
+    CHECK_FALSE(exercise(EpochProtocolMode::adaptive_v2, 0));
 }
 
 TEST_CASE(

@@ -4735,7 +4735,7 @@ namespace hotstuff
                         proposal.hsc = &runtime->owner();
                         processed = runtime->owner()
                             .on_receive_certified_proposal_catchup(
-                                proposal);
+                                proposal, generation);
                     }
                     HOTSTUFF_LOG_INFO(
                         "KAURI_PROPOSAL_CATCHUP outcome=%s replica=%u "
@@ -4756,6 +4756,32 @@ namespace hotstuff
         {
             return false;
         }
+    }
+
+    void HotStuffBase::on_verified_certified_proposal_catchup(
+        const Proposal &proposal,
+        std::uint64_t view_generation) noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            view_generation == 0 || proposal.blk == nullptr)
+            return;
+        const auto generation = find_exact_runtime_generation(
+            proposal.configuration());
+        const auto metadata = exact_context_metadata(proposal.key());
+        if (!generation.has_value() || *generation != view_generation ||
+            !metadata.has_value() ||
+            metadata->tree.root != proposal.proposer)
+            return;
+
+        // The core invokes this hook only after the delivered proposal block,
+        // its quorum certificate, and the block signature have been verified.
+        // Retain the exact authenticated repair identity before update() can
+        // expose a commit callback. This projection is evidence/readiness-only
+        // and cannot admit a proposal, authorize a vote, rotate a tree, or
+        // change consensus state.
+        static_cast<void>(
+            retain_authenticated_proposal_commit_event_identities(
+                proposal, view_generation));
     }
 
     void HotStuffBase::dispatch_exact_vote_fallback(

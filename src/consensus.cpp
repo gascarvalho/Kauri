@@ -688,7 +688,8 @@ namespace hotstuff
     }
 
     bool HotStuffCore::on_receive_certified_proposal_catchup(
-        const Proposal &prop) noexcept
+        const Proposal &prop,
+        std::uint64_t view_generation) noexcept
     {
         try
         {
@@ -700,6 +701,8 @@ namespace hotstuff
                 return false;
 
             sanity_check_delivered(block);
+            on_verified_certified_proposal_catchup(
+                prop, view_generation);
             update(block);
             if (block->qc_ref != nullptr)
                 on_qc_finish(block->qc_ref);

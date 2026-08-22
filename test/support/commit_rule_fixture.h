@@ -193,9 +193,27 @@ public:
         update(block);
     }
 
-    bool apply_certified_catchup(const Proposal &proposal)
+    bool apply_certified_catchup(
+        const Proposal &proposal,
+        std::uint64_t view_generation = 0)
     {
-        return on_receive_certified_proposal_catchup(proposal);
+        return on_receive_certified_proposal_catchup(
+            proposal, view_generation);
+    }
+
+    std::size_t certified_catchup_hook_count() const noexcept
+    {
+        return certified_catchup_hook_count_;
+    }
+
+    std::uint64_t certified_catchup_hook_generation() const noexcept
+    {
+        return certified_catchup_hook_generation_;
+    }
+
+    std::size_t certified_catchup_hook_committed_count() const noexcept
+    {
+        return certified_catchup_hook_committed_count_;
     }
 
     const std::vector<CommittedBlock> &committed() const
@@ -239,6 +257,15 @@ public:
     }
 
 protected:
+    void on_verified_certified_proposal_catchup(
+        const Proposal &,
+        std::uint64_t view_generation) noexcept override
+    {
+        ++certified_catchup_hook_count_;
+        certified_catchup_hook_generation_ = view_generation;
+        certified_catchup_hook_committed_count_ = committed_.size();
+    }
+
     void do_decide(Finality &&finality) override
     {
         callbacks_.push_back(CommitCallbackObservation{
@@ -373,6 +400,9 @@ private:
 
     std::uint16_t next_marker_ = 1;
     std::size_t vote_count_ = 0;
+    std::size_t certified_catchup_hook_count_ = 0;
+    std::uint64_t certified_catchup_hook_generation_ = 0;
+    std::size_t certified_catchup_hook_committed_count_ = 0;
     std::vector<CommittedBlock> committed_;
     std::vector<CommitCallbackObservation> callbacks_;
 };
