@@ -208,7 +208,9 @@ def _write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         for phase in PHASES
     ] + ["adaptive_ratio", "paired_ratio", "effect_tps"]
     with path.open("x", encoding="utf-8", newline="") as output:
-        writer = csv.DictWriter(output, fieldnames=fields)
+        writer = csv.DictWriter(
+            output, fieldnames=fields, lineterminator="\n"
+        )
         writer.writeheader()
         writer.writerows(rows)
 
@@ -294,7 +296,16 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         fontsize=9,
         fontweight="semibold",
     )
-    fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
+    fig.savefig(
+        path.with_suffix(".pdf"),
+        bbox_inches="tight",
+        metadata={
+            "Creator": "Kauri CERT13 figure generator",
+            "Producer": "Matplotlib",
+            "CreationDate": None,
+            "ModDate": None,
+        },
+    )
     fig.savefig(path.with_suffix(".png"), dpi=240, bbox_inches="tight")
     plt.close(fig)
 

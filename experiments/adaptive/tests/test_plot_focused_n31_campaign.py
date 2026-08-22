@@ -61,3 +61,37 @@ def test_phase_medians_require_frozen_order_and_convert_milli_tps() -> None:
         "epoch1": 11_500.0,
         "late": 11_300.0,
     }
+
+
+def test_figure_artifacts_exclude_platform_and_wall_clock_metadata(tmp_path) -> None:
+    rows = [
+        {
+            "pair_id": f"pair-{ordinal:02d}",
+            **{
+                f"{arm}_{phase}_tps": 10_000.0 + ordinal
+                for arm in ("control", "adaptive")
+                for phase in _plotter().PHASES
+            },
+            "adaptive_ratio": 1.0,
+            "paired_ratio": 1.0,
+            "effect_tps": 0.0,
+        }
+        for ordinal in range(1, 6)
+    ]
+
+    csv_path = tmp_path / "campaign.csv"
+    _plotter()._write_csv(csv_path, rows)
+    csv_bytes = csv_path.read_bytes()
+    assert b"\r\n" not in csv_bytes
+    assert csv_bytes.endswith(b"\n")
+
+    _plotter()._render(tmp_path / "campaign", rows)
+    pdf_bytes = (tmp_path / "campaign.pdf").read_bytes()
+    assert b"/CreationDate" not in pdf_bytes
+    assert b"/ModDate" not in pdf_bytes
+
+    _plotter()._render(tmp_path / "campaign-copy", rows)
+    assert (tmp_path / "campaign-copy.pdf").read_bytes() == pdf_bytes
+    assert (tmp_path / "campaign-copy.png").read_bytes() == (
+        tmp_path / "campaign.png"
+    ).read_bytes()
