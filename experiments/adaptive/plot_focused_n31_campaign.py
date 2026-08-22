@@ -271,7 +271,7 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         color="#2563eb",
         marker="o",
         linewidth=1.3,
-        label="Optimized / adaptive baseline",
+        label="Optimized / containment",
     )
     right.plot(
         pair_x,
