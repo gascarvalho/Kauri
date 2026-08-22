@@ -1,4 +1,3 @@
-#include <cerrno>
 #include <cctype>
 #include <cstddef>
 #include <fstream>
@@ -10,11 +9,8 @@
 #include <utility>
 #include <vector>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "catch.hpp"
+#include "support/subprocess.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
@@ -291,72 +287,11 @@ std::vector<std::string> call_arguments(const std::string &call)
     return arguments;
 }
 
-struct ProcessResult
+kauri::test_support::ProcessResult run_hotstuff_app(
+    const std::vector<std::string> &arguments)
 {
-    int status{0};
-    std::string output;
-};
-
-ProcessResult run_hotstuff_app(const std::vector<std::string> &arguments)
-{
-    int output_pipe[2];
-    if (::pipe(output_pipe) != 0)
-        throw std::runtime_error("failed to create subprocess pipe");
-
-    const auto child = ::fork();
-    if (child < 0)
-    {
-        ::close(output_pipe[0]);
-        ::close(output_pipe[1]);
-        throw std::runtime_error("failed to fork hotstuff-app");
-    }
-    if (child == 0)
-    {
-        ::close(output_pipe[0]);
-        if (::dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
-            ::dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(126);
-        ::close(output_pipe[1]);
-
-        std::vector<std::string> owned_arguments;
-        owned_arguments.reserve(arguments.size() + 1);
-        owned_arguments.emplace_back(KAURI_HOTSTUFF_APP_PATH);
-        owned_arguments.insert(
-            owned_arguments.end(), arguments.begin(), arguments.end());
-        std::vector<char *> raw_arguments;
-        raw_arguments.reserve(owned_arguments.size() + 1);
-        for (auto &argument : owned_arguments)
-            raw_arguments.push_back(&argument[0]);
-        raw_arguments.push_back(nullptr);
-        ::execv(KAURI_HOTSTUFF_APP_PATH, raw_arguments.data());
-        _exit(127);
-    }
-
-    ::close(output_pipe[1]);
-    ProcessResult result;
-    char buffer[4096];
-    while (true)
-    {
-        const auto count = ::read(output_pipe[0], buffer, sizeof(buffer));
-        if (count > 0)
-        {
-            result.output.append(buffer, static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
-        break;
-    }
-    ::close(output_pipe[0]);
-
-    int wait_status = 0;
-    while (::waitpid(child, &wait_status, 0) < 0)
-        if (errno != EINTR)
-            throw std::runtime_error("failed to wait for hotstuff-app");
-    result.status = WIFEXITED(wait_status)
-                        ? WEXITSTATUS(wait_status)
-                        : 128 + WTERMSIG(wait_status);
-    return result;
+    return kauri::test_support::run_program_merged(
+        KAURI_HOTSTUFF_APP_PATH, arguments);
 }
 
 } // namespace

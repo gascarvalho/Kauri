@@ -2,20 +2,18 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cerrno>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <utility>
 #include <vector>
 
 #include "hotstuff/structured_event.h"
 #include "support/adaptive_v3_manager_session_fixture.h"
+#include "support/subprocess.h"
 
 #ifndef KAURI_EPOCH_PROFILE_DIGEST_PATH
 #error "KAURI_EPOCH_PROFILE_DIGEST_PATH must name epoch-profile-digest"
@@ -25,63 +23,7 @@ namespace {
 
 using namespace hotstuff;
 using namespace kauri::test_support::cert13;
-
-struct ProcessResult {
-    int status{0};
-    std::string output;
-};
-
-std::string read_all(const int descriptor)
-{
-    std::string contents;
-    char buffer[4096];
-    while (true) {
-        const auto count = ::read(descriptor, buffer, sizeof(buffer));
-        if (count > 0) {
-            contents.append(buffer, static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR) continue;
-        if (count < 0) throw std::runtime_error("failed to read verifier output");
-        return contents;
-    }
-}
-
-ProcessResult run_verifier(const std::filesystem::path &manifest,
-                           const std::filesystem::path &certificate,
-                           const std::filesystem::path &identity)
-{
-    int output_pipe[2];
-    if (::pipe(output_pipe) != 0) throw std::runtime_error("failed to create verifier pipe");
-    const auto child = ::fork();
-    if (child < 0) throw std::runtime_error("failed to fork verifier");
-    if (child == 0) {
-        ::close(output_pipe[0]);
-        if (::dup2(output_pipe[1], STDOUT_FILENO) < 0) _exit(126);
-        ::close(output_pipe[1]);
-        const std::string mode = "--verify-adaptive-v3-readiness-v1";
-        const auto manifest_text = manifest.string();
-        const auto certificate_text = certificate.string();
-        const auto identity_text = identity.string();
-        char *const argv[] = {const_cast<char *>(KAURI_EPOCH_PROFILE_DIGEST_PATH),
-                              const_cast<char *>(mode.c_str()),
-                              const_cast<char *>(manifest_text.c_str()),
-                              const_cast<char *>(certificate_text.c_str()),
-                              const_cast<char *>(identity_text.c_str()), nullptr};
-        ::execv(KAURI_EPOCH_PROFILE_DIGEST_PATH, argv);
-        _exit(127);
-    }
-    ::close(output_pipe[1]);
-    ProcessResult result;
-    result.output = read_all(output_pipe[0]);
-    ::close(output_pipe[0]);
-    int wait_status = 0;
-    while (::waitpid(child, &wait_status, 0) < 0)
-        if (errno != EINTR) throw std::runtime_error("failed to wait for verifier");
-    result.status = WIFEXITED(wait_status) ? WEXITSTATUS(wait_status)
-                                            : 128 + WTERMSIG(wait_status);
-    return result;
-}
+using kauri::test_support::run_program;
 
 struct ExportRoot {
     std::filesystem::path path;
@@ -335,12 +277,16 @@ void verify_cycle(const std::filesystem::path &root,
                   const std::filesystem::path &manifest,
                   const std::string &directory,
                   const std::string &epoch,
-                  const CompletedReadinessArtifacts &artifacts)
+    const CompletedReadinessArtifacts &artifacts)
 {
     const auto certificate = root / directory / (epoch + ".certificate.hex");
     const auto identity = root / directory / (epoch + ".identity.hex");
-    const auto result = run_verifier(manifest, certificate, identity);
+    const auto result = run_program(
+        KAURI_EPOCH_PROFILE_DIGEST_PATH,
+        {"--verify-adaptive-v3-readiness-v1",
+         manifest.string(), certificate.string(), identity.string()});
     REQUIRE(result.status == 0);
+    REQUIRE(result.error.empty());
     REQUIRE(result.output.find("\"valid\":true") != std::string::npos);
     REQUIRE(result.output.find("\"certificate_digest\":\"" +
         artifacts.certificate_digest.to_hex() + "\"") != std::string::npos);

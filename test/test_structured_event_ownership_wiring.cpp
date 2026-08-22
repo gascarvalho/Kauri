@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <array>
-#include <cerrno>
 #include <cctype>
 #include <cstddef>
 #include <fstream>
@@ -11,11 +10,8 @@
 #include <string>
 #include <vector>
 
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include "catch.hpp"
+#include "support/subprocess.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
@@ -134,75 +130,7 @@ bool has_structured_event_timer(const std::string &contents)
     return false;
 }
 
-struct ProcessResult
-{
-    int status{0};
-    std::string output;
-};
-
-ProcessResult run_program(
-    const char *path,
-    const std::vector<std::string> &arguments)
-{
-    int output_pipe[2];
-    if (::pipe(output_pipe) != 0)
-        throw std::runtime_error("failed to create subprocess pipe");
-
-    const auto child = ::fork();
-    if (child < 0)
-    {
-        ::close(output_pipe[0]);
-        ::close(output_pipe[1]);
-        throw std::runtime_error("failed to fork executable");
-    }
-    if (child == 0)
-    {
-        ::close(output_pipe[0]);
-        if (::dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
-            ::dup2(output_pipe[1], STDERR_FILENO) < 0)
-            _exit(126);
-        ::close(output_pipe[1]);
-
-        std::vector<std::string> owned_arguments;
-        owned_arguments.reserve(arguments.size() + 1);
-        owned_arguments.emplace_back(path);
-        owned_arguments.insert(
-            owned_arguments.end(), arguments.begin(), arguments.end());
-        std::vector<char *> raw_arguments;
-        raw_arguments.reserve(owned_arguments.size() + 1);
-        for (auto &argument : owned_arguments)
-            raw_arguments.push_back(&argument[0]);
-        raw_arguments.push_back(nullptr);
-        ::execv(path, raw_arguments.data());
-        _exit(127);
-    }
-
-    ::close(output_pipe[1]);
-    ProcessResult result;
-    char buffer[4096];
-    while (true)
-    {
-        const auto count = ::read(output_pipe[0], buffer, sizeof(buffer));
-        if (count > 0)
-        {
-            result.output.append(buffer, static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
-        break;
-    }
-    ::close(output_pipe[0]);
-
-    int wait_status = 0;
-    while (::waitpid(child, &wait_status, 0) < 0)
-        if (errno != EINTR)
-            throw std::runtime_error("failed to wait for executable");
-    result.status = WIFEXITED(wait_status)
-                        ? WEXITSTATUS(wait_status)
-                        : 128 + WTERMSIG(wait_status);
-    return result;
-}
+using kauri::test_support::run_program_merged;
 
 std::vector<std::string> valid_adaptive_v2_arguments()
 {
@@ -242,7 +170,8 @@ TEST_CASE(
         "fault-window-arm-clock-domain",
         "fault-window-arm-snapshot-evidence-basis"}};
 
-    const auto app_help = run_program(KAURI_HOTSTUFF_APP_PATH, {"--help"});
+    const auto app_help = run_program_merged(
+        KAURI_HOTSTUFF_APP_PATH, {"--help"});
     REQUIRE(app_help.status == 0);
     for (const auto *option : replica_options)
     {
@@ -251,7 +180,7 @@ TEST_CASE(
         CHECK(app_help.output.find(option) != std::string::npos);
     }
 
-    const auto manager_help = run_program(
+    const auto manager_help = run_program_merged(
         KAURI_ADAPTATION_MANAGER_PATH, {"--help"});
     REQUIRE(manager_help.status == 0);
     for (const auto *option : manager_options)
@@ -261,7 +190,7 @@ TEST_CASE(
         CHECK(manager_help.output.find(option) != std::string::npos);
     }
 
-    const auto adaptive_v3_help = run_program(
+    const auto adaptive_v3_help = run_program_merged(
         KAURI_ADAPTATION_MANAGER_PATH,
         {"--protocol-mode", "adaptive_v3", "--help"});
     REQUIRE(adaptive_v3_help.status == 0);
@@ -280,7 +209,7 @@ TEST_CASE(
     CHECK(manager_help.output.find("activation-readiness-member") !=
           std::string::npos);
 
-    const auto rejected = run_program(
+    const auto rejected = run_program_merged(
         KAURI_HOTSTUFF_APP_PATH, valid_adaptive_v2_arguments());
     CHECK(rejected.status != 0);
     CHECK(rejected.output.find("structured-event") != std::string::npos);
@@ -289,7 +218,7 @@ TEST_CASE(
 
     for (const auto *mode : {"legacy_static", "adaptive_v1"})
     {
-        const auto compatible = run_program(
+        const auto compatible = run_program_merged(
             KAURI_HOTSTUFF_APP_PATH,
             {"--epoch-protocol-mode", mode});
         CAPTURE(mode);
@@ -659,7 +588,7 @@ TEST_CASE(
 
     SECTION("the v3 CLI carries public transition authority, not a forged readiness identity")
     {
-        const auto manager_help = run_program(
+        const auto manager_help = run_program_merged(
             KAURI_ADAPTATION_MANAGER_PATH,
             {"--protocol-mode", "adaptive_v3", "--help"});
         REQUIRE(manager_help.status == 0);

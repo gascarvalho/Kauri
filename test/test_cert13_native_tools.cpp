@@ -1,19 +1,17 @@
 #include "catch.hpp"
 
-#include <cerrno>
 #include <cstdio>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sys/wait.h>
-#include <unistd.h>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include "hotstuff/activation_readiness_wire.h"
+#include "support/subprocess.h"
 
 #ifndef KAURI_HOTSTUFF_KEYGEN_PATH
 #error "KAURI_HOTSTUFF_KEYGEN_PATH must name hotstuff-keygen"
@@ -25,114 +23,8 @@
 namespace
 {
 
-struct ProcessResult
-{
-    int status{0};
-    std::string output;
-    std::string error;
-};
-
-std::string read_all(int descriptor)
-{
-    std::string contents;
-    char buffer[4096];
-    while (true)
-    {
-        const auto count = ::read(descriptor, buffer, sizeof(buffer));
-        if (count > 0)
-        {
-            contents.append(buffer, static_cast<std::size_t>(count));
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
-        if (count < 0)
-            throw std::runtime_error("failed to read subprocess output");
-        return contents;
-    }
-}
-
-void write_all(int descriptor, const std::string &input)
-{
-    std::size_t offset = 0;
-    while (offset < input.size())
-    {
-        const auto count = ::write(
-            descriptor, input.data() + offset, input.size() - offset);
-        if (count > 0)
-        {
-            offset += static_cast<std::size_t>(count);
-            continue;
-        }
-        if (count < 0 && errno == EINTR)
-            continue;
-        throw std::runtime_error("failed to write subprocess input");
-    }
-}
-
-ProcessResult run_program(
-    const char *path,
-    const std::vector<std::string> &arguments,
-    const std::string &input = {})
-{
-    int input_pipe[2];
-    int output_pipe[2];
-    int error_pipe[2];
-    if (::pipe(input_pipe) != 0 || ::pipe(output_pipe) != 0 ||
-        ::pipe(error_pipe) != 0)
-        throw std::runtime_error("failed to create subprocess pipes");
-
-    const auto child = ::fork();
-    if (child < 0)
-        throw std::runtime_error("failed to fork executable");
-    if (child == 0)
-    {
-        ::close(input_pipe[1]);
-        ::close(output_pipe[0]);
-        ::close(error_pipe[0]);
-        if (::dup2(input_pipe[0], STDIN_FILENO) < 0 ||
-            ::dup2(output_pipe[1], STDOUT_FILENO) < 0 ||
-            ::dup2(error_pipe[1], STDERR_FILENO) < 0)
-            _exit(126);
-        ::close(input_pipe[0]);
-        ::close(output_pipe[1]);
-        ::close(error_pipe[1]);
-
-        std::vector<std::string> owned_arguments;
-        owned_arguments.reserve(arguments.size() + 1);
-        owned_arguments.emplace_back(path);
-        owned_arguments.insert(
-            owned_arguments.end(), arguments.begin(), arguments.end());
-        std::vector<char *> raw_arguments;
-        raw_arguments.reserve(owned_arguments.size() + 1);
-        for (auto &argument : owned_arguments)
-            raw_arguments.push_back(argument.data());
-        raw_arguments.push_back(nullptr);
-        ::execv(path, raw_arguments.data());
-        _exit(127);
-    }
-
-    ::close(input_pipe[0]);
-    ::close(output_pipe[1]);
-    ::close(error_pipe[1]);
-    write_all(input_pipe[1], input);
-    ::close(input_pipe[1]);
-
-    ProcessResult result;
-    result.output = read_all(output_pipe[0]);
-    result.error = read_all(error_pipe[0]);
-    ::close(output_pipe[0]);
-    ::close(error_pipe[0]);
-
-    int wait_status = 0;
-    while (::waitpid(child, &wait_status, 0) < 0)
-        if (errno != EINTR)
-            throw std::runtime_error("failed to wait for executable");
-    result.status = WIFEXITED(wait_status)
-                        ? WEXITSTATUS(wait_status)
-                        : 128 + WTERMSIG(wait_status);
-    return result;
-}
+using kauri::test_support::ProcessResult;
+using kauri::test_support::run_program;
 
 bool lowercase_hex(const std::string &value, std::size_t size)
 {
