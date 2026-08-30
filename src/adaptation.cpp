@@ -94,6 +94,14 @@ void validate_fixed_bounds(
         throw std::invalid_argument(
             "adaptation policy version is out of bounds");
     }
+    if (policy.reputation_mechanism !=
+            ReputationMechanism::responsiveness &&
+        policy.reputation_mechanism !=
+            ReputationMechanism::latency_priority)
+    {
+        throw std::invalid_argument(
+            "unsupported adaptation reputation mechanism");
+    }
     if (policy.attempt_window == 0 ||
         policy.minimum_attempts == 0 ||
         policy.attempt_window > kMaximumAdaptationAttemptWindow ||
@@ -462,25 +470,47 @@ ReplicaAdaptationResult score_replica(
     return result;
 }
 
-bool ranks_before(const ReplicaAdaptationResult &left,
-                  const ReplicaAdaptationResult &right) noexcept
+bool latency_ranks_before(
+    const ReplicaAdaptationResult &left,
+    const ReplicaAdaptationResult &right) noexcept
 {
-    if (left.eligible != right.eligible)
-        return left.eligible;
-    if (left.response_rate_ppm != right.response_rate_ppm)
-        return left.response_rate_ppm > right.response_rate_ppm;
-    if (left.timeout_rate_ppm != right.timeout_rate_ppm)
-        return left.timeout_rate_ppm < right.timeout_rate_ppm;
     if (left.latency_percentile_us.has_value() !=
         right.latency_percentile_us.has_value())
     {
         return left.latency_percentile_us.has_value();
     }
-    if (left.latency_percentile_us.has_value() &&
-        left.latency_percentile_us != right.latency_percentile_us)
+    return left.latency_percentile_us.has_value() &&
+           left.latency_percentile_us != right.latency_percentile_us
+               ? *left.latency_percentile_us <
+                     *right.latency_percentile_us
+               : false;
+}
+
+bool ranks_before(
+    const ReplicaAdaptationResult &left,
+    const ReplicaAdaptationResult &right,
+    ReputationMechanism mechanism) noexcept
+{
+    if (left.eligible != right.eligible)
+        return left.eligible;
+    if (mechanism == ReputationMechanism::latency_priority &&
+        (left.latency_percentile_us.has_value() !=
+             right.latency_percentile_us.has_value() ||
+         (left.latency_percentile_us.has_value() &&
+          left.latency_percentile_us != right.latency_percentile_us)))
     {
-        return *left.latency_percentile_us <
-               *right.latency_percentile_us;
+        return latency_ranks_before(left, right);
+    }
+    if (left.response_rate_ppm != right.response_rate_ppm)
+        return left.response_rate_ppm > right.response_rate_ppm;
+    if (left.timeout_rate_ppm != right.timeout_rate_ppm)
+        return left.timeout_rate_ppm < right.timeout_rate_ppm;
+    if (left.latency_percentile_us.has_value() !=
+            right.latency_percentile_us.has_value() ||
+        (left.latency_percentile_us.has_value() &&
+         left.latency_percentile_us != right.latency_percentile_us))
+    {
+        return latency_ranks_before(left, right);
     }
     if (left.attempt_count != right.attempt_count)
         return left.attempt_count > right.attempt_count;
@@ -517,6 +547,16 @@ std::string compute_snapshot_id(
     append_big_endian(bytes, policy.trailing_timeout_streak);
     append_big_endian(
         bytes, policy.latency_percentile_basis_points);
+    // Preserve every historical responsiveness snapshot byte-for-byte while
+    // binding newly introduced mechanisms into their snapshot identity.
+    if (policy.reputation_mechanism !=
+        ReputationMechanism::responsiveness)
+    {
+        append_big_endian(
+            bytes,
+            static_cast<std::underlying_type_t<ReputationMechanism>>(
+                policy.reputation_mechanism));
+    }
 
     append_big_endian(
         bytes, static_cast<std::uint32_t>(records.size()));
@@ -618,7 +658,12 @@ AdaptationSnapshot build_adaptation_snapshot(
                 : found->second,
             policy));
     }
-    std::sort(ranking.begin(), ranking.end(), ranks_before);
+    std::sort(
+        ranking.begin(), ranking.end(),
+        [&policy](const auto &left, const auto &right) {
+            return ranks_before(
+                left, right, policy.reputation_mechanism);
+        });
     for (std::size_t rank = 0; rank < ranking.size(); ++rank)
         ranking[rank].rank = static_cast<std::uint32_t>(rank);
 

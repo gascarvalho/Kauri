@@ -275,6 +275,7 @@ using hotstuff::ProposalKey;
 using hotstuff::RatePpm;
 using hotstuff::ReplicaAdaptationResult;
 using hotstuff::ReplicaID;
+using hotstuff::ReputationMechanism;
 using hotstuff::ResponseObservation;
 using hotstuff::ResponseOutcome;
 using hotstuff::ResponsivenessClass;
@@ -571,6 +572,11 @@ TEST_CASE("R09 adaptation API pins versioned fixed-point policy defaults",
     CHECK(hotstuff::kPercentileBasisPointScale == 10'000);
 
     CHECK(static_cast<std::uint8_t>(
+              ReputationMechanism::responsiveness) == 1);
+    CHECK(static_cast<std::uint8_t>(
+              ReputationMechanism::latency_priority) == 2);
+
+    CHECK(static_cast<std::uint8_t>(
               ResponsivenessClass::responsive) == 1);
     CHECK(static_cast<std::uint8_t>(
               ResponsivenessClass::insufficient_evidence) == 2);
@@ -588,12 +594,63 @@ TEST_CASE("R09 adaptation API pins versioned fixed-point policy defaults",
     const AdaptationPolicy policy;
     CHECK(policy.schema_version == 1);
     CHECK(policy.policy_version == "kauri-responsiveness-v1");
+    CHECK(policy.reputation_mechanism ==
+          ReputationMechanism::responsiveness);
     CHECK(policy.attempt_window == 32);
     CHECK(policy.minimum_attempts == 8);
     CHECK(policy.minimum_response_rate_ppm == 750'000);
     CHECK(policy.maximum_timeout_rate_ppm == 250'000);
     CHECK(policy.trailing_timeout_streak == 3);
     CHECK(policy.latency_percentile_basis_points == 5'000);
+}
+
+TEST_CASE(
+    "latency-priority mechanism reuses eligibility and changes only ordering",
+    "[r09][adaptation][reputation-policy][latency]")
+{
+    const auto epoch = epoch_id(34, "r09-latency-priority");
+    RecordBuilder builder(epoch);
+    for (std::uint32_t attempt = 0; attempt < 8; ++attempt)
+        builder.add_on_time(0, 100);
+    builder.add_timeout(1);
+    for (std::uint32_t attempt = 0; attempt < 7; ++attempt)
+        builder.add_on_time(1, 10);
+
+    AdaptationPolicy responsiveness;
+    responsiveness.minimum_attempts = 8;
+    responsiveness.trailing_timeout_streak = 3;
+    const auto responsiveness_snapshot = snapshot(
+        {0, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        responsiveness,
+        3401);
+    REQUIRE(result_for(responsiveness_snapshot, 0).eligible);
+    REQUIRE(result_for(responsiveness_snapshot, 1).eligible);
+    CHECK(ranked_ids(responsiveness_snapshot) ==
+          std::vector<ReplicaID>{0, 1});
+
+    auto latency = responsiveness;
+    latency.policy_version = "kauri-latency-priority-v1";
+    latency.reputation_mechanism =
+        ReputationMechanism::latency_priority;
+    const auto latency_snapshot = snapshot(
+        {0, 1},
+        epoch,
+        builder.records(),
+        builder.cutoff(),
+        latency,
+        3401);
+
+    CHECK(ranked_ids(latency_snapshot) ==
+          std::vector<ReplicaID>{1, 0});
+    CHECK(latency_snapshot.snapshot_id() !=
+          responsiveness_snapshot.snapshot_id());
+    CHECK(result_for(latency_snapshot, 0).classification ==
+          result_for(responsiveness_snapshot, 0).classification);
+    CHECK(result_for(latency_snapshot, 1).classification ==
+          result_for(responsiveness_snapshot, 1).classification);
 }
 
 TEST_CASE("three persistent misses are nonresponsive without healthy false positives",

@@ -26,6 +26,20 @@ constexpr std::uint16_t kPercentileBasisPointScale = 10'000;
 
 using RatePpm = std::uint32_t;
 
+/**
+ * Versioned reputation mechanism used to order one immutable assessment.
+ *
+ * Every mechanism shares the same evidence validation and eligibility
+ * boundary.  A mechanism may change only the deterministic order of the
+ * resulting replica assessments; it cannot change membership, quorum, vote,
+ * certificate, commit, or epoch-activation authority.
+ */
+enum class ReputationMechanism : std::uint8_t
+{
+    responsiveness = 1,
+    latency_priority = 2,
+};
+
 enum class ResponsivenessClass : std::uint8_t
 {
     responsive = 1,
@@ -73,6 +87,8 @@ struct AdaptationPolicy
 {
     std::uint32_t schema_version{kAdaptationSchemaVersion};
     std::string policy_version{"kauri-responsiveness-v1"};
+    ReputationMechanism reputation_mechanism{
+        ReputationMechanism::responsiveness};
     std::uint32_t attempt_window{32};
     std::uint32_t minimum_attempts{8};
     RatePpm minimum_response_rate_ppm{750'000};
@@ -84,6 +100,7 @@ struct AdaptationPolicy
     {
         return schema_version == other.schema_version &&
                policy_version == other.policy_version &&
+               reputation_mechanism == other.reputation_mechanism &&
                attempt_window == other.attempt_window &&
                minimum_attempts == other.minimum_attempts &&
                minimum_response_rate_ppm ==

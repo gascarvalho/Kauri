@@ -252,6 +252,7 @@ struct ManagerOptions
     hotstuff::AdaptationPolicy responsiveness_policy{
         hotstuff::kAdaptationSchemaVersion,
         "adaptive-v2-controller-responsiveness-v1",
+        hotstuff::ReputationMechanism::responsiveness,
         32,
         2,
         750'000,
@@ -329,6 +330,17 @@ Value parse_unsigned(
                  : " must be a canonical unsigned decimal"));
     }
     return value;
+}
+
+hotstuff::ReputationMechanism parse_reputation_mechanism(
+    const std::string &value)
+{
+    if (value == "responsiveness")
+        return hotstuff::ReputationMechanism::responsiveness;
+    if (value == "latency-priority")
+        return hotstuff::ReputationMechanism::latency_priority;
+    throw std::invalid_argument(
+        "reputation mechanism must be responsiveness or latency-priority");
 }
 
 bytearray_t parse_hex(
@@ -2095,6 +2107,8 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_responsiveness_policy_version =
         Config::OptValStr::create(
             "adaptive-v2-controller-responsiveness-v1");
+    auto opt_reputation_mechanism =
+        Config::OptValStr::create("responsiveness");
     auto opt_responsiveness_attempt_window =
         Config::OptValStr::create("32");
     auto opt_responsiveness_minimum_attempts =
@@ -2205,6 +2219,10 @@ ManagerOptions parse_options(int argc, char **argv)
     config.add_opt(
         "responsiveness-policy-version",
         opt_responsiveness_policy_version,
+        Config::SET_VAL);
+    config.add_opt(
+        "reputation-mechanism",
+        opt_reputation_mechanism,
         Config::SET_VAL);
     config.add_opt(
         "responsiveness-attempt-window",
@@ -2391,6 +2409,8 @@ ManagerOptions parse_options(int argc, char **argv)
 
     options.responsiveness_policy.policy_version =
         opt_responsiveness_policy_version->get();
+    options.responsiveness_policy.reputation_mechanism =
+        parse_reputation_mechanism(opt_reputation_mechanism->get());
     options.responsiveness_policy.attempt_window =
         parse_unsigned<std::uint32_t>(
             opt_responsiveness_attempt_window->get(),

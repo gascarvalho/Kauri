@@ -525,7 +525,34 @@ TEST_CASE(
     CHECK(options.required_release_count == 5);
     CHECK(options.maximum_delivery_attempts == 2);
     CHECK(options.retry_interval_ticks == 10);
+    CHECK(options.manager.responsiveness_policy.reputation_mechanism ==
+          hotstuff::ReputationMechanism::responsiveness);
     CHECK_NOTHROW(network_config(options));
+
+    auto latency_arguments = fixture.arguments();
+    latency_arguments.insert(
+        latency_arguments.end(),
+        {"--reputation-mechanism", "latency-priority",
+         "--responsiveness-policy-version",
+         "kauri-latency-priority-v1"});
+    const auto latency_options = parse_adaptive_v3_test_options(
+        latency_arguments);
+    CHECK(latency_options.manager.responsiveness_policy
+              .reputation_mechanism ==
+          hotstuff::ReputationMechanism::latency_priority);
+    CHECK(latency_options.manager.responsiveness_policy.policy_version ==
+          "kauri-latency-priority-v1");
+    CHECK(manager_controller_config(latency_options.manager)
+              .selection.responsiveness_policy.reputation_mechanism ==
+          hotstuff::ReputationMechanism::latency_priority);
+
+    auto invalid_mechanism = fixture.arguments();
+    invalid_mechanism.insert(
+        invalid_mechanism.end(),
+        {"--reputation-mechanism", "fastest-self-reported"});
+    CHECK_THROWS_AS(
+        parse_adaptive_v3_test_options(invalid_mechanism),
+        std::invalid_argument);
 
     auto precomputed_identity = fixture.arguments();
     precomputed_identity.insert(
