@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "profile_id": "n7-reputation-policy-replay-v1",
+  "frozen": true,
+  "source_campaign": {
+    "relative_path": "results/n7-fault-repetition-campaign/89838f30-seed41719-five",
+    "kauri_revision": "89838f3056935dd76c2c999a30d725565f19f1fa",
+    "campaign_plan_sha256": "e33fc3450871406c18046b8e083fd5ab0b5a9a959ba48df7886bcb549d972bfa",
+    "campaign_verdict_sha256": "359fa52fef0a0b2e8e5b37042cee827c12bd3f055f4f46f2d3fb939e816b19b8",
+    "expected_run_count": 15,
+    "expected_repetitions_per_arm": 5,
+    "expected_arms": [
+      "sigkill_crash",
+      "static_authenticated_false_report",
+      "static_persistent_omission"
+    ]
+  },
+  "evidence_window": {
+    "epoch_number": 0,
+    "cutoff_rule": "complete_accepted_manager_prefix",
+    "message_types": ["aggregate_relay", "direct_vote"],
+    "ground_truth_available_to_policy": false
+  },
+  "membership": [0, 1, 2, 3, 4, 5, 6],
+  "responsiveness_policy": {
+    "schema_version": 1,
+    "policy_version": "n7-replay-all-accepted-v1",
+    "attempt_window": 32,
+    "minimum_attempts": 2,
+    "minimum_response_rate_ppm": 750000,
+    "maximum_timeout_rate_ppm": 250000,
+    "trailing_timeout_streak": 2,
+    "latency_percentile_basis_points": 5000
+  },
+  "reputation_mechanisms": [
+    "responsiveness",
+    "latency-priority"
+  ],
+  "role_projection": {
+    "tree_count": 1,
+    "fanout": 2,
+    "root_count": 1,
+    "internal_count": 2,
+    "description": "Counterfactual top-three influential-role projection; it does not activate an epoch."
+  },
+  "acceptance": {
+    "require_original_campaign_pass": true,
+    "require_exact_run_balance": true,
+    "require_shared_eligibility_between_mechanisms": true,
+    "require_independent_reconstruction": true,
+    "performance_superiority_gate": null
+  },
+  "claims_not_made": [
+    "live reputation-policy activation",
+    "throughput or latency improvement",
+    "general Byzantine attribution",
+    "consensus-safety proof from replay"
+  ]
+}
