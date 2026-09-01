@@ -523,9 +523,9 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     right.annotate(
         f"{median_adaptive:.3f}",
         (median_adaptive, median_y),
-        xytext=(0, 11),
+        xytext=(5, 11),
         textcoords="offset points",
-        ha="center",
+        ha="left",
         va="bottom",
         fontsize=7.8,
         color="#005C91",
@@ -534,9 +534,9 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     right.annotate(
         f"{median_paired:.3f}",
         (median_paired, median_y),
-        xytext=(0, 11),
+        xytext=(-5, 11),
         textcoords="offset points",
-        ha="center",
+        ha="right",
         va="bottom",
         fontsize=7.8,
         color="#A84500",
