@@ -105,71 +105,113 @@ def render(artifact_path: Path, validation_path: Path, output_dir: Path) -> tupl
 
     plt.rcParams.update(
         {
+            "font.family": "DejaVu Sans",
             "font.size": 10,
-            "axes.titlesize": 11,
-            "axes.labelsize": 10,
-            "figure.dpi": 160,
+            "axes.titlesize": 11.2,
+            "axes.titleweight": "bold",
+            "axes.labelsize": 9.5,
+            "xtick.labelsize": 9,
+            "ytick.labelsize": 9.5,
+            "legend.fontsize": 8.7,
+            "axes.edgecolor": "#9AA7B2",
+            "axes.linewidth": 0.8,
+            "figure.dpi": 180,
         }
     )
-    figure, axes = plt.subplots(1, 2, figsize=(9.2, 3.5), constrained_layout=True)
+    figure, axes = plt.subplots(
+        2,
+        1,
+        figsize=(7.2, 4.75),
+        constrained_layout=True,
+        gridspec_kw={"height_ratios": (1.0, 1.05)},
+    )
     positions = np.arange(len(ARM_ORDER))
     jitter = np.linspace(-0.12, 0.12, 5)
     for index, values in enumerate(inversions):
         axes[0].scatter(
-            positions[index] + jitter,
             values,
-            color="#4A5568",
-            s=28,
-            alpha=0.85,
+            positions[index] + jitter,
+            color="#607481",
+            edgecolors="white",
+            linewidths=0.6,
+            s=38,
+            alpha=0.9,
+            label="Accepted run" if index == 0 else None,
             zorder=3,
         )
-        axes[0].hlines(
+        axes[0].scatter(
             float(np.median(values)),
-            positions[index] - 0.22,
-            positions[index] + 0.22,
-            color="#C53030",
-            linewidth=2.2,
+            positions[index],
+            color="#D55E00",
+            edgecolors="white",
+            linewidths=0.8,
+            s=70,
+            marker="D",
             label="Median" if index == 0 else None,
             zorder=4,
         )
-    axes[0].set_title("(a) Ordering divergence")
-    axes[0].set_ylabel("Kendall inversion count")
-    axes[0].set_xticks(positions, ARM_LABELS)
-    axes[0].set_ylim(bottom=-0.25)
-    axes[0].grid(axis="y", color="#CBD5E0", linewidth=0.7, alpha=0.7)
-    axes[0].legend(frameon=False, loc="upper left")
+    axes[0].set_title(
+        "(a) Policies diverge only for false-report evidence", loc="left", pad=9
+    )
+    axes[0].set_xlabel("Kendall inversion count")
+    axes[0].set_yticks(positions, ARM_LABELS)
+    axes[0].set_xlim(-0.25, 6.45)
+    axes[0].set_xticks(range(0, 7))
+    axes[0].invert_yaxis()
+    axes[0].grid(axis="x", color="#DCE3E8", linewidth=0.7)
+    axes[0].set_axisbelow(True)
+    axes[0].spines[["top", "right", "left"]].set_visible(False)
+    axes[0].tick_params(axis="y", length=0)
+    axes[0].legend(
+        frameon=False,
+        loc="lower right",
+        ncol=2,
+        handletextpad=0.4,
+        columnspacing=1.1,
+    )
 
-    width = 0.34
+    height = 0.30
     for mechanism_index, (label, color) in enumerate(
         zip(MECHANISM_LABELS, COLORS, strict=True)
     ):
-        offsets = positions + (mechanism_index - 0.5) * width
-        bars = axes[1].bar(
+        offsets = positions + (mechanism_index - 0.5) * height
+        bars = axes[1].barh(
             offsets,
             exclusions[mechanism_index],
-            width,
+            height,
             color=color,
             label=label,
+            edgecolor="white" if mechanism_index == 0 else "#9A5600",
+            linewidth=0.7,
+            hatch=None if mechanism_index == 0 else "///",
         )
-        axes[1].bar_label(bars, padding=2, fontsize=9)
-    axes[1].set_title("(b) Fault actor outside top-three roles")
-    axes[1].set_ylabel("Runs out of five")
-    axes[1].set_xticks(positions, ARM_LABELS)
-    axes[1].set_ylim(0, 5.7)
-    axes[1].set_yticks(range(0, 6))
-    axes[1].grid(axis="y", color="#CBD5E0", linewidth=0.7, alpha=0.7)
-    axes[1].legend(
-        frameon=False,
-        loc="upper center",
-        bbox_to_anchor=(0.5, -0.16),
-        ncol=2,
+        for bar, value in zip(bars, exclusions[mechanism_index], strict=True):
+            axes[1].text(
+                0.10,
+                bar.get_y() + bar.get_height() / 2,
+                f"{label}  {value}/5",
+                ha="left",
+                va="center",
+                fontsize=8.5,
+                fontweight="bold",
+                color="white",
+            )
+    axes[1].set_title(
+        "(b) Post-hoc exclusion from projected influential roles",
+        loc="left",
+        pad=9,
     )
+    axes[1].set_xlabel("Known injected actor outside projected top three (runs)")
+    axes[1].set_yticks(positions, ARM_LABELS)
+    axes[1].set_xlim(0, 5.65)
+    axes[1].set_xticks(range(0, 6))
+    axes[1].invert_yaxis()
+    axes[1].grid(axis="x", color="#DCE3E8", linewidth=0.7)
+    axes[1].set_axisbelow(True)
+    axes[1].spines[["top", "right", "left"]].set_visible(False)
+    axes[1].tick_params(axis="y", length=0)
 
-    figure.suptitle(
-        "Offline policy replay over 15 accepted live N=7 fault runs",
-        fontsize=12,
-        fontweight="bold",
-    )
+    figure.patch.set_facecolor("white")
     figure.savefig(png, bbox_inches="tight")
     figure.savefig(
         pdf,

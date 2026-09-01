@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 
 import pytest
 
@@ -95,3 +96,102 @@ def test_figure_artifacts_exclude_platform_and_wall_clock_metadata(tmp_path) -> 
     assert (tmp_path / "campaign-copy.png").read_bytes() == (
         tmp_path / "campaign.png"
     ).read_bytes()
+
+
+def _accepted_rows() -> list[dict[str, object]]:
+    plotter = _plotter()
+    return [
+        {
+            "pair_id": f"pair-{ordinal:02d}",
+            **{
+                f"{arm}_{phase}_tps": 10_000.0 + ordinal
+                for arm in ("control", "adaptive")
+                for phase in plotter.PHASES
+            },
+            "adaptive_ratio": 0.98 + ordinal / 1000,
+            "paired_ratio": 0.97 + ordinal / 1000,
+            "effect_tps": float(-ordinal),
+        }
+        for ordinal in range(1, 6)
+    ]
+
+
+def _accepted_source(tmp_path):
+    plotter = _plotter()
+    csv_path = tmp_path / f"{plotter.STEM}.csv"
+    plotter._write_csv(csv_path, _accepted_rows())
+    manifest = {
+        "schema_version": 1,
+        "kind": "kauri-cert13-n31-campaign-figure-manifest-v1",
+        "validator_verdict": "PASS",
+        "figure_eligible": True,
+        "claim_eligible": False,
+        "scientific_support": {"supported": False},
+        "campaign_directory": "/accepted/campaign",
+        "campaign_tree_sha256": "1" * 64,
+        "campaign_seal_sha256": "2" * 64,
+        "campaign_validation_sha256": "3" * 64,
+        "trusted_provenance_sha256": "4" * 64,
+        "evidence_revision": "5" * 40,
+        "artifacts": {
+            csv_path.name: {
+                "sha256": plotter._sha256_file(csv_path),
+                "size_bytes": csv_path.stat().st_size,
+            }
+        },
+        "caveats": ["accepted source caveat"],
+    }
+    manifest_path = tmp_path / "source-manifest.json"
+    manifest_path.write_bytes(plotter._canonical(manifest))
+    return csv_path, manifest_path
+
+
+def test_restyle_is_bound_to_the_accepted_csv_and_source_manifest(tmp_path) -> None:
+    plotter = _plotter()
+    csv_path, manifest_path = _accepted_source(tmp_path)
+    outputs = plotter.restyle_accepted_package(
+        csv_path, manifest_path, tmp_path / "restyled"
+    )
+    second = plotter.restyle_accepted_package(
+        csv_path, manifest_path, tmp_path / "restyled-second"
+    )
+
+    output_names = {path.name for path in outputs}
+    assert output_names == {
+        "accepted-source-manifest.json",
+        f"{plotter.STEM}.csv",
+        f"{plotter.STEM}.pdf",
+        f"{plotter.STEM}.png",
+        "figure-manifest.json",
+    }
+    assert (tmp_path / "restyled" / f"{plotter.STEM}.csv").read_bytes() == (
+        csv_path.read_bytes()
+    )
+    assert (
+        tmp_path / "restyled" / "accepted-source-manifest.json"
+    ).read_bytes() == manifest_path.read_bytes()
+    restyled_manifest = json.loads(
+        (tmp_path / "restyled" / "figure-manifest.json").read_bytes()
+    )
+    assert restyled_manifest["rendering_mode"].startswith("presentation-only")
+    assert restyled_manifest["accepted_csv_sha256"] == plotter._sha256_file(
+        csv_path
+    )
+    assert (tmp_path / "restyled" / f"{plotter.STEM}.pdf").read_bytes() == (
+        tmp_path / "restyled-second" / f"{plotter.STEM}.pdf"
+    ).read_bytes()
+    assert (tmp_path / "restyled" / f"{plotter.STEM}.png").read_bytes() == (
+        tmp_path / "restyled-second" / f"{plotter.STEM}.png"
+    ).read_bytes()
+    assert {path.name for path in second} == output_names
+
+
+def test_restyle_rejects_a_csv_that_drifted_after_acceptance(tmp_path) -> None:
+    plotter = _plotter()
+    csv_path, manifest_path = _accepted_source(tmp_path)
+    csv_path.write_bytes(csv_path.read_bytes() + b"\n")
+
+    with pytest.raises(plotter.PlotError, match="not bound"):
+        plotter.restyle_accepted_package(
+            csv_path, manifest_path, tmp_path / "restyled"
+        )
