@@ -29,6 +29,7 @@
 #include <memory>
 #include <functional>
 #include <exception>
+#include <stdexcept>
 #include <type_traits>
 
 #if __cplusplus >= 201703L

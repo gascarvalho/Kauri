@@ -496,9 +496,9 @@ void fisher_yates_leaves(
     std::uint64_t seed,
     std::size_t tree_id) noexcept
 {
-    auto state = seed ^
-                 (0xD1B54A32D192ED03ULL *
-                  static_cast<std::uint64_t>(tree_id + 1));
+    std::uint64_t state = seed ^
+                          (0xD1B54A32D192ED03ULL *
+                           static_cast<std::uint64_t>(tree_id + 1));
     for (std::size_t remaining = leaves.size(); remaining > 1; --remaining)
     {
         const auto index = static_cast<std::size_t>(
