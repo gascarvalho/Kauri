@@ -26,6 +26,7 @@ from experiments.adaptive.kauri_experiment.focused_crash_pair_runtime import (
     reload_v13_readiness_allocations,
     verify_focused_authorization_receipt,
 )
+from experiments.adaptive.kauri_experiment import cpu_quota
 from experiments.adaptive.kauri_experiment.focused_crash_pair_validation import (
     FocusedCrashPairValidationError,
     validate_sealed_campaign,
@@ -50,7 +51,11 @@ class FocusedCrashPairCliError(RuntimeError):
 
 FOCUSED_LAUNCH_BACKEND = FocusedLaunchBackend()
 FOCUSED_PREFLIGHT_CHECKS: object = FocusedLivePreflightChecks
+CPU_QUOTA_ENVIRONMENT_CHECK = cpu_quota.verify_linux_environment
 _PROFILE_DIRECTORY = Path(__file__).resolve().parent / "profiles"
+_CPU_QUOTA_CONTRACT = (
+    _PROFILE_DIRECTORY / "n31-cpu-quota-heterogeneity-smoke-v1.json"
+)
 _V12_PROFILES = {
     "smoke": _PROFILE_DIRECTORY / "n7-f2-q5-two-crash-pair-smoke-v12.json",
     "pair": _PROFILE_DIRECTORY / "n31-f5-q21-three-crash-pair-v12.json",
@@ -503,6 +508,102 @@ def _finalize_pair_abort(
     return arm_root
 
 
+def _finalize_heterogeneity_abort(
+    *,
+    output_root: Path,
+    slot: Mapping[str, object],
+    configuration: Mapping[str, object],
+    runtime_error: FocusedCrashPairRuntimeError,
+    cleanup: Mapping[str, object] | None,
+    cleanup_error: BaseException | None,
+) -> Path:
+    """Preserve a failed excluded smoke without creating pair evidence."""
+
+    expected = {
+        "slot_id": "slot-01",
+        "pair_id": "pair-01",
+        "arm": "adaptive",
+        "pair_seed": 41_720,
+        "execution_ordinal": 1,
+    }
+    if any(slot.get(key) != value for key, value in expected.items()):
+        raise FocusedCrashPairCliError(
+            "failed heterogeneity-smoke slot identity drifted"
+        )
+    child_root = output_root / "children" / "slot-01"
+    configured = configuration.get("run_directory")
+    if (
+        child_root.is_symlink()
+        or not child_root.is_dir()
+        or not isinstance(configured, (str, Path))
+        or Path(configured).is_symlink()
+        or Path(configured).resolve() != child_root.resolve()
+    ):
+        raise FocusedCrashPairCliError(
+            "failed heterogeneity-smoke directory drifted"
+        )
+    if (
+        cleanup_error is not None
+        or cleanup is None
+        or cleanup.get("complete") is not True
+    ):
+        reason = cleanup_error or FocusedCrashPairRuntimeError(
+            "cleanup did not establish a quiescent process set"
+        )
+        _write_exclusive_json(
+            child_root / "cleanup-failure.json",
+            {
+                "schema_version": 1,
+                "kind": "kauri-cpu-quota-cleanup-failure-v1",
+                "state": "INCOMPLETE",
+                "claim_eligible": False,
+                "figure_eligible": False,
+                "complete": False,
+                "reason": _bounded_failure_reason(reason),
+            },
+        )
+        return child_root
+    _write_exclusive_json(child_root / "cleanup.json", dict(cleanup))
+    _write_exclusive_json(
+        child_root / "arm-abort.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-cpu-quota-heterogeneity-arm-abort-v1",
+            "state": "INCOMPLETE",
+            "claim_eligible": False,
+            "figure_eligible": False,
+            **expected,
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "failure": {
+                "category": "runtime_error",
+                "reason": _bounded_failure_reason(runtime_error),
+            },
+        },
+    )
+    child_seal = create_evidence_seal(child_root)
+    _write_exclusive_json(
+        output_root / "heterogeneity-smoke-abort.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-cpu-quota-heterogeneity-smoke-abort-v1",
+            "state": "ABORTED_INCOMPLETE",
+            "claim_eligible": False,
+            "figure_eligible": False,
+            "failed_child": {
+                **expected,
+                "tree_sha256": child_seal.tree_sha256,
+                "seal_sha256": child_seal.seal_sha256,
+            },
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "continuation": "prohibited",
+        },
+    )
+    create_evidence_seal(output_root)
+    return child_root
+
+
 def _execute_focused(
     invocation: Mapping[str, object], *, backend: object
 ) -> Mapping[str, object]:
@@ -511,6 +612,7 @@ def _execute_focused(
     output_root = Path(invocation["output_root"])
     output_root.mkdir(parents=True, exist_ok=False)
     plan: Mapping[str, object] | None = None
+    heterogeneity_smoke = invocation["mode"] == "heterogeneity-smoke"
     if invocation["mode"] == "campaign":
         profile = invocation["profile"]
         preflight = invocation["preflight_receipt"]
@@ -529,6 +631,17 @@ def _execute_focused(
         )
         _write_exclusive_json(output_root / "plan.json", plan)
         slots = list(plan["slots"])
+    elif heterogeneity_smoke:
+        slots = [
+            {
+                "slot_id": "slot-01",
+                "pair_id": "pair-01",
+                "pair_ordinal": 1,
+                "arm": "adaptive",
+                "pair_seed": 41_720,
+                "execution_ordinal": 1,
+            }
+        ]
     else:
         slots = [
             {
@@ -548,7 +661,7 @@ def _execute_focused(
         arm = str(slot["arm"])
         slot_id = str(slot["slot_id"])
         slot_context = context
-        if plan is not None:
+        if plan is not None or heterogeneity_smoke:
             slot_context = {
                 **context,
                 "slot_id": slot_id,
@@ -578,7 +691,7 @@ def _execute_focused(
             raise FocusedCrashPairCliError("backend relabelled focused slot identity")
         configuration = {**configuration, **identity}
         slot_directory = output_root / "children" / slot_id
-        if plan is not None and not slot_directory.exists():
+        if (plan is not None or heterogeneity_smoke) and not slot_directory.exists():
             slot_directory.mkdir(parents=True)
         processes = backend.spawn_processes(configuration)
         outcome: Mapping[str, object] | None = None
@@ -607,6 +720,47 @@ def _execute_focused(
 
         if execution_error is not None:
             if (
+                isinstance(execution_error, FocusedCrashPairRuntimeError)
+                and heterogeneity_smoke
+            ):
+                try:
+                    materialize_abort = getattr(
+                        backend, "materialize_abort_artifacts", None
+                    )
+                    if (
+                        cleanup_error is None
+                        and cleanup is not None
+                        and cleanup.get("complete") is True
+                        and callable(materialize_abort)
+                    ):
+                        materialize_abort(configuration, execution_error)
+                    _finalize_heterogeneity_abort(
+                        output_root=output_root,
+                        slot=slot,
+                        configuration=configuration,
+                        runtime_error=execution_error,
+                        cleanup=cleanup,
+                        cleanup_error=cleanup_error,
+                    )
+                except BaseException as finalization_error:
+                    try:
+                        _write_exclusive_json(
+                            slot_directory / "abort-finalization-failure.json",
+                            {
+                                "schema_version": 1,
+                                "kind": "kauri-focused-abort-finalization-failure-v1",
+                                "state": "INCOMPLETE",
+                                "claim_eligible": False,
+                                "figure_eligible": False,
+                                "category": "finalization_error",
+                                "reason": _bounded_failure_reason(
+                                    finalization_error
+                                ),
+                            },
+                        )
+                    except BaseException:
+                        pass
+            elif (
                 isinstance(execution_error, FocusedCrashPairRuntimeError)
                 and plan is not None
             ):
@@ -736,7 +890,7 @@ def _execute_focused(
         arm_records.setdefault(pair_id, []).append(record)
 
     pair_validations: list[dict[str, object]] = []
-    if plan is None:
+    if plan is None and not heterogeneity_smoke:
         for pair_id, children in sorted(arm_records.items()):
             pair_root = output_root / pair_id
             pair_root.mkdir(parents=True, exist_ok=True)
@@ -854,6 +1008,48 @@ def _execute_focused(
             ],
         )
 
+    heterogeneity_validation: Mapping[str, object] | None = None
+    if heterogeneity_smoke:
+        contract = invocation.get("cpu_quota_contract")
+        if not isinstance(contract, cpu_quota.CpuQuotaContract):
+            raise FocusedCrashPairCliError(
+                "heterogeneity smoke lost its CPU-quota contract"
+            )
+        children = [
+            {
+                "slot_id": record["slot_id"],
+                "pair_id": record["pair_id"],
+                "arm": record["arm"],
+                "tree_sha256": record["seal"].get("tree_sha256"),
+                "seal_sha256": record["seal"].get("seal_sha256"),
+            }
+            for record in records
+        ]
+        receipt = {
+            "schema_version": 1,
+            "kind": "kauri-n31-cpu-quota-heterogeneity-smoke-v1",
+            "state": "TERMINAL",
+            "claim_eligible": False,
+            "figure_eligible": False,
+            "contract_id": contract.contract_id,
+            "contract_sha256": contract.contract_sha256,
+            "contract_semantic_sha256": cpu_quota.contract_digest(contract),
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "children": children,
+        }
+        _write_exclusive_json(
+            output_root / "heterogeneity-smoke-receipt.json", receipt
+        )
+        root_seal = create_evidence_seal(output_root)
+        heterogeneity_validation = {
+            "verdict": "PROVISIONAL",
+            "claim_eligible": False,
+            "figure_eligible": False,
+            "evidence_tree_sha256": root_seal.tree_sha256,
+            "evidence_seal_sha256": root_seal.seal_sha256,
+        }
+
     validation_status = "PASS"
     child_verdicts = [record["validation"].get("verdict") for record in records]
     aggregate_verdicts = [record.get("verdict") for record in pair_validations]
@@ -884,6 +1080,10 @@ def _execute_focused(
         ],
         "pair_validations": pair_validations,
     }
+    if heterogeneity_smoke:
+        result["claim_eligible"] = False
+        result["figure_eligible"] = False
+        result["heterogeneity_validation"] = dict(heterogeneity_validation or {})
     if campaign_validation is not None:
         result["campaign_validation"] = dict(campaign_validation)
     return result
@@ -901,6 +1101,12 @@ def run_focused_campaign(**kwargs: object) -> Mapping[str, object]:
     return _execute_focused(kwargs, backend=FOCUSED_LAUNCH_BACKEND)
 
 
+def run_focused_heterogeneity_smoke(**kwargs: object) -> Mapping[str, object]:
+    """Execute one excluded adaptive arm under the authorized quota contract."""
+
+    return _execute_focused(kwargs, backend=FOCUSED_LAUNCH_BACKEND)
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -913,6 +1119,14 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--pairs", type=int, required=True)
     preflight.add_argument("--output", type=Path, required=True)
 
+    heterogeneity_preflight = subparsers.add_parser("heterogeneity-preflight")
+    heterogeneity_preflight.add_argument("--profile", type=Path)
+    heterogeneity_preflight.add_argument(
+        "--cpu-quota-contract", type=Path, default=_CPU_QUOTA_CONTRACT
+    )
+    heterogeneity_preflight.add_argument("--pairs", type=int, required=True)
+    heterogeneity_preflight.add_argument("--output", type=Path, required=True)
+
     for command in ("smoke", "pair", "campaign"):
         execute = subparsers.add_parser(command)
         execute.add_argument("--profile", type=Path)
@@ -921,6 +1135,23 @@ def _parser() -> argparse.ArgumentParser:
         execute.add_argument("--authorization-receipt", type=Path, required=True)
         execute.add_argument("--output", type=Path, required=True)
         execute.add_argument("--retries", type=int, default=0)
+
+    heterogeneity = subparsers.add_parser("heterogeneity-smoke")
+    heterogeneity.add_argument("--profile", type=Path)
+    heterogeneity.add_argument(
+        "--cpu-quota-contract", type=Path, default=_CPU_QUOTA_CONTRACT
+    )
+    heterogeneity.add_argument("--pairs", type=int, required=True)
+    heterogeneity.add_argument("--preflight-receipt", type=Path, required=True)
+    heterogeneity.add_argument("--authorization-receipt", type=Path, required=True)
+    heterogeneity.add_argument(
+        "--cpu-quota-preflight-receipt", type=Path, required=True
+    )
+    heterogeneity.add_argument(
+        "--cpu-quota-authorization-receipt", type=Path, required=True
+    )
+    heterogeneity.add_argument("--output", type=Path, required=True)
+    heterogeneity.add_argument("--retries", type=int, default=0)
 
     pair = subparsers.add_parser("validate-pair")
     pair.add_argument("--pair-root", type=Path, required=True)
@@ -971,15 +1202,16 @@ def _authorized_execution(
     output = arguments.output.resolve()
     if output.exists():
         raise FocusedCrashPairCliError("allocated result root already exists")
-    profile = load_focused_profile(_profile_path(arguments.profile, arguments.command))
-    _require_mode_profile(profile, arguments.command)
+    profile_mode = "pair" if arguments.command == "heterogeneity-smoke" else arguments.command
+    profile = load_focused_profile(_profile_path(arguments.profile, profile_mode))
+    _require_mode_profile(profile, profile_mode)
     preflight = _read_json(arguments.preflight_receipt, "preflight receipt")
     authorization = _read_json(arguments.authorization_receipt, "authorization receipt")
     request = build_focused_authorization_request(preflight)
     verify_focused_authorization_receipt(request, authorization)
     request_document = json.loads(request)
     expected = {
-        "mode": arguments.command,
+        "mode": profile_mode,
         "pair_count": expected_pairs,
         "profile_sha256": profile.profile_sha256,
         "topology_proof_sha256": profile.topology_proof_sha256,
@@ -992,6 +1224,126 @@ def _authorized_execution(
             "receipts are replayed or do not authorize this exact invocation"
         )
     return profile, preflight, authorization
+
+
+def _load_cpu_quota_contract(
+    path: Path, profile: FocusedProfile
+) -> cpu_quota.CpuQuotaContract:
+    return cpu_quota.load_cpu_quota_contract(
+        path,
+        base_profile_path=_V13_PROFILES["pair"],
+        expected_replica_ids=profile.replica_ids,
+    )
+
+
+def _write_cpu_quota_preflight(
+    *,
+    focused_preflight: Mapping[str, object],
+    contract: cpu_quota.CpuQuotaContract,
+    environment: Mapping[str, object],
+    output_root: Path,
+) -> dict[str, object]:
+    base_request = build_focused_authorization_request(focused_preflight)
+    request = cpu_quota.build_authorization_request(
+        contract,
+        base_authorization_request=base_request,
+        environment=environment,
+        output_root=output_root,
+    )
+    preflight_path = Path(str(focused_preflight["preflight_path"]))
+    root = preflight_path.parent
+    environment_path = root / "cpu-quota-environment.json"
+    request_path = root / "cpu-quota-authorization-request.json"
+    receipt_path = root / "cpu-quota-preflight.json"
+    environment_path.write_bytes(_canonical(environment))
+    request_path.write_bytes(request)
+    receipt = {
+        "schema_version": 1,
+        "kind": "kauri-cpu-quota-preflight-v1",
+        "contract_id": contract.contract_id,
+        "contract_sha256": contract.contract_sha256,
+        "contract_semantic_sha256": cpu_quota.contract_digest(contract),
+        "base_authorization_request_sha256": hashlib.sha256(base_request).hexdigest(),
+        "environment": dict(environment),
+        "environment_sha256": hashlib.sha256(_canonical(environment)).hexdigest(),
+        "authorization_request_sha256": hashlib.sha256(request).hexdigest(),
+        "execution_authorized": False,
+        "launch_permitted": False,
+    }
+    receipt_path.write_bytes(_canonical(receipt))
+    return {
+        **dict(focused_preflight),
+        "cpu_quota_preflight_path": str(receipt_path),
+        "cpu_quota_environment_path": str(environment_path),
+        "cpu_quota_authorization_request_path": str(request_path),
+        "cpu_quota_contract_sha256": contract.contract_sha256,
+    }
+
+
+def _verify_cpu_quota_execution(
+    *,
+    arguments: argparse.Namespace,
+    profile: FocusedProfile,
+    focused_preflight: Mapping[str, object],
+) -> tuple[cpu_quota.CpuQuotaContract, Mapping[str, object]]:
+    contract = _load_cpu_quota_contract(arguments.cpu_quota_contract, profile)
+    receipt = _read_json(
+        arguments.cpu_quota_preflight_receipt, "CPU-quota preflight receipt"
+    )
+    expected_keys = {
+        "schema_version",
+        "kind",
+        "contract_id",
+        "contract_sha256",
+        "contract_semantic_sha256",
+        "base_authorization_request_sha256",
+        "environment",
+        "environment_sha256",
+        "authorization_request_sha256",
+        "execution_authorized",
+        "launch_permitted",
+    }
+    environment = receipt.get("environment")
+    base_request = build_focused_authorization_request(focused_preflight)
+    if (
+        set(receipt) != expected_keys
+        or receipt.get("schema_version") != 1
+        or receipt.get("kind") != "kauri-cpu-quota-preflight-v1"
+        or receipt.get("contract_id") != contract.contract_id
+        or receipt.get("contract_sha256") != contract.contract_sha256
+        or receipt.get("contract_semantic_sha256")
+        != cpu_quota.contract_digest(contract)
+        or receipt.get("base_authorization_request_sha256")
+        != hashlib.sha256(base_request).hexdigest()
+        or not isinstance(environment, Mapping)
+        or receipt.get("environment_sha256")
+        != hashlib.sha256(_canonical(environment)).hexdigest()
+        or receipt.get("execution_authorized") is not False
+        or receipt.get("launch_permitted") is not False
+    ):
+        raise FocusedCrashPairCliError("CPU-quota preflight receipt drifted")
+    request = cpu_quota.build_authorization_request(
+        contract,
+        base_authorization_request=base_request,
+        environment=environment,
+        output_root=arguments.output,
+    )
+    if receipt.get("authorization_request_sha256") != hashlib.sha256(request).hexdigest():
+        raise FocusedCrashPairCliError("CPU-quota preflight authorization drifted")
+    authorization = _read_json(
+        arguments.cpu_quota_authorization_receipt,
+        "CPU-quota authorization receipt",
+    )
+    cpu_quota.verify_authorization_receipt(request, authorization)
+    current_environment = CPU_QUOTA_ENVIRONMENT_CHECK()
+    if dict(current_environment) != dict(environment):
+        raise FocusedCrashPairCliError(
+            "CPU-quota execution environment changed after authorization"
+        )
+    return contract, {
+        "preflight": dict(receipt),
+        "authorization": dict(authorization),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1015,8 +1367,47 @@ def main(argv: Sequence[str] | None = None) -> int:
                 output_root=arguments.output,
                 checks=FOCUSED_PREFLIGHT_CHECKS,
             )
-        elif arguments.command in {"smoke", "pair", "campaign"}:
+        elif arguments.command == "heterogeneity-preflight":
+            if arguments.pairs != 1 or arguments.output.resolve().exists():
+                raise FocusedCrashPairCliError(
+                    "heterogeneity preflight requires one pair allocation"
+                )
+            profile = load_focused_profile(
+                _profile_path(arguments.profile, "pair")
+            )
+            _require_mode_profile(profile, "pair")
+            contract = _load_cpu_quota_contract(
+                arguments.cpu_quota_contract, profile
+            )
+            environment = CPU_QUOTA_ENVIRONMENT_CHECK()
+            focused = prepare_focused_preflight(
+                profile=profile,
+                mode="pair",
+                pair_count=1,
+                output_root=arguments.output,
+                checks=FOCUSED_PREFLIGHT_CHECKS,
+            )
+            result = _write_cpu_quota_preflight(
+                focused_preflight=focused,
+                contract=contract,
+                environment=environment,
+                output_root=arguments.output,
+            )
+        elif arguments.command in {
+            "smoke",
+            "pair",
+            "campaign",
+            "heterogeneity-smoke",
+        }:
             profile, preflight, authorization = _authorized_execution(arguments)
+            quota_contract: cpu_quota.CpuQuotaContract | None = None
+            quota_authorization: Mapping[str, object] | None = None
+            if arguments.command == "heterogeneity-smoke":
+                quota_contract, quota_authorization = _verify_cpu_quota_execution(
+                    arguments=arguments,
+                    profile=profile,
+                    focused_preflight=preflight,
+                )
             pair_issuers = (
                 reload_pair_issuer_allocations(
                     preflight=preflight,
@@ -1036,6 +1427,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "automatic_retries": 0,
                 "replacement_policy": "none",
             }
+            if quota_contract is not None:
+                invocation["cpu_quota_contract"] = quota_contract
+                invocation["cpu_quota_authorization"] = quota_authorization
             if pair_issuers is not None:
                 invocation["pair_issuer_allocations"] = pair_issuers
             context = preflight.get("execution_context")
@@ -1060,7 +1454,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = (
                 run_focused_campaign(**invocation)
                 if arguments.command == "campaign"
-                else run_focused_pair(**invocation)
+                else (
+                    run_focused_heterogeneity_smoke(**invocation)
+                    if arguments.command == "heterogeneity-smoke"
+                    else run_focused_pair(**invocation)
+                )
             )
         elif arguments.command == "validate-pair":
             result = validate_sealed_pair(
@@ -1082,6 +1480,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         FocusedCrashPairCliError,
         FocusedCrashPairRuntimeError,
         FocusedCrashPairValidationError,
+        cpu_quota.CpuQuotaContractError,
     ) as exc:
         parser.error(str(exc))
     _write_cli_result(result)

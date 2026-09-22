@@ -26,6 +26,7 @@ from types import SimpleNamespace
 from typing import Any
 import uuid
 
+from . import cpu_quota
 from . import factorial_validation
 from .faults import (
     FaultEvidence,
@@ -8942,6 +8943,7 @@ class _FocusedProcesses:
     logs: list[Any]
     evidence: FaultEvidence
     lifecycle: FaultLifecycle
+    cpu_quota_runtime: cpu_quota.CpuQuotaRuntime | None = None
 
 
 class FocusedLaunchBackend:
@@ -8969,6 +8971,9 @@ class FocusedLaunchBackend:
             ]
             | None
         ) = None,
+        cpu_quota_runtime_factory: Callable[..., cpu_quota.CpuQuotaRuntime] = (
+            cpu_quota.CpuQuotaRuntime
+        ),
     ) -> None:
         self._spawn = spawn
         self._seal_artifacts = seal_artifacts
@@ -8978,6 +8983,7 @@ class FocusedLaunchBackend:
         self._execute_fault = execute_fault
         self._cleanup_registry = cleanup_registry
         self._materialize_artifacts = materialize_artifacts
+        self._cpu_quota_runtime_factory = cpu_quota_runtime_factory
         self._ledger_tail: str | None = None
         self._fault_receipts: dict[str, dict[str, object]] = {}
 
@@ -9139,6 +9145,38 @@ class FocusedLaunchBackend:
         source_profile = context.get("profile")
         if not isinstance(source_profile, FocusedProfile):
             _error("focused context lost its profile")
+        quota_contract = context.get("cpu_quota_contract")
+        quota_authorization: Mapping[str, object] | None = None
+        if quota_contract is not None:
+            if not isinstance(quota_contract, cpu_quota.CpuQuotaContract):
+                _error("CPU-quota launch contract is invalid")
+            if (
+                quota_contract.base_profile_id != source_profile.profile_id
+                or quota_contract.base_profile_canonical_sha256
+                != source_profile.profile_sha256
+                or quota_contract.replica_ids != source_profile.replica_ids
+                or quota_contract.figure_eligible is not False
+                or quota_contract.manager_visibility != "none"
+            ):
+                _error("CPU-quota launch contract is not bound to the focused profile")
+            raw_quota_authorization = context.get("cpu_quota_authorization")
+            if not isinstance(raw_quota_authorization, Mapping):
+                _error("CPU-quota authorization evidence is absent")
+            quota_authorization = dict(raw_quota_authorization)
+            quota_preflight = quota_authorization.get("preflight")
+            quota_receipt = quota_authorization.get("authorization")
+            if (
+                set(quota_authorization) != {"preflight", "authorization"}
+                or not isinstance(quota_preflight, Mapping)
+                or not isinstance(quota_receipt, Mapping)
+                or quota_preflight.get("contract_sha256")
+                != quota_contract.contract_sha256
+                or quota_receipt.get("contract_sha256")
+                != quota_contract.contract_sha256
+                or quota_receipt.get("figure_eligible") is not False
+                or quota_receipt.get("mode") != "heterogeneity-smoke"
+            ):
+                _error("CPU-quota authorization evidence drifted")
         pair_id = f"pair-{_integer(pair_ordinal, 'pair ordinal', 1):02d}"
         readiness = (
             _v13_launch_readiness_allocation(
@@ -9440,6 +9478,13 @@ class FocusedLaunchBackend:
             "derived/phase-windows.json": {"phases": []},
             "derived/throughput.json": {"rows": []},
         }
+        if quota_authorization is not None:
+            documents["runtime/cpu-quota-preflight.json"] = dict(
+                quota_authorization["preflight"]
+            )
+            documents["runtime/cpu-quota-authorization.json"] = dict(
+                quota_authorization["authorization"]
+            )
         if _is_v4_profile(profile):
             assert parent_request_sha is not None
             documents["runtime/parent-authorization-request.json"] = json.loads(
@@ -9537,6 +9582,7 @@ class FocusedLaunchBackend:
             "manager_launch_checkpoint": (
                 _V13_MANAGER_CHECKPOINT if readiness is not None else None
             ),
+            "cpu_quota_contract": quota_contract,
         }
 
     def spawn_processes(self, configuration: Mapping[str, object]) -> _FocusedProcesses:
@@ -9555,6 +9601,22 @@ class FocusedLaunchBackend:
         lifecycle = evidence.__enter__()
         records: list[ProcessRecord] = []
         logs: list[Any] = []
+        quota_runtime: cpu_quota.CpuQuotaRuntime | None = None
+        quota_contract = configuration.get("cpu_quota_contract")
+        if quota_contract is not None:
+            if not isinstance(quota_contract, cpu_quota.CpuQuotaContract):
+                _error("CPU-quota launch contract is invalid")
+            quota_runtime = self._cpu_quota_runtime_factory(
+                quota_contract,
+                run_id=str(configuration["run_id"]),
+                run_directory=root,
+                base_spawn=self._spawn,
+            )
+        process_spawn = (
+            quota_runtime.spawn_owned_process
+            if quota_runtime is not None
+            else self._spawn
+        )
         commands = [
             ("adaptive-manager", -1, manager_command),
             *(
@@ -9569,7 +9631,7 @@ class FocusedLaunchBackend:
         ]
         try:
             for name, replica, command in commands:
-                record, log = self._spawn(
+                record, log = process_spawn(
                     registry,
                     name=name,
                     replica_id=replica,
@@ -9579,6 +9641,8 @@ class FocusedLaunchBackend:
                 )
                 records.append(record)
                 logs.append(log)
+            if quota_runtime is not None:
+                quota_runtime.start_monitor()
             manager = records[0]
             observed = _capture_process_argv(manager)
             requested = tuple(configuration["manager_command"])
@@ -9616,9 +9680,21 @@ class FocusedLaunchBackend:
                     }
                 )
             )
-            return _FocusedProcesses(registry, records, logs, evidence, lifecycle)
+            return _FocusedProcesses(
+                registry,
+                records,
+                logs,
+                evidence,
+                lifecycle,
+                quota_runtime,
+            )
         except BaseException as exc:
             registry.cleanup(timeout_s=2.0)
+            if quota_runtime is not None:
+                try:
+                    quota_runtime.verify_cleanup()
+                except BaseException:
+                    pass
             for log in logs:
                 log.close()
             evidence.__exit__(type(exc), exc, exc.__traceback__)
@@ -10130,18 +10206,31 @@ class FocusedLaunchBackend:
                 if cleanup_error is None:
                     cleanup_error = exc
                     cleanup_traceback = exc.__traceback__
+        quota_cleanup: Mapping[str, object] | None = None
+        quota_runtime = getattr(processes, "cpu_quota_runtime", None)
+        if quota_runtime is not None:
+            try:
+                quota_cleanup = quota_runtime.verify_cleanup()
+            except BaseException as exc:
+                if cleanup_error is None:
+                    cleanup_error = exc
+                    cleanup_traceback = exc.__traceback__
         if cleanup_error is not None:
             raise cleanup_error.with_traceback(cleanup_traceback)
-        return {
-            "complete": all(
-                record.process.poll() is not None
-                for record in getattr(processes, "records", ())
-            ),
+        complete = all(
+            record.process.poll() is not None
+            for record in getattr(processes, "records", ())
+        ) and (quota_cleanup is None or quota_cleanup.get("complete") is True)
+        result: dict[str, object] = {
+            "complete": complete,
             "outcomes": [
                 asdict(outcome) if is_dataclass(outcome) else outcome
                 for outcome in outcomes
             ],
         }
+        if quota_cleanup is not None:
+            result["cpu_quota"] = dict(quota_cleanup)
+        return result
 
     def materialize_artifacts(
         self,

@@ -41,6 +41,9 @@ N7_PROFILE_V12 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v12.json"
 N31_PROFILE_V12 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v12.json"
 N7_PROFILE_V13 = PROFILE_ROOT / "n7-f2-q5-two-crash-pair-smoke-v13.json"
 N31_PROFILE_V13 = PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v13.json"
+CPU_QUOTA_CONTRACT = (
+    PROFILE_ROOT / "n31-cpu-quota-heterogeneity-smoke-v1.json"
+)
 
 
 def _runner() -> Any:
@@ -442,6 +445,104 @@ def test_execution_never_invokes_or_self_promotes_aggregate_validation(
         assert validation["trusted_provenance_required"] is True
         assert validation["trusted_provenance_supplied"] is False
         assert validation["pending_external_provenance"]["evidence_tree_sha256"]
+
+
+def test_heterogeneity_smoke_runs_one_adaptive_arm_and_is_never_claim_eligible(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    output = tmp_path / "heterogeneity-smoke"
+    backend = _RecordingLaunchBackend()
+    contract = runner.cpu_quota.load_cpu_quota_contract(
+        CPU_QUOTA_CONTRACT,
+        base_profile_path=N31_PROFILE_V13,
+        expected_replica_ids=tuple(range(31)),
+    )
+    result = runner._execute_focused(
+        {
+            **_direct_focused_invocation(output, mode="pair"),
+            "mode": "heterogeneity-smoke",
+            "cpu_quota_contract": contract,
+        },
+        backend=backend,
+    )
+
+    assert [call for call in backend.calls if call[0] == "configuration"] == [
+        ("configuration", "pair-01", "adaptive")
+    ]
+    assert result["claim_eligible"] is False
+    assert result["figure_eligible"] is False
+    assert result["pair_validations"] == []
+    assert result["heterogeneity_validation"]["verdict"] == "PROVISIONAL"
+    receipt = json.loads(
+        (output / "heterogeneity-smoke-receipt.json").read_text(encoding="utf-8")
+    )
+    assert receipt["children"] == [
+        {
+            "arm": "adaptive",
+            "pair_id": "pair-01",
+            "seal_sha256": "d" * 64,
+            "slot_id": "slot-01",
+            "tree_sha256": None,
+        }
+    ]
+    assert receipt["claim_eligible"] is False
+    assert receipt["figure_eligible"] is False
+    assert (output / "evidence-seal.json").is_file()
+
+
+def test_heterogeneity_runtime_failure_is_sealed_only_as_excluded_abort(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    runtime = runtime_fixture._runtime()
+    output = tmp_path / "heterogeneity-abort"
+    contract = runner.cpu_quota.load_cpu_quota_contract(
+        CPU_QUOTA_CONTRACT,
+        base_profile_path=N31_PROFILE_V13,
+        expected_replica_ids=tuple(range(31)),
+    )
+
+    class AbortingBackend(_RecordingLaunchBackend):
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            return {
+                **super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                ),
+                "run_directory": context["slot_directory"],
+            }
+
+        def run_arm(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            self._record("run", configuration)
+            raise runtime.FocusedCrashPairRuntimeError("excluded smoke failed")
+
+    with pytest.raises(runtime.FocusedCrashPairRuntimeError):
+        runner._execute_focused(
+            {
+                **_direct_focused_invocation(output, mode="pair"),
+                "mode": "heterogeneity-smoke",
+                "cpu_quota_contract": contract,
+            },
+            backend=AbortingBackend(),
+        )
+
+    abort = json.loads(
+        (output / "heterogeneity-smoke-abort.json").read_text(encoding="utf-8")
+    )
+    assert abort["state"] == "ABORTED_INCOMPLETE"
+    assert abort["claim_eligible"] is False
+    assert abort["figure_eligible"] is False
+    assert abort["continuation"] == "prohibited"
+    assert (output / "evidence-seal.json").is_file()
+    assert not (output / "heterogeneity-smoke-receipt.json").exists()
 
 
 def test_campaign_run_arm_failure_seals_only_an_incomplete_abort_prefix(
@@ -2465,6 +2566,64 @@ def test_cli_routes_each_supported_mode_once(
     assert [name for name, _kwargs in observed] == [expected_route]
     if command in {"validate-pair", "validate-campaign"}:
         assert observed[0][1]["readiness_verifier_path"] == verifier
+
+
+def test_cli_routes_separately_authorized_heterogeneity_smoke_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner()
+    profile = runtime_fixture._runtime().load_focused_profile(N31_PROFILE_V13)
+    contract = runner.cpu_quota.load_cpu_quota_contract(
+        CPU_QUOTA_CONTRACT,
+        base_profile_path=N31_PROFILE_V13,
+        expected_replica_ids=profile.replica_ids,
+    )
+    preflight = {"execution_context": {}}
+    authorization = {"approved": True}
+    quota_authorization = {"quota_approved": True}
+    reached: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        runner,
+        "_authorized_execution",
+        lambda _arguments: (profile, preflight, authorization),
+    )
+    monkeypatch.setattr(
+        runner,
+        "_verify_cpu_quota_execution",
+        lambda **_kwargs: (contract, quota_authorization),
+    )
+    monkeypatch.setattr(
+        runner,
+        "run_focused_heterogeneity_smoke",
+        lambda **kwargs: reached.append(dict(kwargs)) or {"mode": "done"},
+    )
+    monkeypatch.setattr(runner, "_write_cli_result", lambda _value: None)
+
+    assert (
+        runner.main(
+            [
+                "heterogeneity-smoke",
+                "--pairs",
+                "1",
+                "--preflight-receipt",
+                str(tmp_path / "preflight.json"),
+                "--authorization-receipt",
+                str(tmp_path / "authorization.json"),
+                "--cpu-quota-preflight-receipt",
+                str(tmp_path / "cpu-preflight.json"),
+                "--cpu-quota-authorization-receipt",
+                str(tmp_path / "cpu-authorization.json"),
+                "--output",
+                str(tmp_path / "results"),
+            ]
+        )
+        == 0
+    )
+    assert len(reached) == 1
+    assert reached[0]["mode"] == "heterogeneity-smoke"
+    assert reached[0]["cpu_quota_contract"] is contract
+    assert reached[0]["cpu_quota_authorization"] is quota_authorization
 
 
 @pytest.mark.parametrize("mutation", ("replay", "mismatch"))
