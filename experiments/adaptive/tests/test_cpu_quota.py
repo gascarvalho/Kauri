@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -121,6 +122,20 @@ def test_systemd_and_cgroup_parsers_are_exact() -> None:
         "nr_throttled": 4,
         "throttled_usec": 321,
     }
+    assert cpu_quota.parse_cpu_stat(
+        "usage_usec 1234\nuser_usec 1000\nsystem_usec 234\n"
+    ) == {
+        "usage_usec": 1234,
+        "user_usec": 1000,
+        "system_usec": 234,
+    }
+    with pytest.raises(
+        cpu_quota.CpuQuotaContractError,
+        match="partial throttle accounting",
+    ):
+        cpu_quota.parse_cpu_stat(
+            "usage_usec 1234\nuser_usec 1000\nsystem_usec 234\nnr_periods 9\n"
+        )
     collected = cpu_quota.parse_systemctl_show(
         "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
         "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
@@ -247,6 +262,121 @@ def test_runtime_rejects_scope_that_does_not_own_launched_process(
             log_path=tmp_path / "replica.log",
             working_directory=tmp_path,
         )
+
+
+def test_monitor_failure_preserves_cause_after_verified_cleanup(
+    tmp_path: Path,
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    sampled = threading.Event()
+    unit_states: dict[str, str] = {}
+
+    def spawn(_registry: object, **_kwargs: object) -> tuple[object, object]:
+        return SimpleNamespace(pid=100, pgid=100), object()
+
+    def show_unit(unit: str) -> str:
+        return unit_states.get(
+            unit,
+            "ActiveState=active\nSubState=running\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n",
+        )
+
+    def fail_sample(_path: Path) -> Mapping[str, int]:
+        sampled.set()
+        raise cpu_quota.CpuQuotaContractError(
+            "cgroup cpu.stat lacks required accounting fields"
+        )
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="monitor-failure",
+        run_directory=tmp_path,
+        base_spawn=spawn,
+        show_unit=show_unit,
+        read_cpu_stat=fail_sample,
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+    )
+    runtime.spawn_owned_process(
+        object(),
+        name="replica-0",
+        replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log",
+        working_directory=tmp_path,
+    )
+    unit = json.loads(
+        (tmp_path / "runtime/cpu-quota-launch.json").read_text(encoding="utf-8")
+    )["replicas"][0]["unit"]
+    runtime.start_monitor()
+    assert sampled.wait(timeout=1.0)
+    unit_states[unit] = (
+        "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
+    )
+
+    with pytest.raises(
+        cpu_quota.CpuQuotaCleanupError,
+        match="cgroup cpu.stat lacks required accounting fields",
+    ) as raised:
+        runtime.verify_cleanup()
+
+    cleanup = raised.value.cleanup
+    assert cleanup["complete"] is True
+    assert cleanup["monitor"]["status"] == "FAILED"
+    assert (
+        cleanup["monitor"]["reason"]
+        == "cgroup cpu.stat lacks required accounting fields"
+    )
+    assert cleanup == json.loads(
+        (tmp_path / "runtime/cpu-quota-cleanup.json").read_text(encoding="utf-8")
+    )
+
+
+def test_backend_projects_quota_failure_with_complete_process_cleanup() -> None:
+    quota_cleanup = {
+        "schema_version": 1,
+        "complete": True,
+        "monitor": {"status": "FAILED", "stopped": True, "reason": "sample failed"},
+        "units": [],
+    }
+
+    class Registry:
+        def cleanup(self, *, timeout_s: float) -> tuple[object, ...]:
+            assert timeout_s == 2.0
+            return ()
+
+    class Process:
+        def poll(self) -> int:
+            return 0
+
+    failure = cpu_quota.CpuQuotaCleanupError(
+        "CPU-quota monitor failed: sample failed", cleanup=quota_cleanup
+    )
+
+    class QuotaRuntime:
+        def verify_cleanup(self) -> Mapping[str, object]:
+            raise failure
+
+    processes = SimpleNamespace(
+        registry=Registry(),
+        logs=(),
+        evidence=None,
+        cpu_quota_runtime=QuotaRuntime(),
+        records=(SimpleNamespace(process=Process()),),
+    )
+
+    with pytest.raises(cpu_quota.CpuQuotaCleanupError) as raised:
+        focused_crash_pair_runtime.FocusedLaunchBackend().cleanup({}, processes)
+
+    assert raised.value is failure
+    assert raised.value.cleanup == {
+        "complete": True,
+        "outcomes": [],
+        "cpu_quota": quota_cleanup,
+    }
 
 
 def test_contract_digest_changes_when_assignment_changes() -> None:

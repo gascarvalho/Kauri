@@ -35,10 +35,12 @@ _ASSIGNMENT_KEYS = frozenset({"replica_id", "capacity_class", "cpu_quota_percent
 _LAUNCHER = "systemd-user-scope-cpu-quota-v1"
 _IDENTIFIER = re.compile(r"[a-z][a-z0-9-]{0,63}")
 _DIGEST = re.compile(r"[0-9a-f]{64}")
-_CGROUP_STAT_KEYS = (
+_CGROUP_STAT_REQUIRED_KEYS = (
     "usage_usec",
     "user_usec",
     "system_usec",
+)
+_CGROUP_STAT_THROTTLE_KEYS = (
     "nr_periods",
     "nr_throttled",
     "throttled_usec",
@@ -65,6 +67,14 @@ _AUTHORIZATION_REQUEST_KEYS = frozenset(
 
 class CpuQuotaContractError(RuntimeError):
     """The external resource contract cannot be trusted or applied exactly."""
+
+
+class CpuQuotaCleanupError(CpuQuotaContractError):
+    """Quota monitoring or cleanup failed with a persisted final-state receipt."""
+
+    def __init__(self, message: str, *, cleanup: Mapping[str, object]) -> None:
+        super().__init__(message)
+        self.cleanup = dict(cleanup)
 
 
 @dataclass(frozen=True, slots=True)
@@ -455,9 +465,16 @@ def parse_cpu_stat(payload: str) -> dict[str, int]:
         if value < 0:
             raise CpuQuotaContractError("cgroup cpu.stat value is negative")
         values[fields[0]] = value
-    if not set(_CGROUP_STAT_KEYS).issubset(values):
+    if not set(_CGROUP_STAT_REQUIRED_KEYS).issubset(values):
         raise CpuQuotaContractError("cgroup cpu.stat lacks required accounting fields")
-    return {key: values[key] for key in _CGROUP_STAT_KEYS}
+    throttle_keys = set(_CGROUP_STAT_THROTTLE_KEYS)
+    present_throttle_keys = throttle_keys.intersection(values)
+    if present_throttle_keys and present_throttle_keys != throttle_keys:
+        raise CpuQuotaContractError("cgroup cpu.stat has partial throttle accounting")
+    keys = _CGROUP_STAT_REQUIRED_KEYS + (
+        _CGROUP_STAT_THROTTLE_KEYS if present_throttle_keys else ()
+    )
+    return {key: values[key] for key in keys}
 
 
 def _replace_json(path: Path, value: object) -> None:
@@ -769,23 +786,20 @@ class CpuQuotaRuntime:
         )
         self._monitor.start()
 
-    def stop_monitor(self) -> None:
+    def stop_monitor(self) -> tuple[bool, BaseException | None]:
         monitor = self._monitor
         if monitor is None:
-            return
+            return True, None
         self._monitor_stop.set()
         monitor.join(timeout=5.0)
         if monitor.is_alive():
-            raise CpuQuotaContractError("CPU-quota monitor did not stop")
-        if self._monitor_error is not None:
-            raise CpuQuotaContractError(
-                "CPU-quota monitor failed"
-            ) from self._monitor_error
+            return False, CpuQuotaContractError("CPU-quota monitor did not stop")
+        return True, self._monitor_error
 
     def verify_cleanup(self) -> dict[str, object]:
-        self.stop_monitor()
+        monitor_stopped, monitor_error = self.stop_monitor()
         rows: list[dict[str, object]] = []
-        complete = True
+        complete = monitor_stopped
         for replica_id in sorted(self._units):
             unit = self._units[replica_id]
             properties: dict[str, str] | None = None
@@ -811,10 +825,27 @@ class CpuQuotaRuntime:
                     "control_group": properties["ControlGroup"],
                 }
             )
-        result = {"schema_version": 1, "complete": complete, "units": rows}
+        monitor: dict[str, object] = {
+            "status": "PASSED" if monitor_error is None else "FAILED",
+            "stopped": monitor_stopped,
+        }
+        if monitor_error is not None:
+            monitor["reason"] = str(monitor_error) or type(monitor_error).__name__
+        result = {
+            "schema_version": 1,
+            "complete": complete,
+            "monitor": monitor,
+            "units": rows,
+        }
         _replace_json(self.root / "runtime/cpu-quota-cleanup.json", result)
         if not complete:
-            raise CpuQuotaContractError(
-                "one or more transient CPU-quota units remain active"
+            raise CpuQuotaCleanupError(
+                "CPU-quota cleanup did not establish quiescence",
+                cleanup=result,
             )
+        if monitor_error is not None:
+            reason = str(monitor_error) or type(monitor_error).__name__
+            raise CpuQuotaCleanupError(
+                f"CPU-quota monitor failed: {reason}", cleanup=result
+            ) from monitor_error
         return result

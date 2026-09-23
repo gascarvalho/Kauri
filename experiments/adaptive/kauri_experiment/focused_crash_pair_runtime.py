@@ -10207,16 +10207,21 @@ class FocusedLaunchBackend:
                     cleanup_error = exc
                     cleanup_traceback = exc.__traceback__
         quota_cleanup: Mapping[str, object] | None = None
+        quota_cleanup_error: cpu_quota.CpuQuotaCleanupError | None = None
         quota_runtime = getattr(processes, "cpu_quota_runtime", None)
         if quota_runtime is not None:
             try:
                 quota_cleanup = quota_runtime.verify_cleanup()
+            except cpu_quota.CpuQuotaCleanupError as exc:
+                quota_cleanup = exc.cleanup
+                quota_cleanup_error = exc
+                if cleanup_error is None:
+                    cleanup_error = exc
+                    cleanup_traceback = exc.__traceback__
             except BaseException as exc:
                 if cleanup_error is None:
                     cleanup_error = exc
                     cleanup_traceback = exc.__traceback__
-        if cleanup_error is not None:
-            raise cleanup_error.with_traceback(cleanup_traceback)
         complete = all(
             record.process.poll() is not None
             for record in getattr(processes, "records", ())
@@ -10230,6 +10235,10 @@ class FocusedLaunchBackend:
         }
         if quota_cleanup is not None:
             result["cpu_quota"] = dict(quota_cleanup)
+        if cleanup_error is not None:
+            if cleanup_error is quota_cleanup_error:
+                quota_cleanup_error.cleanup = dict(result)
+            raise cleanup_error.with_traceback(cleanup_traceback)
         return result
 
     def materialize_artifacts(

@@ -513,9 +513,9 @@ def _finalize_heterogeneity_abort(
     output_root: Path,
     slot: Mapping[str, object],
     configuration: Mapping[str, object],
-    runtime_error: FocusedCrashPairRuntimeError,
+    failure: BaseException,
+    failure_category: str,
     cleanup: Mapping[str, object] | None,
-    cleanup_error: BaseException | None,
 ) -> Path:
     """Preserve a failed excluded smoke without creating pair evidence."""
 
@@ -542,14 +542,7 @@ def _finalize_heterogeneity_abort(
         raise FocusedCrashPairCliError(
             "failed heterogeneity-smoke directory drifted"
         )
-    if (
-        cleanup_error is not None
-        or cleanup is None
-        or cleanup.get("complete") is not True
-    ):
-        reason = cleanup_error or FocusedCrashPairRuntimeError(
-            "cleanup did not establish a quiescent process set"
-        )
+    if cleanup is None or cleanup.get("complete") is not True:
         _write_exclusive_json(
             child_root / "cleanup-failure.json",
             {
@@ -559,7 +552,7 @@ def _finalize_heterogeneity_abort(
                 "claim_eligible": False,
                 "figure_eligible": False,
                 "complete": False,
-                "reason": _bounded_failure_reason(reason),
+                "reason": _bounded_failure_reason(failure),
             },
         )
         return child_root
@@ -576,8 +569,8 @@ def _finalize_heterogeneity_abort(
             "automatic_retries": 0,
             "replacement_policy": "none",
             "failure": {
-                "category": "runtime_error",
-                "reason": _bounded_failure_reason(runtime_error),
+                "category": failure_category,
+                "reason": _bounded_failure_reason(failure),
             },
         },
     )
@@ -717,6 +710,9 @@ def _execute_focused(
             cleanup = backend.cleanup(configuration, processes)
         except BaseException as exc:
             cleanup_error = exc
+            error_cleanup = getattr(exc, "cleanup", None)
+            if isinstance(error_cleanup, Mapping):
+                cleanup = dict(error_cleanup)
 
         if execution_error is not None:
             if (
@@ -738,9 +734,9 @@ def _execute_focused(
                         output_root=output_root,
                         slot=slot,
                         configuration=configuration,
-                        runtime_error=execution_error,
+                        failure=execution_error,
+                        failure_category="runtime_error",
                         cleanup=cleanup,
-                        cleanup_error=cleanup_error,
                     )
                 except BaseException as finalization_error:
                     try:
@@ -857,6 +853,34 @@ def _execute_focused(
                         pass
             raise execution_error.with_traceback(execution_traceback)
         if cleanup_error is not None:
+            if heterogeneity_smoke:
+                try:
+                    _finalize_heterogeneity_abort(
+                        output_root=output_root,
+                        slot=slot,
+                        configuration=configuration,
+                        failure=cleanup_error,
+                        failure_category="cleanup_error",
+                        cleanup=cleanup,
+                    )
+                except BaseException as finalization_error:
+                    try:
+                        _write_exclusive_json(
+                            slot_directory / "abort-finalization-failure.json",
+                            {
+                                "schema_version": 1,
+                                "kind": "kauri-focused-abort-finalization-failure-v1",
+                                "state": "INCOMPLETE",
+                                "claim_eligible": False,
+                                "figure_eligible": False,
+                                "category": "finalization_error",
+                                "reason": _bounded_failure_reason(
+                                    finalization_error
+                                ),
+                            },
+                        )
+                    except BaseException:
+                        pass
             raise cleanup_error
         if outcome is None or cleanup is None:
             raise FocusedCrashPairCliError(

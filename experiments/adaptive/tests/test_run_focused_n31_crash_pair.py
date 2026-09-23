@@ -545,6 +545,86 @@ def test_heterogeneity_runtime_failure_is_sealed_only_as_excluded_abort(
     assert not (output / "heterogeneity-smoke-receipt.json").exists()
 
 
+def test_heterogeneity_cleanup_only_failure_seals_verified_quiescent_abort(
+    tmp_path: Path,
+) -> None:
+    runner = _runner()
+    output = tmp_path / "heterogeneity-cleanup-abort"
+    contract = runner.cpu_quota.load_cpu_quota_contract(
+        CPU_QUOTA_CONTRACT,
+        base_profile_path=N31_PROFILE_V13,
+        expected_replica_ids=tuple(range(31)),
+    )
+    cleanup = {
+        "complete": True,
+        "outcomes": [],
+        "cpu_quota": {
+            "complete": True,
+            "monitor": {
+                "status": "FAILED",
+                "reason": "cgroup cpu.stat lacks required accounting fields",
+            },
+            "units": [],
+        },
+    }
+
+    class CleanupOnlyFailureBackend(_RecordingLaunchBackend):
+        def materialize_arm_configuration(
+            self,
+            context: Mapping[str, object],
+            *,
+            pair_ordinal: int,
+            arm: str,
+        ) -> Mapping[str, object]:
+            return {
+                **super().materialize_arm_configuration(
+                    context, pair_ordinal=pair_ordinal, arm=arm
+                ),
+                "run_directory": context["slot_directory"],
+            }
+
+        def cleanup(
+            self, configuration: Mapping[str, object], _processes: object
+        ) -> Mapping[str, object]:
+            self._record("cleanup", configuration)
+            raise runner.cpu_quota.CpuQuotaCleanupError(
+                "CPU-quota monitor failed: "
+                "cgroup cpu.stat lacks required accounting fields",
+                cleanup=cleanup,
+            )
+
+    with pytest.raises(
+        runner.cpu_quota.CpuQuotaCleanupError,
+        match="cgroup cpu.stat lacks required accounting fields",
+    ):
+        runner._execute_focused(
+            {
+                **_direct_focused_invocation(output, mode="pair"),
+                "mode": "heterogeneity-smoke",
+                "cpu_quota_contract": contract,
+            },
+            backend=CleanupOnlyFailureBackend(),
+        )
+
+    child = output / "children/slot-01"
+    recorded_cleanup = json.loads(
+        (child / "cleanup.json").read_text(encoding="utf-8")
+    )
+    arm_abort = json.loads(
+        (child / "arm-abort.json").read_text(encoding="utf-8")
+    )
+    outer_abort = json.loads(
+        (output / "heterogeneity-smoke-abort.json").read_text(encoding="utf-8")
+    )
+    assert recorded_cleanup == cleanup
+    assert arm_abort["failure"]["category"] == "cleanup_error"
+    assert "cgroup cpu.stat lacks" in arm_abort["failure"]["reason"]
+    assert outer_abort["continuation"] == "prohibited"
+    assert (child / "evidence-seal.json").is_file()
+    assert (output / "evidence-seal.json").is_file()
+    assert not (output / "heterogeneity-smoke-receipt.json").exists()
+
+
 def test_campaign_run_arm_failure_seals_only_an_incomplete_abort_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
