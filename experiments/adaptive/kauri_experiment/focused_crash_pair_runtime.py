@@ -4609,7 +4609,11 @@ class FocusedRawEvidenceSource:
             else [
                 path
                 for path in sorted(raw_root.glob("*.jsonl"))
-                if path.name != "fault-orchestrator.jsonl"
+                if path.name
+                not in {
+                    "cpu-quota-samples.jsonl",
+                    "fault-orchestrator.jsonl",
+                }
             ]
         )
         for path in paths:

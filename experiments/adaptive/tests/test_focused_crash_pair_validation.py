@@ -4861,6 +4861,52 @@ def test_raw_terminal_failure_detail_is_required_only_for_v4_profiles(
         v4._events()
 
 
+def test_raw_event_fallback_ignores_cpu_quota_samples(tmp_path: Path) -> None:
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item for item in fixture._children(plan, tmp_path) if item["arm"] == "adaptive"
+    )
+    _complete_child(child)
+    directory = child["sealed_child_directory"]
+    assert isinstance(directory, Path)
+    events = _load_events(directory)
+    raw = directory / "raw"
+    for name in (
+        "replica-events.jsonl",
+        "adaptive-manager-events.jsonl",
+        "client-events.jsonl",
+    ):
+        (raw / name).unlink()
+    for source_id in sorted({str(event["source_id"]) for event in events}):
+        selected = [event for event in events if event["source_id"] == source_id]
+        (raw / f"{source_id}.jsonl").write_text(
+            "".join(json.dumps(event, sort_keys=True) + "\n" for event in selected),
+            encoding="utf-8",
+        )
+    (raw / "cpu-quota-samples.jsonl").write_text(
+        json.dumps(
+            {
+                "active_state": "active",
+                "cpu_quota_percent": 50,
+                "cpu_stat": {
+                    "system_usec": 1,
+                    "usage_usec": 3,
+                    "user_usec": 2,
+                },
+                "replica_id": 0,
+                "schema_version": 1,
+                "source_monotonic_ns": 100,
+                "sub_state": "running",
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert len(_raw_source(directory)._events()) == len(events)
+
+
 @pytest.mark.parametrize(
     "mutation",
     (
