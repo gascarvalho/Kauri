@@ -4254,6 +4254,70 @@ def test_raw_events_ignore_cpu_quota_monitor_rounds(tmp_path: Path) -> None:
     assert {event["source_kind"] for event in events} == {"replica"}
 
 
+def test_raw_events_incrementally_drain_complete_suffix_once(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    initial = source._events()
+    path = root / "raw" / "replica-0.jsonl"
+    first = json.loads(path.read_text(encoding="utf-8"))
+    second = {
+        **first,
+        "source_sequence": 2,
+        "source_monotonic_ns": 2,
+        "event_type": "block.committed",
+        "payload": {},
+    }
+    wire = json.dumps(second).encode("utf-8")
+    split = len(wire) // 2
+
+    with path.open("ab") as stream:
+        stream.write(wire[:split])
+    assert source._events() == initial
+
+    with path.open("ab") as stream:
+        stream.write(wire[split:] + b"\n")
+    updated = source._events()
+
+    assert len(updated) == len(initial) + 1
+    assert updated[-1] == second
+    assert source._events() == updated
+
+
+def test_raw_events_incremental_cursor_rejects_truncation(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    path = root / "raw" / "replica-0.jsonl"
+    source._events()
+    path.write_bytes(path.read_bytes()[:-1])
+
+    with pytest.raises(
+        runtime.FocusedCrashPairRuntimeError,
+        match="truncated",
+    ):
+        source._events()
+
+
+def test_raw_events_incremental_cursor_accepts_new_owned_stream(tmp_path: Path) -> None:
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    deferred = root / "raw" / "replica-6.jsonl"
+    payload = deferred.read_bytes()
+    deferred.unlink()
+
+    assert len(source._events()) == len(profile.replica_ids) - 1
+    deferred.write_bytes(payload)
+
+    assert len(source._events()) == len(profile.replica_ids)
+
+
 def _append_v4_authoritative_configurations(
     root: Path, source: object, profile: object, tree_ids: Sequence[int]
 ) -> None:

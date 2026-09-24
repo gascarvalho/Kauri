@@ -4230,9 +4230,11 @@ def _drive_arm_state_machine(
 class FocusedRawEvidenceSource:
     """Incrementally reconstruct state-machine snapshots from raw artifacts.
 
-    The source never consumes runner outcomes or derived phase documents.  Each
-    poll reparses the append-only native streams, validates their provenance,
-    and builds the requested barrier from bundles, events, and fault evidence.
+    The source never consumes runner outcomes or derived phase documents.  It
+    drains each append-only native stream through a bounded cursor, validates
+    every new event and its source continuity once, and builds the requested
+    barrier from bundles, events, and fault evidence.  Sealed validation still
+    replays the complete immutable streams independently.
     """
 
     def __init__(
@@ -4595,7 +4597,6 @@ class FocusedRawEvidenceSource:
         )
 
     def _events(self) -> list[dict[str, Any]]:
-        events: list[dict[str, Any]] = []
         raw_root = self._root / "raw"
         aggregate_names = (
             "replica-events.jsonl",
@@ -4617,15 +4618,87 @@ class FocusedRawEvidenceSource:
                 }
             ]
         )
+
+        path_identity = tuple(str(path.resolve()) for path in paths)
+        captured_identity = getattr(self, "_event_tail_path_identity", None)
+        if captured_identity is None:
+            self._event_tail_path_identity = path_identity
+            self._event_tail_states: dict[Path, dict[str, object]] = {}
+            self._event_cache: list[dict[str, Any]] = []
+            self._event_source_cursors: dict[
+                tuple[str, str], tuple[str, int, int]
+            ] = {}
+            self._event_run_id: str | None = None
+        elif not set(captured_identity).issubset(path_identity):
+            _error("raw event stream layout changed during live polling")
+        else:
+            self._event_tail_path_identity = path_identity
+
+        events = self._event_cache
+        source_cursors = self._event_source_cursors
+        expected_run_id = getattr(self, "_expected_run_id", None)
+        expected_instances = getattr(self, "_expected_source_instances", {})
         for path in paths:
+            if path.is_symlink() or not path.is_file():
+                _error("raw structured event stream is absent")
+            state = self._event_tail_states.setdefault(
+                path,
+                {
+                    "offset": 0,
+                    "partial": b"",
+                    "device": None,
+                    "inode": None,
+                },
+            )
             try:
-                stream = profiled_fault_runtime.read_jsonl(path, allow_partial=True)
-            except profiled_fault_runtime.ProfiledFaultRuntimeError as exc:
+                with path.open("rb") as stream:
+                    status = os.fstat(stream.fileno())
+                    if not stat.S_ISREG(status.st_mode):
+                        _error("raw structured event stream is not regular")
+                    if state["device"] is None:
+                        state["device"] = status.st_dev
+                        state["inode"] = status.st_ino
+                    elif (
+                        state["device"] != status.st_dev
+                        or state["inode"] != status.st_ino
+                    ):
+                        _error("raw structured event stream was replaced")
+                    offset = _integer(
+                        state["offset"], "raw structured event cursor"
+                    )
+                    if status.st_size < offset:
+                        _error("raw structured event stream was truncated")
+                    stream.seek(offset)
+                    appended = stream.read(status.st_size - offset)
+                if len(appended) != status.st_size - offset:
+                    _error("raw structured event stream changed below its cutoff")
+            except FocusedCrashPairRuntimeError:
+                raise
+            except OSError as exc:
                 raise FocusedCrashPairRuntimeError(
-                    "raw structured event stream is malformed"
+                    "raw structured event stream cannot be read"
                 ) from exc
-            for value in stream:
-                event = _document(value, "raw structured event")
+            state["offset"] = status.st_size
+            payload = bytes(state["partial"]) + appended
+            final_newline = payload.rfind(b"\n")
+            if final_newline < 0:
+                if len(payload) > 1_048_576:
+                    _error("raw structured event record exceeds the bounded cursor")
+                state["partial"] = payload
+                complete = b""
+            else:
+                complete = payload[: final_newline + 1]
+                state["partial"] = payload[final_newline + 1 :]
+                if len(state["partial"]) > 1_048_576:
+                    _error("raw structured event record exceeds the bounded cursor")
+
+            for line in complete.splitlines():
+                try:
+                    event = _document(json.loads(line), "raw structured event")
+                except (json.JSONDecodeError, UnicodeError) as exc:
+                    raise FocusedCrashPairRuntimeError(
+                        "raw structured event stream is malformed"
+                    ) from exc
                 if (
                     set(event) != _RUNTIME_EVENT_KEYS
                     or event.get("event_schema_version") != 1
@@ -4638,44 +4711,49 @@ class FocusedRawEvidenceSource:
                     or not isinstance(event.get("payload"), Mapping)
                 ):
                     _error("raw structured event envelope schema drifted")
-                _integer(event.get("source_sequence"), "raw source sequence", 1)
-                _integer(event.get("source_monotonic_ns"), "raw source timestamp")
+                run_id = str(event["run_id"])
+                source_kind = str(event["source_kind"])
+                source_id = str(event["source_id"])
+                source_instance = str(event["source_instance"])
+                sequence = _integer(
+                    event.get("source_sequence"), "raw source sequence", 1
+                )
+                timestamp = _integer(
+                    event.get("source_monotonic_ns"), "raw source timestamp"
+                )
+                if self._event_run_id is None:
+                    self._event_run_id = run_id
+                elif self._event_run_id != run_id:
+                    _error("raw event streams span multiple runs")
+                if expected_run_id is not None and run_id != expected_run_id:
+                    _error("raw event streams differ from the launched run")
+                if expected_instances and (
+                    source_id not in expected_instances
+                    or source_instance != expected_instances[source_id]
+                ):
+                    _error("raw event streams differ from launched source identities")
+                source_key = (source_kind, source_id)
+                previous = source_cursors.get(source_key)
+                if previous is None:
+                    if sequence != 1:
+                        _error("raw source sequence is not contiguous")
+                elif (
+                    previous[0] != source_instance
+                    or sequence != previous[1] + 1
+                ):
+                    if previous[0] != source_instance:
+                        _error("one raw source ID spans multiple instances")
+                    _error("raw source sequence is not contiguous")
+                if previous is not None and timestamp < previous[2]:
+                    _error("raw source monotonic time regressed")
+                source_cursors[source_key] = (
+                    source_instance,
+                    sequence,
+                    timestamp,
+                )
                 events.append(dict(event))
         if not events:
             return []
-        if len({event["run_id"] for event in events}) != 1:
-            _error("raw event streams span multiple runs")
-        expected_run_id = getattr(self, "_expected_run_id", None)
-        expected_instances = getattr(self, "_expected_source_instances", {})
-        if expected_run_id is not None and events[0]["run_id"] != expected_run_id:
-            _error("raw event streams differ from the launched run")
-        if expected_instances:
-            for event in events:
-                source_id = str(event["source_id"])
-                if (
-                    source_id not in expected_instances
-                    or event["source_instance"] != expected_instances[source_id]
-                ):
-                    _error("raw event streams differ from launched source identities")
-        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-        source_ids: set[tuple[str, str]] = set()
-        for event in events:
-            key = (
-                str(event["source_kind"]),
-                str(event["source_id"]),
-                str(event["source_instance"]),
-            )
-            grouped.setdefault(key, []).append(event)
-        for (kind, source_id, _instance), source_events in grouped.items():
-            if (kind, source_id) in source_ids:
-                _error("one raw source ID spans multiple instances")
-            source_ids.add((kind, source_id))
-            sequences = [int(event["source_sequence"]) for event in source_events]
-            timestamps = [int(event["source_monotonic_ns"]) for event in source_events]
-            if sequences != list(range(1, len(source_events) + 1)):
-                _error("raw source sequence is not contiguous")
-            if timestamps != sorted(timestamps):
-                _error("raw source monotonic time regressed")
         terminal_keys = {
             "cycle_ordinal",
             "policy_intent",
@@ -4712,7 +4790,7 @@ class FocusedRawEvidenceSource:
                 require_for_unhealthy=requires_controller_failure,
             ):
                 _error("manager terminal controller failure drifted")
-        return events
+        return list(events)
 
     def _bundle(self, epoch: int) -> tuple[bytes, Any]:
         path = self._root / "raw" / f"epoch{epoch}.bundle"
