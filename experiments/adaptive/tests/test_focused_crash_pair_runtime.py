@@ -3202,6 +3202,39 @@ def test_v5_runtime_materializes_exact_causal_phase_windows(
     ]
 
 
+def test_first_common_commit_anchor_reuses_precomputed_authoritative_commits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile, events, _receipt, _source = _v5_runtime_phase_fixture()
+    commits = runtime._runtime_authoritative_commits(events, profile)
+
+    def unexpected_reconstruction(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("authoritative commits were reconstructed twice")
+
+    monkeypatch.setattr(
+        runtime, "_runtime_authoritative_commits", unexpected_reconstruction
+    )
+
+    anchor = runtime._runtime_first_common_commit_anchor(
+        events,
+        profile,
+        epoch_number=2,
+        after_ns=105_000_000_000,
+        authoritative_commits=commits,
+    )
+
+    assert anchor == 110_000_000_000
+
+
+def test_live_backend_leaves_one_quota_interval_between_semantic_replays() -> None:
+    runtime = _runtime()
+
+    backend = runtime.FocusedLaunchBackend()
+
+    assert backend._poll_interval_s == 1.0
+
+
 def test_v5_runtime_accepts_a_truly_empty_fault_interval() -> None:
     runtime = _runtime()
     profile, events, receipt, source = _v5_runtime_phase_fixture()
@@ -3500,6 +3533,36 @@ def test_v3_raw_common_commit_caches_lifecycle_identity_per_source(
         if event["event_type"] in {"block.committed", "block.commit_observed"}
     }
     assert len(calls) <= len(configured_sources)
+
+
+def test_v3_raw_common_commit_indexes_the_event_history_once_per_stage(
+    tmp_path: Path,
+) -> None:
+    source, events = _v3_common_commit_fixture(tmp_path)
+    repeated = [deepcopy(events[-1]) for _ in range(1_000)]
+    for event in repeated:
+        event["payload"]["block_hash"] = "f" * 64
+    events.extend(repeated)
+
+    class CountingEvents(Sequence[Mapping[str, object]]):
+        def __init__(self, rows: Sequence[Mapping[str, object]]) -> None:
+            self.rows = tuple(rows)
+            self.full_iterations = 0
+
+        def __len__(self) -> int:
+            return len(self.rows)
+
+        def __getitem__(self, index: object) -> object:
+            return self.rows[index]  # type: ignore[index]
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            self.full_iterations += 1
+            return iter(self.rows)
+
+    counted = CountingEvents(events)
+
+    assert source._common_commit(counted, 1) is not None
+    assert counted.full_iterations <= 5
 
 
 @pytest.mark.parametrize(
