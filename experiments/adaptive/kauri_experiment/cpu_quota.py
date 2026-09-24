@@ -653,6 +653,7 @@ class CpuQuotaRuntime:
         self._process_group = process_group
         self._monotonic_ns = monotonic_ns
         self._units: dict[int, dict[str, object]] = {}
+        self._inactive_units: set[int] = set()
         self._monitor_stop = threading.Event()
         self._monitor: threading.Thread | None = None
         self._monitor_error: BaseException | None = None
@@ -818,29 +819,38 @@ class CpuQuotaRuntime:
         for replica_id in sorted(self._units):
             unit = self._units[replica_id]
             stat_path = Path(str(unit["cpu_stat_path"]))
-            try:
-                observed_quota = self._read_cpu_max(stat_path.parent / "cpu.max")
-                if observed_quota != unit["cpu_quota_per_second_usec"]:
-                    raise CpuQuotaContractError(
-                        "CPU-quota sample no longer matches its launched scope"
-                    )
-                stat = dict(self._read_cpu_stat(stat_path))
-            except _CgroupUnavailableError as sample_error:
-                properties = parse_systemctl_show(self._show_unit(str(unit["unit"])))
-                if not (
-                    properties["ActiveState"] == "inactive"
-                    and properties["SubState"] == "dead"
-                    and properties["ControlGroup"] == ""
-                    and quota_per_second_usec(properties) == 0
-                ):
-                    raise sample_error
+            if replica_id in self._inactive_units:
                 observed_quota = 0
                 active_state = "inactive"
                 sub_state = "dead"
                 stat = None
             else:
-                active_state = str(unit["active_state"])
-                sub_state = str(unit["sub_state"])
+                try:
+                    observed_quota = self._read_cpu_max(stat_path.parent / "cpu.max")
+                    if observed_quota != unit["cpu_quota_per_second_usec"]:
+                        raise CpuQuotaContractError(
+                            "CPU-quota sample no longer matches its launched scope"
+                        )
+                    stat = dict(self._read_cpu_stat(stat_path))
+                except _CgroupUnavailableError as sample_error:
+                    properties = parse_systemctl_show(
+                        self._show_unit(str(unit["unit"]))
+                    )
+                    if not (
+                        properties["ActiveState"] == "inactive"
+                        and properties["SubState"] == "dead"
+                        and properties["ControlGroup"] == ""
+                        and quota_per_second_usec(properties) == 0
+                    ):
+                        raise sample_error
+                    self._inactive_units.add(replica_id)
+                    observed_quota = 0
+                    active_state = "inactive"
+                    sub_state = "dead"
+                    stat = None
+                else:
+                    active_state = str(unit["active_state"])
+                    sub_state = str(unit["sub_state"])
             row: dict[str, object] = {
                 "schema_version": 1,
                 "source_monotonic_ns": timestamp,

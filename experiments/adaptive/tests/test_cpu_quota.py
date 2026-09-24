@@ -347,11 +347,14 @@ def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> N
     base = _contract()
     contract = replace(base, assignments=(base.assignments[0],))
     active = True
+    show_calls = 0
 
     def spawn(_registry: object, **_kwargs: object) -> tuple[object, object]:
         return SimpleNamespace(pid=100, pgid=100), object()
 
     def show_unit(unit: str) -> str:
+        nonlocal show_calls
+        show_calls += 1
         if active:
             return (
                 "ActiveState=active\nSubState=running\n"
@@ -393,6 +396,13 @@ def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> N
     assert rows[0]["sub_state"] == "dead"
     assert rows[0]["cpu_quota_per_second_usec"] == 0
     assert "cpu_stat" not in rows[0]
+
+    repeated = runtime.sample_once()
+
+    assert repeated[0]["active_state"] == "inactive"
+    assert repeated[0]["sub_state"] == "dead"
+    assert "cpu_stat" not in repeated[0]
+    assert show_calls == 2
 
 
 def test_monitor_waits_only_until_the_next_fixed_deadline(tmp_path: Path) -> None:
