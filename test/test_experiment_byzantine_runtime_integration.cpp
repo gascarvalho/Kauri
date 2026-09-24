@@ -271,6 +271,27 @@ public:
         return runtime.find_exact_runtime_generation(configuration);
     }
 
+    static ReplicaID exact_tree_root(
+        const HotStuffBase &runtime,
+        const ConfigurationId &configuration)
+    {
+        const auto *tree = runtime.find_exact_runtime_tree(configuration);
+        if (tree == nullptr)
+            throw std::invalid_argument("exact runtime tree is unavailable");
+        return tree->get_tree().get_tree_root();
+    }
+
+    static EpochActivationEffect active_effect(
+        const HotStuffBase &runtime)
+    {
+        if (runtime.epoch_live_binding == nullptr)
+            throw std::invalid_argument("adaptive runtime is unavailable");
+        const auto active = runtime.epoch_live_binding->active_view();
+        if (!active.has_value())
+            throw std::invalid_argument("active epoch is unavailable");
+        return *active;
+    }
+
     static void capture_local_proposal_before_admission(
         HotStuffBase &runtime,
         const Proposal &proposal)
@@ -2791,6 +2812,69 @@ TEST_CASE(
     CHECK(exercise(EpochProtocolMode::adaptive_v3, 0));
     CHECK_FALSE(exercise(EpochProtocolMode::adaptive_v3, 1));
     CHECK_FALSE(exercise(EpochProtocolMode::adaptive_v2, 0));
+}
+
+TEST_CASE(
+    "certified stale-generation catch-up retains its exact adaptive-v3 identity",
+    "[cert13][adaptive-v3][proposal-repair][identity][integration][rotation]")
+{
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    ScopedSigpipeIgnore ignore_sigpipe;
+
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new ActiveRuntimePaceMaker(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v3,
+        adaptive_v3_runtime_config(1));
+    const auto repaired_configuration =
+        Access::initialize_active_runtime(runtime);
+    const auto repaired_generation =
+        Access::exact_runtime_generation(runtime, repaired_configuration);
+    REQUIRE(repaired_generation.has_value());
+
+    REQUIRE(Access::rotate_to_tree(runtime, 1).error ==
+            EpochIngressError::none);
+    REQUIRE(Access::rotate_to_tree(runtime, 2).error ==
+            EpochIngressError::none);
+    const auto active_before = Access::active_effect(runtime);
+    REQUIRE(active_before.configuration.tree_id == 2);
+    REQUIRE(active_before.generation > *repaired_generation);
+    CHECK_FALSE(Access::exact_runtime_generation(
+        runtime, repaired_configuration).has_value());
+
+    const auto genesis = runtime.get_genesis();
+    auto certificate = Access::direct_certifier(
+        runtime, genesis_certification_key(genesis->get_hash()));
+    const auto block = Access::add_custom_commit_rule_block(
+        runtime,
+        genesis,
+        genesis,
+        std::move(certificate),
+        "certified-stale-generation-catchup",
+        genesis->get_height() + 1);
+    const Proposal proposal(
+        Access::exact_tree_root(runtime, repaired_configuration),
+        repaired_configuration.epoch_number,
+        repaired_configuration.tree_id,
+        repaired_configuration.epoch_digest,
+        block,
+        &runtime);
+
+    REQUIRE(Access::apply_certified_catchup(
+        runtime, proposal, *repaired_generation));
+    const auto active_after = Access::active_effect(runtime);
+    CHECK(active_after.configuration == active_before.configuration);
+    CHECK(active_after.generation == active_before.generation);
+    REQUIRE(Access::retained_commit_event_identity_is_exact(
+        runtime, proposal.key(), *repaired_generation));
+
+    const auto cached =
+        Access::resolve_and_cache_unproven_commit(runtime, block);
+    CHECK(cached.event_key == proposal.key());
+    CHECK(cached.event_generation == repaired_generation);
+    CHECK_FALSE(cached.event_conflicted);
 }
 
 TEST_CASE(

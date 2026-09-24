@@ -1885,6 +1885,9 @@ namespace hotstuff
         void on_verified_certified_proposal_catchup(
             const Proposal &proposal,
             std::uint64_t view_generation) noexcept override;
+        bool is_authenticated_stale_proposal_catchup_generation(
+            const Proposal &proposal,
+            std::uint64_t view_generation) const noexcept;
         void dispatch_exact_vote_fallback(
             const ProposalKey &key,
             std::uint64_t context_generation);

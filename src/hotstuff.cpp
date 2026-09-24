@@ -4768,7 +4768,11 @@ namespace hotstuff
         const auto generation = find_exact_runtime_generation(
             proposal.configuration());
         const auto metadata = exact_context_metadata(proposal.key());
-        if (!generation.has_value() || *generation != view_generation ||
+        const bool authenticated_generation =
+            (generation.has_value() && *generation == view_generation) ||
+            is_authenticated_stale_proposal_catchup_generation(
+                proposal, view_generation);
+        if (!authenticated_generation ||
             !metadata.has_value() ||
             metadata->tree.root != proposal.proposer)
             return;
@@ -4782,6 +4786,60 @@ namespace hotstuff
         static_cast<void>(
             retain_authenticated_proposal_commit_event_identities(
                 proposal, view_generation));
+    }
+
+    bool HotStuffBase::
+    is_authenticated_stale_proposal_catchup_generation(
+        const Proposal &proposal,
+        std::uint64_t view_generation) const noexcept
+    {
+        if (epoch_protocol_mode != EpochProtocolMode::adaptive_v3 ||
+            epoch_live_binding == nullptr || view_generation == 0 ||
+            proposal.blk == nullptr)
+            return false;
+        try
+        {
+            const auto active = epoch_live_binding->active_view();
+            if (!active.has_value() || active->definition == nullptr ||
+                proposal.configuration() == active->configuration ||
+                proposal.configuration().epoch_number !=
+                    active->configuration.epoch_number ||
+                proposal.configuration().epoch_digest !=
+                    active->configuration.epoch_digest ||
+                view_generation >= active->generation)
+                return false;
+
+            const auto packed = view_generation - 1;
+            const auto generation_epoch = static_cast<std::uint32_t>(
+                packed >> 32);
+            const auto generation_ordinal = static_cast<std::uint32_t>(
+                packed);
+            const auto &trees = active->definition->trees();
+            if (generation_epoch !=
+                    proposal.configuration().epoch_number ||
+                generation_ordinal >= active->rotation_ordinal ||
+                trees.empty() ||
+                static_cast<std::uint64_t>(active->rotation_ordinal) -
+                        generation_ordinal >=
+                    trees.size())
+                return false;
+
+            const auto tree = std::find_if(
+                trees.begin(),
+                trees.end(),
+                [&proposal](const EpochTreeDefinition &candidate) {
+                    return candidate.tree_id ==
+                               proposal.configuration().tree_id &&
+                           !candidate.members_breadth_first.empty() &&
+                           candidate.members_breadth_first.front() ==
+                               proposal.proposer;
+                });
+            return tree != trees.end();
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
     void HotStuffBase::dispatch_exact_vote_fallback(
