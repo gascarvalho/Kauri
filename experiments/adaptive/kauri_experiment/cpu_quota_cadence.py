@@ -23,6 +23,7 @@ _KIND = "kauri-cpu-quota-cadence-v1"
 _PROFILE_ROOT = Path(__file__).resolve().parents[1] / "profiles"
 _DEFAULT_CONTRACT = _PROFILE_ROOT / "n31-cpu-quota-heterogeneity-smoke-v1.json"
 _DEFAULT_PROFILE = _PROFILE_ROOT / "n31-f5-q21-three-crash-pair-v13.json"
+_DEFAULT_CRASH_REPLICA_IDS = (21, 22, 23)
 
 
 class CadenceGateError(RuntimeError):
@@ -33,6 +34,7 @@ class CadenceGateError(RuntimeError):
 class CadencePlan:
     sample_seconds: int = 30
     worker_seconds: int = 45
+    precrash_seconds: int = 5
     minimum_samples_per_replica: int = 25
     maximum_gap_multiplier: int = 2
 
@@ -41,6 +43,8 @@ class CadencePlan:
             raise CadenceGateError("cadence sampling must run for at least 10 seconds")
         if self.worker_seconds <= self.sample_seconds:
             raise CadenceGateError("cadence workers must outlive the sampling window")
+        if not 1 <= self.precrash_seconds < self.sample_seconds:
+            raise CadenceGateError("cadence crash must occur inside the sampling window")
         if self.minimum_samples_per_replica < 3:
             raise CadenceGateError("cadence gate requires at least three samples")
         if self.maximum_gap_multiplier != 2:
@@ -93,12 +97,18 @@ def evaluate_cadence(
     rounds: Sequence[Mapping[str, object]],
     *,
     minimum_samples_per_replica: int,
+    crashed_replica_ids: Sequence[int] = (),
 ) -> dict[str, object]:
     """Evaluate the frozen two-interval gap bound over exact replica coverage."""
 
     expected = set(contract.replica_ids)
+    crashed = set(crashed_replica_ids)
     timestamps: dict[int, list[int]] = {replica_id: [] for replica_id in expected}
+    active_seen: set[int] = set()
+    inactive_seen: set[int] = set()
     try:
+        if len(crashed) != len(crashed_replica_ids) or not crashed <= expected:
+            raise CadenceGateError("cadence crash membership drifted")
         for sample in samples:
             replica_id = sample.get("replica_id")
             timestamp = sample.get("source_monotonic_ns")
@@ -107,13 +117,32 @@ def evaluate_cadence(
                 or replica_id not in expected
                 or type(timestamp) is not int
                 or timestamp <= 0
-                or sample.get("active_state") != "active"
                 or sample.get("cpu_quota_percent") != contract.quota_percent(replica_id)
-                or sample.get("cpu_quota_per_second_usec")
-                != contract.quota_percent(replica_id) * 10_000
             ):
                 raise CadenceGateError("cadence sample identity or quota drifted")
+            state = sample.get("active_state")
+            if state == "active":
+                if (
+                    replica_id in inactive_seen
+                    or sample.get("cpu_quota_per_second_usec")
+                    != contract.quota_percent(replica_id) * 10_000
+                ):
+                    raise CadenceGateError("cadence active sample drifted")
+                active_seen.add(replica_id)
+            elif state == "inactive":
+                if (
+                    replica_id not in crashed
+                    or replica_id not in active_seen
+                    or sample.get("sub_state") != "dead"
+                    or sample.get("cpu_quota_per_second_usec") != 0
+                ):
+                    raise CadenceGateError("cadence inactive sample drifted")
+                inactive_seen.add(replica_id)
+            else:
+                raise CadenceGateError("cadence sample lifecycle drifted")
             timestamps[replica_id].append(timestamp)
+        if active_seen != expected or inactive_seen != crashed:
+            raise CadenceGateError("cadence crash transition coverage is incomplete")
         if any(
             len(values) < minimum_samples_per_replica
             or any(right <= left for left, right in zip(values, values[1:]))
@@ -195,6 +224,7 @@ def run_cadence_gate(
     logs: list[IO[bytes]] = []
     failure: BaseException | None = None
     process_cleanup: list[dict[str, object]] = []
+    fault_outcomes: list[dict[str, object]] = []
     quota_cleanup: Mapping[str, object] = {"complete": False}
     try:
         environment = environment_probe()
@@ -215,7 +245,27 @@ def run_cadence_gate(
             )
             logs.append(log)
         runtime.start_monitor()
-        sleep(plan.sample_seconds)
+        sleep(plan.precrash_seconds)
+        fault_outcomes = [
+            {
+                "fault_id": outcome.fault_id,
+                "replica_id": outcome.replica_id,
+                "pid": outcome.pid,
+                "pgid": outcome.pgid,
+                "signal_number": outcome.signal_number,
+                "returncode": outcome.returncode,
+                "requested_monotonic_ns": outcome.requested_monotonic_ns,
+                "confirmed_monotonic_ns": outcome.confirmed_monotonic_ns,
+            }
+            for outcome in registry.sigkill_replica_groups(
+                tuple(
+                    (f"cadence-crash-{replica_id}", replica_id)
+                    for replica_id in _DEFAULT_CRASH_REPLICA_IDS
+                ),
+                timeout_s=2.0,
+            )
+        ]
+        sleep(plan.sample_seconds - plan.precrash_seconds)
     except BaseException as exc:
         failure = exc
     finally:
@@ -253,6 +303,7 @@ def run_cadence_gate(
                 _read_jsonl(root / "raw/cpu-quota-samples.jsonl"),
                 _read_jsonl(root / "raw/cpu-quota-monitor-rounds.jsonl"),
                 minimum_samples_per_replica=plan.minimum_samples_per_replica,
+                crashed_replica_ids=_DEFAULT_CRASH_REPLICA_IDS,
             )
         except BaseException as exc:
             verdict = _failure(str(exc) or type(exc).__name__)
@@ -264,9 +315,12 @@ def run_cadence_gate(
         "plan": {
             "sample_seconds": plan.sample_seconds,
             "worker_seconds": plan.worker_seconds,
+            "precrash_seconds": plan.precrash_seconds,
             "minimum_samples_per_replica": plan.minimum_samples_per_replica,
             "maximum_gap_multiplier": plan.maximum_gap_multiplier,
         },
+        "crashed_replica_ids": list(_DEFAULT_CRASH_REPLICA_IDS),
+        "fault_outcomes": fault_outcomes,
         "environment": dict(environment),
         "process_cleanup": process_cleanup,
         "quota_cleanup": dict(quota_cleanup),

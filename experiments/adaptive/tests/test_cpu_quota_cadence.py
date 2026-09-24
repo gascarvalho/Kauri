@@ -87,12 +87,57 @@ def test_evaluation_rejects_missing_replica_coverage() -> None:
     assert "coverage" in str(result["reason"])
 
 
+def test_evaluation_accepts_exact_crash_transition_without_relaxing_cadence() -> None:
+    contract = _contract()
+    samples, rounds = _evidence(gap_ns=1_000_000_000)
+    crashed = (21, 22, 23)
+    for sample in samples:
+        if (
+            sample["replica_id"] in crashed
+            and sample["source_monotonic_ns"] > 1_000_000_000
+        ):
+            sample["active_state"] = "inactive"
+            sample["sub_state"] = "dead"
+            sample["cpu_quota_per_second_usec"] = 0
+
+    result = cadence.evaluate_cadence(
+        contract,
+        samples,
+        rounds,
+        minimum_samples_per_replica=3,
+        crashed_replica_ids=crashed,
+    )
+
+    assert result["verdict"] == "PASS"
+    assert result["maximum_gap_ms"] == 1_000.0
+
+
+def test_evaluation_rejects_reactivated_scope() -> None:
+    contract = _contract()
+    samples, rounds = _evidence(gap_ns=1_000_000_000)
+    samples[31 + 21]["active_state"] = "inactive"
+    samples[31 + 21]["sub_state"] = "dead"
+    samples[31 + 21]["cpu_quota_per_second_usec"] = 0
+
+    result = cadence.evaluate_cadence(
+        contract,
+        samples,
+        rounds,
+        minimum_samples_per_replica=3,
+        crashed_replica_ids=(21, 22, 23),
+    )
+
+    assert result["verdict"] == "FAIL"
+    assert result["reason"] == "cadence active sample drifted"
+
+
 def test_plan_rejects_short_or_relaxed_gate() -> None:
     plan = cadence.CadencePlan()
 
     for changes in (
         {"sample_seconds": 9},
         {"worker_seconds": 30},
+        {"precrash_seconds": 30},
         {"maximum_gap_multiplier": 3},
     ):
         with pytest.raises(cadence.CadenceGateError):
