@@ -9965,36 +9965,95 @@ def _validate_heterogeneity_quota_evidence(
         raise FocusedCrashPairValidationError("CPU-quota samples are invalid") from exc
     if not samples:
         _error("CPU-quota samples are empty")
+    fault_receipt = _read_json(
+        child_root / "raw" / "fault-receipt.json", "quota fault receipt"
+    )
+    crash_confirmations: dict[int, int] = {}
+    for raw in _sequence(
+        fault_receipt.get("sigkill_outcomes"), "quota SIGKILL outcomes"
+    ):
+        outcome = _mapping(raw, "quota SIGKILL outcome")
+        replica_id = _integer(
+            outcome.get("replica_id"), "quota SIGKILL replica", 0
+        )
+        requested_ns = _uint64(
+            outcome.get("requested_monotonic_ns"),
+            "quota SIGKILL request time",
+            1,
+        )
+        confirmed_ns = _uint64(
+            outcome.get("confirmed_monotonic_ns"),
+            "quota SIGKILL confirmation time",
+            requested_ns,
+        )
+        if (
+            replica_id in crash_confirmations
+            or replica_id not in units
+            or confirmed_ns < requested_ns
+            or outcome.get("signal_number") != 9
+            or outcome.get("returncode") != -9
+        ):
+            _error("quota SIGKILL outcome drifted")
+        crash_confirmations[replica_id] = confirmed_ns
+    if not crash_confirmations:
+        _error("quota evidence lacks confirmed crash targets")
+
     prior: dict[int, tuple[int, Mapping[str, int]]] = {}
     seen: set[int] = set()
+    inactive_seen: set[int] = set()
+    timestamps: dict[int, list[int]] = {}
+    active_rows: dict[int, list[tuple[int, Mapping[str, int]]]] = {}
     sample_keys = {
         "schema_version", "source_monotonic_ns", "replica_id", "cpu_quota_percent",
         "unit", "control_group", "cpu_stat_path", "cpu_quota_per_second_usec",
         "active_state", "sub_state", "cpu_stat",
     }
+    inactive_sample_keys = sample_keys - {"cpu_stat"}
     sample_counts: dict[int, int] = {}
     for raw in samples:
         sample = _mapping(raw, "CPU-quota sample")
         replica_id = _integer(sample.get("replica_id"), "CPU-quota sample replica", 0)
-        stat = _mapping(sample.get("cpu_stat"), "CPU-quota sample accounting")
-        required_stat = {"usage_usec", "user_usec", "system_usec"}
-        throttle_stat = {"nr_periods", "nr_throttled", "throttled_usec"}
+        timestamp = _uint64(
+            sample.get("source_monotonic_ns"), "CPU-quota sample time", 0
+        )
+        replica_timestamps = timestamps.setdefault(replica_id, [])
         if (
-            set(sample) != sample_keys
-            or sample.get("schema_version") != 1
+            sample.get("schema_version") != 1
             or replica_id not in units
+            or (replica_timestamps and timestamp <= replica_timestamps[-1])
             or sample.get("cpu_quota_percent") != contract.quota_percent(replica_id)
             or sample.get("unit") != units[replica_id].get("unit")
             or sample.get("control_group") != units[replica_id].get("control_group")
             or sample.get("cpu_stat_path") != units[replica_id].get("cpu_stat_path")
-            or sample.get("cpu_quota_per_second_usec")
-            != units[replica_id].get("cpu_quota_per_second_usec")
-            or sample.get("active_state") != "active"
-            or sample.get("sub_state") not in {"running", "start"}
-            or (set(stat) != required_stat and set(stat) != required_stat | throttle_stat)
         ):
             _error("CPU-quota sample schema or assignment drifted")
-        timestamp = _uint64(sample.get("source_monotonic_ns"), "CPU-quota sample time", 0)
+        replica_timestamps.append(timestamp)
+        seen.add(replica_id)
+        if sample.get("active_state") == "inactive":
+            if (
+                set(sample) != inactive_sample_keys
+                or replica_id not in crash_confirmations
+                or timestamp < crash_confirmations[replica_id]
+                or sample.get("sub_state") != "dead"
+                or sample.get("cpu_quota_per_second_usec") != 0
+            ):
+                _error("inactive CPU-quota sample is not crash-bound")
+            inactive_seen.add(replica_id)
+            continue
+        if (
+            set(sample) != sample_keys
+            or replica_id in inactive_seen
+            or sample.get("active_state") != "active"
+            or sample.get("sub_state") not in {"running", "start"}
+            or sample.get("cpu_quota_per_second_usec")
+            != units[replica_id].get("cpu_quota_per_second_usec")
+        ):
+            _error("CPU-quota sample schema or assignment drifted")
+        stat = _mapping(sample.get("cpu_stat"), "CPU-quota sample accounting")
+        required_stat = {"usage_usec", "user_usec", "system_usec"}
+        throttle_stat = {"nr_periods", "nr_throttled", "throttled_usec"}
+        if set(stat) != required_stat and set(stat) != required_stat | throttle_stat:
+            _error("CPU-quota sample accounting schema drifted")
         accounting = {key: _uint64(value, f"CPU-quota {key}") for key, value in stat.items()}
         if accounting["usage_usec"] < accounting["user_usec"] + accounting["system_usec"]:
             _error("CPU-quota accounting is inconsistent")
@@ -10007,10 +10066,11 @@ def _validate_heterogeneity_quota_evidence(
             ):
                 _error("CPU-quota samples are not monotonic")
         prior[replica_id] = (timestamp, accounting)
-        seen.add(replica_id)
+        active_rows.setdefault(replica_id, []).append((timestamp, accounting))
         sample_counts[replica_id] = sample_counts.get(replica_id, 0) + 1
     if (
         seen != set(contract.replica_ids)
+        or inactive_seen != set(crash_confirmations)
         or any(sample_counts.get(replica_id, 0) < 2 for replica_id in contract.replica_ids)
         or any(
             prior[replica_id][0] <= 0
@@ -10021,31 +10081,21 @@ def _validate_heterogeneity_quota_evidence(
         _error("CPU-quota samples do not establish sustained accounting")
     # The final and initial rows are retained per replica above, but a positive
     # elapsed interval and service delta are required rather than mere rows.
-    by_replica: dict[int, list[tuple[int, Mapping[str, int]]]] = {}
-    for raw in samples:
-        sample = _mapping(raw, "CPU-quota sample")
-        replica_id = _integer(sample.get("replica_id"), "CPU-quota sample replica", 0)
-        by_replica.setdefault(replica_id, []).append(
-            (
-                _uint64(sample.get("source_monotonic_ns"), "CPU-quota sample time", 0),
-                {
-                    key: _uint64(value, f"CPU-quota {key}")
-                    for key, value in _mapping(sample.get("cpu_stat"), "CPU-quota sample accounting").items()
-                },
-            )
-        )
-    for replica_id, rows in by_replica.items():
-        rows.sort(key=lambda row: row[0])
+    for replica_id, replica_timestamps in timestamps.items():
         maximum_gap_ns = contract.sampling_interval_ms * 2 * 1_000_000
         if any(
-            right[0] - left[0] > maximum_gap_ns
-            for left, right in zip(rows, rows[1:])
+            right - left > maximum_gap_ns
+            for left, right in zip(
+                replica_timestamps, replica_timestamps[1:]
+            )
         ):
             _error(
                 f"CPU-quota sampling cadence exceeded the frozen tolerance for replica {replica_id}"
             )
+        rows = active_rows[replica_id]
         before = [row for row in rows if row[0] <= measurement_start_ns]
-        after = [row for row in rows if row[0] >= measurement_end_ns]
+        required_end_ns = crash_confirmations.get(replica_id, measurement_end_ns)
+        after = [row for row in rows if row[0] >= required_end_ns]
         if (
             not before
             or not after

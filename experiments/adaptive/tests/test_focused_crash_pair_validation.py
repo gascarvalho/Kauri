@@ -702,6 +702,22 @@ def _complete_heterogeneity_smoke(
                     },
                 }
             )
+    fault_receipt = json.loads(
+        (directory / "raw/fault-receipt.json").read_text(encoding="utf-8")
+    )
+    crash_targets = {
+        outcome["replica_id"] for outcome in fault_receipt["sigkill_outcomes"]
+    }
+    final_sample_ns = max(sample["source_monotonic_ns"] for sample in samples)
+    for sample in samples:
+        if (
+            sample["replica_id"] in crash_targets
+            and sample["source_monotonic_ns"] == final_sample_ns
+        ):
+            sample.pop("cpu_stat")
+            sample["cpu_quota_per_second_usec"] = 0
+            sample["active_state"] = "inactive"
+            sample["sub_state"] = "dead"
     (directory / "raw/cpu-quota-samples.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
         encoding="utf-8",
@@ -951,7 +967,14 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
         )
 
     for mutation in (
-        "single-sample", "unit-linkage", "disjoint-window", "cadence-gap", "missing-baseline"
+        "single-sample",
+        "unit-linkage",
+        "disjoint-window",
+        "cadence-gap",
+        "missing-baseline",
+        "inactive-survivor",
+        "reactivated-target",
+        "inactive-before-crash",
     ):
         root, trusted_mutation, contract, preflight, authorization, quota_preflight, quota_authorization = _complete_heterogeneity_smoke(
             tmp_path / mutation
@@ -974,6 +997,38 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
             for sample in samples:
                 if sample["replica_id"] == 0:
                     sample["cpu_stat_path"] = "/tmp/unrelated/cpu.stat"
+        elif mutation == "inactive-survivor":
+            sample = next(
+                sample
+                for sample in reversed(samples)
+                if sample["replica_id"] == 0
+            )
+            sample.pop("cpu_stat")
+            sample["cpu_quota_per_second_usec"] = 0
+            sample["active_state"] = "inactive"
+            sample["sub_state"] = "dead"
+        elif mutation == "reactivated-target":
+            sample = next(
+                sample
+                for sample in samples
+                if sample["replica_id"] == 22
+                and sample["source_monotonic_ns"] == 10_000_000_000
+            )
+            sample.pop("cpu_stat")
+            sample["cpu_quota_per_second_usec"] = 0
+            sample["active_state"] = "inactive"
+            sample["sub_state"] = "dead"
+        elif mutation == "inactive-before-crash":
+            sample = next(
+                sample
+                for sample in samples
+                if sample["replica_id"] == 22
+                and sample["source_monotonic_ns"] == 0
+            )
+            sample.pop("cpu_stat")
+            sample["cpu_quota_per_second_usec"] = 0
+            sample["active_state"] = "inactive"
+            sample["sub_state"] = "dead"
         else:
             if mutation == "disjoint-window":
                 for index, sample in enumerate(samples):
