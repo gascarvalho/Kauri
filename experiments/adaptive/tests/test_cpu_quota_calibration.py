@@ -69,6 +69,35 @@ def test_evaluation_rejects_ratio_that_rounds_up_to_the_minimum() -> None:
     assert "ratio" in verdict["reason"]
 
 
+def test_evaluation_accepts_one_microsecond_cpu_stat_rounding() -> None:
+    plan = calibration.CalibrationPlan(measurement_seconds=10)
+    slow = _sample("slow", 25, before=1_000, after=3_000_000)
+    fast = _sample("fast", 100, before=2_000, after=9_000_000)
+    slow["after_cpu_stat"]["user_usec"] += 1  # type: ignore[index]
+    fast["after_cpu_stat"]["user_usec"] += 1  # type: ignore[index]
+
+    verdict = calibration.evaluate_calibration(
+        plan, (slow, fast), elapsed_usec=10_000_000
+    )
+
+    assert verdict["verdict"] == "PASS"
+
+
+def test_evaluation_rejects_cpu_stat_excess_beyond_rounding_bound() -> None:
+    plan = calibration.CalibrationPlan(measurement_seconds=10)
+    slow = _sample("slow", 25, before=1_000, after=3_000_000)
+    slow["after_cpu_stat"]["user_usec"] += 2  # type: ignore[index]
+
+    verdict = calibration.evaluate_calibration(
+        plan,
+        (slow, _sample("fast", 100, before=2_000, after=9_000_000)),
+        elapsed_usec=10_000_000,
+    )
+
+    assert verdict["verdict"] == "FAIL"
+    assert verdict["reason"] == "cpu.stat component accounting exceeds usage"
+
+
 @pytest.mark.parametrize(
     "samples, elapsed_usec, expected_reason",
     (

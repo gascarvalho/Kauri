@@ -26,6 +26,7 @@ from . import cpu_quota
 
 _SCHEMA_VERSION = 1
 _KIND = "kauri-cpu-quota-calibration-v1"
+_CPU_STAT_ROUNDING_TOLERANCE_USEC = 1
 _UNIT_PART = re.compile(r"[^a-z0-9]+")
 _COHORTS = ("slow", "fast")
 
@@ -152,7 +153,11 @@ def _stat_delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[str
         if right < left:
             raise CalibrationError("cpu.stat accounting is not monotonic")
         delta[key] = right - left
-    if delta["user_usec"] + delta["system_usec"] > delta["usage_usec"]:
+    # The kernel converts independently maintained nanosecond counters to
+    # microseconds. Across two snapshots, truncation can make the component
+    # delta exceed the total delta by exactly one microsecond.
+    component_excess = delta["user_usec"] + delta["system_usec"] - delta["usage_usec"]
+    if component_excess > _CPU_STAT_ROUNDING_TOLERANCE_USEC:
         raise CalibrationError("cpu.stat component accounting exceeds usage")
     return delta
 
