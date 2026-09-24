@@ -4230,6 +4230,30 @@ def _write_exact_live_tail_set(
     return source
 
 
+def test_raw_events_ignore_cpu_quota_monitor_rounds(tmp_path: Path) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    source = _write_exact_live_tail_set(root, profile)
+    (root / "raw" / "cpu-quota-monitor-rounds.jsonl").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "kind": "kauri-cpu-quota-monitor-round-v1",
+                "round_ordinal": 1,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events = source._events()
+
+    assert len(events) == len(profile.replica_ids)
+    assert {event["source_kind"] for event in events} == {"replica"}
+
+
 def _append_v4_authoritative_configurations(
     root: Path, source: object, profile: object, tree_ids: Sequence[int]
 ) -> None:
