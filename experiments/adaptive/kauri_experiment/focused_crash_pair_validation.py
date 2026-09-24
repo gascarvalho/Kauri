@@ -7316,6 +7316,7 @@ def _validate_v13_parent_authorization_projection(
     contract: Mapping[str, object],
     *,
     authorized_child_path: Path | None = None,
+    heterogeneity_smoke: bool = False,
 ) -> Mapping[str, object]:
     """Validate and select the child-bound v13 public approval projection."""
     profile = _mapping(contract["profile"], "focused profile")
@@ -7382,6 +7383,15 @@ def _validate_v13_parent_authorization_projection(
             and slot[5:].isdigit()
             and bound_child.resolve() == (output_root / "children" / slot).resolve()
         )
+    elif heterogeneity_smoke:
+        child_path_valid = (
+            request.get("mode") == "pair"
+            and count == 1
+            and pair == "pair-01"
+            and slot == "slot-01"
+            and bound_child.resolve()
+            == (output_root / "children" / "slot-01").resolve()
+        )
     else:
         child_path_valid = (
             bound_child.name in {"control", "adaptive"}
@@ -7398,6 +7408,7 @@ def _validate_parent_authorization_projection(
     contract: Mapping[str, object],
     *,
     authorized_child_path: Path | None = None,
+    heterogeneity_smoke: bool = False,
 ) -> Mapping[str, object] | None:
     """Route parent authorization by frozen profile schema without sniffing."""
     profile = _mapping(contract["profile"], "focused profile")
@@ -7406,6 +7417,7 @@ def _validate_parent_authorization_projection(
             root,
             contract,
             authorized_child_path=authorized_child_path,
+            heterogeneity_smoke=heterogeneity_smoke,
         )
     request_path = root / "runtime" / "parent-authorization-request.json"
     receipt_path = root / "runtime" / "parent-authorization-receipt.json"
@@ -8292,6 +8304,7 @@ def _validate_fault_window_arm(
     *,
     snapshot_audit_ns: int | None,
     authorized_child_path: Path | None = None,
+    heterogeneity_smoke: bool = False,
 ) -> Mapping[str, object] | None:
     """Independently bind the persisted v4 arm; it is never evidence itself."""
 
@@ -8394,6 +8407,7 @@ def _validate_fault_window_arm(
         root,
         contract,
         authorized_child_path=authorized_child_path,
+        heterogeneity_smoke=heterogeneity_smoke,
     )
     coverage = _mapping(contract["reporter_coverage_plan"], "reporter coverage plan")
     parent_request_path = root / "runtime" / "parent-authorization-request.json"
@@ -9034,6 +9048,7 @@ def _validate_sealed_v13_arm(
     trusted_provenance: Mapping[str, object],
     readiness_verifier_path: Path | None,
     authorized_child_path: Path | None,
+    heterogeneity_smoke: bool,
 ) -> dict[str, object]:
     """Validate one exact v13 arm without entering archived validation paths."""
 
@@ -9200,6 +9215,7 @@ def _validate_sealed_v13_arm(
         root,
         contract,
         authorized_child_path=authorized_child_path,
+        heterogeneity_smoke=heterogeneity_smoke,
     )
     public_manifest = _validate_v13_readiness_public_manifest(
         root, contract, selected_projection
@@ -9230,6 +9246,7 @@ def _validate_sealed_v13_arm(
         events,
         snapshot_audit_ns=epoch1_audit_ns,
         authorized_child_path=authorized_child_path,
+        heterogeneity_smoke=heterogeneity_smoke,
     )
     if dict(_mapping(armed_projection, "v13 armed readiness projection")) != dict(
         selected_projection
@@ -9345,6 +9362,7 @@ def _validate_sealed_arm(
     trusted_provenance: object,
     readiness_verifier_path: Path | None = None,
     authorized_child_path: Path | None = None,
+    heterogeneity_smoke: bool = False,
 ) -> dict[str, object]:
     """Reconstruct one sealed arm from raw sources before joining fault truth."""
 
@@ -9366,6 +9384,7 @@ def _validate_sealed_arm(
             trusted_provenance=trusted_provenance,
             readiness_verifier_path=readiness_verifier_path,
             authorized_child_path=authorized_child_path,
+            heterogeneity_smoke=heterogeneity_smoke,
         )
     profile_sha = str(contract["profile_sha256"])
     proof_sha = str(contract["topology_proof_sha256"])
@@ -10134,6 +10153,7 @@ def validate_sealed_heterogeneity_smoke(
         child_root,
         trusted_provenance=_mapping(trusted.get("child"), "heterogeneity child provenance"),
         readiness_verifier_path=readiness_verifier_path,
+        heterogeneity_smoke=True,
     )
     if (
         child.get("arm") != "adaptive"

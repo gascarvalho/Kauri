@@ -819,6 +819,66 @@ def _complete_heterogeneity_smoke(
     return root, trusted, contract, preflight, authorization, quota_preflight, quota_authorization
 
 
+def test_v13_parent_authorization_accepts_only_explicit_heterogeneity_layout(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    profile = json.loads(N31_PROFILE_V13.read_text(encoding="utf-8"))
+    output_root = tmp_path / "heterogeneity-smoke"
+    child = output_root / "children" / "slot-01"
+    runtime = child / "runtime"
+    runtime.mkdir(parents=True)
+    projection = {
+        "manifest_sha256": "d" * 64,
+        "membership_digest": "e" * 64,
+        "member_count": 31,
+    }
+    request = {
+        "schema_version": 2,
+        "mode": "pair",
+        "pair_count": 1,
+        "profile_sha256": runtime_fixture._canonical_profile_sha256(profile),
+        "topology_proof_sha256": profile["topology"]["proof_sha256"],
+        "output_root": str(output_root.resolve()),
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "authorization_nonce": "heterogeneity-test",
+        "execution_context_sha256": "c" * 64,
+        "pair_readiness_manifests": {"pair-01": projection},
+    }
+    request_bytes = fixture._canonical(request)
+    receipt = {
+        **request,
+        "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+        "approval_reference": "test-authorized-heterogeneity-smoke",
+        "approved_utc": "2026-09-24T12:00:00+00:00",
+    }
+    (runtime / "parent-authorization-request.json").write_bytes(request_bytes)
+    (runtime / "parent-authorization-receipt.json").write_bytes(
+        fixture._canonical(receipt)
+    )
+    _write_json(
+        child / "pair-receipt.json",
+        {"pair_id": "pair-01", "slot_id": "slot-01"},
+    )
+    contract = {
+        "profile": profile,
+        "profile_sha256": request["profile_sha256"],
+        "topology_proof_sha256": request["topology_proof_sha256"],
+    }
+
+    assert validation._validate_v13_parent_authorization_projection(
+        child,
+        contract,
+        heterogeneity_smoke=True,
+    ) == projection
+    with pytest.raises(
+        validation.FocusedCrashPairValidationError,
+        match="child pair binding drifted",
+    ):
+        validation._validate_v13_parent_authorization_projection(child, contract)
+
+
 def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
     tmp_path: Path,
 ) -> None:
