@@ -129,6 +129,10 @@ def test_systemd_and_cgroup_parsers_are_exact() -> None:
         "user_usec": 1000,
         "system_usec": 234,
     }
+    assert cpu_quota.parse_cpu_max("50000 100000\n") == 500_000
+    assert cpu_quota.parse_cpu_max("200000 100000\n") == 2_000_000
+    with pytest.raises(cpu_quota.CpuQuotaContractError, match="finite quota"):
+        cpu_quota.parse_cpu_max("max 100000\n")
     with pytest.raises(
         cpu_quota.CpuQuotaContractError,
         match="partial throttle accounting",
@@ -264,6 +268,185 @@ def test_runtime_rejects_scope_that_does_not_own_launched_process(
         )
 
 
+def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    show_calls = 0
+
+    def spawn(_registry: object, **_kwargs: object) -> tuple[object, object]:
+        return SimpleNamespace(pid=100, pgid=100), object()
+
+    def show_unit(unit: str) -> str:
+        nonlocal show_calls
+        show_calls += 1
+        return (
+            "ActiveState=active\nSubState=running\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        )
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="direct-cgroup-sampling",
+        run_directory=tmp_path,
+        base_spawn=spawn,
+        show_unit=show_unit,
+        read_cpu_max=lambda _path: 500_000,
+        read_cpu_stat=lambda _path: {
+            "usage_usec": 1,
+            "user_usec": 1,
+            "system_usec": 0,
+        },
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+        monotonic_ns=lambda: 123,
+    )
+    runtime.spawn_owned_process(
+        object(),
+        name="replica-0",
+        replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log",
+        working_directory=tmp_path,
+    )
+    assert show_calls == 1
+
+    rows = runtime.sample_once()
+
+    assert show_calls == 1
+    assert rows == [
+        {
+            "schema_version": 1,
+            "source_monotonic_ns": 123,
+            "replica_id": 0,
+            "cpu_quota_percent": 50,
+            "unit": "kauri-direct-cgroup-sampling-r0.scope",
+            "control_group": "/user.slice/kauri-direct-cgroup-sampling-r0.scope",
+            "cpu_stat_path": "/sys/fs/cgroup/user.slice/kauri-direct-cgroup-sampling-r0.scope/cpu.stat",
+            "cpu_quota_per_second_usec": 500_000,
+            "active_state": "active",
+            "sub_state": "running",
+            "cpu_stat": {
+                "usage_usec": 1,
+                "user_usec": 1,
+                "system_usec": 0,
+            },
+        }
+    ]
+
+    runtime._read_cpu_max = lambda _path: 250_000
+    with pytest.raises(
+        cpu_quota.CpuQuotaContractError,
+        match="no longer matches",
+    ):
+        runtime.sample_once()
+    assert show_calls == 1
+
+
+def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    active = True
+
+    def spawn(_registry: object, **_kwargs: object) -> tuple[object, object]:
+        return SimpleNamespace(pid=100, pgid=100), object()
+
+    def show_unit(unit: str) -> str:
+        if active:
+            return (
+                "ActiveState=active\nSubState=running\n"
+                "CPUQuotaPerSecUSec=500ms\n"
+                f"ControlGroup=/user.slice/{unit}\n"
+            )
+        return (
+            "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+            "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
+        )
+
+    def missing(_path: Path) -> int:
+        raise cpu_quota._CgroupUnavailableError("cgroup disappeared")
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="cgroup-disappeared",
+        run_directory=tmp_path,
+        base_spawn=spawn,
+        show_unit=show_unit,
+        read_cpu_max=missing,
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+        monotonic_ns=lambda: 456,
+    )
+    runtime.spawn_owned_process(
+        object(),
+        name="replica-0",
+        replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log",
+        working_directory=tmp_path,
+    )
+    active = False
+
+    rows = runtime.sample_once()
+
+    assert rows[0]["active_state"] == "inactive"
+    assert rows[0]["sub_state"] == "dead"
+    assert rows[0]["cpu_quota_per_second_usec"] == 0
+    assert "cpu_stat" not in rows[0]
+
+
+def test_monitor_waits_only_until_the_next_fixed_deadline(tmp_path: Path) -> None:
+    contract = _contract()
+
+    class Clock:
+        now = 0
+
+        def read(self) -> int:
+            return self.now
+
+    clock = Clock()
+    waits: list[float] = []
+
+    class Stop:
+        def is_set(self) -> bool:
+            return len(waits) >= 2
+
+        def set(self) -> None:
+            return None
+
+        def wait(self, seconds: float) -> bool:
+            waits.append(seconds)
+            clock.now += int(seconds * 1_000_000_000)
+            return len(waits) >= 2
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="fixed-deadline",
+        run_directory=tmp_path,
+        monotonic_ns=clock.read,
+    )
+
+    def sample_once() -> list[dict[str, object]]:
+        timestamp = clock.now
+        clock.now += 250_000_000
+        return [{"source_monotonic_ns": timestamp}]
+
+    runtime.sample_once = sample_once  # type: ignore[method-assign]
+    runtime._monitor_stop = Stop()  # type: ignore[assignment]
+
+    runtime._monitor_loop()
+
+    assert waits == [0.75, 0.75]
+    rounds = [
+        json.loads(line)
+        for line in (tmp_path / "raw/cpu-quota-monitor-rounds.jsonl")
+        .read_text(encoding="ascii")
+        .splitlines()
+    ]
+    assert [row["duration_ns"] for row in rounds] == [250_000_000, 250_000_000]
+    assert [row["completion_overrun_ns"] for row in rounds] == [0, 0]
+
+
 def test_monitor_failure_preserves_cause_after_verified_cleanup(
     tmp_path: Path,
 ) -> None:
@@ -295,6 +478,7 @@ def test_monitor_failure_preserves_cause_after_verified_cleanup(
         run_directory=tmp_path,
         base_spawn=spawn,
         show_unit=show_unit,
+        read_cpu_max=lambda _path: 500_000,
         read_cpu_stat=fail_sample,
         read_cgroup_procs=lambda _path: (100,),
         process_group=lambda _pid: 100,
@@ -544,6 +728,10 @@ def test_focused_backend_preserves_normal_path_and_wraps_only_opted_in_replicas(
             selected,
             **kwargs,
             show_unit=show_unit,
+            read_cpu_max=lambda path: contract.quota_percent(
+                int(str(path).rsplit("r", 1)[1].split(".", 1)[0])
+            )
+            * 10_000,
             read_cpu_stat=lambda _path: {
                 "usage_usec": 1,
                 "user_usec": 1,

@@ -91,6 +91,10 @@ class CpuQuotaCleanupError(CpuQuotaContractError):
         self.cleanup = dict(cleanup)
 
 
+class _CgroupUnavailableError(CpuQuotaContractError):
+    """A launch-bound cgroup file disappeared during lifecycle sampling."""
+
+
 @dataclass(frozen=True, slots=True)
 class CpuQuotaAssignment:
     replica_id: int
@@ -253,7 +257,9 @@ def validate_linux_environment(environment: Mapping[str, object]) -> dict[str, o
         or any(not isinstance(item, str) or not item for item in controllers)
         or controllers != sorted(set(controllers))
         or "cpu" not in controllers
-        or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths)
+        or any(
+            not isinstance(path, str) or not Path(path).is_absolute() for path in paths
+        )
         or document.get("probe_quota_percent") != 25
         or document.get("probe_exit_code") != 0
     ):
@@ -516,6 +522,28 @@ def parse_cpu_stat(payload: str) -> dict[str, int]:
     return {key: values[key] for key in keys}
 
 
+def parse_cpu_max(payload: str) -> int:
+    """Return one finite cgroup-v2 CPU quota as microseconds per second."""
+
+    fields = payload.split()
+    if len(fields) != 2:
+        raise CpuQuotaContractError("cgroup cpu.max is malformed")
+    quota_text, period_text = fields
+    if quota_text == "max":
+        raise CpuQuotaContractError("cgroup cpu.max must expose a finite quota")
+    try:
+        quota = int(quota_text)
+        period = int(period_text)
+    except ValueError as exc:
+        raise CpuQuotaContractError("cgroup cpu.max is malformed") from exc
+    if quota <= 0 or period <= 0:
+        raise CpuQuotaContractError("cgroup cpu.max is malformed")
+    scaled = quota * 1_000_000
+    if scaled % period != 0:
+        raise CpuQuotaContractError("cgroup cpu.max quota is not exact")
+    return scaled // period
+
+
 def _replace_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -604,6 +632,7 @@ class CpuQuotaRuntime:
         run_directory: Path,
         base_spawn: Callable[..., tuple[object, object]] | None = None,
         show_unit: Callable[[str], str] | None = None,
+        read_cpu_max: Callable[[Path], int] | None = None,
         read_cpu_stat: Callable[[Path], Mapping[str, int]] | None = None,
         read_cgroup_procs: Callable[[Path], Sequence[int]] | None = None,
         process_group: Callable[[int], int] = os.getpgid,
@@ -618,6 +647,7 @@ class CpuQuotaRuntime:
         self.root = Path(run_directory)
         self._base_spawn = base_spawn
         self._show_unit = show_unit or self._default_show_unit
+        self._read_cpu_max = read_cpu_max or self._default_read_cpu_max
         self._read_cpu_stat = read_cpu_stat or self._default_read_cpu_stat
         self._read_cgroup_procs = read_cgroup_procs or self._default_read_cgroup_procs
         self._process_group = process_group
@@ -667,11 +697,20 @@ class CpuQuotaRuntime:
         return result.stdout
 
     @staticmethod
+    def _default_read_cpu_max(path: Path) -> int:
+        try:
+            return parse_cpu_max(path.read_text(encoding="ascii"))
+        except OSError as exc:
+            raise _CgroupUnavailableError(
+                f"cannot read cgroup quota at {path}"
+            ) from exc
+
+    @staticmethod
     def _default_read_cpu_stat(path: Path) -> Mapping[str, int]:
         try:
             return parse_cpu_stat(path.read_text(encoding="ascii"))
         except OSError as exc:
-            raise CpuQuotaContractError(
+            raise _CgroupUnavailableError(
                 f"cannot read cgroup accounting at {path}"
             ) from exc
 
@@ -778,18 +817,30 @@ class CpuQuotaRuntime:
         rows: list[dict[str, object]] = []
         for replica_id in sorted(self._units):
             unit = self._units[replica_id]
-            properties = parse_systemctl_show(self._show_unit(str(unit["unit"])))
-            if (
-                properties["ActiveState"] == "active"
-                and (
-                    properties["ControlGroup"] != unit["control_group"]
-                    or quota_per_second_usec(properties)
-                    != unit["cpu_quota_per_second_usec"]
-                )
-            ):
-                raise CpuQuotaContractError(
-                    "CPU-quota sample no longer matches its launched scope"
-                )
+            stat_path = Path(str(unit["cpu_stat_path"]))
+            try:
+                observed_quota = self._read_cpu_max(stat_path.parent / "cpu.max")
+                if observed_quota != unit["cpu_quota_per_second_usec"]:
+                    raise CpuQuotaContractError(
+                        "CPU-quota sample no longer matches its launched scope"
+                    )
+                stat = dict(self._read_cpu_stat(stat_path))
+            except _CgroupUnavailableError as sample_error:
+                properties = parse_systemctl_show(self._show_unit(str(unit["unit"])))
+                if not (
+                    properties["ActiveState"] == "inactive"
+                    and properties["SubState"] == "dead"
+                    and properties["ControlGroup"] == ""
+                    and quota_per_second_usec(properties) == 0
+                ):
+                    raise sample_error
+                observed_quota = 0
+                active_state = "inactive"
+                sub_state = "dead"
+                stat = None
+            else:
+                active_state = str(unit["active_state"])
+                sub_state = str(unit["sub_state"])
             row: dict[str, object] = {
                 "schema_version": 1,
                 "source_monotonic_ns": timestamp,
@@ -798,14 +849,12 @@ class CpuQuotaRuntime:
                 "unit": unit["unit"],
                 "control_group": unit["control_group"],
                 "cpu_stat_path": unit["cpu_stat_path"],
-                "cpu_quota_per_second_usec": quota_per_second_usec(properties),
-                "active_state": properties["ActiveState"],
-                "sub_state": properties["SubState"],
+                "cpu_quota_per_second_usec": observed_quota,
+                "active_state": active_state,
+                "sub_state": sub_state,
             }
-            if properties["ActiveState"] == "active":
-                row["cpu_stat"] = dict(
-                    self._read_cpu_stat(Path(str(unit["cpu_stat_path"])))
-                )
+            if stat is not None:
+                row["cpu_stat"] = stat
             rows.append(row)
         path = self.root / "raw/cpu-quota-samples.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -818,9 +867,43 @@ class CpuQuotaRuntime:
 
     def _monitor_loop(self) -> None:
         try:
+            interval_ns = self.contract.sampling_interval_ms * 1_000_000
+            scheduled_ns = self._monotonic_ns()
+            round_ordinal = 0
             while not self._monitor_stop.is_set():
-                self.sample_once()
-                self._monitor_stop.wait(self.contract.sampling_interval_ms / 1_000)
+                started_ns = self._monotonic_ns()
+                rows = self.sample_once()
+                finished_ns = self._monotonic_ns()
+                round_row = {
+                    "schema_version": 1,
+                    "round_ordinal": round_ordinal,
+                    "scheduled_monotonic_ns": scheduled_ns,
+                    "started_monotonic_ns": started_ns,
+                    "sample_monotonic_ns": (
+                        rows[0].get("source_monotonic_ns") if rows else None
+                    ),
+                    "finished_monotonic_ns": finished_ns,
+                    "duration_ns": finished_ns - started_ns,
+                    "start_lateness_ns": max(0, started_ns - scheduled_ns),
+                    "completion_overrun_ns": max(
+                        0, finished_ns - (scheduled_ns + interval_ns)
+                    ),
+                }
+                path = self.root / "raw/cpu-quota-monitor-rounds.jsonl"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                with path.open("ab") as output:
+                    output.write(_canonical(round_row))
+                    output.flush()
+                    os.fsync(output.fileno())
+                round_ordinal += 1
+                next_scheduled_ns = scheduled_ns + interval_ns
+                now_ns = self._monotonic_ns()
+                while next_scheduled_ns + interval_ns <= now_ns:
+                    next_scheduled_ns += interval_ns
+                scheduled_ns = next_scheduled_ns
+                delay_seconds = max(0, scheduled_ns - now_ns) / 1_000_000_000
+                if self._monitor_stop.wait(delay_seconds):
+                    break
         except BaseException as exc:
             self._monitor_error = exc
             self._monitor_stop.set()
