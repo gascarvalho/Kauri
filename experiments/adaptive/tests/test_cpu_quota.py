@@ -541,6 +541,9 @@ def test_backend_projects_quota_failure_with_complete_process_cleanup() -> None:
     )
 
     class QuotaRuntime:
+        def stop_monitor(self) -> tuple[bool, None]:
+            return True, None
+
         def verify_cleanup(self) -> Mapping[str, object]:
             raise failure
 

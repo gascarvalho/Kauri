@@ -10187,6 +10187,19 @@ class FocusedLaunchBackend:
         outcomes: Sequence[object] = ()
         cleanup_error: BaseException | None = None
         cleanup_traceback = None
+        quota_runtime = getattr(processes, "cpu_quota_runtime", None)
+        if quota_runtime is not None:
+            try:
+                monitor_stopped, monitor_error = quota_runtime.stop_monitor()
+                if not monitor_stopped:
+                    raise cpu_quota.CpuQuotaContractError(
+                        "CPU-quota monitor did not stop before process cleanup"
+                    )
+                if monitor_error is not None:
+                    raise monitor_error
+            except BaseException as exc:
+                cleanup_error = exc
+                cleanup_traceback = exc.__traceback__
         try:
             outcomes = (
                 self._cleanup_registry(processes)
@@ -10213,7 +10226,6 @@ class FocusedLaunchBackend:
                     cleanup_traceback = exc.__traceback__
         quota_cleanup: Mapping[str, object] | None = None
         quota_cleanup_error: cpu_quota.CpuQuotaCleanupError | None = None
-        quota_runtime = getattr(processes, "cpu_quota_runtime", None)
         if quota_runtime is not None:
             try:
                 quota_cleanup = quota_runtime.verify_cleanup()

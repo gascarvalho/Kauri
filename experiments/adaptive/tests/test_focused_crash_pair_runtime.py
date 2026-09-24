@@ -7060,6 +7060,44 @@ def test_default_backend_registry_cleanup_precedes_materialization_and_seal(
     assert trace == ["registry-cleanup", "materialize", "seal"]
 
 
+def test_default_backend_stops_quota_monitor_before_registry_cleanup(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime()
+    trace: list[str] = []
+
+    class Registry:
+        def cleanup(self, *, timeout_s: float) -> tuple[object, ...]:
+            assert timeout_s > 0
+            assert trace == ["stop-monitor"]
+            trace.append("registry-cleanup")
+            return ()
+
+    class QuotaRuntime:
+        def stop_monitor(self) -> tuple[bool, None]:
+            trace.append("stop-monitor")
+            return True, None
+
+        def verify_cleanup(self) -> dict[str, object]:
+            assert trace == ["stop-monitor", "registry-cleanup"]
+            trace.append("quota-cleanup")
+            return {"complete": True}
+
+    backend = runtime.FocusedLaunchBackend()
+    processes = SimpleNamespace(
+        registry=Registry(),
+        records=(),
+        logs=(),
+        cpu_quota_runtime=QuotaRuntime(),
+    )
+
+    cleanup = backend.cleanup({"run_directory": tmp_path}, processes)
+
+    assert cleanup["complete"] is True
+    assert cleanup["cpu_quota"] == {"complete": True}
+    assert trace == ["stop-monitor", "registry-cleanup", "quota-cleanup"]
+
+
 def test_default_backend_cleanup_closes_every_writer_after_registry_failure(
     tmp_path: Path,
 ) -> None:
