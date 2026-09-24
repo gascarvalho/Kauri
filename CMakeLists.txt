@@ -284,10 +284,6 @@ add_library(hotstuff_static STATIC $<TARGET_OBJECTS:hotstuff>)
 set_target_properties(hotstuff_static PROPERTIES OUTPUT_NAME "hotstuff")
 target_link_libraries(hotstuff_static PRIVATE salticidae_static secp256k1 crypto ${CMAKE_THREAD_LIBS_INIT} ${GMP_LIBRARIES} ${GMPXX_LIBRARIES} blstmp relic_s pthread sodium)
 
-if(BUILD_TESTING)
-    add_subdirectory(test)
-endif()
-
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE "Release")
 endif()
@@ -299,6 +295,11 @@ option(HOTSTUFF_MSG_STAT "enable message statistics" ON)
 option(HOTSTUFF_BLK_PROFILE "enable block profiling" OFF)
 option(HOTSTUFF_TWO_STEP "use two-step HotStuff (instead of three-step HS)" OFF)
 option(BUILD_EXAMPLES "build examples" ON)
+
+if(BUILD_TESTING AND NOT BUILD_EXAMPLES)
+    message(FATAL_ERROR
+        "BUILD_TESTING requires BUILD_EXAMPLES because integration tests use example binaries")
+endif()
 
 configure_file(src/config.h.in include/hotstuff/config.h @ONLY)
 
@@ -315,6 +316,10 @@ target_link_libraries(hotstuff-keygen hotstuff_static blstmp relic_s relic_s pth
 add_executable(hotstuff-tls-keygen
     src/hotstuff_tls_keygen.cpp)
 target_link_libraries(hotstuff-tls-keygen hotstuff_static blstmp relic_s pthread sodium)
+
+if(BUILD_TESTING)
+    add_subdirectory(test)
+endif()
 
 find_package(Doxygen)
 if (DOXYGEN_FOUND)
