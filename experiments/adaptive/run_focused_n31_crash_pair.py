@@ -30,6 +30,7 @@ from experiments.adaptive.kauri_experiment import cpu_quota
 from experiments.adaptive.kauri_experiment.focused_crash_pair_validation import (
     FocusedCrashPairValidationError,
     validate_sealed_campaign,
+    validate_sealed_heterogeneity_smoke,
     validate_sealed_pair,
 )
 from experiments.adaptive.kauri_experiment.profiled_fault_archive import (
@@ -1185,6 +1186,25 @@ def _parser() -> argparse.ArgumentParser:
     campaign.add_argument("--campaign-root", type=Path, required=True)
     campaign.add_argument("--trusted-provenance", type=Path, required=True)
     campaign.add_argument("--readiness-verifier-path", type=Path)
+    heterogeneity_validation = subparsers.add_parser("validate-heterogeneity-smoke")
+    heterogeneity_validation.add_argument("--smoke-root", type=Path, required=True)
+    heterogeneity_validation.add_argument("--trusted-provenance", type=Path, required=True)
+    heterogeneity_validation.add_argument(
+        "--cpu-quota-contract", type=Path, default=_CPU_QUOTA_CONTRACT
+    )
+    heterogeneity_validation.add_argument(
+        "--preflight-receipt", type=Path, required=True
+    )
+    heterogeneity_validation.add_argument(
+        "--authorization-receipt", type=Path, required=True
+    )
+    heterogeneity_validation.add_argument(
+        "--cpu-quota-preflight-receipt", type=Path, required=True
+    )
+    heterogeneity_validation.add_argument(
+        "--cpu-quota-authorization-receipt", type=Path, required=True
+    )
+    heterogeneity_validation.add_argument("--readiness-verifier-path", type=Path)
     return parser
 
 
@@ -1492,11 +1512,39 @@ def main(argv: Sequence[str] | None = None) -> int:
                 ),
                 readiness_verifier_path=arguments.readiness_verifier_path,
             )
-        else:
+        elif arguments.command == "validate-campaign":
             result = validate_sealed_campaign(
                 campaign_directory=arguments.campaign_root,
                 trusted_provenance=_read_json(
                     arguments.trusted_provenance, "trusted provenance"
+                ),
+                readiness_verifier_path=arguments.readiness_verifier_path,
+            )
+        else:
+            contract = cpu_quota.load_cpu_quota_contract(
+                arguments.cpu_quota_contract,
+                base_profile_path=_V13_PROFILES["pair"],
+                expected_replica_ids=tuple(range(31)),
+            )
+            result = validate_sealed_heterogeneity_smoke(
+                arguments.smoke_root,
+                trusted_provenance=_read_json(
+                    arguments.trusted_provenance, "trusted provenance"
+                ),
+                cpu_quota_contract=contract,
+                focused_preflight=_read_json(
+                    arguments.preflight_receipt, "preflight receipt"
+                ),
+                focused_authorization=_read_json(
+                    arguments.authorization_receipt, "authorization receipt"
+                ),
+                cpu_quota_preflight=_read_json(
+                    arguments.cpu_quota_preflight_receipt,
+                    "CPU-quota preflight receipt",
+                ),
+                cpu_quota_authorization=_read_json(
+                    arguments.cpu_quota_authorization_receipt,
+                    "CPU-quota authorization receipt",
                 ),
                 readiness_verifier_path=arguments.readiness_verifier_path,
             )

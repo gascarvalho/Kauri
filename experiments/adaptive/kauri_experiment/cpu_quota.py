@@ -63,6 +63,20 @@ _AUTHORIZATION_REQUEST_KEYS = frozenset(
         "authorization_nonce",
     }
 )
+_ENVIRONMENT_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "verified",
+        "kernel",
+        "cgroup_version",
+        "controllers",
+        "systemctl_path",
+        "systemd_run_path",
+        "probe_quota_percent",
+        "probe_exit_code",
+    }
+)
 
 
 class CpuQuotaContractError(RuntimeError):
@@ -192,9 +206,7 @@ def build_authorization_request(
         raise CpuQuotaContractError(
             "base authorization does not bind the excluded N=31 smoke"
         )
-    environment_document = dict(environment)
-    if environment_document.get("verified") is not True:
-        raise CpuQuotaContractError("CPU-quota environment is not verified")
+    environment_document = validate_linux_environment(environment)
     base_sha = _sha256(base_authorization_request)
     environment_sha = _sha256(_canonical(environment_document))
     nonce = _sha256(
@@ -220,6 +232,33 @@ def build_authorization_request(
         "authorization_nonce": nonce,
     }
     return _canonical(request)
+
+
+def validate_linux_environment(environment: Mapping[str, object]) -> dict[str, object]:
+    """Require the complete, exact probe record before authorizing a quota run."""
+
+    document = dict(environment)
+    controllers = document.get("controllers")
+    paths = (document.get("systemctl_path"), document.get("systemd_run_path"))
+    if (
+        set(document) != _ENVIRONMENT_KEYS
+        or document.get("schema_version") != 1
+        or document.get("kind") != "kauri-cpu-quota-environment-v1"
+        or document.get("verified") is not True
+        or not isinstance(document.get("kernel"), str)
+        or not document["kernel"]
+        or document.get("cgroup_version") != 2
+        or not isinstance(controllers, list)
+        or not controllers
+        or any(not isinstance(item, str) or not item for item in controllers)
+        or controllers != sorted(set(controllers))
+        or "cpu" not in controllers
+        or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths)
+        or document.get("probe_quota_percent") != 25
+        or document.get("probe_exit_code") != 0
+    ):
+        raise CpuQuotaContractError("CPU-quota environment probe record drifted")
+    return document
 
 
 def verify_authorization_receipt(
@@ -740,11 +779,26 @@ class CpuQuotaRuntime:
         for replica_id in sorted(self._units):
             unit = self._units[replica_id]
             properties = parse_systemctl_show(self._show_unit(str(unit["unit"])))
+            if (
+                properties["ActiveState"] == "active"
+                and (
+                    properties["ControlGroup"] != unit["control_group"]
+                    or quota_per_second_usec(properties)
+                    != unit["cpu_quota_per_second_usec"]
+                )
+            ):
+                raise CpuQuotaContractError(
+                    "CPU-quota sample no longer matches its launched scope"
+                )
             row: dict[str, object] = {
                 "schema_version": 1,
                 "source_monotonic_ns": timestamp,
                 "replica_id": replica_id,
                 "cpu_quota_percent": unit["cpu_quota_percent"],
+                "unit": unit["unit"],
+                "control_group": unit["control_group"],
+                "cpu_stat_path": unit["cpu_stat_path"],
+                "cpu_quota_per_second_usec": quota_per_second_usec(properties),
                 "active_state": properties["ActiveState"],
                 "sub_state": properties["SubState"],
             }

@@ -491,6 +491,45 @@ def test_heterogeneity_smoke_runs_one_adaptive_arm_and_is_never_claim_eligible(
     assert (output / "evidence-seal.json").is_file()
 
 
+def test_cli_routes_root_bound_heterogeneity_validation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner()
+    paths = {
+        name: tmp_path / f"{name}.json"
+        for name in (
+            "trusted", "preflight", "authorization", "quota-preflight", "quota-authorization"
+        )
+    }
+    for path in paths.values():
+        path.write_bytes(_canonical({}))
+    reached: dict[str, object] = {}
+    contract = object()
+    monkeypatch.setattr(
+        runner.cpu_quota, "load_cpu_quota_contract", lambda *_args, **_kwargs: contract
+    )
+    monkeypatch.setattr(
+        runner,
+        "validate_sealed_heterogeneity_smoke",
+        lambda root, **kwargs: reached.update({"root": root, **kwargs}) or {"verdict": "PASS"},
+    )
+    captured: list[Mapping[str, object]] = []
+    monkeypatch.setattr(runner, "_write_cli_result", captured.append)
+    assert runner.main(
+        [
+            "validate-heterogeneity-smoke", "--smoke-root", str(tmp_path / "root"),
+            "--trusted-provenance", str(paths["trusted"]),
+            "--preflight-receipt", str(paths["preflight"]),
+            "--authorization-receipt", str(paths["authorization"]),
+            "--cpu-quota-preflight-receipt", str(paths["quota-preflight"]),
+            "--cpu-quota-authorization-receipt", str(paths["quota-authorization"]),
+        ]
+    ) == 0
+    assert reached["cpu_quota_contract"] is contract
+    assert reached["root"] == tmp_path / "root"
+    assert captured == [{"verdict": "PASS"}]
+
+
 def test_heterogeneity_runtime_failure_is_sealed_only_as_excluded_abort(
     tmp_path: Path,
 ) -> None:

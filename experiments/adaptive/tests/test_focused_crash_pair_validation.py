@@ -21,8 +21,13 @@ from experiments.adaptive.tests import test_n31_crash_pair_contract as native_fi
 from experiments.adaptive.tests import (
     test_focused_crash_pair_runtime as runtime_fixture,
 )
+from experiments.adaptive.kauri_experiment import cpu_quota
 
 VALIDATION = "experiments.adaptive.kauri_experiment.focused_crash_pair_validation"
+CPU_QUOTA_CONTRACT = (
+    Path(__file__).parents[1] / "profiles/n31-cpu-quota-heterogeneity-smoke-v1.json"
+)
+N31_PROFILE_V13 = Path(__file__).parents[1] / "profiles/n31-f5-q21-three-crash-pair-v13.json"
 
 
 def _validation() -> Any:
@@ -606,6 +611,344 @@ def _aggregate_trusted_provenance(
             "provenance": provenance,
         }
     return {"schema_version": 1, "children": entries}
+
+
+def _complete_heterogeneity_smoke(
+    tmp_path: Path,
+) -> tuple[Path, dict[str, object], cpu_quota.CpuQuotaContract, dict[str, object], dict[str, object], dict[str, object], dict[str, object]]:
+    """Build one sealed single-child smoke root with external approval records."""
+
+    plan = fixture._plan(fixture._runner())
+    child = next(
+        item
+        for item in fixture._children(plan, tmp_path / "source")
+        if item["arm"] == "adaptive"
+    )
+    child["slot_id"] = "slot-01"
+    _complete_child(child)
+    root = tmp_path / "heterogeneity-smoke"
+    directory = root / "children" / "slot-01"
+    _copy_child(child, directory)
+    profile = json.loads((directory / "profile.json").read_text(encoding="utf-8"))
+    contract = cpu_quota.load_cpu_quota_contract(
+        CPU_QUOTA_CONTRACT,
+        base_profile_path=N31_PROFILE_V13,
+        expected_replica_ids=tuple(range(31)),
+    )
+    contract_document = json.loads(CPU_QUOTA_CONTRACT.read_text(encoding="utf-8"))
+    contract = replace(
+        contract,
+        base_profile_id=str(profile["profile_id"]),
+        base_profile_sha256="a" * 64,
+        base_profile_canonical_sha256=runtime_fixture._canonical_profile_sha256(profile),
+    )
+    contract_document.update(
+        {
+            "base_profile_id": contract.base_profile_id,
+            "base_profile_sha256": contract.base_profile_sha256,
+            "base_profile_canonical_sha256": contract.base_profile_canonical_sha256,
+        }
+    )
+    _write_json(directory / "runtime/cpu-quota-contract.json", contract_document)
+    units = [
+        {
+            "replica_id": assignment.replica_id,
+            "cpu_quota_percent": assignment.cpu_quota_percent,
+            "unit": f"kauri-smoke-r{assignment.replica_id}.scope",
+            "control_group": f"/user.slice/kauri-r{assignment.replica_id}",
+            "cpu_stat_path": f"/sys/fs/cgroup/user.slice/kauri-r{assignment.replica_id}/cpu.stat",
+            "owned_pid": assignment.replica_id + 1000,
+            "owned_pgid": assignment.replica_id + 1000,
+            "cgroup_pids": [assignment.replica_id + 1000],
+            "active_state": "active",
+            "sub_state": "running",
+            "cpu_quota_per_second_usec": assignment.cpu_quota_percent * 10_000,
+        }
+        for assignment in contract.assignments
+    ]
+    _write_json(
+        directory / "runtime/cpu-quota-launch.json",
+        {
+            "schema_version": 1,
+            "launcher": contract.launcher,
+            "contract_id": contract.contract_id,
+            "contract_sha256": contract.contract_sha256,
+            "manager_visibility": "none",
+            "replicas": units,
+        },
+    )
+    samples = []
+    for sample_ordinal, timestamp in enumerate(
+        range(0, 20_000_000_000 + 1, 1_000_000_000), start=1
+    ):
+        usage = sample_ordinal * 100
+        for assignment in contract.assignments:
+            samples.append(
+                {
+                    "schema_version": 1,
+                    "source_monotonic_ns": timestamp,
+                    "replica_id": assignment.replica_id,
+                    "cpu_quota_percent": assignment.cpu_quota_percent,
+                    "unit": f"kauri-smoke-r{assignment.replica_id}.scope",
+                    "control_group": f"/user.slice/kauri-r{assignment.replica_id}",
+                    "cpu_stat_path": f"/sys/fs/cgroup/user.slice/kauri-r{assignment.replica_id}/cpu.stat",
+                    "cpu_quota_per_second_usec": assignment.cpu_quota_percent * 10_000,
+                    "active_state": "active",
+                    "sub_state": "running",
+                    "cpu_stat": {
+                        "usage_usec": usage,
+                        "user_usec": usage - 10,
+                        "system_usec": 10,
+                    },
+                }
+            )
+    (directory / "raw/cpu-quota-samples.jsonl").write_text(
+        "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    _write_json(
+        directory / "runtime/cpu-quota-cleanup.json",
+        {
+            "schema_version": 1,
+            "complete": True,
+            "monitor": {"status": "PASSED", "stopped": True},
+            "units": [
+                {
+                    "replica_id": unit["replica_id"],
+                    "unit": unit["unit"],
+                    "load_state": "not-found",
+                    "active_state": "inactive",
+                    "sub_state": "dead",
+                    "control_group": "",
+                }
+                for unit in units
+            ],
+        },
+    )
+    _reseal(directory)
+    child_provenance = _trusted_provenance(directory)
+    preflight = {
+        "schema_version": 1,
+        "mode": "pair",
+        "pair_count": 1,
+        "profile_sha256": contract.base_profile_canonical_sha256,
+        "topology_proof_sha256": child_provenance["topology_proof_sha256"],
+        "output_root": str(root.resolve()),
+        "automatic_retries": 0,
+        "replacement_policy": "none",
+        "authorization_nonce": "a" * 64,
+        "execution_authorized": False,
+        "launch_permitted": False,
+    }
+    request = runtime_fixture._runtime().build_focused_authorization_request(preflight)
+    request_document = json.loads(request)
+    preflight["request_sha256"] = hashlib.sha256(request).hexdigest()
+    authorization = {
+        **request_document,
+        "request_sha256": hashlib.sha256(request).hexdigest(),
+        "approval_reference": "test-authorized-smoke",
+        "approved_utc": "2026-09-24T12:00:00+00:00",
+    }
+    environment = {
+        "schema_version": 1,
+        "kind": "kauri-cpu-quota-environment-v1",
+        "verified": True,
+        "kernel": "test",
+        "cgroup_version": 2,
+        "controllers": ["cpu"],
+        "systemctl_path": "/usr/bin/systemctl",
+        "systemd_run_path": "/usr/bin/systemd-run",
+        "probe_quota_percent": 25,
+        "probe_exit_code": 0,
+    }
+    base_request = runtime_fixture._runtime().build_focused_authorization_request(preflight)
+    quota_request = cpu_quota.build_authorization_request(
+        contract,
+        base_authorization_request=base_request,
+        environment=environment,
+        output_root=root,
+    )
+    quota_preflight = {
+        "schema_version": 1,
+        "kind": "kauri-cpu-quota-preflight-v1",
+        "contract_id": contract.contract_id,
+        "contract_sha256": contract.contract_sha256,
+        "contract_semantic_sha256": cpu_quota.contract_digest(contract),
+        "base_authorization_request_sha256": hashlib.sha256(base_request).hexdigest(),
+        "environment": environment,
+        "environment_sha256": hashlib.sha256(
+            json.dumps(environment, separators=(",", ":"), sort_keys=True).encode() + b"\n"
+        ).hexdigest(),
+        "authorization_request_sha256": hashlib.sha256(quota_request).hexdigest(),
+        "execution_authorized": False,
+        "launch_permitted": False,
+    }
+    quota_authorization = {
+        **json.loads(quota_request),
+        "request_sha256": hashlib.sha256(quota_request).hexdigest(),
+        "approval_reference": "test-authorized-quota-smoke",
+        "approved_utc": "2026-09-24T12:00:00+00:00",
+    }
+    child_seal = fixture._archive().verify_evidence_seal(directory)
+    _write_json(
+        root / "heterogeneity-smoke-receipt.json",
+        {
+            "schema_version": 1,
+            "kind": "kauri-n31-cpu-quota-heterogeneity-smoke-v1",
+            "state": "TERMINAL",
+            "claim_eligible": False,
+            "figure_eligible": False,
+            "contract_id": contract.contract_id,
+            "contract_sha256": contract.contract_sha256,
+            "contract_semantic_sha256": cpu_quota.contract_digest(contract),
+            "automatic_retries": 0,
+            "replacement_policy": "none",
+            "children": [{
+                "slot_id": "slot-01", "pair_id": "pair-01", "arm": "adaptive",
+                "tree_sha256": child_seal.tree_sha256, "seal_sha256": child_seal.seal_sha256,
+            }],
+        },
+    )
+    root_seal = fixture._archive().create_evidence_seal(root)
+    trusted = {
+        "schema_version": 1,
+        "evidence_tree_sha256": root_seal.tree_sha256,
+        "evidence_seal_sha256": root_seal.seal_sha256,
+        "child": child_provenance,
+    }
+    return root, trusted, contract, preflight, authorization, quota_preflight, quota_authorization
+
+
+def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    root, trusted, contract, preflight, authorization, quota_preflight, quota_authorization = _complete_heterogeneity_smoke(tmp_path)
+    result = validation.validate_sealed_heterogeneity_smoke(
+        root,
+        trusted_provenance=trusted,
+        cpu_quota_contract=contract,
+        focused_preflight=preflight,
+        focused_authorization=authorization,
+        cpu_quota_preflight=quota_preflight,
+        cpu_quota_authorization=quota_authorization,
+    )
+    assert result["verdict"] == "PASS"
+    assert result["claim_eligible"] is False
+    assert result["figure_eligible"] is False
+
+    root, trusted_topology, contract, preflight, _authorization, quota_preflight, _quota_authorization = _complete_heterogeneity_smoke(
+        tmp_path / "topology-recomputed"
+    )
+    child = root / "children" / "slot-01"
+    bad_preflight = dict(preflight)
+    bad_preflight["topology_proof_sha256"] = "0" * 64
+    bad_preflight.pop("request_sha256", None)
+    bad_request = runtime_fixture._runtime().build_focused_authorization_request(
+        bad_preflight
+    )
+    bad_preflight["request_sha256"] = hashlib.sha256(bad_request).hexdigest()
+    bad_authorization = {
+        **json.loads(bad_request),
+        "request_sha256": hashlib.sha256(bad_request).hexdigest(),
+        "approval_reference": "test-recomputed-topology",
+        "approved_utc": "2026-09-24T12:00:00+00:00",
+    }
+    environment = quota_preflight["environment"]
+    assert isinstance(environment, Mapping)
+    bad_quota_request = cpu_quota.build_authorization_request(
+        contract,
+        base_authorization_request=bad_request,
+        environment=environment,
+        output_root=root,
+    )
+    bad_quota_preflight = {
+        **quota_preflight,
+        "base_authorization_request_sha256": hashlib.sha256(bad_request).hexdigest(),
+        "authorization_request_sha256": hashlib.sha256(bad_quota_request).hexdigest(),
+    }
+    bad_quota_authorization = {
+        **json.loads(bad_quota_request),
+        "request_sha256": hashlib.sha256(bad_quota_request).hexdigest(),
+        "approval_reference": "test-recomputed-quota-topology",
+        "approved_utc": "2026-09-24T12:00:00+00:00",
+    }
+    with pytest.raises(validation.FocusedCrashPairValidationError):
+        validation._validate_heterogeneity_quota_evidence(
+            root,
+            child,
+            contract,
+            focused_preflight=bad_preflight,
+            focused_authorization=bad_authorization,
+            quota_preflight=bad_quota_preflight,
+            quota_authorization=bad_quota_authorization,
+            profile_sha256=contract.base_profile_canonical_sha256,
+            topology_proof_sha256=str(
+                trusted_topology["child"]["topology_proof_sha256"]
+            ),
+            measurement_start_ns=0,
+            measurement_end_ns=20_000_000_000,
+        )
+
+    for mutation in (
+        "single-sample", "unit-linkage", "disjoint-window", "cadence-gap", "missing-baseline"
+    ):
+        root, trusted_mutation, contract, preflight, authorization, quota_preflight, quota_authorization = _complete_heterogeneity_smoke(
+            tmp_path / mutation
+        )
+        child = root / "children" / "slot-01"
+        sample_path = child / "raw/cpu-quota-samples.jsonl"
+        samples = [json.loads(line) for line in sample_path.read_text(encoding="utf-8").splitlines()]
+        if mutation == "single-sample":
+            samples = [
+                sample
+                for sample in samples
+                if sample["replica_id"] != 0
+                or sample["source_monotonic_ns"] == 0
+            ]
+        elif mutation == "unit-linkage":
+            launch_path = child / "runtime/cpu-quota-launch.json"
+            launch = json.loads(launch_path.read_text(encoding="utf-8"))
+            launch["replicas"][0]["cpu_stat_path"] = "/tmp/unrelated/cpu.stat"
+            launch_path.write_text(json.dumps(launch), encoding="utf-8")
+            for sample in samples:
+                if sample["replica_id"] == 0:
+                    sample["cpu_stat_path"] = "/tmp/unrelated/cpu.stat"
+        else:
+            if mutation == "disjoint-window":
+                for index, sample in enumerate(samples):
+                    sample["source_monotonic_ns"] = 10 + index // 31
+            elif mutation == "cadence-gap":
+                samples = [
+                    sample
+                    for sample in samples
+                    if sample["replica_id"] != 0
+                    or sample["source_monotonic_ns"]
+                    in {0, 20_000_000_000}
+                ]
+            else:
+                samples = [
+                    sample for sample in samples
+                    if sample["replica_id"] != 0 or sample["source_monotonic_ns"] != 0
+                ]
+        sample_path.write_text(
+            "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
+            encoding="utf-8",
+        )
+        with pytest.raises(validation.FocusedCrashPairValidationError):
+            validation._validate_heterogeneity_quota_evidence(
+                root,
+                child,
+                contract,
+                focused_preflight=preflight,
+                focused_authorization=authorization,
+                quota_preflight=quota_preflight,
+                quota_authorization=quota_authorization,
+                profile_sha256=contract.base_profile_canonical_sha256,
+                topology_proof_sha256=str(trusted_mutation["child"]["topology_proof_sha256"]),
+                measurement_start_ns=0,
+                measurement_end_ns=20_000_000_000,
+            )
 
 
 @pytest.mark.parametrize(

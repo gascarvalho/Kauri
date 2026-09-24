@@ -19,6 +19,7 @@ from experiments.adaptive import run_n31_crash_pair_campaign as campaign_contrac
 
 from . import factorial_validation
 from . import focused_crash_pair_runtime
+from . import cpu_quota
 from .profiled_fault_archive import EvidenceSealError, verify_evidence_seal
 
 _PROFILE_KEYS = {
@@ -9767,6 +9768,429 @@ def validate_sealed_arm(
     )
 
 
+def _validate_heterogeneity_quota_evidence(
+    root: Path,
+    child_root: Path,
+    contract: cpu_quota.CpuQuotaContract,
+    *,
+    focused_preflight: Mapping[str, object],
+    focused_authorization: Mapping[str, object],
+    quota_preflight: Mapping[str, object],
+    quota_authorization: Mapping[str, object],
+    profile_sha256: str,
+    topology_proof_sha256: str,
+    measurement_start_ns: int,
+    measurement_end_ns: int,
+) -> None:
+    """Bind a sealed smoke child to its separate, manager-blind quota approval."""
+
+    try:
+        base_request = focused_crash_pair_runtime.build_focused_authorization_request(
+            focused_preflight
+        )
+        focused_crash_pair_runtime.verify_focused_authorization_receipt(
+            base_request, focused_authorization
+        )
+    except focused_crash_pair_runtime.FocusedCrashPairRuntimeError as exc:
+        raise FocusedCrashPairValidationError(
+            "heterogeneity focused authorization rejected"
+        ) from exc
+    try:
+        base = _mapping(json.loads(base_request), "heterogeneity base request")
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise FocusedCrashPairValidationError(
+            "heterogeneity base authorization is invalid"
+        ) from exc
+    if (
+        base.get("mode") != "pair"
+        or base.get("pair_count") != 1
+        or base.get("profile_sha256") != profile_sha256
+        or base.get("topology_proof_sha256") != topology_proof_sha256
+        or base.get("output_root") != str(root.resolve())
+        or base.get("automatic_retries") != 0
+        or base.get("replacement_policy") != "none"
+    ):
+        _error("heterogeneity base authorization is not root-bound")
+
+    quota_keys = {
+        "schema_version",
+        "kind",
+        "contract_id",
+        "contract_sha256",
+        "contract_semantic_sha256",
+        "base_authorization_request_sha256",
+        "environment",
+        "environment_sha256",
+        "authorization_request_sha256",
+        "execution_authorized",
+        "launch_permitted",
+    }
+    environment = quota_preflight.get("environment")
+    if (
+        set(quota_preflight) != quota_keys
+        or quota_preflight.get("schema_version") != 1
+        or quota_preflight.get("kind") != "kauri-cpu-quota-preflight-v1"
+        or quota_preflight.get("contract_id") != contract.contract_id
+        or quota_preflight.get("contract_sha256") != contract.contract_sha256
+        or quota_preflight.get("contract_semantic_sha256")
+        != cpu_quota.contract_digest(contract)
+        or quota_preflight.get("base_authorization_request_sha256")
+        != hashlib.sha256(base_request).hexdigest()
+        or not isinstance(environment, Mapping)
+        or quota_preflight.get("environment_sha256")
+        != hashlib.sha256(_canonical(environment)).hexdigest()
+        or quota_preflight.get("execution_authorized") is not False
+        or quota_preflight.get("launch_permitted") is not False
+    ):
+        _error("heterogeneity CPU-quota preflight drifted")
+    try:
+        quota_request = cpu_quota.build_authorization_request(
+            contract,
+            base_authorization_request=base_request,
+            environment=environment,
+            output_root=root,
+        )
+        cpu_quota.verify_authorization_receipt(quota_request, quota_authorization)
+    except cpu_quota.CpuQuotaContractError as exc:
+        raise FocusedCrashPairValidationError(
+            "heterogeneity CPU-quota authorization rejected"
+        ) from exc
+    if quota_preflight.get("authorization_request_sha256") != hashlib.sha256(
+        quota_request
+    ).hexdigest():
+        _error("heterogeneity CPU-quota authorization digest drifted")
+
+    recorded_contract = _read_json(
+        child_root / "runtime" / "cpu-quota-contract.json", "recorded quota contract"
+    )
+    expected_contract = {
+        "schema_version": contract.schema_version,
+        "contract_id": contract.contract_id,
+        "enabled": contract.enabled,
+        "figure_eligible": contract.figure_eligible,
+        "launcher": contract.launcher,
+        "manager_visibility": contract.manager_visibility,
+        "sampling_interval_ms": contract.sampling_interval_ms,
+        "base_profile_id": contract.base_profile_id,
+        "base_profile_sha256": contract.base_profile_sha256,
+        "base_profile_canonical_sha256": contract.base_profile_canonical_sha256,
+        "assignments": [
+            {
+                "replica_id": item.replica_id,
+                "capacity_class": item.capacity_class,
+                "cpu_quota_percent": item.cpu_quota_percent,
+            }
+            for item in contract.assignments
+        ],
+    }
+    if dict(recorded_contract) != expected_contract:
+        _error("recorded CPU-quota contract differs from authorization")
+    launch = _read_json(child_root / "runtime" / "cpu-quota-launch.json", "quota launch")
+    expected_launch_keys = {
+        "schema_version", "launcher", "contract_id", "contract_sha256",
+        "manager_visibility", "replicas",
+    }
+    replicas = _sequence(launch.get("replicas"), "quota launch replicas")
+    if (
+        set(launch) != expected_launch_keys
+        or launch.get("schema_version") != 1
+        or launch.get("launcher") != contract.launcher
+        or launch.get("contract_id") != contract.contract_id
+        or launch.get("contract_sha256") != contract.contract_sha256
+        or launch.get("manager_visibility") != "none"
+        or len(replicas) != len(contract.assignments)
+    ):
+        _error("quota launch receipt drifted")
+    units: dict[int, Mapping[str, Any]] = {}
+    unit_keys = {
+        "replica_id", "cpu_quota_percent", "unit", "control_group",
+        "cpu_stat_path", "owned_pid", "owned_pgid", "cgroup_pids",
+        "active_state", "sub_state", "cpu_quota_per_second_usec",
+    }
+    for raw in replicas:
+        unit = _mapping(raw, "quota launch replica")
+        replica_id = _integer(unit.get("replica_id"), "quota launch replica", 0)
+        if (
+            set(unit) != unit_keys
+            or replica_id in units
+            or replica_id not in contract.replica_ids
+            or unit.get("cpu_quota_percent") != contract.quota_percent(replica_id)
+            or unit.get("cpu_quota_per_second_usec")
+            != contract.quota_percent(replica_id) * 10_000
+            or not isinstance(unit.get("unit"), str)
+            or not isinstance(unit.get("control_group"), str)
+            or not str(unit["control_group"]).startswith("/")
+            or ".." in Path(str(unit["control_group"])).parts
+            or not isinstance(unit.get("cpu_stat_path"), str)
+            or unit.get("cpu_stat_path")
+            != str(Path("/sys/fs/cgroup") / str(unit["control_group"]).lstrip("/") / "cpu.stat")
+            or unit.get("active_state") != "active"
+            or unit.get("sub_state") not in {"running", "start"}
+            or _integer(unit.get("owned_pid"), "quota owned PID", 1)
+            != _integer(unit.get("owned_pgid"), "quota owned PGID", 1)
+        ):
+            _error("quota launch replica drifted")
+        pids = _sequence(unit.get("cgroup_pids"), "quota cgroup PIDs")
+        if _integer(unit["owned_pid"], "quota owned PID", 1) not in pids:
+            _error("quota launch cgroup ownership drifted")
+        units[replica_id] = unit
+    if set(units) != set(contract.replica_ids):
+        _error("quota launch membership drifted")
+
+    sample_path = child_root / "raw" / "cpu-quota-samples.jsonl"
+    if sample_path.is_symlink() or not sample_path.is_file():
+        _error("CPU-quota samples are absent")
+    try:
+        samples = [json.loads(line) for line in sample_path.read_bytes().splitlines()]
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise FocusedCrashPairValidationError("CPU-quota samples are invalid") from exc
+    if not samples:
+        _error("CPU-quota samples are empty")
+    prior: dict[int, tuple[int, Mapping[str, int]]] = {}
+    seen: set[int] = set()
+    sample_keys = {
+        "schema_version", "source_monotonic_ns", "replica_id", "cpu_quota_percent",
+        "unit", "control_group", "cpu_stat_path", "cpu_quota_per_second_usec",
+        "active_state", "sub_state", "cpu_stat",
+    }
+    sample_counts: dict[int, int] = {}
+    for raw in samples:
+        sample = _mapping(raw, "CPU-quota sample")
+        replica_id = _integer(sample.get("replica_id"), "CPU-quota sample replica", 0)
+        stat = _mapping(sample.get("cpu_stat"), "CPU-quota sample accounting")
+        required_stat = {"usage_usec", "user_usec", "system_usec"}
+        throttle_stat = {"nr_periods", "nr_throttled", "throttled_usec"}
+        if (
+            set(sample) != sample_keys
+            or sample.get("schema_version") != 1
+            or replica_id not in units
+            or sample.get("cpu_quota_percent") != contract.quota_percent(replica_id)
+            or sample.get("unit") != units[replica_id].get("unit")
+            or sample.get("control_group") != units[replica_id].get("control_group")
+            or sample.get("cpu_stat_path") != units[replica_id].get("cpu_stat_path")
+            or sample.get("cpu_quota_per_second_usec")
+            != units[replica_id].get("cpu_quota_per_second_usec")
+            or sample.get("active_state") != "active"
+            or sample.get("sub_state") not in {"running", "start"}
+            or (set(stat) != required_stat and set(stat) != required_stat | throttle_stat)
+        ):
+            _error("CPU-quota sample schema or assignment drifted")
+        timestamp = _uint64(sample.get("source_monotonic_ns"), "CPU-quota sample time", 0)
+        accounting = {key: _uint64(value, f"CPU-quota {key}") for key, value in stat.items()}
+        if accounting["usage_usec"] < accounting["user_usec"] + accounting["system_usec"]:
+            _error("CPU-quota accounting is inconsistent")
+        previous = prior.get(replica_id)
+        if previous is not None:
+            if (
+                timestamp <= previous[0]
+                or set(accounting) != set(previous[1])
+                or any(accounting[key] < previous[1][key] for key in accounting)
+            ):
+                _error("CPU-quota samples are not monotonic")
+        prior[replica_id] = (timestamp, accounting)
+        seen.add(replica_id)
+        sample_counts[replica_id] = sample_counts.get(replica_id, 0) + 1
+    if (
+        seen != set(contract.replica_ids)
+        or any(sample_counts.get(replica_id, 0) < 2 for replica_id in contract.replica_ids)
+        or any(
+            prior[replica_id][0] <= 0
+            or prior[replica_id][1]["usage_usec"] <= 0
+            for replica_id in contract.replica_ids
+        )
+    ):
+        _error("CPU-quota samples do not establish sustained accounting")
+    # The final and initial rows are retained per replica above, but a positive
+    # elapsed interval and service delta are required rather than mere rows.
+    by_replica: dict[int, list[tuple[int, Mapping[str, int]]]] = {}
+    for raw in samples:
+        sample = _mapping(raw, "CPU-quota sample")
+        replica_id = _integer(sample.get("replica_id"), "CPU-quota sample replica", 0)
+        by_replica.setdefault(replica_id, []).append(
+            (
+                _uint64(sample.get("source_monotonic_ns"), "CPU-quota sample time", 0),
+                {
+                    key: _uint64(value, f"CPU-quota {key}")
+                    for key, value in _mapping(sample.get("cpu_stat"), "CPU-quota sample accounting").items()
+                },
+            )
+        )
+    for replica_id, rows in by_replica.items():
+        rows.sort(key=lambda row: row[0])
+        maximum_gap_ns = contract.sampling_interval_ms * 2 * 1_000_000
+        if any(
+            right[0] - left[0] > maximum_gap_ns
+            for left, right in zip(rows, rows[1:])
+        ):
+            _error(
+                f"CPU-quota sampling cadence exceeded the frozen tolerance for replica {replica_id}"
+            )
+        before = [row for row in rows if row[0] <= measurement_start_ns]
+        after = [row for row in rows if row[0] >= measurement_end_ns]
+        if (
+            not before
+            or not after
+            or after[0][0] <= before[-1][0]
+            or after[0][1]["usage_usec"] <= before[-1][1]["usage_usec"]
+        ):
+            _error(
+                f"CPU-quota samples do not cover the reconstructed measurement interval for replica {replica_id}"
+            )
+
+    cleanup = _read_json(child_root / "runtime" / "cpu-quota-cleanup.json", "quota cleanup")
+    cleanup_units = _sequence(cleanup.get("units"), "quota cleanup units")
+    if (
+        set(cleanup) != {"schema_version", "complete", "monitor", "units"}
+        or cleanup.get("schema_version") != 1
+        or cleanup.get("complete") is not True
+        or _mapping(cleanup.get("monitor"), "quota cleanup monitor")
+        != {"status": "PASSED", "stopped": True}
+        or len(cleanup_units) != len(units)
+    ):
+        _error("quota cleanup receipt drifted")
+    cleaned: set[int] = set()
+    for raw in cleanup_units:
+        unit = _mapping(raw, "quota cleanup unit")
+        replica_id = _integer(unit.get("replica_id"), "quota cleanup replica", 0)
+        if (
+            set(unit) != {"replica_id", "unit", "load_state", "active_state", "sub_state", "control_group"}
+            or replica_id in cleaned
+            or replica_id not in units
+            or unit.get("unit") != units[replica_id].get("unit")
+            or unit.get("active_state") != "inactive"
+            or unit.get("sub_state") != "dead"
+            or unit.get("control_group") != ""
+        ):
+            _error("quota cleanup unit drifted")
+        cleaned.add(replica_id)
+    if cleaned != set(units):
+        _error("quota cleanup membership drifted")
+
+
+def validate_sealed_heterogeneity_smoke(
+    smoke_directory: Path,
+    *,
+    trusted_provenance: object,
+    cpu_quota_contract: cpu_quota.CpuQuotaContract,
+    focused_preflight: Mapping[str, object],
+    focused_authorization: Mapping[str, object],
+    cpu_quota_preflight: Mapping[str, object],
+    cpu_quota_authorization: Mapping[str, object],
+    readiness_verifier_path: Path | None = None,
+) -> dict[str, object]:
+    """Validate the sealed, excluded single-arm CPU-quota smoke layout."""
+
+    root = Path(smoke_directory)
+    if not isinstance(cpu_quota_contract, cpu_quota.CpuQuotaContract):
+        _error("heterogeneity CPU-quota contract is invalid")
+    if root.is_symlink() or not root.is_dir():
+        _error("heterogeneity smoke directory is absent")
+    try:
+        root_seal = verify_evidence_seal(root)
+    except (EvidenceSealError, OSError) as exc:
+        raise FocusedCrashPairValidationError(
+            "heterogeneity smoke evidence seal rejected"
+        ) from exc
+    trusted = _mapping(trusted_provenance, "heterogeneity trusted provenance")
+    if set(trusted) != {"schema_version", "evidence_tree_sha256", "evidence_seal_sha256", "child"} or trusted.get("schema_version") != 1:
+        _error("heterogeneity trusted provenance schema drifted")
+    if (
+        trusted.get("evidence_tree_sha256") != root_seal.tree_sha256
+        or trusted.get("evidence_seal_sha256") != root_seal.seal_sha256
+    ):
+        _error("heterogeneity trusted provenance root seal drifted")
+    child_root = root / "children" / "slot-01"
+    receipt = _read_json(root / "heterogeneity-smoke-receipt.json", "heterogeneity receipt")
+    children = _sequence(receipt.get("children"), "heterogeneity receipt children")
+    expected_receipt_keys = {
+        "schema_version", "kind", "state", "claim_eligible", "figure_eligible",
+        "contract_id", "contract_sha256", "contract_semantic_sha256",
+        "automatic_retries", "replacement_policy", "children",
+    }
+    if (
+        set(receipt) != expected_receipt_keys
+        or receipt.get("schema_version") != 1
+        or receipt.get("kind") != "kauri-n31-cpu-quota-heterogeneity-smoke-v1"
+        or receipt.get("state") != "TERMINAL"
+        or receipt.get("claim_eligible") is not False
+        or receipt.get("figure_eligible") is not False
+        or receipt.get("contract_id") != cpu_quota_contract.contract_id
+        or receipt.get("contract_sha256") != cpu_quota_contract.contract_sha256
+        or receipt.get("contract_semantic_sha256") != cpu_quota.contract_digest(cpu_quota_contract)
+        or receipt.get("automatic_retries") != 0
+        or receipt.get("replacement_policy") != "none"
+        or len(children) != 1
+    ):
+        _error("heterogeneity receipt schema or contract drifted")
+    child_entry = _mapping(children[0], "heterogeneity receipt child")
+    if (
+        set(child_entry) != {"slot_id", "pair_id", "arm", "tree_sha256", "seal_sha256"}
+        or child_entry.get("slot_id") != "slot-01"
+        or child_entry.get("pair_id") != "pair-01"
+        or child_entry.get("arm") != "adaptive"
+    ):
+        _error("heterogeneity receipt child identity drifted")
+    child = _validate_sealed_arm(
+        child_root,
+        trusted_provenance=_mapping(trusted.get("child"), "heterogeneity child provenance"),
+        readiness_verifier_path=readiness_verifier_path,
+    )
+    if (
+        child.get("arm") != "adaptive"
+        or child.get("pair_id") != "pair-01"
+        or child.get("slot_id") != "slot-01"
+        or child_entry.get("tree_sha256") != child["child"]["evidence_tree_sha256"]
+        or child_entry.get("seal_sha256") != child["child"]["evidence_seal_sha256"]
+        or _mapping(
+            _read_json(child_root / "profile.json", "heterogeneity child profile"),
+            "heterogeneity child profile",
+        ).get("profile_id") != cpu_quota_contract.base_profile_id
+    ):
+        _error("heterogeneity sealed child identity, profile, or seal drifted")
+    phases = [
+        _mapping(phase, "heterogeneity phase")
+        for phase in _sequence(
+            _mapping(child["scientific_measurements"], "heterogeneity measurements").get("phases"),
+            "heterogeneity phases",
+        )
+    ]
+    if not phases:
+        _error("heterogeneity reconstructed measurement phases drifted")
+    measurement_start_ns = min(
+        _integer(phase.get("start_ns"), "heterogeneity measurement start", 0)
+        for phase in phases
+    )
+    measurement_end_ns = max(
+        _integer(phase.get("end_ns"), "heterogeneity measurement end", 1)
+        for phase in phases
+    )
+    _validate_heterogeneity_quota_evidence(
+        root,
+        child_root,
+        cpu_quota_contract,
+        focused_preflight=focused_preflight,
+        focused_authorization=focused_authorization,
+        quota_preflight=cpu_quota_preflight,
+        quota_authorization=cpu_quota_authorization,
+        profile_sha256=cpu_quota_contract.base_profile_canonical_sha256,
+        topology_proof_sha256=str(child["topology_proof_sha256"]),
+        measurement_start_ns=measurement_start_ns,
+        measurement_end_ns=measurement_end_ns,
+    )
+    return {
+        "schema_version": 1,
+        "verdict": "PASS",
+        "claim_eligible": False,
+        "figure_eligible": False,
+        "state": "TERMINAL",
+        "source_blind_reconstruction": True,
+        "cpu_quota_evidence_validated": True,
+        "evidence_tree_sha256": root_seal.tree_sha256,
+        "evidence_seal_sha256": root_seal.seal_sha256,
+        "child": dict(child),
+    }
+
+
 def validate_sealed_pair(
     pair_directory: Path,
     *,
@@ -9971,5 +10395,6 @@ __all__ = [
     "reconstruct_focused_ranking",
     "validate_sealed_arm",
     "validate_sealed_campaign",
+    "validate_sealed_heterogeneity_smoke",
     "validate_sealed_pair",
 ]

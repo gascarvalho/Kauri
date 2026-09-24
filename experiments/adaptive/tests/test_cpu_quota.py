@@ -403,7 +403,18 @@ def test_secondary_authorization_binds_contract_environment_and_base_run(
         "replacement_policy": "none",
     }
     base_request = cpu_quota._canonical(base)
-    environment = {"verified": True, "cgroup_version": 2}
+    environment = {
+        "schema_version": 1,
+        "kind": "kauri-cpu-quota-environment-v1",
+        "verified": True,
+        "kernel": "test-kernel",
+        "cgroup_version": 2,
+        "controllers": ["cpu", "memory"],
+        "systemctl_path": "/usr/bin/systemctl",
+        "systemd_run_path": "/usr/bin/systemd-run",
+        "probe_quota_percent": 25,
+        "probe_exit_code": 0,
+    }
     request = cpu_quota.build_authorization_request(
         contract,
         base_authorization_request=base_request,
@@ -430,6 +441,13 @@ def test_secondary_authorization_binds_contract_environment_and_base_run(
     changed = {**receipt, "contract_sha256": "0" * 64}
     with pytest.raises(cpu_quota.CpuQuotaContractError):
         cpu_quota.verify_authorization_receipt(request, changed)
+    with pytest.raises(cpu_quota.CpuQuotaContractError):
+        cpu_quota.build_authorization_request(
+            contract,
+            base_authorization_request=base_request,
+            environment={"verified": True},
+            output_root=output,
+        )
 
 
 def test_linux_environment_probe_is_shell_free_and_requires_cgroup_v2(
