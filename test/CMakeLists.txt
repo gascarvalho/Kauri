@@ -421,6 +421,20 @@ set_tests_properties(
     LABELS "unit;adaptive;intentional-red;tree-policy"
     TIMEOUT 10)
 add_kauri_catch_test(
+    test_static_resource_sham
+    test_static_resource_sham.cpp)
+set_tests_properties(
+    test_static_resource_sham PROPERTIES
+    LABELS "integration;adaptive;static-resource;sham"
+    TIMEOUT 10)
+add_test(
+    NAME test_struc31_placement_matrix
+    COMMAND $<TARGET_FILE:struc31-placement-matrix> --self-test)
+set_tests_properties(
+    test_struc31_placement_matrix PROPERTIES
+    LABELS "unit;adaptive;struc31;structural-matrix"
+    TIMEOUT 10)
+add_kauri_catch_test(
     test_adaptation_manager
     test_adaptation_manager.cpp)
 set_tests_properties(
