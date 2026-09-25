@@ -9065,7 +9065,8 @@ class FocusedLaunchBackend:
         spawn: Callable[..., tuple[ProcessRecord, Any]] = spawn_owned_process,
         seal_artifacts: Callable[..., dict[str, object]] = _seal_arm_artifacts,
         poll_snapshot: Callable[[str], Mapping[str, object] | None] | None = None,
-        poll_interval_s: float = 1.0,
+        poll_interval_s: float = 0.05,
+        semantic_poll_interval_s: float = 1.0,
         readiness_timeout_s: float = 60.0,
         execute_fault: (
             Callable[[Mapping[str, object], object], Mapping[str, object]] | None
@@ -9085,6 +9086,9 @@ class FocusedLaunchBackend:
         self._seal_artifacts = seal_artifacts
         self._poll_snapshot = poll_snapshot
         self._poll_interval_s = max(0.0, float(poll_interval_s))
+        self._semantic_poll_interval_s = max(
+            0.0, float(semantic_poll_interval_s)
+        )
         self._readiness_timeout_s = max(0.0, float(readiness_timeout_s))
         self._execute_fault = execute_fault
         self._cleanup_registry = cleanup_registry
@@ -9872,6 +9876,11 @@ class FocusedLaunchBackend:
         *,
         deadline_monotonic: float | None = None,
     ) -> Mapping[str, object]:
+        interval_s = (
+            self._semantic_poll_interval_s
+            if self._poll_snapshot is None
+            else self._poll_interval_s
+        )
         deadline = (
             time.monotonic() + self._readiness_timeout_s
             if deadline_monotonic is None
@@ -9883,8 +9892,8 @@ class FocusedLaunchBackend:
                 return dict(_document(snapshot, f"{name} runtime snapshot"))
             if time.monotonic() >= deadline:
                 _error(f"timed out waiting for {name} runtime evidence")
-            if self._poll_interval_s:
-                time.sleep(self._poll_interval_s)
+            if interval_s:
+                time.sleep(interval_s)
 
     def _wait_for_prefault_configuration(
         self,
@@ -9975,7 +9984,7 @@ class FocusedLaunchBackend:
         if self._poll_snapshot is None:
             source = FocusedRawEvidenceSource(
                 run_directory=Path(configuration["run_directory"]),
-                poll_interval_s=self._poll_interval_s,
+                poll_interval_s=self._semantic_poll_interval_s,
                 timeout_s=self._readiness_timeout_s,
                 process_records=tuple(getattr(processes, "records", ())),
                 expected_run_id=str(configuration["run_id"]),

@@ -3227,12 +3227,78 @@ def test_first_common_commit_anchor_reuses_precomputed_authoritative_commits(
     assert anchor == 110_000_000_000
 
 
-def test_live_backend_leaves_one_quota_interval_between_semantic_replays() -> None:
+def test_live_backend_separates_coordination_from_semantic_replay_pacing() -> None:
     runtime = _runtime()
 
     backend = runtime.FocusedLaunchBackend()
 
-    assert backend._poll_interval_s == 1.0
+    assert backend._poll_interval_s == 0.05
+    assert backend._semantic_poll_interval_s == 1.0
+
+
+def test_live_backend_passes_only_semantic_pacing_to_raw_evidence_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = _runtime()
+    captured: dict[str, object] = {}
+
+    class StopPolling(RuntimeError):
+        pass
+
+    class Source:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def poll(self, _name: str) -> Mapping[str, object]:
+            raise StopPolling
+
+        def unexpected_exit_ids(self) -> tuple[int, ...]:
+            return ()
+
+    monkeypatch.setattr(runtime, "FocusedRawEvidenceSource", Source)
+    backend = runtime.FocusedLaunchBackend(
+        poll_interval_s=0.02,
+        semantic_poll_interval_s=0.75,
+    )
+
+    with pytest.raises(StopPolling):
+        backend.run_arm(
+            {
+                "run_directory": tmp_path,
+                "run_id": "poll-separation",
+                "source_instances": {},
+                "profile": SimpleNamespace(),
+                "pair_id": "pair-01",
+                "arm": "control",
+            },
+            SimpleNamespace(records=()),
+        )
+
+    assert captured["poll_interval_s"] == 0.75
+
+
+def test_live_backend_waits_one_quota_interval_between_semantic_replays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    clock = {"now": 0.0}
+    observations: list[float] = []
+
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock["now"])
+
+    def advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(runtime.time, "sleep", advance)
+
+    def poll(_name: str) -> Mapping[str, object] | None:
+        observations.append(clock["now"])
+        return {"ready": True} if len(observations) == 2 else None
+
+    backend = runtime.FocusedLaunchBackend()
+
+    assert backend._wait_for_snapshot("readiness", poll) == {"ready": True}
+    assert observations == [0.0, 1.0]
 
 
 def test_v5_runtime_accepts_a_truly_empty_fault_interval() -> None:
@@ -4857,6 +4923,49 @@ def test_prefault_wait_reaches_exact_barrier_before_returning() -> None:
         == barrier
     )
     assert trace == ["poll", "poll", "poll"]
+
+
+def test_prefault_wait_confirms_observed_1425ms_configuration_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _runtime()
+    profile = _fcrash_h_profile(N7_PROFILE_V3)
+    configuration = {
+        "epoch_number": 0,
+        "tree_id": profile.raw["topology"]["active_tree_id"],
+        "epoch_digest": profile.raw["topology"]["epoch_zero_digest"],
+    }
+    barrier = [
+        {"replica_id": replica, "configuration": dict(configuration)}
+        for replica in profile.replica_ids
+    ]
+    clock = {"now": 0.0}
+
+    monkeypatch.setattr(runtime.time, "monotonic", lambda: clock["now"])
+
+    def advance(seconds: float) -> None:
+        clock["now"] += seconds
+
+    monkeypatch.setattr(runtime.time, "sleep", advance)
+
+    class Source:
+        def latch_prefault_active_configuration_barrier(self) -> object:
+            if 0.425 <= clock["now"] < 1.850:
+                return barrier
+            return None
+
+    processes = SimpleNamespace(
+        records=[SimpleNamespace(process=SimpleNamespace(poll=lambda: None))]
+    )
+    backend = runtime.FocusedLaunchBackend()
+
+    assert (
+        backend._wait_for_prefault_configuration(
+            Source(), processes, deadline_monotonic=3.0
+        )
+        == barrier
+    )
+    assert clock["now"] < 1.850
 
 
 def test_prefault_wait_rechecks_process_health_after_confirmation() -> None:
