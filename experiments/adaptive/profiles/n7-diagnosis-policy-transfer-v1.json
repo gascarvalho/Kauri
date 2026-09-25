@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "frozen": true,
+  "analysis_id": "n7-diagnosis-policy-transfer-v1",
+  "analysis_timing": "retrospective_post_hoc",
+  "source_campaign": {
+    "relative_path": "results/n7-fault-repetition-campaign/89838f30-seed41719-five",
+    "kauri_revision": "89838f3056935dd76c2c999a30d725565f19f1fa",
+    "plan_sha256": "e33fc3450871406c18046b8e083fd5ab0b5a9a959ba48df7886bcb549d972bfa",
+    "verdict_sha256": "359fa52fef0a0b2e8e5b37042cee827c12bd3f055f4f46f2d3fb939e816b19b8"
+  },
+  "source_replay": {
+    "relative_path": "results/n7-reputation-policy-replay/c90a19bf-seed41719-v3/reputation-policy-replay.json",
+    "kauri_revision": "c90a19bf57de68d70d866ddfe9fda90529c8810d",
+    "artifact_sha256": "7d6f4599fe2869199c2324b0107c75dd198b65f05c7f8095dd7b44244e315220",
+    "validation_sha256": "ea885e7bff4d1364f7c46f2d24baf6686006a9f8133a92ef7d0b8a6949f1ee14",
+    "profile_sha256": "5cc0d7e6f0d62d871e76cb3a0767144f7d315d62121c090440b4b3ef1ce20783"
+  },
+  "fixed_contract": {
+    "arm": "static_authenticated_false_report",
+    "ordinals": [2, 4, 9, 12, 14],
+    "membership": [0, 1, 2, 3, 4, 5, 6],
+    "reporter_id": 6,
+    "target_id": 1,
+    "mechanisms": ["responsiveness", "latency-priority"],
+    "influential_count": 3,
+    "evidence_cutoff": "terminal_complete_accepted_manager_prefix",
+    "analysis_timing": "retrospective_post_hoc"
+  },
+  "claims_not_made": [
+    "no live epoch or counterfactual tree is activated by this audit",
+    "no throughput or latency effect follows from the offline projection",
+    "no general Byzantine attribution or policy superiority follows from five N=7 runs",
+    "no consensus-safety claim follows from this retrospective join",
+    "the terminal ranking is not a ranking captured at diagnostic settlement",
+    "the passive certificate is not an input to the two scalar replay policies",
+    "a correct eligible target need not be promoted into the projected top three"
+  ]
+}
