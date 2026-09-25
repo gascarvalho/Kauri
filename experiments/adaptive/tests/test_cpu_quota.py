@@ -6,6 +6,7 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -341,6 +342,57 @@ def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> 
     ):
         runtime.sample_once()
     assert show_calls == 1
+
+
+def test_default_quota_samples_share_the_fault_evidence_raw_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    raw_timestamp = 1_234_567_890_000
+
+    def spawn(_registry: object, **_kwargs: object) -> tuple[object, object]:
+        return SimpleNamespace(pid=100, pgid=100), object()
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="raw-clock-sampling",
+        run_directory=tmp_path,
+        base_spawn=spawn,
+        show_unit=lambda unit: (
+            "ActiveState=active\nSubState=running\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        ),
+        read_cpu_max=lambda _path: 500_000,
+        read_cpu_stat=lambda _path: {
+            "usage_usec": 1,
+            "user_usec": 1,
+            "system_usec": 0,
+        },
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+    )
+    runtime.spawn_owned_process(
+        object(),
+        name="replica-0",
+        replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log",
+        working_directory=tmp_path,
+    )
+    native_clock = time.clock_gettime_ns
+
+    def clock_gettime_ns(clock_id: int) -> int:
+        if clock_id == time.CLOCK_MONOTONIC_RAW:
+            return raw_timestamp
+        return native_clock(clock_id)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "clock_gettime_ns", clock_gettime_ns)
+        rows = runtime.sample_once()
+
+    assert rows[0]["source_monotonic_ns"] == raw_timestamp
 
 
 def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> None:

@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any
 
+from .profiled_fault_runtime import monotonic_raw_ns
+
 _CONTRACT_KEYS = frozenset(
     {
         "schema_version",
@@ -636,7 +638,7 @@ class CpuQuotaRuntime:
         read_cpu_stat: Callable[[Path], Mapping[str, int]] | None = None,
         read_cgroup_procs: Callable[[Path], Sequence[int]] | None = None,
         process_group: Callable[[int], int] = os.getpgid,
-        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+        monotonic_ns: Callable[[], int] = monotonic_raw_ns,
     ) -> None:
         if base_spawn is None:
             from .profiled_fault_runtime import spawn_owned_process

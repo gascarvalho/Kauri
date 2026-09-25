@@ -970,6 +970,7 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
         "single-sample",
         "unit-linkage",
         "disjoint-window",
+        "clock-domain-offset",
         "cadence-gap",
         "missing-baseline",
         "inactive-survivor",
@@ -1033,6 +1034,9 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
             if mutation == "disjoint-window":
                 for index, sample in enumerate(samples):
                     sample["source_monotonic_ns"] = 10 + index // 31
+            elif mutation == "clock-domain-offset":
+                for sample in samples:
+                    sample["source_monotonic_ns"] += 37_000_000_000
             elif mutation == "cadence-gap":
                 samples = [
                     sample
@@ -1050,7 +1054,14 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
             "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
             encoding="utf-8",
         )
-        with pytest.raises(validation.FocusedCrashPairValidationError):
+        with pytest.raises(
+            validation.FocusedCrashPairValidationError,
+            match=(
+                "samples do not cover"
+                if mutation == "clock-domain-offset"
+                else None
+            ),
+        ):
             validation._validate_heterogeneity_quota_evidence(
                 root,
                 child,
