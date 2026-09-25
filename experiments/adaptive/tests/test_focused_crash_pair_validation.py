@@ -705,19 +705,37 @@ def _complete_heterogeneity_smoke(
     fault_receipt = json.loads(
         (directory / "raw/fault-receipt.json").read_text(encoding="utf-8")
     )
-    crash_targets = {
-        outcome["replica_id"] for outcome in fault_receipt["sigkill_outcomes"]
+    crash_confirmations = {
+        outcome["replica_id"]: outcome["confirmed_monotonic_ns"]
+        for outcome in fault_receipt["sigkill_outcomes"]
     }
-    final_sample_ns = max(sample["source_monotonic_ns"] for sample in samples)
     for sample in samples:
-        if (
-            sample["replica_id"] in crash_targets
-            and sample["source_monotonic_ns"] == final_sample_ns
-        ):
+        confirmation = crash_confirmations.get(sample["replica_id"])
+        if confirmation is not None and sample["source_monotonic_ns"] >= confirmation:
             sample.pop("cpu_stat")
             sample["cpu_quota_per_second_usec"] = 0
             sample["active_state"] = "inactive"
             sample["sub_state"] = "dead"
+    for replica_id, confirmation in crash_confirmations.items():
+        initial = next(sample for sample in samples if sample["replica_id"] == replica_id)
+        active = {
+            **initial,
+            "source_monotonic_ns": confirmation - 1,
+            "cpu_stat": {"usage_usec": 200, "user_usec": 190, "system_usec": 10},
+        }
+        inactive = {
+            key: value for key, value in active.items() if key != "cpu_stat"
+        }
+        inactive.update(
+            {
+                "source_monotonic_ns": confirmation + 1,
+                "cpu_quota_per_second_usec": 0,
+                "active_state": "inactive",
+                "sub_state": "dead",
+            }
+        )
+        samples.extend((active, inactive))
+    samples.sort(key=lambda sample: (sample["source_monotonic_ns"], sample["replica_id"]))
     (directory / "raw/cpu-quota-samples.jsonl").write_text(
         "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
         encoding="utf-8",
@@ -1015,10 +1033,14 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
                 if sample["replica_id"] == 22
                 and sample["source_monotonic_ns"] == 10_000_000_000
             )
-            sample.pop("cpu_stat")
-            sample["cpu_quota_per_second_usec"] = 0
-            sample["active_state"] = "inactive"
-            sample["sub_state"] = "dead"
+            sample["cpu_stat"] = {
+                "usage_usec": 300,
+                "user_usec": 290,
+                "system_usec": 10,
+            }
+            sample["cpu_quota_per_second_usec"] = contract.quota_percent(22) * 10_000
+            sample["active_state"] = "active"
+            sample["sub_state"] = "running"
         elif mutation == "inactive-before-crash":
             sample = next(
                 sample
@@ -1075,6 +1097,70 @@ def test_sealed_heterogeneity_smoke_validates_one_root_bound_adaptive_child(
                 measurement_start_ns=0,
                 measurement_end_ns=20_000_000_000,
             )
+
+
+def test_heterogeneity_quota_accepts_crash_bracketed_by_active_and_inactive_samples(
+    tmp_path: Path,
+) -> None:
+    validation = _validation()
+    root, trusted, contract, preflight, authorization, quota_preflight, quota_authorization = _complete_heterogeneity_smoke(
+        tmp_path
+    )
+    child = root / "children" / "slot-01"
+    receipt = json.loads((child / "raw/fault-receipt.json").read_text(encoding="utf-8"))
+    for ordinal, outcome in enumerate(receipt["sigkill_outcomes"]):
+        outcome["requested_monotonic_ns"] = 10_000_000_000 + ordinal
+        outcome["confirmed_monotonic_ns"] = 10_500_000_000 + ordinal
+    _write_json(child / "raw/fault-receipt.json", receipt)
+    confirmations = {
+        outcome["replica_id"]: outcome["confirmed_monotonic_ns"]
+        for outcome in receipt["sigkill_outcomes"]
+    }
+    sample_path = child / "raw/cpu-quota-samples.jsonl"
+    samples = [json.loads(line) for line in sample_path.read_text(encoding="utf-8").splitlines()]
+    samples = [
+        sample
+        for sample in samples
+        if sample["replica_id"] not in confirmations
+        or sample["source_monotonic_ns"] % 1_000_000_000 == 0
+    ]
+    for sample in samples:
+        confirmation = confirmations.get(sample["replica_id"])
+        if confirmation is None:
+            continue
+        if sample["source_monotonic_ns"] < confirmation:
+            ordinal = sample["source_monotonic_ns"] // 1_000_000_000
+            usage = (ordinal + 1) * 100
+            sample["cpu_stat"] = {
+                "usage_usec": usage,
+                "user_usec": usage - 10,
+                "system_usec": 10,
+            }
+            sample["cpu_quota_per_second_usec"] = contract.quota_percent(sample["replica_id"]) * 10_000
+            sample["active_state"] = "active"
+            sample["sub_state"] = "running"
+            continue
+        sample.pop("cpu_stat", None)
+        sample["cpu_quota_per_second_usec"] = 0
+        sample["active_state"] = "inactive"
+        sample["sub_state"] = "dead"
+    sample_path.write_text(
+        "".join(json.dumps(sample, sort_keys=True) + "\n" for sample in samples),
+        encoding="utf-8",
+    )
+    validation._validate_heterogeneity_quota_evidence(
+        root,
+        child,
+        contract,
+        focused_preflight=preflight,
+        focused_authorization=authorization,
+        quota_preflight=quota_preflight,
+        quota_authorization=quota_authorization,
+        profile_sha256=contract.base_profile_canonical_sha256,
+        topology_proof_sha256=str(trusted["child"]["topology_proof_sha256"]),
+        measurement_start_ns=0,
+        measurement_end_ns=20_000_000_000,
+    )
 
 
 @pytest.mark.parametrize(

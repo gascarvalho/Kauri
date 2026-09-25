@@ -10001,6 +10001,7 @@ def _validate_heterogeneity_quota_evidence(
     prior: dict[int, tuple[int, Mapping[str, int]]] = {}
     seen: set[int] = set()
     inactive_seen: set[int] = set()
+    first_inactive_ns: dict[int, int] = {}
     timestamps: dict[int, list[int]] = {}
     active_rows: dict[int, list[tuple[int, Mapping[str, int]]]] = {}
     sample_keys = {
@@ -10039,6 +10040,7 @@ def _validate_heterogeneity_quota_evidence(
             ):
                 _error("inactive CPU-quota sample is not crash-bound")
             inactive_seen.add(replica_id)
+            first_inactive_ns.setdefault(replica_id, timestamp)
             continue
         if (
             set(sample) != sample_keys
@@ -10094,14 +10096,32 @@ def _validate_heterogeneity_quota_evidence(
             )
         rows = active_rows[replica_id]
         before = [row for row in rows if row[0] <= measurement_start_ns]
-        required_end_ns = crash_confirmations.get(replica_id, measurement_end_ns)
-        after = [row for row in rows if row[0] >= required_end_ns]
-        if (
-            not before
-            or not after
-            or after[0][0] <= before[-1][0]
-            or after[0][1]["usage_usec"] <= before[-1][1]["usage_usec"]
-        ):
+        if not before:
+            _error(
+                f"CPU-quota samples do not cover the reconstructed measurement interval for replica {replica_id}"
+            )
+        if replica_id in crash_confirmations:
+            # A killed process cannot provide an active accounting sample after
+            # SIGKILL confirmation. Bound the last active and first inactive
+            # samples around that confirmation instead.
+            confirmation_ns = crash_confirmations[replica_id]
+            last_active_ns, last_accounting = rows[-1]
+            inactive_ns = first_inactive_ns[replica_id]
+            covered = (
+                last_active_ns > before[-1][0]
+                and abs(last_active_ns - confirmation_ns) <= maximum_gap_ns
+                and inactive_ns - confirmation_ns <= maximum_gap_ns
+                and inactive_ns > last_active_ns
+                and last_accounting["usage_usec"] > before[-1][1]["usage_usec"]
+            )
+        else:
+            after = [row for row in rows if row[0] >= measurement_end_ns]
+            covered = (
+                bool(after)
+                and after[0][0] > before[-1][0]
+                and after[0][1]["usage_usec"] > before[-1][1]["usage_usec"]
+            )
+        if not covered:
             _error(
                 f"CPU-quota samples do not cover the reconstructed measurement interval for replica {replica_id}"
             )
