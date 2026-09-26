@@ -13,6 +13,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+import platform
 import signal
 from pathlib import Path
 import socket
@@ -22,6 +23,7 @@ import uuid
 from typing import Callable, Mapping
 
 from . import n31_static_e0_feasibility as feasibility
+from . import cpu_quota
 from . import profiled_fault_runtime as runtime
 from .processes import ProcessRegistry
 
@@ -338,16 +340,22 @@ def _generate_identities_bounded(
 def execute_once(
     *, plan: feasibility.FeasibilityPlan, preflight: Mapping[str, object],
     directory: Path, hard_timeout_s: float = 180.0,
+    quota_contract: cpu_quota.CpuQuotaContract | None = None,
+    required_complete_cycles: int = 1,
 ) -> dict[str, object]:
-    """One CPU-free, no-manager, zero-retry local feasibility attempt.
+    """One no-manager, zero-retry feasibility attempt.
 
-    This is not a cluster launcher or throughput study. The caller must add an
+    This is not a validated throughput study. The caller must add an
     external hard watchdog (for example GNU timeout) as a final kill boundary.
     All in-process failures are sealed, including partial spawn/cleanup truth.
     """
 
     if hard_timeout_s <= 20 or hard_timeout_s > 300:
         raise LocalExecutorError("local hard timeout must be in (20, 300] seconds")
+    if required_complete_cycles < 1 or required_complete_cycles > 20:
+        raise LocalExecutorError("required complete cycle count is outside 1..20")
+    if quota_contract is not None and platform.system() != "Linux":
+        raise LocalExecutorError("CPU quota mode requires Linux")
     directory = directory.resolve()
     if directory.exists():
         raise LocalExecutorError("one attempt requires an exact fresh output directory")
@@ -360,13 +368,16 @@ def execute_once(
     work_deadline_ns = deadline_ns - 10_000_000_000
     run_id = f"w16-local-{uuid.uuid4().hex}"
     registry = ProcessRegistry()
+    quota_runtime: cpu_quota.CpuQuotaRuntime | None = None
     log_handles = []
     held: BoundNoListener | None = None
     inputs: LaunchInputs | None = None
     witness = False
     failure: str | None = None
     cleanup_error: str | None = None
+    quota_cleanup: dict[str, object] | None = None
     raw_hashes: dict[str, str] = {}
+    artifact_hashes: dict[str, str] = {}
     old_alarm = signal.getsignal(signal.SIGALRM)
 
     def _alarm(_signal: int, _frame: object) -> None:
@@ -403,10 +414,16 @@ def execute_once(
             run_id=run_id, hard_timeout_s=hard_timeout_s,
             fixed_deadline_monotonic_ns=work_deadline_ns,
         )
+        if quota_contract is not None:
+            quota_runtime = cpu_quota.CpuQuotaRuntime(
+                quota_contract, run_id=run_id, run_directory=directory
+            )
         for replica in plan.profile.replica_ids:
             if time.monotonic_ns() >= work_deadline_ns:
                 raise TimeoutError("local W16 deadline elapsed while launching replicas")
-            record, handle = runtime.spawn_owned_process(
+            spawn = (quota_runtime.spawn_owned_process if quota_runtime is not None
+                     else runtime.spawn_owned_process)
+            record, handle = spawn(
                 registry, name=f"replica-{replica}", replica_id=replica,
                 command=(str(inputs.binaries["app"]), "--conf", paths["main"],
                          "--conf", str(directory / "config" / f"replica-{replica}.conf")),
@@ -417,6 +434,8 @@ def execute_once(
             if record.process.poll() is not None:
                 raise LocalExecutorError(f"replica {replica} exited during launch")
         assert_exactly_31_registered(registry)
+        if quota_runtime is not None:
+            quota_runtime.start_monitor()
         while time.monotonic_ns() < work_deadline_ns:
             if any(record.process.poll() is not None for record in registry.records):
                 raise LocalExecutorError("replica exited before owned cleanup")
@@ -426,14 +445,28 @@ def execute_once(
                     allow_partial=True,
                 ) for replica in plan.profile.replica_ids
             }
-            witness, _detail = feasibility.event_gate(
+            event_passed, _detail = feasibility.event_gate(
                 streams, observer=plan.profile.authoritative_observer,
                 run_id=run_id, source_instances=inputs.source_instances,
                 epoch_digest=inputs.epoch_zero_digest,
                 expected_terminal_reason="shared_outbox_delivery_failed",
             )
-            if witness:
-                break
+            if event_passed:
+                observer_events = streams[f"replica-{plan.profile.authoritative_observer}"]
+                terminal_sequence = max(
+                    event["source_sequence"] for event in observer_events
+                    if event["event_type"] == "adaptive_v2_reporting_terminal"
+                )
+                tree_zero = [event for event in observer_events
+                             if event["event_type"] == "adaptive.configuration_active"
+                             and event["payload"].get("epoch_number") == 0
+                             and event["payload"].get("tree_id") == 0
+                             and event["payload"].get("epoch_digest") == inputs.epoch_zero_digest
+                             and (quota_runtime is None or
+                                  event["source_sequence"] > terminal_sequence)]
+                if len(tree_zero) >= required_complete_cycles + 1:
+                    witness = True
+                    break
             time.sleep(1.0)
         if not witness:
             raise TimeoutError("local W16 event witness was not complete by deadline")
@@ -442,10 +475,21 @@ def execute_once(
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_alarm)
+        if quota_runtime is not None:
+            _stopped, monitor_error = quota_runtime.stop_monitor()
+            if monitor_error is not None:
+                cleanup_error = f"CPU quota monitor failed: {monitor_error}"
         try:
             registry.cleanup(timeout_s=0.2)
         except BaseException as exc:
             cleanup_error = str(exc).strip() or type(exc).__name__
+        if quota_runtime is not None:
+            try:
+                quota_cleanup = quota_runtime.verify_cleanup()
+            except BaseException as exc:
+                cleanup_error = (cleanup_error or "") + (
+                    f"; CPU quota cleanup failed: {exc}"
+                )
         for handle in log_handles:
             handle.close()
         if held is not None:
@@ -459,6 +503,14 @@ def execute_once(
                 cleanup_error = (cleanup_error or "") + (
                     f"; cannot hash replica {replica} raw stream: {exc}"
                 )
+        try:
+            for path in sorted(directory.rglob("*")):
+                if path.is_symlink():
+                    raise LocalExecutorError("artifact tree contains an unowned symlink")
+                if path.is_file():
+                    artifact_hashes[str(path.relative_to(directory))] = _sha256(path)
+        except BaseException as exc:
+            cleanup_error = (cleanup_error or "") + f"; cannot inventory artifacts: {exc}"
 
     records = registry.records
     all_exited = all(record.process.poll() is not None for record in records)
@@ -492,6 +544,12 @@ def execute_once(
         "all_registered_exited": all_exited,
         "treegen_sha256": plan.treegen_sha256,
         "raw_sha256": raw_hashes,
+        "artifact_sha256": artifact_hashes,
+        "quota_contract_sha256": (
+            quota_contract.contract_sha256 if quota_contract is not None else None
+        ),
+        "quota_cleanup": quota_cleanup,
+        "required_complete_cycles": required_complete_cycles,
         "preflight": dict(preflight),
         "epoch_zero_digest": inputs.epoch_zero_digest if inputs is not None else None,
         "started_monotonic_ns": started_ns,
