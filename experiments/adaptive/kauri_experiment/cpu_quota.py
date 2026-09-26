@@ -655,6 +655,9 @@ class CpuQuotaRuntime:
         self._process_group = process_group
         self._monotonic_ns = monotonic_ns
         self._units: dict[int, dict[str, object]] = {}
+        # Include a scope whose launch succeeded but quota/ownership
+        # verification failed before it could enter the verified receipt.
+        self._attempted_units: dict[int, str] = {}
         self._inactive_units: set[int] = set()
         self._monitor_stop = threading.Event()
         self._monitor: threading.Thread | None = None
@@ -775,6 +778,7 @@ class CpuQuotaRuntime:
             replica_id=replica_id,
             command=tuple(kwargs["command"]),
         )
+        self._attempted_units[replica_id] = unit
         record, log = self._base_spawn(registry, **{**kwargs, "command": wrapped})
         properties = self._active_properties(replica_id, unit)
         cgroup = properties["ControlGroup"]
@@ -949,12 +953,14 @@ class CpuQuotaRuntime:
         monitor_stopped, monitor_error = self.stop_monitor()
         rows: list[dict[str, object]] = []
         complete = monitor_stopped
-        for replica_id in sorted(self._units):
-            unit = self._units[replica_id]
+        for replica_id in sorted(set(self._attempted_units) | set(self._units)):
+            unit_name = self._attempted_units.get(replica_id)
+            if unit_name is None:
+                unit_name = str(self._units[replica_id]["unit"])
             properties: dict[str, str] | None = None
             inactive = False
             for _attempt in range(40):
-                properties = parse_systemctl_show(self._show_unit(str(unit["unit"])))
+                properties = parse_systemctl_show(self._show_unit(unit_name))
                 inactive = (
                     properties["ActiveState"] == "inactive"
                     and properties["ControlGroup"] == ""
@@ -967,7 +973,8 @@ class CpuQuotaRuntime:
             rows.append(
                 {
                     "replica_id": replica_id,
-                    "unit": unit["unit"],
+                    "unit": unit_name,
+                    "launch_verified": replica_id in self._units,
                     "load_state": properties.get("LoadState", "loaded"),
                     "active_state": properties["ActiveState"],
                     "sub_state": properties["SubState"],

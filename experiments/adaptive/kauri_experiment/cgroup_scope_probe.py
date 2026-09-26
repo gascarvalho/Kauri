@@ -88,6 +88,7 @@ class CgroupScopeProbeReceipt:
     identity_revalidated: bool
     cgroup_kill_attempted: bool
     populated_after_kill: int | None
+    cgroup_removed_after_kill: bool
     worker_exit_code: int | None
     deadline_exhausted: bool
     completed: bool
@@ -103,6 +104,8 @@ class _OsCgroupDirectory:
         stat_result = self._os.fstat(fd)
         self.dev = int(stat_result.st_dev)
         self.ino = int(stat_result.st_ino)
+        self._kill_written = False
+        self.removed_after_kill = False
 
     def member_pids(self) -> tuple[int, ...]:
         payload = self._read_file("cgroup.procs")
@@ -121,11 +124,21 @@ class _OsCgroupDirectory:
             written = self._os.write(child_fd, b"1")
             if written != 1:
                 raise RuntimeError("cgroup.kill did not accept exactly one byte")
+            self._kill_written = True
         finally:
             self._os.close(child_fd)
 
     def populated(self) -> int:
-        payload = self._read_file("cgroup.events")
+        try:
+            payload = self._read_file("cgroup.events")
+        except FileNotFoundError:
+            # A collected transient scope may disappear immediately after
+            # cgroup.kill. Linux cannot remove a populated cgroup. This is
+            # evidence of emptiness only after our exact write succeeded.
+            if not self._kill_written:
+                raise
+            self.removed_after_kill = True
+            return 0
         rows: dict[str, str] = {}
         try:
             for raw in payload.decode("ascii").splitlines():
@@ -238,6 +251,7 @@ class CgroupScopeProbe:
             identity_revalidated=False,
             cgroup_kill_attempted=False,
             populated_after_kill=None,
+            cgroup_removed_after_kill=False,
             worker_exit_code=None,
             deadline_exhausted=False,
             completed=False,
@@ -283,6 +297,7 @@ class CgroupScopeProbe:
             return replace(
                 receipt,
                 populated_after_kill=populated,
+                cgroup_removed_after_kill=bool(getattr(directory, "removed_after_kill", False)),
                 worker_exit_code=exit_code,
                 completed=True,
             )
@@ -301,6 +316,7 @@ class CgroupScopeProbe:
                     receipt = replace(
                         receipt,
                         populated_after_kill=self._wait_for_unpopulated(directory, deadline),
+                        cgroup_removed_after_kill=bool(getattr(directory, "removed_after_kill", False)),
                     )
                 except BaseException:
                     pass

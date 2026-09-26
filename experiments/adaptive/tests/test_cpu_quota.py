@@ -267,6 +267,16 @@ def test_runtime_rejects_scope_that_does_not_own_launched_process(
             log_path=tmp_path / "replica.log",
             working_directory=tmp_path,
         )
+    # A failed ownership check must not erase the attempted scope from the
+    # cleanup inventory after the process registry has stopped its group.
+    runtime._show_unit = lambda _unit: (
+        "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+        "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
+    )
+    cleanup = runtime.verify_cleanup()
+    assert cleanup["complete"] is True
+    assert cleanup["units"][0]["launch_verified"] is False
+    assert cleanup["units"][0]["replica_id"] == 0
 
 
 def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> None:

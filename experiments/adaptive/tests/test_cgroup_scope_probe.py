@@ -220,6 +220,8 @@ class _FakeOs:
         self.writes: list[tuple[int, bytes]] = []
         self._next = 40
         self._payload_by_fd: dict[int, bytes] = {}
+        self.remove_after_kill = False
+        self.events_missing = False
         self.files = {
             "cgroup.procs": b"11\n12\n",
             "cgroup.events": b"populated 0\nfrozen 0\n",
@@ -227,6 +229,10 @@ class _FakeOs:
 
     def open(self, path: str, flags: int, dir_fd: int | None = None) -> int:
         self.opens.append((path, flags, dir_fd))
+        if path == "cgroup.events" and (
+            self.events_missing or (self.remove_after_kill and self.writes)
+        ):
+            raise FileNotFoundError(path)
         result = self._next
         self._next += 1
         if path in self.files:
@@ -289,3 +295,16 @@ def test_directory_rejects_nonempty_or_schema_drifted_events() -> None:
     fake_os.files["cgroup.events"] = b"populated 0\n"
     with pytest.raises(RuntimeError, match="exact populated"):
         directory.populated()
+
+
+def test_collected_cgroup_disappearance_counts_only_after_exact_kill_write() -> None:
+    fake_os = _FakeOs()
+    fake_os.remove_after_kill = True
+    fake_os.events_missing = True
+    directory = _OsCgroupDirectory(fd=40, os_api=fake_os)
+    with pytest.raises(FileNotFoundError):
+        directory.populated()
+    fake_os.events_missing = False
+    directory.kill()
+    assert directory.populated() == 0
+    assert directory.removed_after_kill is True
