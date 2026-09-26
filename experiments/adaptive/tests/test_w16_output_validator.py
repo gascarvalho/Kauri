@@ -93,7 +93,7 @@ def _contract_document(contract: object) -> dict[str, object]:
 
 def _build_output(
     root: Path, *, cpu_mode: str | None = None, arm: str = "slow-roots",
-    slow_throttling: bool = True,
+    slow_throttling: bool = True, terminal_after_tree: int | None = None,
 ) -> Path:
     root.mkdir()
     for name in ("config", "raw", "logs"):
@@ -140,12 +140,20 @@ def _build_output(
         add("process.started", {"exit_status": None})
         add("adaptive.configuration_active", _active(replica, 0, digest))
         add("process.ready", {"exit_status": None})
+        terminal_emitted = False
         for tree in range(1, 21):
             add("adaptive.configuration_active", _active(replica, tree, digest))
-        add("adaptive_v2_reporting_terminal", {
-            "reason": "shared_outbox_delivery_failed",
-            "terminal_monotonic_ns": 1_000_000_000 + (sequence + 1) * 10_000_000,
-        })
+            if tree == terminal_after_tree:
+                add("adaptive_v2_reporting_terminal", {
+                    "reason": "shared_outbox_delivery_failed",
+                    "terminal_monotonic_ns": 1_000_000_000 + (sequence + 1) * 10_000_000,
+                })
+                terminal_emitted = True
+        if not terminal_emitted:
+            add("adaptive_v2_reporting_terminal", {
+                "reason": "shared_outbox_delivery_failed",
+                "terminal_monotonic_ns": 1_000_000_000 + (sequence + 1) * 10_000_000,
+            })
         if cpu_mode is None:
             if replica == 2:
                 add("block.committed", _commit(1, 0, digest, observer=True))
@@ -339,6 +347,7 @@ def _reseal(root: Path) -> None:
 def test_cpu_free_output_passes_only_bounded_feasibility(tmp_path: Path) -> None:
     result = validate_w16_output(_build_output(tmp_path / "run"))
     assert result["verdict"] == "PASS", result
+    assert result["kind"] == "kauri-w16-output-validation-v2"
     assert result["evidence_class"] == "CPU_FREE_FEASIBILITY"
     assert result["throughput"] is None
     assert result["claim_eligible"] is False
@@ -352,6 +361,107 @@ def test_cpu_output_derives_commit_throughput_and_checks_quota(tmp_path: Path) -
     assert result["quota"]["mode"] == "heterogeneous"
     assert result["authorization"]["approval_ref"].startswith("user-confirmation:")
     assert result["claim_eligible"] is False
+
+
+def test_cpu_output_accepts_mid_cycle_terminal_when_all_sources_settle_before_window(
+    tmp_path: Path,
+) -> None:
+    result = validate_w16_output(_build_output(
+        tmp_path / "run", cpu_mode="heterogeneous", terminal_after_tree=11,
+    ))
+    assert result["verdict"] == "PASS", result
+
+
+def test_cpu_output_rejects_missing_exact_epoch_zero_cycle(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous", terminal_after_tree=11)
+    path = root / "raw/replica-0.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    for row in rows:
+        if (row["event_type"] == "adaptive.configuration_active"
+                and row["payload"]["tree_id"] == 20):
+            row["payload"]["tree_id"] = 19
+    path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                            for row in rows), encoding="utf-8")
+    _reseal(root)
+    result = validate_w16_output(root)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "epoch_zero_cycle"
+
+
+def test_cpu_output_rejects_forged_cycle_before_process_started(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous", terminal_after_tree=11)
+    path = root / "raw/replica-0.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    digest = next(row["payload"]["epoch_digest"] for row in rows
+                  if row["event_type"] == "adaptive.configuration_active")
+    for row in rows:
+        row["source_sequence"] += 21
+        if (row["event_type"] == "adaptive.configuration_active"
+                and row["payload"]["tree_id"] == 20):
+            row["payload"]["tree_id"] = 19
+    run_id = str(rows[0]["run_id"])
+    forged = [
+        _envelope(run_id, 0, tree + 1, 100_000_000 + tree,
+                  "adaptive.configuration_active", _active(0, tree, digest))
+        for tree in range(21)
+    ]
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in forged + rows
+    ), encoding="utf-8")
+    _reseal(root)
+    result = validate_w16_output(root)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "epoch_zero_cycle"
+
+
+def test_cpu_output_rejects_terminal_after_global_measurement_start(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous", terminal_after_tree=11)
+    observer_rows = [json.loads(line) for line in (root / "raw/replica-2.jsonl").read_text().splitlines()]
+    observer_terminal = next(row for row in observer_rows if row["event_type"] == "adaptive_v2_reporting_terminal")
+    start = next(row["source_monotonic_ns"] for row in observer_rows
+                 if row["event_type"] == "adaptive.configuration_active"
+                 and row["source_sequence"] > observer_terminal["source_sequence"]
+                 and row["payload"]["tree_id"] == 0)
+    path = root / "raw/replica-0.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    terminal_index = next(index for index, row in enumerate(rows)
+                          if row["event_type"] == "adaptive_v2_reporting_terminal")
+    delta = start + 1 - rows[terminal_index]["source_monotonic_ns"]
+    for row in rows[terminal_index:]:
+        row["source_monotonic_ns"] += delta
+    path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                            for row in rows), encoding="utf-8")
+    _reseal(root)
+    result = validate_w16_output(root)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "settlement_boundary"
+
+
+def test_cpu_output_rejects_cycle_completion_after_global_measurement_start(
+    tmp_path: Path,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous", terminal_after_tree=11)
+    observer_rows = [json.loads(line) for line in (root / "raw/replica-2.jsonl").read_text().splitlines()]
+    observer_terminal = next(row for row in observer_rows if row["event_type"] == "adaptive_v2_reporting_terminal")
+    start = next(row["source_monotonic_ns"] for row in observer_rows
+                 if row["event_type"] == "adaptive.configuration_active"
+                 and row["source_sequence"] > observer_terminal["source_sequence"]
+                 and row["payload"]["tree_id"] == 0)
+    path = root / "raw/replica-0.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    first_post_terminal_active = next(index for index, row in enumerate(rows)
+                                      if row["event_type"] == "adaptive.configuration_active"
+                                      and row["payload"]["tree_id"] == 12)
+    delta = start + 1 - rows[first_post_terminal_active]["source_monotonic_ns"]
+    for row in rows[first_post_terminal_active:]:
+        row["source_monotonic_ns"] += delta
+    path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                            for row in rows), encoding="utf-8")
+    _reseal(root)
+    result = validate_w16_output(root)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "settlement_boundary"
 
 
 def test_cpu_fixture_authorization_matches_current_producer_schema(

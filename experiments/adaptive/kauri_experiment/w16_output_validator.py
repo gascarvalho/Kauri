@@ -366,6 +366,8 @@ def _validate_streams(
 
     observer_events: list[dict[str, object]] | None = None
     observer_terminal_index = -1
+    terminal_times: list[tuple[str, int]] = []
+    cycle_completion_times: list[tuple[str, int]] = []
     for replica in range(31):
         source = f"replica-{replica}"
         path = root / "raw" / f"{source}.jsonl"
@@ -437,18 +439,26 @@ def _validate_streams(
             )
         ):
             _fail("lifecycle", f"{source} lifecycle is incomplete or reordered")
-        initial_cycle = False
+        initial_cycle_completion: int | None = None
         for offset in range(max(0, len(active) - 20)):
             candidate = active[offset:offset + 21]
             if (
                 [tree for _index, tree in candidate] == list(range(21))
-                and candidate[-1][0] < terminals[0]
+                and lifecycle["process.started"][0] < candidate[0][0]
                 and lifecycle["process.ready"][0] < candidate[-1][0]
+                and candidate[-1][0] < lifecycle["process.stopping"][0]
             ):
-                initial_cycle = True
+                initial_cycle_completion = int(
+                    events[candidate[-1][0]]["source_monotonic_ns"]
+                )
                 break
-        if not initial_cycle:
-            _fail("epoch_zero_cycle", f"{source} lacks one complete pre-terminal native cycle")
+        if initial_cycle_completion is None:
+            _fail(
+                "epoch_zero_cycle",
+                f"{source} lacks one complete native cycle between ready and stopping",
+            )
+        terminal_times.append((source, int(events[terminals[0]]["source_monotonic_ns"])))
+        cycle_completion_times.append((source, initial_cycle_completion))
         if replica == 2:
             observer_events = events
             observer_terminal_index = terminals[0]
@@ -484,6 +494,20 @@ def _validate_streams(
     end_ns = int(window[-1]["source_monotonic_ns"])
     if end_ns <= start_ns:
         _fail("measurement_window", "measurement window has non-positive duration", observed=True)
+    late_terminal = [source for source, timestamp in terminal_times if timestamp >= start_ns]
+    if late_terminal:
+        _fail(
+            "settlement_boundary",
+            "reporting terminal does not precede the global measurement start for "
+            + ", ".join(late_terminal),
+        )
+    late_cycle = [source for source, timestamp in cycle_completion_times if timestamp >= start_ns]
+    if late_cycle:
+        _fail(
+            "settlement_boundary",
+            "complete Epoch-0 cycle does not precede the global measurement start for "
+            + ", ".join(late_cycle),
+        )
     return observer_events, terminal_sequence, start_ns, end_ns
 
 
@@ -991,7 +1015,7 @@ def validate_w16_output(root: Path) -> dict[str, object]:
 
     result: dict[str, object] = {
         "schema_version": 1,
-        "kind": "kauri-w16-output-validation-v1",
+        "kind": "kauri-w16-output-validation-v2",
         "verdict": "INCOMPLETE",
         "evidence_class": None,
         "claim_eligible": False,
