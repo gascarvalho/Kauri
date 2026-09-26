@@ -115,6 +115,28 @@ def test_execute_once_rejects_unbound_preflight_before_creating_output(tmp_path:
     assert not (tmp_path / "run").exists()
 
 
+def test_execute_once_accepts_480_second_bound_and_rejects_larger(
+    tmp_path: Path,
+) -> None:
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+    del receipt["binary_sha256"]
+    accepted_output = tmp_path / "accepted-bound"
+    with pytest.raises(executor.LocalExecutorError, match="binary hashes"):
+        executor.execute_once(
+            plan=plan, preflight=receipt, directory=accepted_output,
+            hard_timeout_s=480,
+        )
+    assert not accepted_output.exists()
+
+    rejected_output = tmp_path / "rejected-bound"
+    with pytest.raises(executor.LocalExecutorError, match=r"\(20, 480\]"):
+        executor.execute_once(
+            plan=plan, preflight=receipt, directory=rejected_output,
+            hard_timeout_s=480.001,
+        )
+    assert not rejected_output.exists()
+
+
 def test_cpu_execution_rejects_missing_authorization_before_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -239,8 +261,8 @@ def test_cpu_authorization_binds_exact_preflight_cell_and_output(
         "binary_sha256": preflight["binary_sha256"],
         "output_root": str(output.resolve()),
         "required_complete_cycles": 5,
-        "hard_timeout_s": 300,
-        "external_timeout_s": 540,
+        "hard_timeout_s": 480,
+        "external_timeout_s": 720,
         "automatic_retries": 0,
         "claim_eligible": False,
         "figure_eligible": False,
@@ -252,13 +274,30 @@ def test_cpu_authorization_binds_exact_preflight_cell_and_output(
     assert cli._read_cpu_authorization(
         path, preflight_bytes=preflight_bytes, preflight=preflight,
         arm="slow-roots", quota_mode="heterogeneous",
-        output=output, hard_timeout_s=300,
+        output=output, hard_timeout_s=480,
     ) == path.read_bytes()
-    document["output_root"] = str(tmp_path / "other")
+    document["hard_timeout_s"] = 300
     path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
     with pytest.raises(cli.executor.LocalExecutorError, match="exact cell"):
         cli._read_cpu_authorization(
             path, preflight_bytes=preflight_bytes, preflight=preflight,
             arm="slow-roots", quota_mode="heterogeneous",
             output=output, hard_timeout_s=300,
+        )
+    document["hard_timeout_s"] = 480.001
+    path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(cli.executor.LocalExecutorError, match="exact cell"):
+        cli._read_cpu_authorization(
+            path, preflight_bytes=preflight_bytes, preflight=preflight,
+            arm="slow-roots", quota_mode="heterogeneous",
+            output=output, hard_timeout_s=480.001,
+        )
+    document["hard_timeout_s"] = 480
+    document["output_root"] = str(tmp_path / "other")
+    path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(cli.executor.LocalExecutorError, match="exact cell"):
+        cli._read_cpu_authorization(
+            path, preflight_bytes=preflight_bytes, preflight=preflight,
+            arm="slow-roots", quota_mode="heterogeneous",
+            output=output, hard_timeout_s=480,
         )

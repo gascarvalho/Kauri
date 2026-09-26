@@ -53,8 +53,9 @@ def _read_cpu_authorization(
         or document["binary_sha256"] != preflight.get("binary_sha256")
         or document["output_root"] != str(output.resolve())
         or document["required_complete_cycles"] != 5
-        or document["hard_timeout_s"] != hard_timeout_s
-        or document["external_timeout_s"] != 540
+        or hard_timeout_s != 480
+        or document["hard_timeout_s"] != 480
+        or document["external_timeout_s"] != 720
         or document["automatic_retries"] != 0
         or document["claim_eligible"] is not False
         or document["figure_eligible"] is not False

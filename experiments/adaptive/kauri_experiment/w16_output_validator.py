@@ -980,10 +980,8 @@ def _validate_authorization(
         or document.get("binary_sha256") != preflight["binary_sha256"]
         or document.get("output_root") != str(root)
         or document.get("required_complete_cycles") != 5
-        or not isinstance(document.get("hard_timeout_s"), (int, float))
-        or isinstance(document.get("hard_timeout_s"), bool)
-        or not 20 < float(document["hard_timeout_s"]) <= 300
-        or document.get("external_timeout_s") != 540
+        or document.get("hard_timeout_s") != 480
+        or document.get("external_timeout_s") != 720
         or document.get("automatic_retries") != 0
         or document.get("claim_eligible") is not False
         or document.get("figure_eligible") is not False

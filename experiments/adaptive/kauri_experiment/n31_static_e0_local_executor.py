@@ -360,8 +360,8 @@ def execute_once(
     All in-process failures are sealed, including partial spawn/cleanup truth.
     """
 
-    if hard_timeout_s <= 20 or hard_timeout_s > 300:
-        raise LocalExecutorError("local hard timeout must be in (20, 300] seconds")
+    if hard_timeout_s <= 20 or hard_timeout_s > 480:
+        raise LocalExecutorError("local hard timeout must be in (20, 480] seconds")
     if required_complete_cycles < 1 or required_complete_cycles > 20:
         raise LocalExecutorError("required complete cycle count is outside 1..20")
     if quota_contract is not None and platform.system() != "Linux":

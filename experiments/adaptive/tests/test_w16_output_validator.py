@@ -6,6 +6,8 @@ import hashlib
 import json
 from pathlib import Path
 
+import pytest
+
 from experiments.adaptive.kauri_experiment import n31_static_e0_feasibility as feasibility
 from experiments.adaptive.kauri_experiment import static_e0_cpu_contract
 from experiments.adaptive.kauri_experiment.w16_output_validator import validate_w16_output
@@ -293,8 +295,8 @@ def _build_output(
             "arm": arm, "quota_mode": cpu_mode,
             "preflight_sha256": hashlib.sha256(_canonical_for_test(preflight)).hexdigest(),
             "binary_sha256": preflight["binary_sha256"], "output_root": str(root.resolve()),
-            "required_complete_cycles": 5, "hard_timeout_s": 300,
-            "external_timeout_s": 540, "automatic_retries": 0,
+            "required_complete_cycles": 5, "hard_timeout_s": 480,
+            "external_timeout_s": 720, "automatic_retries": 0,
             "claim_eligible": False, "figure_eligible": False,
             "approval_ref": "user-confirmation:2026-09-26:inesc-cpu-throughput",
             "approved_at_utc": "2026-09-26T12:00:00Z",
@@ -476,13 +478,33 @@ def test_cpu_fixture_authorization_matches_current_producer_schema(
     assert cli._read_cpu_authorization(
         root / "authorization.json", preflight_bytes=preflight_bytes,
         preflight=receipt["preflight"], arm="slow-roots",
-        quota_mode="heterogeneous", output=root, hard_timeout_s=300,
+        quota_mode="heterogeneous", output=root, hard_timeout_s=480,
     ) == (root / "authorization.json").read_bytes()
     scope = json.loads(
         (root / "runtime/cpu-quota-scope-termination.json").read_text()
     )["units"][0]
     assert scope["worker_live_at_cleanup"] is True
     assert scope["member_pids_before_kill"] == [1000]
+
+
+@pytest.mark.parametrize("hard_timeout_s", (300, 480.001))
+def test_cpu_output_rejects_non_frozen_internal_timeout(
+    tmp_path: Path, hard_timeout_s: float,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    authorization_path = root / "authorization.json"
+    authorization = json.loads(authorization_path.read_text())
+    authorization["hard_timeout_s"] = hard_timeout_s
+    _write_json(authorization_path, authorization)
+    receipt_path = root / "feasibility-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["authorization_sha256"] = _digest(authorization_path)
+    _write_json(receipt_path, receipt)
+    _reseal(root)
+
+    result = validate_w16_output(root)
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "cpu_authorization"
 
 
 def test_pipelined_commit_may_use_an_earlier_activated_tree(tmp_path: Path) -> None:
