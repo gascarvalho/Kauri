@@ -13,6 +13,7 @@ from experiments.adaptive.kauri_experiment import static_e0_cpu_contract
 from experiments.adaptive.kauri_experiment.w16_output_validator import (
     validate_w16_output,
     validate_w16_output_v3,
+    validate_w16_output_v4,
 )
 
 
@@ -463,6 +464,38 @@ def _mutate_required_branch_payload(root: Path, mutation: str) -> None:
     _reseal(root)
 
 
+def _add_delta_success_triplet(root: Path) -> None:
+    path = root / "raw/replica-6.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    timeout_index = next(
+        index for index, row in enumerate(rows)
+        if row["event_type"] == "aggregation.required_branch_incomplete"
+    )
+    timeout = rows[timeout_index]
+    payload = dict(timeout["payload"])
+    payload.update({
+        "accepted_signers": [4], "required_branch_gaps": [],
+    })
+    additions = [
+        _envelope(str(rows[0]["run_id"]), 6, 0,
+                  int(timeout["source_monotonic_ns"]) + offset, event_type, dict(payload))
+        for offset, event_type in enumerate((
+            "aggregation.delta_reserved", "aggregation.delta_enqueued",
+            "aggregation.delta_committed",
+        ), 1)
+    ]
+    rows[timeout_index + 1:timeout_index + 1] = additions
+    for sequence, row in enumerate(rows, 1):
+        row["source_sequence"] = sequence
+    floor = int(additions[-1]["source_monotonic_ns"]) + 1
+    for row in rows[timeout_index + 4:]:
+        row["source_monotonic_ns"] = max(int(row["source_monotonic_ns"]), floor)
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+
 def test_cpu_free_output_passes_only_bounded_feasibility(tmp_path: Path) -> None:
     result = validate_w16_output(_build_output(tmp_path / "run"))
     assert result["verdict"] == "PASS", result
@@ -545,6 +578,150 @@ def test_v3_admits_and_counts_a_valid_required_branch_diagnostic(tmp_path: Path)
             "post_measurement_gap_count": 0,
         }],
     }
+
+
+def test_v4_admits_only_a_complete_timeout_bound_delta_triplet(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+    _add_delta_success_triplet(root)
+
+    v3 = validate_w16_output_v3(root)
+    assert v3["verdict"] == "FAIL"
+    assert v3["reason_code"] == "unexpected_native_event"
+    result = validate_w16_output_v4(root)
+    assert result["verdict"] == "PASS", result
+    assert result["kind"] == "kauri-w16-output-validation-v4"
+    assert result["delta_success_triplets"] == {
+        "schema_version": 1,
+        "event_type": "aggregation.delta_success_triplet",
+        "total_count": 1,
+        "signer_count": 1,
+        "pre_measurement_count": 0,
+        "in_measurement_count": 1,
+        "post_measurement_count": 0,
+        "by_replica": [{
+            "replica_id": 6, "triplet_count": 1, "signer_count": 1,
+            "pre_measurement_count": 0, "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
+        "by_tree": [{
+            "tree_id": 17, "triplet_count": 1, "signer_count": 1,
+            "pre_measurement_count": 0, "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
+    }
+
+
+@pytest.mark.parametrize("mutation", (
+    "orphan", "reordered", "signer-mismatch", "released", "rejected",
+))
+def test_v4_rejects_non_successful_or_incoherent_delta_lifecycles(
+    tmp_path: Path, mutation: str,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+    _add_delta_success_triplet(root)
+    path = root / "raw/replica-6.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    delta_indexes = [
+        index for index, row in enumerate(rows)
+        if row["event_type"].startswith("aggregation.delta_")
+    ]
+    if mutation == "orphan":
+        del rows[delta_indexes[0]]
+    elif mutation == "reordered":
+        rows[delta_indexes[1]]["event_type"] = "aggregation.delta_committed"
+        rows[delta_indexes[2]]["event_type"] = "aggregation.delta_enqueued"
+    elif mutation == "signer-mismatch":
+        rows[delta_indexes[1]]["payload"]["accepted_signers"] = [3]
+    elif mutation == "released":
+        rows[delta_indexes[1]]["event_type"] = "aggregation.delta_released"
+    else:
+        rows[delta_indexes[1]]["event_type"] = "aggregation.delta_rejected"
+    for sequence, row in enumerate(rows, 1):
+        row["source_sequence"] = sequence
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+    result = validate_w16_output_v4(root)
+    assert result["verdict"] == "FAIL", mutation
+    assert result["reason_code"] == "delta_triplet"
+
+
+@pytest.mark.parametrize("mutation", ("no-timeout", "gap-mismatch", "phase-crossing"))
+def test_v4_rejects_unbound_or_phase_crossing_delta_triplets(
+    tmp_path: Path, mutation: str,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+    _add_delta_success_triplet(root)
+    path = root / "raw/replica-6.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    if mutation == "no-timeout":
+        rows = [row for row in rows if row["event_type"] != "aggregation.required_branch_incomplete"]
+    elif mutation == "gap-mismatch":
+        for row in rows:
+            if row["event_type"].startswith("aggregation.delta_"):
+                row["payload"]["accepted_signers"] = [3]
+    else:
+        observer = [json.loads(line) for line in (root / "raw/replica-2.jsonl").read_text().splitlines()]
+        terminal = next(row for row in observer if row["event_type"] == "adaptive_v2_reporting_terminal")
+        end = [row for row in observer if row["event_type"] == "adaptive.configuration_active"
+               and row["source_sequence"] > terminal["source_sequence"]][-1]["source_monotonic_ns"]
+        committed = next(row for row in rows if row["event_type"] == "aggregation.delta_committed")
+        committed["source_monotonic_ns"] = int(end) + 1
+        for row in rows[rows.index(committed) + 1:]:
+            row["source_monotonic_ns"] = max(int(row["source_monotonic_ns"]), int(end) + 2)
+    for sequence, row in enumerate(rows, 1):
+        row["source_sequence"] = sequence
+    path.write_text("".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                            for row in rows), encoding="utf-8")
+    _reseal(root)
+    result = validate_w16_output_v4(root)
+    assert result["verdict"] == "FAIL", mutation
+    assert result["reason_code"] == "delta_triplet"
+
+
+def test_v4_rejects_initial_relay_after_timeout_before_delta(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+    _add_delta_success_triplet(root)
+    path = root / "raw/replica-6.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    timeout_index = next(index for index, row in enumerate(rows)
+                         if row["event_type"] == "aggregation.required_branch_incomplete")
+    delta_index = timeout_index + 1
+    timeout_time = int(rows[timeout_index]["source_monotonic_ns"])
+    for row in rows[delta_index:delta_index + 3]:
+        row["source_monotonic_ns"] = int(row["source_monotonic_ns"]) + 3
+    payload = dict(rows[delta_index]["payload"])
+    payload["accepted_signers"] = [6]
+    run_id = str(rows[0]["run_id"])
+    initial = [
+        _envelope(run_id, 6, 0, timeout_time + offset, event_type, dict(payload))
+        for offset, event_type in enumerate((
+            "aggregation.initial_reserved", "aggregation.initial_enqueued",
+            "aggregation.initial_committed",
+        ), 1)
+    ]
+    rows[delta_index:delta_index] = initial
+    for row in rows[delta_index + 6:]:
+        row["source_monotonic_ns"] = max(
+            int(row["source_monotonic_ns"]), timeout_time + 7,
+        )
+    for sequence, row in enumerate(rows, 1):
+        row["source_sequence"] = sequence
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+        for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+    result = validate_w16_output_v4(root)
+    assert result["verdict"] == "FAIL", result
+    assert result["reason_code"] == "delta_triplet"
 
 
 @pytest.mark.parametrize(

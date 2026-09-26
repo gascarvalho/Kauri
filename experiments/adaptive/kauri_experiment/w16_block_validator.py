@@ -1,6 +1,6 @@
 """Read-only validation of one complete exploratory W16 four-cell block.
 
-Each cell is first reconstructed by the independent W16 v3 cell validator.
+Each cell is first reconstructed by the independent W16 v4 cell validator.
 This module then checks the frozen block identity and computes only the
 predeclared topology-by-quota directional interaction.  A complete block is
 still exploratory: neither a positive direction nor a ``PASS`` verdict creates
@@ -16,11 +16,11 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .w16_output_validator import validate_w16_output_v3
+from .w16_output_validator import validate_w16_output_v4
 
 
-KIND = "kauri-w16-four-cell-block-validation-v2"
-CELL_KIND = "kauri-w16-output-validation-v3"
+KIND = "kauri-w16-four-cell-block-validation-v3"
+CELL_KIND = "kauri-w16-output-validation-v4"
 ORDER = (
     ("slow-roots", "homogeneous"),
     ("fast-roots", "homogeneous"),
@@ -297,6 +297,98 @@ def _required_branch_diagnostics(
     }
 
 
+def _delta_success_diagnostics(
+    value: object, *, expected_ordinal: int,
+) -> dict[str, object]:
+    """Check the complete, phase-classified delta-triplet summary."""
+
+    if not isinstance(value, Mapping):
+        _fail("cell_diagnostics_contract", f"cell {expected_ordinal} lacks delta diagnostics")
+    expected = {
+        "schema_version", "event_type", "total_count", "signer_count",
+        "pre_measurement_count", "in_measurement_count",
+        "post_measurement_count", "by_replica", "by_tree",
+    }
+    if set(value) != expected:
+        _fail("cell_diagnostics_contract", f"cell {expected_ordinal} delta schema drifted")
+    total = value.get("total_count")
+    signers = value.get("signer_count")
+    phases = tuple(value.get(key) for key in (
+        "pre_measurement_count", "in_measurement_count", "post_measurement_count",
+    ))
+    if (
+        value.get("schema_version") != 1
+        or value.get("event_type") != "aggregation.delta_success_triplet"
+        or not _nonnegative_integer(total)
+        or not _nonnegative_integer(signers)
+        or any(not _nonnegative_integer(count) for count in phases)
+        or int(total) != sum(int(count) for count in phases)
+        or int(signers) < int(total)
+    ):
+        _fail("cell_diagnostics_contract", f"cell {expected_ordinal} delta totals are malformed")
+
+    def rows_for(label: str, id_key: str, limit: int) -> list[dict[str, int]]:
+        raw_rows = value.get(label)
+        if not isinstance(raw_rows, list):
+            _fail("cell_diagnostics_contract", f"cell {expected_ordinal} {label} is not an array")
+        normalized: list[dict[str, int]] = []
+        previous = -1
+        for raw in raw_rows:
+            if not isinstance(raw, Mapping) or set(raw) != {
+                id_key, "triplet_count", "signer_count",
+                "pre_measurement_count", "in_measurement_count",
+                "post_measurement_count",
+            }:
+                _fail("cell_diagnostics_contract", f"cell {expected_ordinal} {label} row schema drifted")
+            identifier = raw.get(id_key)
+            triplets = raw.get("triplet_count")
+            row_signers = raw.get("signer_count")
+            row_phases = tuple(raw.get(key) for key in (
+                "pre_measurement_count", "in_measurement_count", "post_measurement_count",
+            ))
+            if (
+                type(identifier) is not int or identifier <= previous
+                or identifier < 0 or identifier >= limit
+                or not _positive_integer(triplets)
+                or not _positive_integer(row_signers)
+                or int(row_signers) < int(triplets)
+                or any(not _nonnegative_integer(count) for count in row_phases)
+                or int(triplets) != sum(int(count) for count in row_phases)
+            ):
+                _fail("cell_diagnostics_contract", f"cell {expected_ordinal} {label} row is malformed")
+            normalized.append({
+                id_key: identifier, "triplet_count": int(triplets),
+                "signer_count": int(row_signers),
+                "pre_measurement_count": int(row_phases[0]),
+                "in_measurement_count": int(row_phases[1]),
+                "post_measurement_count": int(row_phases[2]),
+            })
+            previous = identifier
+        if (
+            sum(row["triplet_count"] for row in normalized) != int(total)
+            or sum(row["signer_count"] for row in normalized) != int(signers)
+            or any(sum(row[key] for row in normalized) != int(expected_count)
+                   for key, expected_count in zip((
+                       "pre_measurement_count", "in_measurement_count",
+                       "post_measurement_count",
+                   ), phases, strict=True))
+        ):
+            _fail("cell_diagnostics_contract", f"cell {expected_ordinal} {label} does not sum to totals")
+        return normalized
+
+    return {
+        "schema_version": 1,
+        "event_type": "aggregation.delta_success_triplet",
+        "total_count": int(total),
+        "signer_count": int(signers),
+        "pre_measurement_count": int(phases[0]),
+        "in_measurement_count": int(phases[1]),
+        "post_measurement_count": int(phases[2]),
+        "by_replica": rows_for("by_replica", "replica_id", 31),
+        "by_tree": rows_for("by_tree", "tree_id", 21),
+    }
+
+
 def _canonical_sha256(value: object) -> str:
     payload = json.dumps(
         value, allow_nan=False, ensure_ascii=True,
@@ -327,7 +419,7 @@ def _read_cell_metadata(
     ):
         _fail(
             "cell_validation_contract",
-            f"cell {expected_ordinal} is not a bounded W16 v3 CPU validation",
+            f"cell {expected_ordinal} is not a bounded W16 v4 CPU validation",
         )
     verdict = validation.get("verdict")
     if verdict != "PASS":
@@ -347,6 +439,10 @@ def _read_cell_metadata(
     )
     required_branch_diagnostics = _required_branch_diagnostics(
         validation.get("required_branch_incomplete"),
+        expected_ordinal=expected_ordinal,
+    )
+    delta_success_diagnostics = _delta_success_diagnostics(
+        validation.get("delta_success_triplets"),
         expected_ordinal=expected_ordinal,
     )
     binary_sha256 = _mapping(preflight.get("binary_sha256"), "binary hashes")
@@ -427,6 +523,7 @@ def _read_cell_metadata(
         "duration_ns": int(duration_ns),
         "throughput_milli_tps": int(milli_tps),
         "required_branch_incomplete": required_branch_diagnostics,
+        "delta_success_triplets": delta_success_diagnostics,
         "cell_validation_sha256": _canonical_sha256(validation),
     }
 
@@ -480,7 +577,7 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
                 _fail("sealed_cell", f"cell {ordinal} lacks receipt or authorization")
             receipt_before = receipt_path.read_bytes()
             authorization_before = authorization_path.read_bytes()
-            validation = validate_w16_output_v3(root)
+            validation = validate_w16_output_v4(root)
             if not isinstance(validation, Mapping):
                 _fail("cell_validation_contract", f"cell {ordinal} validator returned no object")
             cells.append(_read_cell_metadata(
@@ -528,6 +625,14 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
                 "ordinal": cell["ordinal"],
                 "label": cell["label"],
                 **dict(cell["required_branch_incomplete"]),
+            }
+            for cell in cells
+        ]
+        delta_cells = [
+            {
+                "ordinal": cell["ordinal"],
+                "label": cell["label"],
+                **dict(cell["delta_success_triplets"]),
             }
             for cell in cells
         ]
@@ -591,6 +696,22 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
                         for cell in diagnostic_cells
                     ),
                     "by_cell": diagnostic_cells,
+                },
+                "delta_success_triplets": {
+                    "schema_version": 1,
+                    "event_type": "aggregation.delta_success_triplet",
+                    "total_count": sum(int(cell["total_count"]) for cell in delta_cells),
+                    "signer_count": sum(int(cell["signer_count"]) for cell in delta_cells),
+                    "pre_measurement_count": sum(
+                        int(cell["pre_measurement_count"]) for cell in delta_cells
+                    ),
+                    "in_measurement_count": sum(
+                        int(cell["in_measurement_count"]) for cell in delta_cells
+                    ),
+                    "post_measurement_count": sum(
+                        int(cell["post_measurement_count"]) for cell in delta_cells
+                    ),
+                    "by_cell": delta_cells,
                 },
             },
             "positive_mechanism": positive_mechanism,

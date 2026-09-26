@@ -81,7 +81,7 @@ def _cell_results(roots: list[Path], throughputs: tuple[int, int, int, int]) -> 
     return {
         root.resolve(): {
             "schema_version": 1,
-            "kind": "kauri-w16-output-validation-v3",
+            "kind": "kauri-w16-output-validation-v4",
             "verdict": "PASS",
             "evidence_class": "CPU_QUOTA_SINGLE_ARM",
             "claim_eligible": False,
@@ -112,10 +112,43 @@ def _cell_results(roots: list[Path], throughputs: tuple[int, int, int, int]) -> 
                 "by_tree": [],
                 "by_direct_child": [],
             },
+            "delta_success_triplets": {
+                "schema_version": 1,
+                "event_type": "aggregation.delta_success_triplet",
+                "total_count": 0,
+                "signer_count": 0,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 0,
+                "post_measurement_count": 0,
+                "by_replica": [],
+                "by_tree": [],
+            },
         }
         for ordinal, (root, (arm, mode), throughput) in enumerate(
             zip(roots, ORDER, throughputs, strict=True), 1
         )
+    }
+
+
+def _one_delta_success() -> dict[str, object]:
+    return {
+        "schema_version": 1,
+        "event_type": "aggregation.delta_success_triplet",
+        "total_count": 1,
+        "signer_count": 1,
+        "pre_measurement_count": 0,
+        "in_measurement_count": 1,
+        "post_measurement_count": 0,
+        "by_replica": [{
+            "replica_id": 6, "triplet_count": 1, "signer_count": 1,
+            "pre_measurement_count": 0, "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
+        "by_tree": [{
+            "tree_id": 17, "triplet_count": 1, "signer_count": 1,
+            "pre_measurement_count": 0, "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
     }
 
 
@@ -130,7 +163,7 @@ def _install_cell_validator(
         calls.append(resolved)
         return results[resolved]
 
-    monkeypatch.setattr(validator, "validate_w16_output_v3", fake)
+    monkeypatch.setattr(validator, "validate_w16_output_v4", fake)
     return calls
 
 
@@ -159,7 +192,7 @@ def _replace_run_id(root: Path, run_id: str, ordinal: int) -> None:
     _reseal_cell_output(root)
 
 
-def test_real_v3_validator_accepts_complete_four_cell_fixture(tmp_path: Path) -> None:
+def test_real_v4_validator_accepts_complete_four_cell_fixture(tmp_path: Path) -> None:
     roots: list[Path] = []
     for ordinal, (arm, mode) in enumerate(ORDER, 1):
         root = _build_cell_output(
@@ -185,7 +218,7 @@ def test_complete_block_computes_only_predeclared_direction(
     result = validator.validate_w16_block(roots)
 
     assert result["verdict"] == "PASS", result
-    assert result["kind"] == "kauri-w16-four-cell-block-validation-v2"
+    assert result["kind"] == "kauri-w16-four-cell-block-validation-v3"
     assert result["claim_eligible"] is False
     assert result["figure_eligible"] is False
     assert result["campaign_claim"] is False
@@ -251,6 +284,70 @@ def test_complete_negative_direction_is_still_a_valid_block(
     assert result["positive_mechanism"] is False
     assert result["effects"]["heterogeneous_ratio"] > 1
     assert result["effects"]["log_interaction"] < 0
+
+
+def test_carries_exact_delta_success_diagnostics_into_block_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    results = _cell_results(roots, (1_000_000, 1_010_000, 800_000, 1_200_000))
+    results[roots[2].resolve()]["delta_success_triplets"] = _one_delta_success()
+    _install_cell_validator(monkeypatch, results)
+
+    result = validator.validate_w16_block(roots)
+
+    assert result["verdict"] == "PASS", result
+    delta = result["diagnostics"]["delta_success_triplets"]
+    assert delta["total_count"] == 1
+    assert delta["signer_count"] == 1
+    assert delta["in_measurement_count"] == 1
+    assert [cell["total_count"] for cell in delta["by_cell"]] == [0, 0, 1, 0]
+    assert result["cells"][2]["delta_success_triplets"] == _one_delta_success()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing", "extra-key", "wrong-type", "phase-drift",
+        "missing-replica", "missing-tree", "signer-drift", "row-zero",
+        "row-id-drift", "row-phase-drift",
+    ),
+)
+def test_rejects_malformed_delta_success_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mutation: str,
+) -> None:
+    roots = _roots(tmp_path)
+    results = _cell_results(roots, (1_000_000, 1_010_000, 800_000, 1_200_000))
+    target = results[roots[2].resolve()]
+    delta = _one_delta_success()
+    target["delta_success_triplets"] = delta
+    if mutation == "missing":
+        del target["delta_success_triplets"]
+    elif mutation == "extra-key":
+        delta["extra"] = 0
+    elif mutation == "wrong-type":
+        delta["event_type"] = "aggregation.initial_committed"
+    elif mutation == "phase-drift":
+        delta["in_measurement_count"] = 0
+    elif mutation == "missing-replica":
+        delta["by_replica"] = []
+    elif mutation == "missing-tree":
+        delta["by_tree"] = []
+    elif mutation == "signer-drift":
+        delta["signer_count"] = 2
+    elif mutation == "row-zero":
+        delta["by_replica"][0]["triplet_count"] = 0
+    elif mutation == "row-id-drift":
+        delta["by_tree"][0]["tree_id"] = 21
+    elif mutation == "row-phase-drift":
+        delta["by_tree"][0]["in_measurement_count"] = 0
+    _install_cell_validator(monkeypatch, results)
+
+    result = validator.validate_w16_block(roots)
+
+    assert result["verdict"] == "INCOMPLETE", (mutation, result)
+    assert result["reason_code"] == "cell_diagnostics_contract"
+    assert "effects" not in result
 
 
 def test_carries_exact_required_branch_diagnostics_into_block_result(

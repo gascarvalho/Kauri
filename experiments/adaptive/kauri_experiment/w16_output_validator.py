@@ -71,6 +71,7 @@ _ALLOWED_EVENT_TYPES = frozenset(
     }
 )
 _RequiredBranchEvent = tuple[int, int, int, tuple[tuple[int, int], ...]]
+_DeltaTriplet = tuple[int, int, int, int, int, int]
 
 
 class _InvalidEvidence(RuntimeError):
@@ -398,9 +399,73 @@ def _required_child_subtrees(
     return branches
 
 
+def _assigned_subtree(plan: object, *, replica: int, tree_id: int) -> set[int]:
+    schedule = static_topology_n31.build_schedule(plan.arm)
+    tree = schedule["trees"][tree_id]
+    assert isinstance(tree, dict)
+    members = tree["members_breadth_first"]
+    assert isinstance(members, list)
+    indexes = [members.index(replica)]
+    subtree: set[int] = set()
+    while indexes:
+        index = indexes.pop()
+        subtree.add(int(members[index]))
+        indexes.extend(range(
+            static_topology_n31.FANOUT * index + 1,
+            min(static_topology_n31.FANOUT * index + 1 + static_topology_n31.FANOUT,
+                len(members)),
+        ))
+    return subtree
+
+
+def _aggregation_identity(payload: Mapping[str, object]) -> tuple[int, int, str, str, int]:
+    return (
+        int(payload["epoch_number"]), int(payload["tree_id"]),
+        str(payload["epoch_digest"]), str(payload["block_hash"]),
+        int(payload["context_generation"]),
+    )
+
+
+def _validate_nonroot_forwarding_payload(
+    payload: object, *, replica: int, digest: str, plan: object,
+    code: str,
+) -> tuple[tuple[int, int, str, str, int], tuple[int, ...]]:
+    if not isinstance(payload, dict) or set(payload) != _ACTIVE_KEYS:
+        _fail(code, "forwarding payload schema drifted", observed=True)
+    tree_id = payload.get("tree_id")
+    signers = _strict_replica_ids(payload.get("accepted_signers"))
+    if (
+        payload.get("epoch_number") != 0
+        or not _integer(tree_id) or int(tree_id) >= 21
+        or payload.get("epoch_digest") != digest
+        or not _digest(payload.get("block_hash"))
+        or not _integer(payload.get("context_generation"), minimum=1)
+        or payload.get("observer_replica") != replica
+        or payload.get("wait_exempt_signers") != []
+        or signers is None or not signers
+        or payload.get("absent_direct_children") != []
+        or payload.get("missing_optional_signers") != []
+        or payload.get("required_branch_gaps") != []
+        or payload.get("root_signer_count") != 0
+        or payload.get("global_quorum") != 0
+        or payload.get("rejection_reason") is not None
+    ):
+        _fail(code, "forwarding identity differs from W16 non-root relay", observed=True)
+    schedule = static_topology_n31.build_schedule(plan.arm)
+    tree = schedule["trees"][int(tree_id)]
+    assert isinstance(tree, dict)
+    members = tree["members_breadth_first"]
+    assert isinstance(members, list)
+    if int(members[0]) == replica or not set(signers).issubset(
+        _assigned_subtree(plan, replica=replica, tree_id=int(tree_id))
+    ):
+        _fail(code, "forwarding signers are outside the frozen non-root subtree", observed=True)
+    return _aggregation_identity(payload), tuple(signers)
+
+
 def _validate_required_branch_incomplete(
     payload: object, *, replica: int, digest: str, plan: object,
-) -> tuple[int, tuple[tuple[int, int], ...]]:
+) -> tuple[tuple[int, int, str, str, int], int, tuple[tuple[int, int], ...]]:
     """Accept only the exact observational timeout record emitted by W16."""
 
     if not isinstance(payload, dict) or set(payload) != _ACTIVE_KEYS:
@@ -441,7 +506,7 @@ def _validate_required_branch_incomplete(
             _fail("required_branch_incomplete", "diagnostic gap is not an exact required child subtree", observed=True)
         previous_child = int(child)
         normalized_gaps.append((int(child), len(missing)))
-    return int(tree_id), tuple(normalized_gaps)
+    return _aggregation_identity(payload), int(tree_id), tuple(normalized_gaps)
 
 
 def _required_branch_diagnostic_summary(
@@ -506,10 +571,56 @@ def _required_branch_diagnostic_summary(
     }
 
 
+def _delta_triplet_summary(
+    triplets: Sequence[_DeltaTriplet], *, start_ns: int, end_ns: int,
+) -> dict[str, object]:
+    def bucket(timestamp: int) -> str:
+        return (
+            "pre_measurement_count" if timestamp < start_ns
+            else "in_measurement_count" if timestamp < end_ns
+            else "post_measurement_count"
+        )
+
+    by_replica: dict[int, dict[str, int]] = {}
+    by_tree: dict[int, dict[str, int]] = {}
+    for replica, _reserved, _enqueued, committed, tree_id, signer_count in triplets:
+        phase = bucket(committed)
+        replica_row = by_replica.setdefault(
+            replica,
+            {"replica_id": replica, "triplet_count": 0, "signer_count": 0,
+             "pre_measurement_count": 0, "in_measurement_count": 0,
+             "post_measurement_count": 0},
+        )
+        tree_row = by_tree.setdefault(
+            tree_id,
+            {"tree_id": tree_id, "triplet_count": 0, "signer_count": 0,
+             "pre_measurement_count": 0, "in_measurement_count": 0,
+             "post_measurement_count": 0},
+        )
+        for row in (replica_row, tree_row):
+            row["triplet_count"] += 1
+            row["signer_count"] += signer_count
+            row[phase] += 1
+    return {
+        "schema_version": 1,
+        "event_type": "aggregation.delta_success_triplet",
+        "total_count": len(triplets),
+        "signer_count": sum(item[5] for item in triplets),
+        "pre_measurement_count": sum(row["pre_measurement_count"] for row in by_replica.values()),
+        "in_measurement_count": sum(row["in_measurement_count"] for row in by_replica.values()),
+        "post_measurement_count": sum(row["post_measurement_count"] for row in by_replica.values()),
+        "by_replica": [by_replica[replica] for replica in sorted(by_replica)],
+        "by_tree": [by_tree[tree_id] for tree_id in sorted(by_tree)],
+    }
+
+
 def _validate_streams(
     root: Path, receipt: Mapping[str, object], *, cpu_run: bool,
-    plan: object, allow_required_branch_incomplete: bool,
-) -> tuple[list[dict[str, object]], int, int, int, list[_RequiredBranchEvent]]:
+    plan: object, allow_required_branch_incomplete: bool, allow_delta_triplets: bool,
+) -> tuple[
+    list[dict[str, object]], int, int, int, list[_RequiredBranchEvent],
+    list[_DeltaTriplet],
+]:
     run_id = receipt.get("run_id")
     digest = receipt.get("epoch_zero_digest")
     raw_sha256 = receipt.get("raw_sha256")
@@ -525,6 +636,7 @@ def _validate_streams(
     terminal_times: list[tuple[str, int]] = []
     cycle_completion_times: list[tuple[str, int]] = []
     required_branch_events: list[_RequiredBranchEvent] = []
+    delta_triplets: list[_DeltaTriplet] = []
     for replica in range(31):
         source = f"replica-{replica}"
         path = root / "raw" / f"{source}.jsonl"
@@ -535,6 +647,15 @@ def _validate_streams(
         terminals: list[int] = []
         lifecycle: dict[str, list[int]] = defaultdict(list)
         previous_time = 0
+        initial_signers: dict[tuple[int, int, str, str, int], tuple[int, ...]] = {}
+        timeout_signers: dict[tuple[int, int, str, str, int], set[int]] = defaultdict(set)
+        forwarded_delta_signers: dict[tuple[int, int, str, str, int], set[int]] = defaultdict(set)
+        pending_initial: tuple[
+            tuple[int, int, str, str, int], tuple[int, ...], int
+        ] | None = None
+        pending_delta: tuple[
+            tuple[int, int, str, str, int], tuple[int, ...], int, int
+        ] | None = None
         for index, event in enumerate(events):
             if set(event) != _ENVELOPE_KEYS:
                 _fail("native_event_schema", f"{source} envelope schema drifted")
@@ -553,11 +674,33 @@ def _validate_streams(
                 _fail("native_envelope", f"{source} has a gapped or unbound envelope", observed=True)
             previous_time = int(event["source_monotonic_ns"])
             event_type = str(event["event_type"])
+            if pending_initial is not None:
+                expected_initial = (
+                    "aggregation.initial_enqueued"
+                    if pending_initial[2] == 1
+                    else "aggregation.initial_committed"
+                )
+                if event_type != expected_initial:
+                    _fail("delta_triplet", f"{source} initial relay is incomplete or nonconsecutive", observed=True)
+            if pending_delta is not None:
+                expected = (
+                    "aggregation.delta_enqueued"
+                    if pending_delta[3] == 1
+                    else "aggregation.delta_committed"
+                )
+                if event_type != expected:
+                    _fail("delta_triplet", f"{source} delta triplet is incomplete or nonconsecutive", observed=True)
             if event_type in _FATAL_EVENTS:
                 _fail("fatal_native_event", f"{source} emitted {event_type}", observed=True)
             if event_type not in _ALLOWED_EVENT_TYPES and not (
                 allow_required_branch_incomplete
                 and event_type == "aggregation.required_branch_incomplete"
+            ) and not (
+                allow_delta_triplets
+                and event_type in {
+                    "aggregation.delta_reserved", "aggregation.delta_enqueued",
+                    "aggregation.delta_committed",
+                }
             ):
                 _fail(
                     "unexpected_native_event",
@@ -586,14 +729,90 @@ def _validate_streams(
                     (index, _validate_active(event["payload"], replica=replica, digest=str(digest)))
                 )
             elif event_type == "aggregation.required_branch_incomplete":
-                tree_id, gaps = _validate_required_branch_incomplete(
+                identity, tree_id, gaps = _validate_required_branch_incomplete(
                     event["payload"], replica=replica, digest=str(digest), plan=plan,
                 )
+                for child, _missing_count in gaps:
+                    timeout_signers[identity].update(
+                        next(
+                            gap["missing_required_signers"]
+                            for gap in event["payload"]["required_branch_gaps"]
+                            if gap["direct_child"] == child
+                        )
+                    )
                 required_branch_events.append(
                     (replica, int(event["source_monotonic_ns"]), tree_id, gaps)
                 )
+            elif event_type.startswith("aggregation.initial_") and allow_delta_triplets:
+                if event_type not in {
+                    "aggregation.initial_reserved", "aggregation.initial_enqueued",
+                    "aggregation.initial_committed",
+                }:
+                    _fail("delta_triplet", f"{source} emitted unsuccessful initial transition {event_type}", observed=True)
+                identity, signers = _validate_nonroot_forwarding_payload(
+                    event["payload"], replica=replica, digest=str(digest), plan=plan,
+                    code="delta_triplet",
+                )
+                if event_type == "aggregation.initial_reserved":
+                    if (
+                        pending_initial is not None or identity in initial_signers
+                        or identity in timeout_signers
+                        or identity in forwarded_delta_signers
+                    ):
+                        _fail("delta_triplet", f"{source} initial relay order is invalid", observed=True)
+                    pending_initial = (identity, signers, 1)
+                elif (
+                    pending_initial is None or pending_initial[0] != identity
+                    or pending_initial[1] != signers
+                ):
+                    _fail("delta_triplet", f"{source} initial relay identity differs", observed=True)
+                elif event_type == "aggregation.initial_enqueued":
+                    pending_initial = (identity, signers, 2)
+                else:
+                    initial_signers[identity] = signers
+                    pending_initial = None
+            elif event_type.startswith("aggregation.delta_"):
+                if event_type not in {
+                    "aggregation.delta_reserved", "aggregation.delta_enqueued",
+                    "aggregation.delta_committed",
+                }:
+                    _fail("delta_triplet", f"{source} emitted non-success delta transition {event_type}", observed=True)
+                identity, signers = _validate_nonroot_forwarding_payload(
+                    event["payload"], replica=replica, digest=str(digest), plan=plan,
+                    code="delta_triplet",
+                )
+                timestamp = int(event["source_monotonic_ns"])
+                if event_type == "aggregation.delta_reserved":
+                    if pending_delta is not None or identity not in timeout_signers:
+                        _fail("delta_triplet", f"{source} delta lacks one preceding timeout", observed=True)
+                    if not set(signers).issubset(timeout_signers[identity]):
+                        _fail("delta_triplet", f"{source} delta signer is not covered by timeout gaps", observed=True)
+                    if (
+                        set(signers) & set(initial_signers.get(identity, ()))
+                        or set(signers) & forwarded_delta_signers[identity]
+                    ):
+                        _fail("delta_triplet", f"{source} delta signer is not disjoint", observed=True)
+                    pending_delta = (identity, signers, timestamp, 1)
+                elif pending_delta is None or pending_delta[0] != identity or pending_delta[1] != signers:
+                    _fail("delta_triplet", f"{source} delta transition differs from reservation", observed=True)
+                elif event_type == "aggregation.delta_enqueued":
+                    pending_delta = (identity, signers, pending_delta[2], 2)
+                else:
+                    if timestamp < pending_delta[2]:
+                        _fail("delta_triplet", f"{source} delta commit time regressed", observed=True)
+                    forwarded_delta_signers[identity].update(signers)
+                    delta_triplets.append((
+                        replica, pending_delta[2],
+                        int(events[index - 1]["source_monotonic_ns"]), timestamp,
+                        identity[1], len(signers),
+                    ))
+                    pending_delta = None
             elif event_type == "block.committed":
                 _validate_commit(event["payload"], digest=str(digest), observer=(replica == 2))
+        if pending_delta is not None:
+            _fail("delta_triplet", f"{source} ends with an incomplete delta triplet", observed=True)
+        if pending_initial is not None:
+            _fail("delta_triplet", f"{source} ends with an incomplete initial relay", observed=True)
         if (
             len(terminals) != 1
             or any(len(lifecycle[kind]) != 1 for kind in (
@@ -635,7 +854,7 @@ def _validate_streams(
     terminal_sequence = int(terminal_event["source_sequence"])
     terminal_time = int(terminal_event["source_monotonic_ns"])
     if not cpu_run:
-        return observer_events, terminal_sequence, terminal_time, terminal_time, required_branch_events
+        return observer_events, terminal_sequence, terminal_time, terminal_time, required_branch_events, delta_triplets
 
     cycles = receipt.get("required_complete_cycles")
     if not _integer(cycles, minimum=1) or int(cycles) != 5:
@@ -661,6 +880,13 @@ def _validate_streams(
     end_ns = int(window[-1]["source_monotonic_ns"])
     if end_ns <= start_ns:
         _fail("measurement_window", "measurement window has non-positive duration", observed=True)
+    def _phase(timestamp: int) -> int:
+        return 0 if timestamp < start_ns else 1 if timestamp < end_ns else 2
+    if any(
+        len({_phase(reserved), _phase(enqueued), _phase(committed)}) != 1
+        for _replica, reserved, enqueued, committed, _tree, _signers in delta_triplets
+    ):
+        _fail("delta_triplet", "delta triplet crosses a measurement phase boundary", observed=True)
     late_terminal = [source for source, timestamp in terminal_times if timestamp >= start_ns]
     if late_terminal:
         _fail(
@@ -675,7 +901,7 @@ def _validate_streams(
             "complete Epoch-0 cycle does not precede the global measurement start for "
             + ", ".join(late_cycle),
         )
-    return observer_events, terminal_sequence, start_ns, end_ns, required_branch_events
+    return observer_events, terminal_sequence, start_ns, end_ns, required_branch_events, delta_triplets
 
 
 def _derive_throughput(
@@ -1169,7 +1395,7 @@ def _validate_authorization(
     }
 
 
-def _validate_w16_output(root: Path, *, v3: bool) -> dict[str, object]:
+def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
     """Validate one immutable W16 output root without modifying it.
 
     ``PASS`` means the bounded evidence class named in the result is complete.
@@ -1181,8 +1407,7 @@ def _validate_w16_output(root: Path, *, v3: bool) -> dict[str, object]:
     result: dict[str, object] = {
         "schema_version": 1,
         "kind": (
-            "kauri-w16-output-validation-v3" if v3
-            else "kauri-w16-output-validation-v2"
+            f"kauri-w16-output-validation-v{version}"
         ),
         "verdict": "INCOMPLETE",
         "evidence_class": None,
@@ -1243,17 +1468,23 @@ def _validate_w16_output(root: Path, *, v3: bool) -> dict[str, object]:
             or cpu_run != (outcome.get("quota_scope_cleanup") is not None)
         ):
             _fail("cpu_identity", "quota contract and cleanup presence disagree")
-        events, terminal_sequence, start_ns, end_ns, required_branch_events = _validate_streams(
+        (events, terminal_sequence, start_ns, end_ns, required_branch_events,
+         delta_triplets) = _validate_streams(
             candidate, outcome, cpu_run=cpu_run, plan=plan,
-            allow_required_branch_incomplete=v3,
+            allow_required_branch_incomplete=version >= 3,
+            allow_delta_triplets=version >= 4,
         )
         result["run_id"] = outcome["run_id"]
         result["revision"] = outcome["preflight"]["revision"]
         result["arm"] = arm
         result["epoch_zero_digest"] = outcome["epoch_zero_digest"]
-        if v3:
+        if version >= 3:
             result["required_branch_incomplete"] = _required_branch_diagnostic_summary(
                 required_branch_events, start_ns=start_ns, end_ns=end_ns,
+            )
+        if version >= 4:
+            result["delta_success_triplets"] = _delta_triplet_summary(
+                delta_triplets, start_ns=start_ns, end_ns=end_ns,
             )
         if cpu_run:
             throughput = _derive_throughput(
@@ -1309,7 +1540,7 @@ def _validate_w16_output(root: Path, *, v3: bool) -> dict[str, object]:
 def validate_w16_output(root: Path) -> dict[str, object]:
     """Validate an immutable W16 output with the original v2 event contract."""
 
-    return _validate_w16_output(root, v3=False)
+    return _validate_w16_output(root, version=2)
 
 
 def validate_w16_output_v3(root: Path) -> dict[str, object]:
@@ -1320,4 +1551,10 @@ def validate_w16_output_v3(root: Path) -> dict[str, object]:
     placement, and otherwise applies the same producer-bound checks as v2.
     """
 
-    return _validate_w16_output(root, v3=True)
+    return _validate_w16_output(root, version=3)
+
+
+def validate_w16_output_v4(root: Path) -> dict[str, object]:
+    """Prospectively validate a fresh W16 root with safe late-delta evidence."""
+
+    return _validate_w16_output(root, version=4)
