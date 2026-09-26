@@ -494,13 +494,15 @@ def event_gate(
 
         ready = [index for index, event in enumerate(events)
                  if event["event_type"] == "process.ready"]
-        if len(ready) != 1 or ready[0] != 0:
+        if len(ready) != 1:
             return False, f"{source} lacks exactly one process.ready"
         cycle_final_index = _complete_epoch_zero_cycle(
             events, epoch_digest=epoch_digest, source_id=source
         )
         if cycle_final_index is None:
             return False, f"{source} lacks an exact ordered Epoch-0 activation cycle"
+        if ready[0] >= cycle_final_index:
+            return False, f"{source} became ready only after the complete Epoch-0 cycle"
         terminals = [
             (index, event)
             for index, event in enumerate(events)

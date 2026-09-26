@@ -258,6 +258,25 @@ def test_terminal_may_precede_full_tree_cycle_but_commit_chain_must_follow_both(
     assert _gate(module, streams, digest, instances)[0] is False
 
 
+def test_native_startup_may_activate_tree_zero_before_process_ready() -> None:
+    module = _module()
+    streams, digest, instances = _complete_native_streams()
+    for replica, events in enumerate(streams.values()):
+        events.insert(
+            0, _native_event(
+                replica=replica, sequence=1, event_type="process.started",
+                payload={"exit_status": None},
+            ),
+        )
+        ready = next(event for event in events if event["event_type"] == "process.ready")
+        events.remove(ready)
+        events.insert(2, ready)
+        for sequence, event in enumerate(events, 1):
+            event["source_sequence"] = sequence
+            event["source_monotonic_ns"] = sequence * 100
+    assert _gate(module, streams, digest, instances)[0] is True
+
+
 @pytest.mark.parametrize(
     "mutate, expected",
     [
