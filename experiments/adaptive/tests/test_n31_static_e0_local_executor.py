@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib
+import json
 from pathlib import Path
 
 import pytest
@@ -114,6 +115,33 @@ def test_execute_once_rejects_unbound_preflight_before_creating_output(tmp_path:
     assert not (tmp_path / "run").exists()
 
 
+def test_cpu_execution_rejects_missing_authorization_before_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+    monkeypatch.setattr(executor.platform, "system", lambda: "Linux")
+    output = tmp_path / "unauthorized"
+    with pytest.raises(executor.LocalExecutorError, match="authorization"):
+        executor.execute_once(
+            plan=plan, preflight=receipt, directory=output,
+            quota_contract=object(),
+        )
+    assert not output.exists()
+
+
+def test_cpu_witness_waits_for_monitor_round_after_window_end(tmp_path: Path) -> None:
+    _f, executor = _modules()
+    rounds = tmp_path / "cpu-quota-monitor-rounds.jsonl"
+    assert executor._cpu_round_brackets_end(rounds, 200) is False
+    rounds.write_text('{"sample_monotonic_ns":199}\n', encoding="utf-8")
+    assert executor._cpu_round_brackets_end(rounds, 200) is False
+    rounds.write_text(
+        '{"sample_monotonic_ns":199}\n{"sample_monotonic_ns":200}\n',
+        encoding="utf-8",
+    )
+    assert executor._cpu_round_brackets_end(rounds, 200) is True
+
+
 def test_execute_once_seals_keygen_failure_without_launch(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -186,3 +214,51 @@ def test_registry_gate_requires_every_replica_group() -> None:
     executor.assert_exactly_31_registered(Registry(31))
     with pytest.raises(executor.LocalExecutorError, match="exactly the 31"):
         executor.assert_exactly_31_registered(Registry(30))
+
+
+def test_cpu_authorization_binds_exact_preflight_cell_and_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1]))
+    from experiments.adaptive import run_n31_static_e0_local_executor as cli
+
+    _f, _executor, plan, _tree, _binaries, preflight = _inputs(tmp_path)
+    preflight_bytes = (json.dumps(preflight, sort_keys=True) + "\n").encode()
+    output = tmp_path / "cpu-cell"
+    document = {
+        "schema_version": 1,
+        "kind": "kauri-w16-static-e0-exploratory-authorization-v1",
+        "block_id": "w16-static-e0-test-block",
+        "block_order": list(cli._W16_BLOCK_ORDER),
+        "cell_ordinal": 3,
+        "revision": preflight["revision"],
+        "profile_sha256": plan.profile.sha256,
+        "arm": "slow-roots",
+        "quota_mode": "heterogeneous",
+        "preflight_sha256": hashlib.sha256(preflight_bytes).hexdigest(),
+        "binary_sha256": preflight["binary_sha256"],
+        "output_root": str(output.resolve()),
+        "required_complete_cycles": 5,
+        "hard_timeout_s": 300,
+        "external_timeout_s": 540,
+        "automatic_retries": 0,
+        "claim_eligible": False,
+        "figure_eligible": False,
+        "approval_ref": "user-confirmation:2026-09-26:inesc-cpu-throughput",
+        "approved_at_utc": "2026-09-26T12:00:00Z",
+    }
+    path = tmp_path / "authorization.json"
+    path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    assert cli._read_cpu_authorization(
+        path, preflight_bytes=preflight_bytes, preflight=preflight,
+        arm="slow-roots", quota_mode="heterogeneous",
+        output=output, hard_timeout_s=300,
+    ) == path.read_bytes()
+    document["output_root"] = str(tmp_path / "other")
+    path.write_text(json.dumps(document, sort_keys=True) + "\n", encoding="utf-8")
+    with pytest.raises(cli.executor.LocalExecutorError, match="exact cell"):
+        cli._read_cpu_authorization(
+            path, preflight_bytes=preflight_bytes, preflight=preflight,
+            arm="slow-roots", quota_mode="heterogeneous",
+            output=output, hard_timeout_s=300,
+        )

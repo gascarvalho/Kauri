@@ -16,6 +16,7 @@ import threading
 import time
 from typing import Any
 
+from .cgroup_scope_probe import _open_cgroup_directory
 from .profiled_fault_runtime import monotonic_raw_ns
 
 _CONTRACT_KEYS = frozenset(
@@ -47,6 +48,8 @@ _CGROUP_STAT_THROTTLE_KEYS = (
     "nr_throttled",
     "throttled_usec",
 )
+_SYSTEMCTL_SHOW_TIMEOUT_S = 2.0
+_CGROUP_CLEANUP_POLL_S = 0.05
 _AUTHORIZATION_REQUEST_KEYS = frozenset(
     {
         "schema_version",
@@ -93,6 +96,10 @@ class CpuQuotaCleanupError(CpuQuotaContractError):
         self.cleanup = dict(cleanup)
 
 
+class CpuQuotaScopeCleanupError(CpuQuotaCleanupError):
+    """An ownership-bound cgroup termination produced incomplete evidence."""
+
+
 class _CgroupUnavailableError(CpuQuotaContractError):
     """A launch-bound cgroup file disappeared during lifecycle sampling."""
 
@@ -136,6 +143,22 @@ class CpuQuotaContract:
 
     def capacity_class(self, replica_id: int) -> str:
         return self.assignment(replica_id).capacity_class
+
+
+@dataclass(slots=True)
+class _OwnedScopeBinding:
+    replica_id: int
+    unit: str
+    invocation_id: str
+    control_group: str
+    worker_pid: int
+    worker_pgid: int
+    cgroup_dev: int
+    cgroup_ino: int
+    directory: Any
+    worker: Any
+    kill_attempted: bool = False
+    closed: bool = False
 
 
 def _canonical(value: object) -> bytes:
@@ -480,7 +503,7 @@ def parse_systemctl_show(payload: str) -> dict[str, str]:
         result[key] = value
     required = {"ActiveState", "SubState", "CPUQuotaPerSecUSec", "ControlGroup"}
     if not required.issubset(result) or not set(result).issubset(
-        required | {"LoadState"}
+        required | {"LoadState", "InvocationID"}
     ):
         raise CpuQuotaContractError("systemd property output schema drifted")
     return result
@@ -637,8 +660,10 @@ class CpuQuotaRuntime:
         read_cpu_max: Callable[[Path], int] | None = None,
         read_cpu_stat: Callable[[Path], Mapping[str, int]] | None = None,
         read_cgroup_procs: Callable[[Path], Sequence[int]] | None = None,
+        open_cgroup: Callable[[str], Any] | None = None,
         process_group: Callable[[int], int] = os.getpgid,
         monotonic_ns: Callable[[], int] = monotonic_raw_ns,
+        deadline_monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if base_spawn is None:
             from .profiled_fault_runtime import spawn_owned_process
@@ -652,12 +677,16 @@ class CpuQuotaRuntime:
         self._read_cpu_max = read_cpu_max or self._default_read_cpu_max
         self._read_cpu_stat = read_cpu_stat or self._default_read_cpu_stat
         self._read_cgroup_procs = read_cgroup_procs or self._default_read_cgroup_procs
+        self._open_cgroup = open_cgroup or _open_cgroup_directory
         self._process_group = process_group
         self._monotonic_ns = monotonic_ns
+        self._deadline_monotonic_ns = deadline_monotonic_ns
         self._units: dict[int, dict[str, object]] = {}
         # Include a scope whose launch succeeded but quota/ownership
         # verification failed before it could enter the verified receipt.
         self._attempted_units: dict[int, str] = {}
+        self._owned_scopes: dict[int, _OwnedScopeBinding] = {}
+        self._scope_termination_result: dict[str, object] | None = None
         self._inactive_units: set[int] = set()
         self._monitor_stop = threading.Event()
         self._monitor: threading.Thread | None = None
@@ -667,28 +696,37 @@ class CpuQuotaRuntime:
         )
 
     @staticmethod
-    def _default_show_unit(unit: str) -> str:
-        result = subprocess.run(
-            (
-                "systemctl",
-                "--user",
-                "show",
-                unit,
-                "--no-pager",
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=LoadState",
-                "--property=CPUQuotaPerSecUSec",
-                "--property=ControlGroup",
-            ),
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+    def _default_show_unit(
+        unit: str, *, timeout_s: float = _SYSTEMCTL_SHOW_TIMEOUT_S
+    ) -> str:
+        try:
+            result = subprocess.run(
+                (
+                    "systemctl",
+                    "--user",
+                    "show",
+                    unit,
+                    "--no-pager",
+                    "--property=ActiveState",
+                    "--property=SubState",
+                    "--property=LoadState",
+                    "--property=InvocationID",
+                    "--property=CPUQuotaPerSecUSec",
+                    "--property=ControlGroup",
+                ),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise CpuQuotaContractError(
+                f"systemd inspection timed out for transient unit {unit}"
+            ) from exc
         if "LoadState=not-found" in result.stdout:
             return (
                 "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
-                "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
+                "InvocationID=\nCPUQuotaPerSecUSec=0us\nControlGroup=\n"
             )
         if result.returncode != 0:
             detail = result.stderr.strip() or result.stdout.strip()
@@ -698,9 +736,25 @@ class CpuQuotaRuntime:
         if not result.stdout.strip():
             return (
                 "ActiveState=inactive\nSubState=dead\n"
-                "CPUQuotaPerSecUSec=0us\nControlGroup=\n"
+                "InvocationID=\nCPUQuotaPerSecUSec=0us\nControlGroup=\n"
             )
         return result.stdout
+
+    def _inspect_unit(self, unit: str, *, timeout_s: float | None = None) -> str:
+        show = self._show_unit
+        if (
+            getattr(show, "__self__", None) is self
+            and getattr(show, "__func__", None) is CpuQuotaRuntime._default_show_unit
+        ):
+            return show(
+                unit,
+                timeout_s=(
+                    _SYSTEMCTL_SHOW_TIMEOUT_S
+                    if timeout_s is None
+                    else min(_SYSTEMCTL_SHOW_TIMEOUT_S, timeout_s)
+                ),
+            )
+        return show(unit)
 
     @staticmethod
     def _default_read_cpu_max(path: Path) -> int:
@@ -737,12 +791,13 @@ class CpuQuotaRuntime:
         expected_quota = self.contract.quota_percent(replica_id) * 10_000
         last: dict[str, str] | None = None
         for _attempt in range(40):
-            properties = parse_systemctl_show(self._show_unit(unit))
+            properties = parse_systemctl_show(self._inspect_unit(unit))
             last = properties
             cgroup = properties["ControlGroup"]
             if (
                 properties["ActiveState"] == "active"
                 and properties["SubState"] in {"running", "start"}
+                and bool(properties.get("InvocationID"))
                 and cgroup.startswith("/")
                 and ".." not in Path(cgroup).parts
                 and quota_per_second_usec(properties) == expected_quota
@@ -778,6 +833,10 @@ class CpuQuotaRuntime:
             replica_id=replica_id,
             command=tuple(kwargs["command"]),
         )
+        if replica_id in self._attempted_units:
+            raise CpuQuotaContractError(
+                f"replica {replica_id} already has a CPU scope launch attempt"
+            )
         self._attempted_units[replica_id] = unit
         record, log = self._base_spawn(registry, **{**kwargs, "command": wrapped})
         properties = self._active_properties(replica_id, unit)
@@ -786,10 +845,12 @@ class CpuQuotaRuntime:
         stat_path = cgroup_path / "cpu.stat"
         owned_pid = getattr(record, "pid", None)
         owned_pgid = getattr(record, "pgid", None)
-        cgroup_pids = tuple(self._read_cgroup_procs(cgroup_path / "cgroup.procs"))
+        directory = self._open_cgroup(cgroup)
         try:
+            cgroup_pids = tuple(directory.member_pids())
             cgroup_pgids = tuple(self._process_group(pid) for pid in cgroup_pids)
-        except OSError as exc:
+        except BaseException as exc:
+            directory.close()
             raise CpuQuotaContractError(
                 f"cannot verify process-group ownership for {unit}"
             ) from exc
@@ -798,11 +859,26 @@ class CpuQuotaRuntime:
             or type(owned_pgid) is not int
             or owned_pid <= 0
             or owned_pid != owned_pgid
+            or owned_pid not in cgroup_pids
             or owned_pgid not in cgroup_pgids
         ):
+            directory.close()
             raise CpuQuotaContractError(
                 f"transient unit {unit} does not own the launched process group"
             )
+        binding = _OwnedScopeBinding(
+            replica_id=replica_id,
+            unit=unit,
+            invocation_id=str(properties["InvocationID"]),
+            control_group=cgroup,
+            worker_pid=owned_pid,
+            worker_pgid=owned_pgid,
+            cgroup_dev=int(directory.dev),
+            cgroup_ino=int(directory.ino),
+            directory=directory,
+            worker=getattr(record, "process", record),
+        )
+        self._owned_scopes[replica_id] = binding
         self._units[replica_id] = {
             "replica_id": replica_id,
             "cpu_quota_percent": self.contract.quota_percent(replica_id),
@@ -840,7 +916,7 @@ class CpuQuotaRuntime:
                     stat = dict(self._read_cpu_stat(stat_path))
                 except _CgroupUnavailableError as sample_error:
                     properties = parse_systemctl_show(
-                        self._show_unit(str(unit["unit"]))
+                        self._inspect_unit(str(unit["unit"]))
                     )
                     if not (
                         properties["ActiveState"] == "inactive"
@@ -939,39 +1015,276 @@ class CpuQuotaRuntime:
         )
         self._monitor.start()
 
-    def stop_monitor(self) -> tuple[bool, BaseException | None]:
+    def stop_monitor(
+        self, *, timeout_s: float = 5.0
+    ) -> tuple[bool, BaseException | None]:
+        if timeout_s < 0:
+            raise ValueError("monitor stop timeout cannot be negative")
         monitor = self._monitor
         if monitor is None:
             return True, None
         self._monitor_stop.set()
-        monitor.join(timeout=5.0)
+        monitor.join(timeout=timeout_s)
         if monitor.is_alive():
             return False, CpuQuotaContractError("CPU-quota monitor did not stop")
         return True, self._monitor_error
 
-    def verify_cleanup(self) -> dict[str, object]:
-        monitor_stopped, monitor_error = self.stop_monitor()
+    def terminate_owned_scopes(self, deadline_ns: int) -> dict[str, object]:
+        """Kill only launch-bound cgroups and preserve per-scope cleanup truth.
+
+        The absolute deadline uses ``time.monotonic_ns``. A scope without an
+        ownership-verified directory descriptor is never targeted. Repeated
+        calls return or re-raise the first sealed result without another kill.
+        """
+
+        if isinstance(deadline_ns, bool) or not isinstance(deadline_ns, int):
+            raise ValueError("scope cleanup deadline must be an integer")
+        if self._scope_termination_result is not None:
+            cached = dict(self._scope_termination_result)
+            if cached.get("complete") is True:
+                return cached
+            raise CpuQuotaScopeCleanupError(
+                "CPU-quota scope termination was incomplete", cleanup=cached
+            )
+
+        rows: list[dict[str, object]] = []
+        complete = True
+        deadline_exhausted = False
+        replica_ids = sorted(set(self._attempted_units) | set(self._owned_scopes))
+        for replica_id in replica_ids:
+            unit = self._attempted_units[replica_id]
+            binding = self._owned_scopes.get(replica_id)
+            if binding is None:
+                complete = False
+                rows.append(
+                    {
+                        "replica_id": replica_id,
+                        "unit": unit,
+                        "ownership_verified": False,
+                        "status": "not_ownership_verified",
+                        "kill_attempted": False,
+                    }
+                )
+                continue
+
+            row: dict[str, object] = {
+                "replica_id": replica_id,
+                "unit": binding.unit,
+                "ownership_verified": True,
+                "invocation_id": binding.invocation_id,
+                "control_group": binding.control_group,
+                "worker_pid": binding.worker_pid,
+                "worker_pgid": binding.worker_pgid,
+                "cgroup_dev": binding.cgroup_dev,
+                "cgroup_ino": binding.cgroup_ino,
+                "identity_revalidated": False,
+                "kill_attempted": binding.kill_attempted,
+                "populated_after_kill": None,
+                "cgroup_removed_after_kill": False,
+                "status": "pending",
+                "error": None,
+            }
+            try:
+                remaining_ns = deadline_ns - self._deadline_monotonic_ns()
+                if remaining_ns <= 0:
+                    deadline_exhausted = True
+                    raise TimeoutError("CPU-quota scope cleanup deadline elapsed")
+                properties = parse_systemctl_show(
+                    self._inspect_unit(
+                        binding.unit, timeout_s=remaining_ns / 1_000_000_000
+                    )
+                )
+                inactive = (
+                    properties["ActiveState"] == "inactive"
+                    and properties["ControlGroup"] == ""
+                )
+                if inactive:
+                    row["status"] = "already_inactive"
+                    rows.append(row)
+                    continue
+                if (
+                    properties["ActiveState"] != "active"
+                    or properties.get("InvocationID") != binding.invocation_id
+                    or properties["ControlGroup"] != binding.control_group
+                ):
+                    row["status"] = "identity_changed"
+                    complete = False
+                    rows.append(row)
+                    continue
+
+                member_pids = tuple(binding.directory.member_pids())
+                worker = binding.worker
+                worker_poll = getattr(worker, "poll", None)
+                worker_is_live = not callable(worker_poll) or worker_poll() is None
+                row["worker_live_at_cleanup"] = worker_is_live
+                row["member_pids_before_kill"] = list(member_pids)
+                if (
+                    int(binding.directory.dev) != binding.cgroup_dev
+                    or int(binding.directory.ino) != binding.cgroup_ino
+                    or int(getattr(worker, "pid", -1)) != binding.worker_pid
+                    or (
+                        worker_is_live
+                        and (
+                            binding.worker_pid not in member_pids
+                            or self._process_group(binding.worker_pid)
+                            != binding.worker_pgid
+                        )
+                    )
+                ):
+                    row["status"] = "ownership_changed"
+                    complete = False
+                    rows.append(row)
+                    continue
+                row["identity_revalidated"] = True
+                binding.kill_attempted = True
+                row["kill_attempted"] = True
+                binding.directory.kill()
+                while True:
+                    if self._deadline_monotonic_ns() >= deadline_ns:
+                        deadline_exhausted = True
+                        raise TimeoutError(
+                            "CPU-quota scope cleanup deadline elapsed after cgroup.kill"
+                        )
+                    populated = int(binding.directory.populated())
+                    if populated not in {0, 1}:
+                        raise CpuQuotaContractError(
+                            "owned cgroup returned an invalid populated state"
+                        )
+                    if populated == 0:
+                        row["populated_after_kill"] = 0
+                        row["cgroup_removed_after_kill"] = bool(
+                            getattr(binding.directory, "removed_after_kill", False)
+                        )
+                        row["status"] = "killed_and_empty"
+                        break
+                    remaining_ns = deadline_ns - self._deadline_monotonic_ns()
+                    if remaining_ns <= 0:
+                        deadline_exhausted = True
+                        raise TimeoutError(
+                            "CPU-quota scope cleanup deadline elapsed after cgroup.kill"
+                        )
+                    time.sleep(
+                        min(_CGROUP_CLEANUP_POLL_S, remaining_ns / 1_000_000_000)
+                    )
+            except BaseException as exc:
+                complete = False
+                if row["status"] == "pending":
+                    row["status"] = "cleanup_failed"
+                row["error"] = str(exc).strip() or type(exc).__name__
+            finally:
+                if not binding.closed:
+                    try:
+                        binding.directory.close()
+                    except BaseException as exc:
+                        complete = False
+                        row["status"] = "close_failed"
+                        row["error"] = str(exc).strip() or type(exc).__name__
+                    binding.closed = True
+            rows.append(row)
+
+        result: dict[str, object] = {
+            "schema_version": 1,
+            "complete": complete,
+            "deadline_ns": deadline_ns,
+            "deadline_exhausted": deadline_exhausted,
+            "units": rows,
+        }
+        self._scope_termination_result = result
+        try:
+            _replace_json(
+                self.root / "runtime/cpu-quota-scope-termination.json", result
+            )
+        except BaseException as exc:
+            result["complete"] = False
+            result["receipt_error"] = str(exc).strip() or type(exc).__name__
+            raise CpuQuotaScopeCleanupError(
+                "CPU-quota scope termination receipt could not be persisted",
+                cleanup=result,
+            ) from exc
+        if not complete:
+            raise CpuQuotaScopeCleanupError(
+                "CPU-quota scope termination was incomplete", cleanup=result
+            )
+        return result
+
+    def verify_cleanup(self, deadline_ns: int | None = None) -> dict[str, object]:
+        """Prove every attempted unit inactive within one optional deadline."""
+
+        if deadline_ns is not None and (
+            isinstance(deadline_ns, bool) or not isinstance(deadline_ns, int)
+        ):
+            raise ValueError("cleanup deadline must be an integer or None")
+        monitor_timeout = 5.0
+        if deadline_ns is not None:
+            monitor_timeout = max(
+                0.0,
+                min(
+                    monitor_timeout,
+                    (deadline_ns - self._deadline_monotonic_ns()) / 1_000_000_000,
+                ),
+            )
+        monitor_stopped, monitor_error = self.stop_monitor(timeout_s=monitor_timeout)
         rows: list[dict[str, object]] = []
         complete = monitor_stopped
+        deadline_exhausted = False
         for replica_id in sorted(set(self._attempted_units) | set(self._units)):
             unit_name = self._attempted_units.get(replica_id)
             if unit_name is None:
                 unit_name = str(self._units[replica_id]["unit"])
             properties: dict[str, str] | None = None
             inactive = False
+            inspection_error: str | None = None
             for _attempt in range(40):
-                properties = parse_systemctl_show(self._show_unit(unit_name))
+                timeout_s: float | None = None
+                if deadline_ns is not None:
+                    remaining_ns = deadline_ns - self._deadline_monotonic_ns()
+                    if remaining_ns <= 0:
+                        deadline_exhausted = True
+                        inspection_error = "CPU-quota cleanup deadline elapsed"
+                        break
+                    timeout_s = remaining_ns / 1_000_000_000
+                try:
+                    properties = parse_systemctl_show(
+                        self._inspect_unit(unit_name, timeout_s=timeout_s)
+                    )
+                except BaseException as exc:
+                    inspection_error = str(exc).strip() or type(exc).__name__
+                    if (
+                        deadline_ns is not None
+                        and self._deadline_monotonic_ns() >= deadline_ns
+                    ):
+                        deadline_exhausted = True
+                    break
                 inactive = (
                     properties["ActiveState"] == "inactive"
                     and properties["ControlGroup"] == ""
                 )
                 if inactive:
                     break
-                time.sleep(0.05)
-            assert properties is not None
+                delay = _CGROUP_CLEANUP_POLL_S
+                if deadline_ns is not None:
+                    delay = min(
+                        delay,
+                        max(
+                            0.0,
+                            (deadline_ns - self._deadline_monotonic_ns())
+                            / 1_000_000_000,
+                        ),
+                    )
+                time.sleep(delay)
             complete = complete and inactive
-            rows.append(
-                {
+            if properties is None:
+                rows.append(
+                    {
+                        "replica_id": replica_id,
+                        "unit": unit_name,
+                        "launch_verified": replica_id in self._units,
+                        "inspection_complete": False,
+                        "error": inspection_error or "unit inspection was incomplete",
+                    }
+                )
+            else:
+                row: dict[str, object] = {
                     "replica_id": replica_id,
                     "unit": unit_name,
                     "launch_verified": replica_id in self._units,
@@ -980,7 +1293,18 @@ class CpuQuotaRuntime:
                     "sub_state": properties["SubState"],
                     "control_group": properties["ControlGroup"],
                 }
-            )
+                if inspection_error is not None:
+                    row["inspection_complete"] = False
+                    row["error"] = inspection_error
+                rows.append(row)
+            binding = self._owned_scopes.get(replica_id)
+            if binding is not None and not binding.closed:
+                try:
+                    binding.directory.close()
+                except BaseException as exc:
+                    complete = False
+                    rows[-1]["close_error"] = str(exc).strip() or type(exc).__name__
+                binding.closed = True
         monitor: dict[str, object] = {
             "status": "PASSED" if monitor_error is None else "FAILED",
             "stopped": monitor_stopped,
@@ -993,7 +1317,17 @@ class CpuQuotaRuntime:
             "monitor": monitor,
             "units": rows,
         }
-        _replace_json(self.root / "runtime/cpu-quota-cleanup.json", result)
+        if deadline_exhausted:
+            result["deadline_ns"] = deadline_ns
+            result["deadline_exhausted"] = True
+        try:
+            _replace_json(self.root / "runtime/cpu-quota-cleanup.json", result)
+        except BaseException as exc:
+            result["complete"] = False
+            result["receipt_error"] = str(exc).strip() or type(exc).__name__
+            raise CpuQuotaCleanupError(
+                "CPU-quota cleanup receipt could not be persisted", cleanup=result
+            ) from exc
         if not complete:
             raise CpuQuotaCleanupError(
                 "CPU-quota cleanup did not establish quiescence",

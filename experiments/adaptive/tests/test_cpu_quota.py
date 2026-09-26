@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 import json
 from pathlib import Path
+import subprocess
 import threading
 import time
 from types import SimpleNamespace
@@ -25,6 +26,34 @@ def _contract() -> cpu_quota.CpuQuotaContract:
         base_profile_path=BASE_PROFILE_PATH,
         expected_replica_ids=tuple(range(31)),
     )
+
+
+class _OwnedCgroup:
+    dev = 41
+    ino = 73
+    removed_after_kill = False
+
+    def __init__(
+        self, *, members: tuple[int, ...] = (100,), kill_raises: bool = False
+    ) -> None:
+        self.members = members
+        self.kill_raises = kill_raises
+        self.kill_count = 0
+        self.closed = False
+
+    def member_pids(self) -> tuple[int, ...]:
+        return self.members
+
+    def kill(self) -> None:
+        self.kill_count += 1
+        if self.kill_raises:
+            raise OSError("uncertain cgroup.kill write")
+
+    def populated(self) -> int:
+        return 0 if self.kill_count else 1
+
+    def close(self) -> None:
+        self.closed = True
 
 
 def test_checked_in_contract_binds_profile_and_epoch1_capacity_layout() -> None:
@@ -169,7 +198,7 @@ def test_runtime_wraps_only_replicas_and_verifies_cleanup(tmp_path: Path) -> Non
     def show_unit(unit: str) -> str:
         return unit_states.get(
             unit,
-            "ActiveState=active\nSubState=running\n"
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
             f"CPUQuotaPerSecUSec={contract.quota_percent(int(unit.rsplit('r', 1)[1].split('.', 1)[0])) * 10}ms\n"
             f"ControlGroup=/user.slice/{unit}\n",
         )
@@ -189,6 +218,7 @@ def test_runtime_wraps_only_replicas_and_verifies_cleanup(tmp_path: Path) -> Non
             "throttled_usec": 0,
         },
         read_cgroup_procs=lambda _path: (100,),
+        open_cgroup=lambda _group: _OwnedCgroup(),
         process_group=lambda _pid: 100,
     )
     registry = object()
@@ -247,11 +277,12 @@ def test_runtime_rejects_scope_that_does_not_own_launched_process(
         run_directory=tmp_path,
         base_spawn=spawn,
         show_unit=lambda unit: (
-            "ActiveState=active\nSubState=running\n"
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
             "CPUQuotaPerSecUSec=500ms\n"
             f"ControlGroup=/user.slice/{unit}\n"
         ),
         read_cgroup_procs=lambda _path: (101,),
+        open_cgroup=lambda _group: _OwnedCgroup(members=(101,)),
         process_group=lambda _pid: 101,
     )
 
@@ -279,6 +310,282 @@ def test_runtime_rejects_scope_that_does_not_own_launched_process(
     assert cleanup["units"][0]["replica_id"] == 0
 
 
+def test_partial_launch_retains_owned_cgroup_for_identity_stable_kill(
+    tmp_path: Path,
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    directory = _OwnedCgroup()
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="partial-owned-scope",
+        run_directory=tmp_path,
+        base_spawn=lambda _registry, **_kwargs: (
+            SimpleNamespace(pid=100, pgid=100), object()
+        ),
+        show_unit=lambda unit: (
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        ),
+        open_cgroup=lambda _group: directory,
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+    )
+    runtime._write_launch_receipt = lambda: (_ for _ in ()).throw(
+        RuntimeError("receipt write failed")
+    )
+
+    with pytest.raises(RuntimeError, match="receipt write failed"):
+        runtime.spawn_owned_process(
+            object(), name="replica-0", replica_id=0,
+            command=("hotstuff-app", "--idx", "0"),
+            log_path=tmp_path / "replica.log", working_directory=tmp_path,
+        )
+
+    receipt = runtime.terminate_owned_scopes(
+        deadline_ns=time.monotonic_ns() + 1_000_000_000
+    )
+
+    assert receipt["complete"] is True
+    assert receipt["units"][0]["status"] == "killed_and_empty"
+    assert receipt["units"][0]["identity_revalidated"] is True
+    assert receipt["units"][0]["kill_attempted"] is True
+    assert runtime.terminate_owned_scopes(
+        deadline_ns=time.monotonic_ns() + 1_000_000_000
+    ) == receipt
+    assert directory.kill_count == 1
+    assert directory.closed is True
+
+
+def test_stale_scope_identity_is_never_killed_by_unit_name(tmp_path: Path) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    directory = _OwnedCgroup()
+    invocation = "invocation-a"
+
+    def show_unit(unit: str) -> str:
+        return (
+            "ActiveState=active\nSubState=running\n"
+            f"InvocationID={invocation}\nCPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        )
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="stale-owned-scope",
+        run_directory=tmp_path,
+        base_spawn=lambda _registry, **_kwargs: (
+            SimpleNamespace(pid=100, pgid=100), object()
+        ),
+        show_unit=show_unit,
+        open_cgroup=lambda _group: directory,
+        read_cgroup_procs=lambda _path: (100,),
+        process_group=lambda _pid: 100,
+    )
+    runtime.spawn_owned_process(
+        object(), name="replica-0", replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log", working_directory=tmp_path,
+    )
+    invocation = "invocation-b"
+
+    with pytest.raises(cpu_quota.CpuQuotaCleanupError) as raised:
+        runtime.terminate_owned_scopes(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+
+    row = raised.value.cleanup["units"][0]
+    assert row["status"] == "identity_changed"
+    assert row["kill_attempted"] is False
+    assert directory.kill_count == 0
+    assert directory.closed is True
+
+
+def test_exited_worker_does_not_leave_owned_descendants_in_cgroup(
+    tmp_path: Path,
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    directory = _OwnedCgroup()
+
+    class Worker:
+        pid = 100
+
+        def poll(self) -> int | None:
+            return None
+
+    worker = Worker()
+    record = SimpleNamespace(pid=100, pgid=100, process=worker)
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="exited-worker-descendant",
+        run_directory=tmp_path,
+        base_spawn=lambda _registry, **_kwargs: (record, object()),
+        show_unit=lambda unit: (
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        ),
+        open_cgroup=lambda _group: directory,
+        process_group=lambda pid: 100 if pid == 100 else 101,
+    )
+    runtime.spawn_owned_process(
+        object(), name="replica-0", replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log", working_directory=tmp_path,
+    )
+    worker.poll = lambda: 0  # type: ignore[method-assign]
+    directory.members = (101,)
+
+    receipt = runtime.terminate_owned_scopes(
+        deadline_ns=time.monotonic_ns() + 1_000_000_000
+    )
+
+    assert receipt["complete"] is True
+    assert receipt["units"][0]["worker_live_at_cleanup"] is False
+    assert receipt["units"][0]["member_pids_before_kill"] == [101]
+    assert directory.kill_count == 1
+    assert directory.closed is True
+
+
+def test_uncertain_owned_cgroup_kill_is_never_retried(tmp_path: Path) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    directory = _OwnedCgroup(kill_raises=True)
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="uncertain-owned-kill",
+        run_directory=tmp_path,
+        base_spawn=lambda _registry, **_kwargs: (
+            SimpleNamespace(pid=100, pgid=100), object()
+        ),
+        show_unit=lambda unit: (
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
+            "CPUQuotaPerSecUSec=500ms\n"
+            f"ControlGroup=/user.slice/{unit}\n"
+        ),
+        open_cgroup=lambda _group: directory,
+        process_group=lambda _pid: 100,
+    )
+    runtime.spawn_owned_process(
+        object(), name="replica-0", replica_id=0,
+        command=("hotstuff-app", "--idx", "0"),
+        log_path=tmp_path / "replica.log", working_directory=tmp_path,
+    )
+
+    with pytest.raises(cpu_quota.CpuQuotaScopeCleanupError) as first:
+        runtime.terminate_owned_scopes(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+    with pytest.raises(cpu_quota.CpuQuotaScopeCleanupError) as repeated:
+        runtime.terminate_owned_scopes(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+
+    assert first.value.cleanup == repeated.value.cleanup
+    assert first.value.cleanup["units"][0]["kill_attempted"] is True
+    assert directory.kill_count == 1
+    assert directory.closed is True
+
+
+def test_unverified_partial_scope_is_reported_without_destructive_action(
+    tmp_path: Path,
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    opened = False
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="unverified-partial-scope",
+        run_directory=tmp_path,
+        base_spawn=lambda _registry, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("spawn registration failed")
+        ),
+        open_cgroup=lambda _group: (_ for _ in ()).throw(
+            AssertionError("must not open an unverified scope during cleanup")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="spawn registration failed"):
+        runtime.spawn_owned_process(
+            object(), name="replica-0", replica_id=0,
+            command=("hotstuff-app", "--idx", "0"),
+            log_path=tmp_path / "replica.log", working_directory=tmp_path,
+        )
+    with pytest.raises(cpu_quota.CpuQuotaCleanupError) as raised:
+        runtime.terminate_owned_scopes(
+            deadline_ns=time.monotonic_ns() + 1_000_000_000
+        )
+
+    assert opened is False
+    assert raised.value.cleanup["units"] == [
+        {
+            "replica_id": 0,
+            "unit": "kauri-unverified-partial-scope-r0.scope",
+            "ownership_verified": False,
+            "status": "not_ownership_verified",
+            "kill_attempted": False,
+        }
+    ]
+
+
+def test_default_systemd_inspection_has_a_bounded_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def run(*_args: object, **kwargs: object) -> SimpleNamespace:
+        observed.update(kwargs)
+        raise subprocess.TimeoutExpired(cmd="systemctl", timeout=kwargs["timeout"])
+
+    monkeypatch.setattr(cpu_quota.subprocess, "run", run)
+    with pytest.raises(cpu_quota.CpuQuotaContractError, match="timed out"):
+        cpu_quota.CpuQuotaRuntime._default_show_unit("example.scope")
+    assert observed["timeout"] == 2.0
+
+
+def test_verify_cleanup_deadline_writes_and_raises_partial_receipt(
+    tmp_path: Path,
+) -> None:
+    base = _contract()
+    contract = replace(base, assignments=(base.assignments[0],))
+    now = -1_000_000_000
+    show_calls = 0
+
+    def clock() -> int:
+        nonlocal now
+        now += 1_000_000_000
+        return now
+
+    def show_unit(_unit: str) -> str:
+        nonlocal show_calls
+        show_calls += 1
+        return (
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
+            "CPUQuotaPerSecUSec=500ms\nControlGroup=/user.slice/partial.scope\n"
+        )
+
+    runtime = cpu_quota.CpuQuotaRuntime(
+        contract,
+        run_id="deadline-cleanup",
+        run_directory=tmp_path,
+        show_unit=show_unit,
+        deadline_monotonic_ns=clock,
+    )
+    runtime._attempted_units[0] = "partial.scope"
+
+    with pytest.raises(cpu_quota.CpuQuotaCleanupError) as raised:
+        runtime.verify_cleanup(deadline_ns=2_000_000_000)
+
+    assert show_calls == 1
+    assert raised.value.cleanup["deadline_exhausted"] is True
+    assert raised.value.cleanup["complete"] is False
+    assert raised.value.cleanup == json.loads(
+        (tmp_path / "runtime/cpu-quota-cleanup.json").read_text(encoding="utf-8")
+    )
+
+
 def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> None:
     base = _contract()
     contract = replace(base, assignments=(base.assignments[0],))
@@ -291,7 +598,7 @@ def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> 
         nonlocal show_calls
         show_calls += 1
         return (
-            "ActiveState=active\nSubState=running\n"
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
             "CPUQuotaPerSecUSec=500ms\n"
             f"ControlGroup=/user.slice/{unit}\n"
         )
@@ -309,6 +616,7 @@ def test_sampling_reads_cgroup_files_without_polling_systemd(tmp_path: Path) -> 
             "system_usec": 0,
         },
         read_cgroup_procs=lambda _path: (100,),
+        open_cgroup=lambda _group: _OwnedCgroup(),
         process_group=lambda _pid: 100,
         monotonic_ns=lambda: 123,
     )
@@ -370,7 +678,7 @@ def test_default_quota_samples_share_the_fault_evidence_raw_clock(
         run_directory=tmp_path,
         base_spawn=spawn,
         show_unit=lambda unit: (
-            "ActiveState=active\nSubState=running\n"
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
             "CPUQuotaPerSecUSec=500ms\n"
             f"ControlGroup=/user.slice/{unit}\n"
         ),
@@ -381,6 +689,7 @@ def test_default_quota_samples_share_the_fault_evidence_raw_clock(
             "system_usec": 0,
         },
         read_cgroup_procs=lambda _path: (100,),
+        open_cgroup=lambda _group: _OwnedCgroup(),
         process_group=lambda _pid: 100,
     )
     runtime.spawn_owned_process(
@@ -419,7 +728,7 @@ def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> N
         show_calls += 1
         if active:
             return (
-                "ActiveState=active\nSubState=running\n"
+                "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
                 "CPUQuotaPerSecUSec=500ms\n"
                 f"ControlGroup=/user.slice/{unit}\n"
             )
@@ -439,6 +748,7 @@ def test_sampling_uses_systemd_only_after_cgroup_disappears(tmp_path: Path) -> N
         show_unit=show_unit,
         read_cpu_max=missing,
         read_cgroup_procs=lambda _path: (100,),
+        open_cgroup=lambda _group: _OwnedCgroup(),
         process_group=lambda _pid: 100,
         monotonic_ns=lambda: 456,
     )
@@ -533,7 +843,7 @@ def test_monitor_failure_preserves_cause_after_verified_cleanup(
     def show_unit(unit: str) -> str:
         return unit_states.get(
             unit,
-            "ActiveState=active\nSubState=running\n"
+            "ActiveState=active\nSubState=running\nInvocationID=invocation-a\n"
             "CPUQuotaPerSecUSec=500ms\n"
             f"ControlGroup=/user.slice/{unit}\n",
         )
@@ -553,6 +863,7 @@ def test_monitor_failure_preserves_cause_after_verified_cleanup(
         read_cpu_max=lambda _path: 500_000,
         read_cpu_stat=fail_sample,
         read_cgroup_procs=lambda _path: (100,),
+        open_cgroup=lambda _group: _OwnedCgroup(),
         process_group=lambda _pid: 100,
     )
     runtime.spawn_owned_process(
@@ -792,6 +1103,7 @@ def test_focused_backend_preserves_normal_path_and_wraps_only_opted_in_replicas(
         return (
             f"ActiveState={'active' if active else 'inactive'}\n"
             f"SubState={'running' if active else 'dead'}\n"
+            f"InvocationID={'invocation-a' if active else ''}\n"
             f"CPUQuotaPerSecUSec={quota_ms}ms\n"
             f"ControlGroup={'/user.slice/' + unit if active else ''}\n"
         )
@@ -816,6 +1128,7 @@ def test_focused_backend_preserves_normal_path_and_wraps_only_opted_in_replicas(
                 "throttled_usec": 0,
             },
             read_cgroup_procs=lambda _path: (100,),
+            open_cgroup=lambda _group: _OwnedCgroup(),
             process_group=lambda _pid: 100,
         )
 

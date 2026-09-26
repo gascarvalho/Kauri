@@ -1,11 +1,7 @@
-"""Fail-closed preparation seam for the W16 local N=31 feasibility run.
+"""Fail-closed preparation and one-shot runner for W16 N=31 feasibility.
 
-This module deliberately contains *no launch path*.  It specifies and checks
-the immutable inputs a later reviewed launcher would require, while keeping
-the current experiment incapable of starting a replica or a cluster job.
-In particular, a preflight is not execution authority: it must be bound to
-the exact executables, written tree file, native epoch-zero digest helper,
-and a held non-listening manager socket.
+An exact preflight alone is not execution authority. CPU-quota runs also
+require a cell-bound, byte-preserved exploratory authorization.
 """
 
 from __future__ import annotations
@@ -337,11 +333,25 @@ def _generate_identities_bounded(
     )
 
 
+def _cpu_round_brackets_end(rounds_path: Path, window_end_ns: int) -> bool:
+    """Require one fully persisted monitor round after the final tree boundary."""
+
+    if not rounds_path.is_file():
+        return False
+    rounds = runtime.read_jsonl(rounds_path, allow_partial=True)
+    return any(
+        type(row.get("sample_monotonic_ns")) is int
+        and row["sample_monotonic_ns"] >= window_end_ns
+        for row in rounds
+    )
+
+
 def execute_once(
     *, plan: feasibility.FeasibilityPlan, preflight: Mapping[str, object],
     directory: Path, hard_timeout_s: float = 180.0,
     quota_contract: cpu_quota.CpuQuotaContract | None = None,
     required_complete_cycles: int = 1,
+    authorization_bytes: bytes | None = None,
 ) -> dict[str, object]:
     """One no-manager, zero-retry feasibility attempt.
 
@@ -356,6 +366,8 @@ def execute_once(
         raise LocalExecutorError("required complete cycle count is outside 1..20")
     if quota_contract is not None and platform.system() != "Linux":
         raise LocalExecutorError("CPU quota mode requires Linux")
+    if (quota_contract is None) != (authorization_bytes is None):
+        raise LocalExecutorError("CPU execution requires an exact authorization; CPU-free execution forbids it")
     directory = directory.resolve()
     if directory.exists():
         raise LocalExecutorError("one attempt requires an exact fresh output directory")
@@ -363,6 +375,9 @@ def execute_once(
     directory.mkdir(parents=True, mode=0o700)
     for subdirectory in ("config", "logs", "raw"):
         (directory / subdirectory).mkdir(mode=0o700)
+    if authorization_bytes is not None:
+        with (directory / "authorization.json").open("xb") as authorization_file:
+            authorization_file.write(authorization_bytes)
     started_ns = time.monotonic_ns()
     deadline_ns = started_ns + int(hard_timeout_s * 1_000_000_000)
     work_deadline_ns = deadline_ns - 10_000_000_000
@@ -376,6 +391,7 @@ def execute_once(
     failure: str | None = None
     cleanup_error: str | None = None
     quota_cleanup: dict[str, object] | None = None
+    quota_scope_cleanup: dict[str, object] | None = None
     raw_hashes: dict[str, str] = {}
     artifact_hashes: dict[str, str] = {}
     old_alarm = signal.getsignal(signal.SIGALRM)
@@ -465,8 +481,18 @@ def execute_once(
                              and (quota_runtime is None or
                                   event["source_sequence"] > terminal_sequence)]
                 if len(tree_zero) >= required_complete_cycles + 1:
-                    witness = True
-                    break
+                    if quota_runtime is None:
+                        witness = True
+                        break
+                    window_end_ns = int(
+                        tree_zero[required_complete_cycles]["source_monotonic_ns"]
+                    )
+                    if _cpu_round_brackets_end(
+                        directory / "raw/cpu-quota-monitor-rounds.jsonl",
+                        window_end_ns,
+                    ):
+                        witness = True
+                        break
             time.sleep(1.0)
         if not witness:
             raise TimeoutError("local W16 event witness was not complete by deadline")
@@ -476,16 +502,39 @@ def execute_once(
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, old_alarm)
         if quota_runtime is not None:
-            _stopped, monitor_error = quota_runtime.stop_monitor()
-            if monitor_error is not None:
-                cleanup_error = f"CPU quota monitor failed: {monitor_error}"
+            stopped, monitor_error = quota_runtime.stop_monitor()
+            if not stopped or monitor_error is not None:
+                cleanup_error = f"CPU quota monitor failed: {monitor_error or 'did not stop'}"
         try:
             registry.cleanup(timeout_s=0.2)
         except BaseException as exc:
-            cleanup_error = str(exc).strip() or type(exc).__name__
+            cleanup_error = (cleanup_error or "") + (
+                f"; process registry cleanup failed: {str(exc).strip() or type(exc).__name__}"
+            )
         if quota_runtime is not None:
             try:
-                quota_cleanup = quota_runtime.verify_cleanup()
+                quota_scope_cleanup = quota_runtime.terminate_owned_scopes(
+                    deadline_ns=started_ns + int((hard_timeout_s + 90) * 1_000_000_000)
+                )
+            except cpu_quota.CpuQuotaScopeCleanupError as exc:
+                quota_scope_cleanup = exc.cleanup
+                cleanup_error = (cleanup_error or "") + (
+                    f"; owned CPU scope termination failed: {exc}"
+                )
+            except BaseException as exc:
+                cleanup_error = (cleanup_error or "") + (
+                    f"; owned CPU scope termination failed: {exc}"
+                )
+        if quota_runtime is not None:
+            try:
+                quota_cleanup = quota_runtime.verify_cleanup(
+                    deadline_ns=started_ns + int((hard_timeout_s + 160) * 1_000_000_000)
+                )
+            except cpu_quota.CpuQuotaCleanupError as exc:
+                quota_cleanup = exc.cleanup
+                cleanup_error = (cleanup_error or "") + (
+                    f"; CPU quota cleanup failed: {exc}"
+                )
             except BaseException as exc:
                 cleanup_error = (cleanup_error or "") + (
                     f"; CPU quota cleanup failed: {exc}"
@@ -548,7 +597,12 @@ def execute_once(
         "quota_contract_sha256": (
             quota_contract.contract_sha256 if quota_contract is not None else None
         ),
+        "authorization_sha256": (
+            hashlib.sha256(authorization_bytes).hexdigest()
+            if authorization_bytes is not None else None
+        ),
         "quota_cleanup": quota_cleanup,
+        "quota_scope_cleanup": quota_scope_cleanup,
         "required_complete_cycles": required_complete_cycles,
         "preflight": dict(preflight),
         "epoch_zero_digest": inputs.epoch_zero_digest if inputs is not None else None,
