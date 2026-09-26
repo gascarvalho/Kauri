@@ -1658,6 +1658,7 @@ namespace hotstuff
         bool has_pending_adaptive_v2_lifecycle_fence() const noexcept;
         void suppress_adaptive_v2_lifecycle_reporting(
             const char *reason) noexcept;
+        void emit_adaptive_v2_reporting_terminal(const char *reason) noexcept;
         void poison_adaptive_v2_reporting(const char *reason) noexcept;
         AdaptiveV2ReportingDeliveryResult
         transmit_adaptive_v2_report(

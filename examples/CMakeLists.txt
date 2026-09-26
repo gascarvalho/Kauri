@@ -22,6 +22,7 @@ add_executable(hotstuff-app hotstuff_app.cpp)
 add_executable(hotstuff-client hotstuff_client.cpp)
 add_executable(adaptation-manager adaptation_manager.cpp)
 add_executable(epoch-profile-digest epoch_profile_digest.cpp)
+add_executable(static-epoch0-digest static_epoch0_digest.cpp)
 add_executable(struc31-placement-matrix struc31_placement_matrix.cpp)
 
 target_compile_options(hotstuff-app PUBLIC -Wl,-no_pie)
@@ -76,6 +77,9 @@ TARGET_LINK_LIBRARIES(
     epoch-profile-digest PRIVATE
     ${GMP_LIBRARIES} ${GMPXX_LIBRARIES}
     hotstuff_static blstmp relic_s pthread sodium)
+
+target_include_directories(static-epoch0-digest PUBLIC ${relic_BINARY_DIR}/include ${relic_SOURCE_DIR}/include ${GMP_INCLUDES} ${INCLUDE_DIRECTORIES} ../bls/src)
+TARGET_LINK_LIBRARIES(static-epoch0-digest PRIVATE ${GMP_LIBRARIES} ${GMPXX_LIBRARIES} hotstuff_static blstmp relic_s pthread sodium)
 
 target_include_directories(
     struc31-placement-matrix PRIVATE ${relic_BINARY_DIR}/include)

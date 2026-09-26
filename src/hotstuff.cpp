@@ -12082,10 +12082,29 @@ namespace hotstuff
     void HotStuffBase::poison_adaptive_v2_reporting(
         const char *reason) noexcept
     {
+        emit_adaptive_v2_reporting_terminal(reason);
         suppress_adaptive_v2_lifecycle_reporting(reason);
         if (adaptive_v2_reporting_outbox != nullptr)
             adaptive_v2_reporting_outbox->shutdown();
         cancel_adaptive_v2_reporting_flush();
+    }
+
+    void HotStuffBase::emit_adaptive_v2_reporting_terminal(
+        const char *reason) noexcept
+    {
+        if (structured_event_emitter == nullptr || reason == nullptr ||
+            *reason == '\0')
+            return;
+        try
+        {
+            structured_event_emitter->emit(
+                StructuredEventPayload{AdaptiveV2ReportingTerminalStructuredEvent{
+                    reason, adaptive_monotonic_now_ns()}});
+        }
+        catch (...)
+        {
+            // Reporting evidence must not affect consensus progress.
+        }
     }
 
     AdaptiveV2ReportingDeliveryResult

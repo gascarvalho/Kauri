@@ -376,6 +376,16 @@ bool payload_type(const StructuredEventPayload &payload,
             type = StructuredEventType::block_commit_identity_witness;
             return true;
         }
+        case 6:
+        {
+            const auto &event =
+                std::get<AdaptiveV2ReportingTerminalStructuredEvent>(payload);
+            if (event.terminal_monotonic_ns == 0 || event.reason.empty() ||
+                event.reason.size() > 256 || !valid_utf8(event.reason))
+                return false;
+            type = StructuredEventType::adaptive_v2_reporting_terminal;
+            return true;
+        }
         default:
             return false;
     }
@@ -2391,6 +2401,17 @@ void append_commit_identity_witness_payload(
     builder.append('}');
 }
 
+void append_adaptive_v2_reporting_terminal_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2ReportingTerminalStructuredEvent &event)
+{
+    builder.append("{\"reason\":");
+    builder.append_escaped(event.reason);
+    builder.append(",\"terminal_monotonic_ns\":");
+    builder.append_integer(event.terminal_monotonic_ns);
+    builder.append('}');
+}
+
 void append_fault_contribution_opportunity_payload(
     JsonLineBuilder &builder,
     const FaultContributionOpportunityStructuredEvent &event)
@@ -3225,6 +3246,11 @@ std::string serialize_event(const StructuredEventConfig &config,
                 builder,
                 std::get<CommitIdentityWitnessStructuredEvent>(payload));
             break;
+        case 6:
+            append_adaptive_v2_reporting_terminal_payload(
+                builder,
+                std::get<AdaptiveV2ReportingTerminalStructuredEvent>(payload));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -3858,6 +3884,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_ready";
         case StructuredEventType::adaptive_v2_convergence_failure:
             return "adaptive_v2_convergence_failure";
+        case StructuredEventType::adaptive_v2_reporting_terminal:
+            return "adaptive_v2_reporting_terminal";
         case StructuredEventType::adaptive_v2_evidence_snapshot:
             return "adaptive_v2_evidence_snapshot";
         case StructuredEventType::adaptive_v2_session_terminal:

@@ -549,6 +549,7 @@ using hotstuff::AdaptiveV2EpochChangeIdentity;
 using hotstuff::AdaptiveV2ManagerCycleOutcome;
 using hotstuff::AdaptiveV2ManagerCycleTerminalReason;
 using hotstuff::AdaptiveV2ManagerSessionTerminalStructuredEvent;
+using hotstuff::AdaptiveV2ReportingTerminalStructuredEvent;
 using hotstuff::AdaptiveV2ShapeDecisionStructuredEvent;
 using hotstuff::AcceptedEvidenceRecord;
 using hotstuff::AuditStructuredEventEmitter;
@@ -1803,8 +1804,8 @@ TEST_CASE("V13 exposes a closed payload-only protocol emitter",
     CHECK(KAURI_HAS_STRUCTURED_EVENT_API == 1);
     CHECK(hotstuff::kStructuredEventSchemaVersion == 1);
 
-    static_assert(std::variant_size<StructuredEventPayload>::value == 6,
-                  "protocol evidence has lifecycle and four commit payloads");
+    static_assert(std::variant_size<StructuredEventPayload>::value == 7,
+                  "protocol evidence includes the reporting terminal witness");
     static_assert(std::is_final<StructuredEventSink>::value,
                   "one owner controls the queue and output path");
     static_assert(!std::is_copy_constructible<StructuredEventSink>::value,
@@ -2006,7 +2007,7 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
             StructuredEventSink>::value,
         "the bounded sink implements the separate adaptive capability");
     static_assert(
-        std::variant_size<StructuredEventPayload>::value == 6,
+        std::variant_size<StructuredEventPayload>::value == 7,
         "adaptive aggregation evidence stays outside protocol payloads");
 
     struct Mapping
@@ -2105,6 +2106,23 @@ TEST_CASE("WE06-C04 maps every adaptive transition to one canonical event",
         observed_types.push_back(mapping.type);
         observed_names.emplace_back(mapping.name);
     }
+}
+
+TEST_CASE("W16 reporting exhaustion emits one replica-local terminal witness",
+          "[w16][structured-event][reporting-terminal]")
+{
+    const auto payload = StructuredEventPayload{
+        AdaptiveV2ReportingTerminalStructuredEvent{
+            "shared_outbox_terminal_report", 1234}};
+    CHECK(structured_event_type(payload) ==
+          StructuredEventType::adaptive_v2_reporting_terminal);
+    CHECK(std::string(structured_event_type_name(
+              StructuredEventType::adaptive_v2_reporting_terminal)) ==
+          "adaptive_v2_reporting_terminal");
+
+    const auto invalid = StructuredEventPayload{
+        AdaptiveV2ReportingTerminalStructuredEvent{"", 0}};
+    CHECK(structured_event_type(invalid) == static_cast<StructuredEventType>(0));
 }
 
 TEST_CASE("AE01 maps exact command and accepted reputation audit events",

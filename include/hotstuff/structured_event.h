@@ -151,6 +151,16 @@ struct CommitIdentityWitnessStructuredEvent
 };
 
 /**
+ * Replica-local terminal result for the bounded adaptive-v2 reporting outbox.
+ * It is observational: emitting it neither votes nor changes epoch state.
+ */
+struct AdaptiveV2ReportingTerminalStructuredEvent
+{
+    std::string reason;
+    std::uint64_t terminal_monotonic_ns{0};
+};
+
+/**
  * Prospective ground truth for one cached experiment-only contribution
  * decision. This record is observational and grants no voting, transport,
  * fault-selection, or epoch authority.
@@ -477,7 +487,8 @@ using StructuredEventPayload = std::variant<
     CommitStructuredEvent,
     CommitObservedStructuredEvent,
     CommitIdentityUnavailableStructuredEvent,
-    CommitIdentityWitnessStructuredEvent>;
+    CommitIdentityWitnessStructuredEvent,
+    AdaptiveV2ReportingTerminalStructuredEvent>;
 
 using AuditStructuredEventPayload = std::variant<
     EpochCommandCommittedStructuredEvent,
@@ -588,6 +599,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_converged,
     adaptive_v2_ready,
     adaptive_v2_convergence_failure,
+    adaptive_v2_reporting_terminal,
     adaptive_v2_evidence_snapshot,
     adaptive_v2_session_terminal,
     evidence_observation_accepted,
