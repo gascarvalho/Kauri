@@ -17,6 +17,7 @@ from typing import Mapping, Sequence
 
 from . import n31_static_e0_feasibility as feasibility
 from . import static_e0_cpu_contract
+from . import static_topology_n31
 
 
 _RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v1"
@@ -69,6 +70,7 @@ _ALLOWED_EVENT_TYPES = frozenset(
         "aggregation.root_quorum_progress", "aggregation.root_qc_published",
     }
 )
+_RequiredBranchEvent = tuple[int, int, int, tuple[tuple[int, int], ...]]
 
 
 class _InvalidEvidence(RuntimeError):
@@ -351,9 +353,163 @@ def _validate_commit(payload: object, *, digest: str, observer: bool) -> dict[st
     return payload
 
 
+def _strict_replica_ids(value: object) -> list[int] | None:
+    if (
+        not isinstance(value, list)
+        or any(not _integer(replica) or int(replica) >= 31 for replica in value)
+    ):
+        return None
+    replicas = [int(replica) for replica in value]
+    if replicas != sorted(set(replicas)):
+        return None
+    return replicas
+
+
+def _required_child_subtrees(
+    plan: object, *, replica: int, tree_id: int,
+) -> dict[int, set[int]]:
+    """Derive exact required child subtrees from the frozen W16 topology."""
+
+    schedule = static_topology_n31.build_schedule(plan.arm)
+    tree = schedule["trees"][tree_id]
+    assert isinstance(tree, dict)
+    members = tree["members_breadth_first"]
+    assert isinstance(members, list)
+    local_index = members.index(replica)
+    branches: dict[int, set[int]] = {}
+    for child_index in range(
+        static_topology_n31.FANOUT * local_index + 1,
+        min(static_topology_n31.FANOUT * local_index + 1 + static_topology_n31.FANOUT,
+            len(members)),
+    ):
+        subtree_indexes = [child_index]
+        subtree: set[int] = set()
+        while subtree_indexes:
+            index = subtree_indexes.pop()
+            subtree.add(int(members[index]))
+            subtree_indexes.extend(
+                range(
+                    static_topology_n31.FANOUT * index + 1,
+                    min(static_topology_n31.FANOUT * index + 1 + static_topology_n31.FANOUT,
+                        len(members)),
+                )
+            )
+        branches[int(members[child_index])] = subtree
+    return branches
+
+
+def _validate_required_branch_incomplete(
+    payload: object, *, replica: int, digest: str, plan: object,
+) -> tuple[int, tuple[tuple[int, int], ...]]:
+    """Accept only the exact observational timeout record emitted by W16."""
+
+    if not isinstance(payload, dict) or set(payload) != _ACTIVE_KEYS:
+        _fail("required_branch_incomplete", "diagnostic payload schema drifted", observed=True)
+    tree_id = payload.get("tree_id")
+    if (
+        payload.get("epoch_number") != 0
+        or not _integer(tree_id) or int(tree_id) >= 21
+        or payload.get("epoch_digest") != digest
+        or not _digest(payload.get("block_hash"))
+        or not _integer(payload.get("context_generation"), minimum=1)
+        or payload.get("observer_replica") != replica
+        or payload.get("wait_exempt_signers") != []
+        or payload.get("accepted_signers") != []
+        or payload.get("absent_direct_children") != []
+        or payload.get("missing_optional_signers") != []
+        or payload.get("root_signer_count") != 0
+        or payload.get("global_quorum") != 0
+        or payload.get("rejection_reason") is not None
+    ):
+        _fail("required_branch_incomplete", "diagnostic identity differs from W16 timeout emitter", observed=True)
+    gaps = payload.get("required_branch_gaps")
+    if not isinstance(gaps, list) or not gaps:
+        _fail("required_branch_incomplete", "diagnostic has no required child gap", observed=True)
+    branches = _required_child_subtrees(plan, replica=replica, tree_id=int(tree_id))
+    previous_child = -1
+    normalized_gaps: list[tuple[int, int]] = []
+    for gap in gaps:
+        if not isinstance(gap, dict) or set(gap) != {"direct_child", "missing_required_signers"}:
+            _fail("required_branch_incomplete", "diagnostic child-gap schema drifted", observed=True)
+        child = gap.get("direct_child")
+        missing = _strict_replica_ids(gap.get("missing_required_signers"))
+        if (
+            not _integer(child) or int(child) not in branches
+            or int(child) <= previous_child or not missing
+            or not set(missing).issubset(branches[int(child)])
+        ):
+            _fail("required_branch_incomplete", "diagnostic gap is not an exact required child subtree", observed=True)
+        previous_child = int(child)
+        normalized_gaps.append((int(child), len(missing)))
+    return int(tree_id), tuple(normalized_gaps)
+
+
+def _required_branch_diagnostic_summary(
+    events: Sequence[_RequiredBranchEvent], *, start_ns: int, end_ns: int,
+) -> dict[str, object]:
+    """Classify admitted timeout observations against the fixed CPU window."""
+
+    per_replica: dict[int, dict[str, int]] = {}
+    per_tree: dict[int, dict[str, int]] = {}
+    per_child: dict[int, dict[str, int]] = {}
+    gap_count = 0
+    missing_signer_count = 0
+    for replica, timestamp, tree_id, gaps in events:
+        bucket = (
+            "pre_measurement_count" if timestamp < start_ns
+            else "in_measurement_count" if timestamp < end_ns
+            else "post_measurement_count"
+        )
+        row = per_replica.setdefault(
+            replica,
+            {"replica_id": replica, "count": 0,
+             "pre_measurement_count": 0, "in_measurement_count": 0,
+             "post_measurement_count": 0},
+        )
+        row["count"] += 1
+        row[bucket] += 1
+        tree = per_tree.setdefault(
+            tree_id,
+            {"tree_id": tree_id, "event_count": 0,
+             "pre_measurement_count": 0, "in_measurement_count": 0,
+             "post_measurement_count": 0},
+        )
+        tree["event_count"] += 1
+        tree[bucket] += 1
+        for child, missing_count in gaps:
+            gap_count += 1
+            missing_signer_count += missing_count
+            child_row = per_child.setdefault(
+                child,
+                {"replica_id": child, "gap_count": 0,
+                 "missing_signer_count": 0,
+                 "pre_measurement_gap_count": 0,
+                 "in_measurement_gap_count": 0,
+                 "post_measurement_gap_count": 0},
+            )
+            child_row["gap_count"] += 1
+            child_row["missing_signer_count"] += missing_count
+            child_row[bucket.replace("_count", "_gap_count")] += 1
+    rows = [per_replica[replica] for replica in sorted(per_replica)]
+    return {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": len(events),
+        "pre_measurement_count": sum(row["pre_measurement_count"] for row in rows),
+        "in_measurement_count": sum(row["in_measurement_count"] for row in rows),
+        "post_measurement_count": sum(row["post_measurement_count"] for row in rows),
+        "by_replica": rows,
+        "gap_count": gap_count,
+        "missing_signer_count": missing_signer_count,
+        "by_tree": [per_tree[tree_id] for tree_id in sorted(per_tree)],
+        "by_direct_child": [per_child[replica] for replica in sorted(per_child)],
+    }
+
+
 def _validate_streams(
-    root: Path, receipt: Mapping[str, object], *, cpu_run: bool
-) -> tuple[list[dict[str, object]], int, int, int]:
+    root: Path, receipt: Mapping[str, object], *, cpu_run: bool,
+    plan: object, allow_required_branch_incomplete: bool,
+) -> tuple[list[dict[str, object]], int, int, int, list[_RequiredBranchEvent]]:
     run_id = receipt.get("run_id")
     digest = receipt.get("epoch_zero_digest")
     raw_sha256 = receipt.get("raw_sha256")
@@ -368,6 +524,7 @@ def _validate_streams(
     observer_terminal_index = -1
     terminal_times: list[tuple[str, int]] = []
     cycle_completion_times: list[tuple[str, int]] = []
+    required_branch_events: list[_RequiredBranchEvent] = []
     for replica in range(31):
         source = f"replica-{replica}"
         path = root / "raw" / f"{source}.jsonl"
@@ -398,7 +555,10 @@ def _validate_streams(
             event_type = str(event["event_type"])
             if event_type in _FATAL_EVENTS:
                 _fail("fatal_native_event", f"{source} emitted {event_type}", observed=True)
-            if event_type not in _ALLOWED_EVENT_TYPES:
+            if event_type not in _ALLOWED_EVENT_TYPES and not (
+                allow_required_branch_incomplete
+                and event_type == "aggregation.required_branch_incomplete"
+            ):
                 _fail(
                     "unexpected_native_event",
                     f"{source} emitted non-W16 event {event_type}",
@@ -424,6 +584,13 @@ def _validate_streams(
             elif event_type == "adaptive.configuration_active":
                 active.append(
                     (index, _validate_active(event["payload"], replica=replica, digest=str(digest)))
+                )
+            elif event_type == "aggregation.required_branch_incomplete":
+                tree_id, gaps = _validate_required_branch_incomplete(
+                    event["payload"], replica=replica, digest=str(digest), plan=plan,
+                )
+                required_branch_events.append(
+                    (replica, int(event["source_monotonic_ns"]), tree_id, gaps)
                 )
             elif event_type == "block.committed":
                 _validate_commit(event["payload"], digest=str(digest), observer=(replica == 2))
@@ -468,7 +635,7 @@ def _validate_streams(
     terminal_sequence = int(terminal_event["source_sequence"])
     terminal_time = int(terminal_event["source_monotonic_ns"])
     if not cpu_run:
-        return observer_events, terminal_sequence, terminal_time, terminal_time
+        return observer_events, terminal_sequence, terminal_time, terminal_time, required_branch_events
 
     cycles = receipt.get("required_complete_cycles")
     if not _integer(cycles, minimum=1) or int(cycles) != 5:
@@ -508,7 +675,7 @@ def _validate_streams(
             "complete Epoch-0 cycle does not precede the global measurement start for "
             + ", ".join(late_cycle),
         )
-    return observer_events, terminal_sequence, start_ns, end_ns
+    return observer_events, terminal_sequence, start_ns, end_ns, required_branch_events
 
 
 def _derive_throughput(
@@ -1002,7 +1169,7 @@ def _validate_authorization(
     }
 
 
-def validate_w16_output(root: Path) -> dict[str, object]:
+def _validate_w16_output(root: Path, *, v3: bool) -> dict[str, object]:
     """Validate one immutable W16 output root without modifying it.
 
     ``PASS`` means the bounded evidence class named in the result is complete.
@@ -1013,7 +1180,10 @@ def validate_w16_output(root: Path) -> dict[str, object]:
 
     result: dict[str, object] = {
         "schema_version": 1,
-        "kind": "kauri-w16-output-validation-v2",
+        "kind": (
+            "kauri-w16-output-validation-v3" if v3
+            else "kauri-w16-output-validation-v2"
+        ),
         "verdict": "INCOMPLETE",
         "evidence_class": None,
         "claim_eligible": False,
@@ -1073,13 +1243,18 @@ def validate_w16_output(root: Path) -> dict[str, object]:
             or cpu_run != (outcome.get("quota_scope_cleanup") is not None)
         ):
             _fail("cpu_identity", "quota contract and cleanup presence disagree")
-        events, terminal_sequence, start_ns, end_ns = _validate_streams(
-            candidate, outcome, cpu_run=cpu_run
+        events, terminal_sequence, start_ns, end_ns, required_branch_events = _validate_streams(
+            candidate, outcome, cpu_run=cpu_run, plan=plan,
+            allow_required_branch_incomplete=v3,
         )
         result["run_id"] = outcome["run_id"]
         result["revision"] = outcome["preflight"]["revision"]
         result["arm"] = arm
         result["epoch_zero_digest"] = outcome["epoch_zero_digest"]
+        if v3:
+            result["required_branch_incomplete"] = _required_branch_diagnostic_summary(
+                required_branch_events, start_ns=start_ns, end_ns=end_ns,
+            )
         if cpu_run:
             throughput = _derive_throughput(
                 events, start_ns=start_ns, end_ns=end_ns,
@@ -1129,3 +1304,20 @@ def validate_w16_output(root: Path) -> dict[str, object]:
         result["reason_code"] = "validator_input_error"
         result["detail"] = str(exc) or type(exc).__name__
     return result
+
+
+def validate_w16_output(root: Path) -> dict[str, object]:
+    """Validate an immutable W16 output with the original v2 event contract."""
+
+    return _validate_w16_output(root, v3=False)
+
+
+def validate_w16_output_v3(root: Path) -> dict[str, object]:
+    """Prospectively validate a fresh W16 root with audited timeout diagnostics.
+
+    This does not reinterpret a sealed v2 result.  It admits only a strictly
+    validated ``required_branch_incomplete`` observation, reports its window
+    placement, and otherwise applies the same producer-bound checks as v2.
+    """
+
+    return _validate_w16_output(root, v3=True)

@@ -81,7 +81,7 @@ def _cell_results(roots: list[Path], throughputs: tuple[int, int, int, int]) -> 
     return {
         root.resolve(): {
             "schema_version": 1,
-            "kind": "kauri-w16-output-validation-v2",
+            "kind": "kauri-w16-output-validation-v3",
             "verdict": "PASS",
             "evidence_class": "CPU_QUOTA_SINGLE_ARM",
             "claim_eligible": False,
@@ -98,6 +98,19 @@ def _cell_results(roots: list[Path], throughputs: tuple[int, int, int, int]) -> 
                 "transaction_count": throughput,
                 "duration_ns": 1_000_000_000_000,
                 "throughput_milli_tps": throughput,
+            },
+            "required_branch_incomplete": {
+                "schema_version": 1,
+                "event_type": "aggregation.required_branch_incomplete",
+                "total_count": 0,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 0,
+                "post_measurement_count": 0,
+                "gap_count": 0,
+                "missing_signer_count": 0,
+                "by_replica": [],
+                "by_tree": [],
+                "by_direct_child": [],
             },
         }
         for ordinal, (root, (arm, mode), throughput) in enumerate(
@@ -117,7 +130,7 @@ def _install_cell_validator(
         calls.append(resolved)
         return results[resolved]
 
-    monkeypatch.setattr(validator, "validate_w16_output", fake)
+    monkeypatch.setattr(validator, "validate_w16_output_v3", fake)
     return calls
 
 
@@ -146,7 +159,7 @@ def _replace_run_id(root: Path, run_id: str, ordinal: int) -> None:
     _reseal_cell_output(root)
 
 
-def test_real_v2_validator_accepts_complete_four_cell_fixture(tmp_path: Path) -> None:
+def test_real_v3_validator_accepts_complete_four_cell_fixture(tmp_path: Path) -> None:
     roots: list[Path] = []
     for ordinal, (arm, mode) in enumerate(ORDER, 1):
         root = _build_cell_output(
@@ -172,7 +185,7 @@ def test_complete_block_computes_only_predeclared_direction(
     result = validator.validate_w16_block(roots)
 
     assert result["verdict"] == "PASS", result
-    assert result["kind"] == "kauri-w16-four-cell-block-validation-v1"
+    assert result["kind"] == "kauri-w16-four-cell-block-validation-v2"
     assert result["claim_eligible"] is False
     assert result["figure_eligible"] is False
     assert result["campaign_claim"] is False
@@ -238,6 +251,328 @@ def test_complete_negative_direction_is_still_a_valid_block(
     assert result["positive_mechanism"] is False
     assert result["effects"]["heterogeneous_ratio"] > 1
     assert result["effects"]["log_interaction"] < 0
+
+
+def test_carries_exact_required_branch_diagnostics_into_block_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    roots = _roots(tmp_path)
+    results = _cell_results(roots, (1_000_000, 1_010_000, 800_000, 1_200_000))
+    results[roots[2].resolve()]["required_branch_incomplete"] = {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": 7,
+        "pre_measurement_count": 2,
+        "in_measurement_count": 5,
+        "post_measurement_count": 0,
+        "gap_count": 8,
+        "missing_signer_count": 8,
+        "by_replica": [{
+            "replica_id": 6,
+            "count": 7,
+            "pre_measurement_count": 2,
+            "in_measurement_count": 5,
+            "post_measurement_count": 0,
+        }],
+        "by_tree": [
+            {
+                "tree_id": 16,
+                "event_count": 3,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 3,
+                "post_measurement_count": 0,
+            },
+            {
+                "tree_id": 17,
+                "event_count": 2,
+                "pre_measurement_count": 1,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+            {
+                "tree_id": 18,
+                "event_count": 2,
+                "pre_measurement_count": 1,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+        ],
+        "by_direct_child": [
+            {
+                "replica_id": 2,
+                "gap_count": 3,
+                "missing_signer_count": 3,
+                "pre_measurement_gap_count": 0,
+                "in_measurement_gap_count": 3,
+                "post_measurement_gap_count": 0,
+            },
+            {
+                "replica_id": 4,
+                "gap_count": 5,
+                "missing_signer_count": 5,
+                "pre_measurement_gap_count": 2,
+                "in_measurement_gap_count": 3,
+                "post_measurement_gap_count": 0,
+            },
+        ],
+    }
+    _install_cell_validator(monkeypatch, results)
+
+    result = validator.validate_w16_block(roots)
+
+    assert result["verdict"] == "PASS", result
+    assert result["diagnostics"]["required_branch_incomplete"] == {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": 7,
+        "pre_measurement_count": 2,
+        "in_measurement_count": 5,
+        "post_measurement_count": 0,
+        "gap_count": 8,
+        "missing_signer_count": 8,
+        "by_cell": [
+            {
+                "ordinal": 1,
+                "label": "slow-roots:homogeneous",
+                "schema_version": 1,
+                "event_type": "aggregation.required_branch_incomplete",
+                "total_count": 0,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 0,
+                "post_measurement_count": 0,
+                "gap_count": 0,
+                "missing_signer_count": 0,
+                "by_replica": [],
+                "by_tree": [],
+                "by_direct_child": [],
+            },
+            {
+                "ordinal": 2,
+                "label": "fast-roots:homogeneous",
+                "schema_version": 1,
+                "event_type": "aggregation.required_branch_incomplete",
+                "total_count": 0,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 0,
+                "post_measurement_count": 0,
+                "gap_count": 0,
+                "missing_signer_count": 0,
+                "by_replica": [],
+                "by_tree": [],
+                "by_direct_child": [],
+            },
+            {
+                "ordinal": 3,
+                "label": "slow-roots:heterogeneous",
+                "schema_version": 1,
+                "event_type": "aggregation.required_branch_incomplete",
+                "total_count": 7,
+                "pre_measurement_count": 2,
+                "in_measurement_count": 5,
+                "post_measurement_count": 0,
+                "gap_count": 8,
+                "missing_signer_count": 8,
+                "by_replica": [{
+                    "replica_id": 6,
+                    "count": 7,
+                    "pre_measurement_count": 2,
+                    "in_measurement_count": 5,
+                    "post_measurement_count": 0,
+                }],
+                "by_tree": [
+                    {
+                        "tree_id": 16,
+                        "event_count": 3,
+                        "pre_measurement_count": 0,
+                        "in_measurement_count": 3,
+                        "post_measurement_count": 0,
+                    },
+                    {
+                        "tree_id": 17,
+                        "event_count": 2,
+                        "pre_measurement_count": 1,
+                        "in_measurement_count": 1,
+                        "post_measurement_count": 0,
+                    },
+                    {
+                        "tree_id": 18,
+                        "event_count": 2,
+                        "pre_measurement_count": 1,
+                        "in_measurement_count": 1,
+                        "post_measurement_count": 0,
+                    },
+                ],
+                "by_direct_child": [
+                    {
+                        "replica_id": 2,
+                        "gap_count": 3,
+                        "missing_signer_count": 3,
+                        "pre_measurement_gap_count": 0,
+                        "in_measurement_gap_count": 3,
+                        "post_measurement_gap_count": 0,
+                    },
+                    {
+                        "replica_id": 4,
+                        "gap_count": 5,
+                        "missing_signer_count": 5,
+                        "pre_measurement_gap_count": 2,
+                        "in_measurement_gap_count": 3,
+                        "post_measurement_gap_count": 0,
+                    },
+                ],
+            },
+            {
+                "ordinal": 4,
+                "label": "fast-roots:heterogeneous",
+                "schema_version": 1,
+                "event_type": "aggregation.required_branch_incomplete",
+                "total_count": 0,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 0,
+                "post_measurement_count": 0,
+                "gap_count": 0,
+                "missing_signer_count": 0,
+                "by_replica": [],
+                "by_tree": [],
+                "by_direct_child": [],
+            },
+        ],
+    }
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "missing-object",
+        "schema-drift",
+        "event-type-drift",
+        "negative-total",
+        "category-sum-drift",
+        "replica-order-drift",
+        "replica-count-zero",
+        "replica-sum-drift",
+        "replica-category-sum-drift",
+        "gap-total-drift",
+        "missing-total-drift",
+        "tree-order-drift",
+        "tree-sum-drift",
+        "child-order-drift",
+        "child-gap-sum-drift",
+        "child-missing-sum-drift",
+    ),
+)
+def test_rejects_malformed_required_branch_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    roots = _roots(tmp_path)
+    results = _cell_results(roots, (1_000_000, 1_010_000, 800_000, 1_200_000))
+    target = results[roots[2].resolve()]
+    diagnostics = {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": 2,
+        "pre_measurement_count": 0,
+        "in_measurement_count": 2,
+        "post_measurement_count": 0,
+        "gap_count": 2,
+        "missing_signer_count": 2,
+        "by_replica": [
+            {
+                "replica_id": 5,
+                "count": 1,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+            {
+                "replica_id": 6,
+                "count": 1,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+        ],
+        "by_tree": [
+            {
+                "tree_id": 16,
+                "event_count": 1,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+            {
+                "tree_id": 17,
+                "event_count": 1,
+                "pre_measurement_count": 0,
+                "in_measurement_count": 1,
+                "post_measurement_count": 0,
+            },
+        ],
+        "by_direct_child": [
+            {
+                "replica_id": 2,
+                "gap_count": 1,
+                "missing_signer_count": 1,
+                "pre_measurement_gap_count": 0,
+                "in_measurement_gap_count": 1,
+                "post_measurement_gap_count": 0,
+            },
+            {
+                "replica_id": 4,
+                "gap_count": 1,
+                "missing_signer_count": 1,
+                "pre_measurement_gap_count": 0,
+                "in_measurement_gap_count": 1,
+                "post_measurement_gap_count": 0,
+            },
+        ],
+    }
+    target["required_branch_incomplete"] = diagnostics
+    if mutation == "missing-object":
+        del target["required_branch_incomplete"]
+    elif mutation == "schema-drift":
+        diagnostics["extra"] = 0
+    elif mutation == "event-type-drift":
+        diagnostics["event_type"] = "aggregation.root_qc_published"
+    elif mutation == "negative-total":
+        diagnostics["total_count"] = -1
+    elif mutation == "category-sum-drift":
+        diagnostics["in_measurement_count"] = 1
+    elif mutation == "replica-order-drift":
+        diagnostics["by_replica"].reverse()
+    elif mutation == "replica-count-zero":
+        diagnostics["by_replica"][0]["count"] = 0
+    elif mutation == "replica-sum-drift":
+        diagnostics["by_replica"][0]["count"] = 2
+        diagnostics["by_replica"][0]["in_measurement_count"] = 2
+    elif mutation == "replica-category-sum-drift":
+        diagnostics["by_replica"][0]["post_measurement_count"] = 1
+    elif mutation == "gap-total-drift":
+        diagnostics["gap_count"] = 3
+    elif mutation == "missing-total-drift":
+        diagnostics["missing_signer_count"] = 3
+    elif mutation == "tree-order-drift":
+        diagnostics["by_tree"].reverse()
+    elif mutation == "tree-sum-drift":
+        diagnostics["by_tree"][0]["event_count"] = 2
+        diagnostics["by_tree"][0]["in_measurement_count"] = 2
+    elif mutation == "child-order-drift":
+        diagnostics["by_direct_child"].reverse()
+    elif mutation == "child-gap-sum-drift":
+        diagnostics["by_direct_child"][0]["gap_count"] = 2
+        diagnostics["by_direct_child"][0]["in_measurement_gap_count"] = 2
+        diagnostics["by_direct_child"][0]["missing_signer_count"] = 2
+    elif mutation == "child-missing-sum-drift":
+        diagnostics["by_direct_child"][0]["missing_signer_count"] = 2
+    _install_cell_validator(monkeypatch, results)
+
+    result = validator.validate_w16_block(roots)
+
+    assert result["verdict"] == "INCOMPLETE"
+    assert result["reason_code"] == "cell_diagnostics_contract"
+    assert "effects" not in result
 
 
 @pytest.mark.parametrize(
@@ -363,7 +698,7 @@ def test_rejects_cell_validator_version_drift(
 ) -> None:
     roots = _roots(tmp_path)
     results = _cell_results(roots, (1_000_000, 1_010_000, 800_000, 1_200_000))
-    results[roots[0].resolve()]["kind"] = "kauri-w16-output-validation-v3"
+    results[roots[0].resolve()]["kind"] = "kauri-w16-output-validation-v2"
     _install_cell_validator(monkeypatch, results)
 
     result = validator.validate_w16_block(roots)

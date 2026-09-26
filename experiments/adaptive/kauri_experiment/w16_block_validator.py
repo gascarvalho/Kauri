@@ -1,6 +1,6 @@
 """Read-only validation of one complete exploratory W16 four-cell block.
 
-Each cell is first reconstructed by the independent W16 v2 cell validator.
+Each cell is first reconstructed by the independent W16 v3 cell validator.
 This module then checks the frozen block identity and computes only the
 predeclared topology-by-quota directional interaction.  A complete block is
 still exploratory: neither a positive direction nor a ``PASS`` verdict creates
@@ -16,11 +16,11 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .w16_output_validator import validate_w16_output
+from .w16_output_validator import validate_w16_output_v3
 
 
-KIND = "kauri-w16-four-cell-block-validation-v1"
-CELL_KIND = "kauri-w16-output-validation-v2"
+KIND = "kauri-w16-four-cell-block-validation-v2"
+CELL_KIND = "kauri-w16-output-validation-v3"
 ORDER = (
     ("slow-roots", "homogeneous"),
     ("fast-roots", "homogeneous"),
@@ -67,6 +67,236 @@ def _positive_integer(value: object) -> bool:
     return type(value) is int and value > 0
 
 
+def _nonnegative_integer(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _required_branch_diagnostics(
+    value: object, *, expected_ordinal: int,
+) -> dict[str, object]:
+    if not isinstance(value, Mapping):
+        _fail(
+            "cell_diagnostics_contract",
+            f"cell {expected_ordinal} lacks required-branch diagnostics",
+        )
+    diagnostics = _mapping(
+        value, f"cell {expected_ordinal} required-branch diagnostics"
+    )
+    expected_keys = {
+        "schema_version", "event_type", "total_count",
+        "pre_measurement_count", "in_measurement_count",
+        "post_measurement_count", "gap_count", "missing_signer_count",
+        "by_replica", "by_tree", "by_direct_child",
+    }
+    if set(diagnostics) != expected_keys:
+        _fail(
+            "cell_diagnostics_contract",
+            f"cell {expected_ordinal} required-branch diagnostics schema drifted",
+        )
+    counts = (
+        diagnostics.get("total_count"),
+        diagnostics.get("pre_measurement_count"),
+        diagnostics.get("in_measurement_count"),
+        diagnostics.get("post_measurement_count"),
+    )
+    by_replica = diagnostics.get("by_replica")
+    gap_count = diagnostics.get("gap_count")
+    missing_signer_count = diagnostics.get("missing_signer_count")
+    by_tree = diagnostics.get("by_tree")
+    by_direct_child = diagnostics.get("by_direct_child")
+    if (
+        diagnostics.get("schema_version") != 1
+        or diagnostics.get("event_type")
+        != "aggregation.required_branch_incomplete"
+        or any(not _nonnegative_integer(count) for count in counts)
+        or not _nonnegative_integer(gap_count)
+        or not _nonnegative_integer(missing_signer_count)
+        or not isinstance(by_replica, list)
+        or not isinstance(by_tree, list)
+        or not isinstance(by_direct_child, list)
+        or int(counts[0]) != sum(int(count) for count in counts[1:])
+        or int(gap_count) < int(counts[0])
+        or int(missing_signer_count) < int(gap_count)
+    ):
+        _fail(
+            "cell_diagnostics_contract",
+            f"cell {expected_ordinal} required-branch diagnostics are malformed",
+        )
+
+    normalized_replicas: list[dict[str, int]] = []
+    previous_replica = -1
+    for raw_entry in by_replica:
+        entry = _mapping(
+            raw_entry, f"cell {expected_ordinal} per-replica diagnostics"
+        )
+        if set(entry) != {
+            "replica_id", "count", "pre_measurement_count",
+            "in_measurement_count", "post_measurement_count",
+        }:
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-replica diagnostics schema drifted",
+            )
+        replica_id = entry.get("replica_id")
+        replica_counts = (
+            entry.get("count"),
+            entry.get("pre_measurement_count"),
+            entry.get("in_measurement_count"),
+            entry.get("post_measurement_count"),
+        )
+        if (
+            type(replica_id) is not int
+            or replica_id < 0 or replica_id >= 31
+            or replica_id <= previous_replica
+            or not _positive_integer(replica_counts[0])
+            or any(not _nonnegative_integer(count) for count in replica_counts[1:])
+            or int(replica_counts[0])
+            != sum(int(count) for count in replica_counts[1:])
+        ):
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-replica diagnostics are malformed",
+            )
+        normalized_replicas.append({
+            "replica_id": replica_id,
+            "count": int(replica_counts[0]),
+            "pre_measurement_count": int(replica_counts[1]),
+            "in_measurement_count": int(replica_counts[2]),
+            "post_measurement_count": int(replica_counts[3]),
+        })
+        previous_replica = replica_id
+
+    normalized_trees: list[dict[str, int]] = []
+    previous_tree = -1
+    for raw_entry in by_tree:
+        entry = _mapping(
+            raw_entry, f"cell {expected_ordinal} per-tree diagnostics"
+        )
+        if set(entry) != {
+            "tree_id", "event_count", "pre_measurement_count",
+            "in_measurement_count", "post_measurement_count",
+        }:
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-tree diagnostics schema drifted",
+            )
+        tree_id = entry.get("tree_id")
+        tree_counts = (
+            entry.get("event_count"),
+            entry.get("pre_measurement_count"),
+            entry.get("in_measurement_count"),
+            entry.get("post_measurement_count"),
+        )
+        if (
+            type(tree_id) is not int
+            or tree_id < 0 or tree_id >= 21
+            or tree_id <= previous_tree
+            or not _positive_integer(tree_counts[0])
+            or any(not _nonnegative_integer(count) for count in tree_counts[1:])
+            or int(tree_counts[0])
+            != sum(int(count) for count in tree_counts[1:])
+        ):
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-tree diagnostics are malformed",
+            )
+        normalized_trees.append({
+            "tree_id": tree_id,
+            "event_count": int(tree_counts[0]),
+            "pre_measurement_count": int(tree_counts[1]),
+            "in_measurement_count": int(tree_counts[2]),
+            "post_measurement_count": int(tree_counts[3]),
+        })
+        previous_tree = tree_id
+
+    normalized_children: list[dict[str, int]] = []
+    previous_child = -1
+    for raw_entry in by_direct_child:
+        entry = _mapping(
+            raw_entry, f"cell {expected_ordinal} per-child diagnostics"
+        )
+        if set(entry) != {
+            "replica_id", "gap_count", "missing_signer_count",
+            "pre_measurement_gap_count", "in_measurement_gap_count",
+            "post_measurement_gap_count",
+        }:
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-child diagnostics schema drifted",
+            )
+        child_id = entry.get("replica_id")
+        child_counts = (
+            entry.get("gap_count"),
+            entry.get("pre_measurement_gap_count"),
+            entry.get("in_measurement_gap_count"),
+            entry.get("post_measurement_gap_count"),
+        )
+        child_missing = entry.get("missing_signer_count")
+        if (
+            type(child_id) is not int
+            or child_id < 0 or child_id >= 31
+            or child_id <= previous_child
+            or not _positive_integer(child_counts[0])
+            or not _positive_integer(child_missing)
+            or int(child_missing) < int(child_counts[0])
+            or any(not _nonnegative_integer(count) for count in child_counts[1:])
+            or int(child_counts[0])
+            != sum(int(count) for count in child_counts[1:])
+        ):
+            _fail(
+                "cell_diagnostics_contract",
+                f"cell {expected_ordinal} per-child diagnostics are malformed",
+            )
+        normalized_children.append({
+            "replica_id": child_id,
+            "gap_count": int(child_counts[0]),
+            "missing_signer_count": int(child_missing),
+            "pre_measurement_gap_count": int(child_counts[1]),
+            "in_measurement_gap_count": int(child_counts[2]),
+            "post_measurement_gap_count": int(child_counts[3]),
+        })
+        previous_child = child_id
+
+    if (
+        sum(entry["count"] for entry in normalized_replicas) != int(counts[0])
+        or sum(entry["pre_measurement_count"] for entry in normalized_replicas)
+        != int(counts[1])
+        or sum(entry["in_measurement_count"] for entry in normalized_replicas)
+        != int(counts[2])
+        or sum(entry["post_measurement_count"] for entry in normalized_replicas)
+        != int(counts[3])
+        or sum(entry["event_count"] for entry in normalized_trees)
+        != int(counts[0])
+        or sum(entry["pre_measurement_count"] for entry in normalized_trees)
+        != int(counts[1])
+        or sum(entry["in_measurement_count"] for entry in normalized_trees)
+        != int(counts[2])
+        or sum(entry["post_measurement_count"] for entry in normalized_trees)
+        != int(counts[3])
+        or sum(entry["gap_count"] for entry in normalized_children)
+        != int(gap_count)
+        or sum(entry["missing_signer_count"] for entry in normalized_children)
+        != int(missing_signer_count)
+    ):
+        _fail(
+            "cell_diagnostics_contract",
+            f"cell {expected_ordinal} per-replica diagnostics do not sum to totals",
+        )
+    return {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": int(counts[0]),
+        "pre_measurement_count": int(counts[1]),
+        "in_measurement_count": int(counts[2]),
+        "post_measurement_count": int(counts[3]),
+        "gap_count": int(gap_count),
+        "missing_signer_count": int(missing_signer_count),
+        "by_replica": normalized_replicas,
+        "by_tree": normalized_trees,
+        "by_direct_child": normalized_children,
+    }
+
+
 def _canonical_sha256(value: object) -> str:
     payload = json.dumps(
         value, allow_nan=False, ensure_ascii=True,
@@ -97,7 +327,7 @@ def _read_cell_metadata(
     ):
         _fail(
             "cell_validation_contract",
-            f"cell {expected_ordinal} is not a bounded W16 v2 CPU validation",
+            f"cell {expected_ordinal} is not a bounded W16 v3 CPU validation",
         )
     verdict = validation.get("verdict")
     if verdict != "PASS":
@@ -114,6 +344,10 @@ def _read_cell_metadata(
     quota = _mapping(validation.get("quota"), "cell quota")
     validation_authorization = _mapping(
         validation.get("authorization"), "cell authorization summary"
+    )
+    required_branch_diagnostics = _required_branch_diagnostics(
+        validation.get("required_branch_incomplete"),
+        expected_ordinal=expected_ordinal,
     )
     binary_sha256 = _mapping(preflight.get("binary_sha256"), "binary hashes")
     run_id = receipt.get("run_id")
@@ -192,6 +426,7 @@ def _read_cell_metadata(
         "transaction_count": int(transaction_count),
         "duration_ns": int(duration_ns),
         "throughput_milli_tps": int(milli_tps),
+        "required_branch_incomplete": required_branch_diagnostics,
         "cell_validation_sha256": _canonical_sha256(validation),
     }
 
@@ -245,7 +480,7 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
                 _fail("sealed_cell", f"cell {ordinal} lacks receipt or authorization")
             receipt_before = receipt_path.read_bytes()
             authorization_before = authorization_path.read_bytes()
-            validation = validate_w16_output(root)
+            validation = validate_w16_output_v3(root)
             if not isinstance(validation, Mapping):
                 _fail("cell_validation_contract", f"cell {ordinal} validator returned no object")
             cells.append(_read_cell_metadata(
@@ -288,6 +523,14 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
             / interaction_exact.denominator
         )
         positive_mechanism = b_x > a_x and interaction_exact > 1
+        diagnostic_cells = [
+            {
+                "ordinal": cell["ordinal"],
+                "label": cell["label"],
+                **dict(cell["required_branch_incomplete"]),
+            }
+            for cell in cells
+        ]
         result.update({
             "verdict": "PASS",
             "reason_code": "exploratory_block_complete",
@@ -319,6 +562,35 @@ def validate_w16_block(roots: Sequence[Path]) -> dict[str, object]:
                 "interaction_exact": {
                     "numerator": interaction_exact.numerator,
                     "denominator": interaction_exact.denominator,
+                },
+            },
+            "diagnostics": {
+                "required_branch_incomplete": {
+                    "schema_version": 1,
+                    "event_type": "aggregation.required_branch_incomplete",
+                    "total_count": sum(
+                        int(cell["total_count"]) for cell in diagnostic_cells
+                    ),
+                    "pre_measurement_count": sum(
+                        int(cell["pre_measurement_count"])
+                        for cell in diagnostic_cells
+                    ),
+                    "in_measurement_count": sum(
+                        int(cell["in_measurement_count"])
+                        for cell in diagnostic_cells
+                    ),
+                    "post_measurement_count": sum(
+                        int(cell["post_measurement_count"])
+                        for cell in diagnostic_cells
+                    ),
+                    "gap_count": sum(
+                        int(cell["gap_count"]) for cell in diagnostic_cells
+                    ),
+                    "missing_signer_count": sum(
+                        int(cell["missing_signer_count"])
+                        for cell in diagnostic_cells
+                    ),
+                    "by_cell": diagnostic_cells,
                 },
             },
             "positive_mechanism": positive_mechanism,

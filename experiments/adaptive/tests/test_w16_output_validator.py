@@ -10,7 +10,10 @@ import pytest
 
 from experiments.adaptive.kauri_experiment import n31_static_e0_feasibility as feasibility
 from experiments.adaptive.kauri_experiment import static_e0_cpu_contract
-from experiments.adaptive.kauri_experiment.w16_output_validator import validate_w16_output
+from experiments.adaptive.kauri_experiment.w16_output_validator import (
+    validate_w16_output,
+    validate_w16_output_v3,
+)
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -346,6 +349,120 @@ def _reseal(root: Path) -> None:
     _write_json(receipt_path, receipt)
 
 
+def _add_required_branch_incomplete(
+    root: Path, *, direct_child: int = 4, missing_signers: list[int] | None = None,
+    root_signer_count: int = 0, global_quorum: int = 0, replica: int = 6,
+    tree_id: int = 17,
+) -> None:
+    """Insert one v3 diagnostic at replica 6 inside the CPU window."""
+
+    observer_rows = [
+        json.loads(line)
+        for line in (root / "raw/replica-2.jsonl").read_text().splitlines()
+    ]
+    terminal = next(
+        row for row in observer_rows
+        if row["event_type"] == "adaptive_v2_reporting_terminal"
+    )
+    start = next(
+        row["source_monotonic_ns"] for row in observer_rows
+        if row["event_type"] == "adaptive.configuration_active"
+        and row["source_sequence"] > terminal["source_sequence"]
+        and row["payload"]["tree_id"] == 0
+    )
+    path = root / "raw" / f"replica-{replica}.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    insertion = next(
+        index for index, row in enumerate(rows)
+        if row["event_type"] == "process.stopping"
+    )
+    payload = {
+        "epoch_number": 0,
+        "tree_id": tree_id,
+        "epoch_digest": "827e7626c74f8d815bca6ae5cbe10e312bc4f00f287e67d41277b8d689b21c0f",
+        "block_hash": _hash(9_999),
+        "context_generation": 1,
+        "observer_replica": replica,
+        "wait_exempt_signers": [],
+        "accepted_signers": [],
+        "absent_direct_children": [],
+        "missing_optional_signers": [],
+        "required_branch_gaps": [{
+            "direct_child": direct_child,
+            "missing_required_signers": (
+                [direct_child] if missing_signers is None else missing_signers
+            ),
+        }],
+        "root_signer_count": root_signer_count,
+        "global_quorum": global_quorum,
+        "rejection_reason": None,
+    }
+    rows.insert(insertion, _envelope(
+        str(rows[0]["run_id"]), replica, 0, int(start) + 1,
+        "aggregation.required_branch_incomplete", payload,
+    ))
+    for sequence, row in enumerate(rows, 1):
+        row["source_sequence"] = sequence
+        row["source_monotonic_ns"] = 1_000_000_000 + sequence * 10_000_000
+    inserted = rows[insertion]
+    inserted["source_monotonic_ns"] = int(start) + 1
+    for row in rows[insertion + 1:]:
+        row["source_monotonic_ns"] = max(
+            int(row["source_monotonic_ns"]), int(start) + 2
+        )
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+
+def _mutate_required_branch_payload(root: Path, mutation: str) -> None:
+    path = root / "raw/replica-6.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    payload = next(
+        row["payload"] for row in rows
+        if row["event_type"] == "aggregation.required_branch_incomplete"
+    )
+    if mutation == "wrong-epoch":
+        payload["epoch_number"] = 1
+    elif mutation == "wrong-digest":
+        payload["epoch_digest"] = "f" * 64
+    elif mutation == "tree-out-of-range":
+        payload["tree_id"] = 21
+    elif mutation == "bad-block-hash":
+        payload["block_hash"] = "not-a-digest"
+    elif mutation == "zero-context":
+        payload["context_generation"] = 0
+    elif mutation == "wrong-observer":
+        payload["observer_replica"] = 5
+    elif mutation == "wait-exempt":
+        payload["wait_exempt_signers"] = [1]
+    elif mutation == "accepted":
+        payload["accepted_signers"] = [1]
+    elif mutation == "absent":
+        payload["absent_direct_children"] = [1]
+    elif mutation == "missing-optional":
+        payload["missing_optional_signers"] = [1]
+    elif mutation == "rejection":
+        payload["rejection_reason"] = "forged"
+    elif mutation == "empty-gaps":
+        payload["required_branch_gaps"] = []
+    elif mutation == "duplicate-gap-child":
+        payload["required_branch_gaps"].append({
+            "direct_child": 4, "missing_required_signers": [4],
+        })
+    elif mutation == "unsorted-gap-child":
+        payload["required_branch_gaps"].append({
+            "direct_child": 3, "missing_required_signers": [3],
+        })
+    else:
+        raise AssertionError(f"unknown mutation: {mutation}")
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+
 def test_cpu_free_output_passes_only_bounded_feasibility(tmp_path: Path) -> None:
     result = validate_w16_output(_build_output(tmp_path / "run"))
     assert result["verdict"] == "PASS", result
@@ -363,6 +480,161 @@ def test_cpu_output_derives_commit_throughput_and_checks_quota(tmp_path: Path) -
     assert result["quota"]["mode"] == "heterogeneous"
     assert result["authorization"]["approval_ref"].startswith("user-confirmation:")
     assert result["claim_eligible"] is False
+
+
+def test_v3_reports_zero_timeout_diagnostics_without_changing_v2(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "PASS", result
+    assert result["kind"] == "kauri-w16-output-validation-v3"
+    assert result["required_branch_incomplete"] == {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": 0,
+        "pre_measurement_count": 0,
+        "in_measurement_count": 0,
+        "post_measurement_count": 0,
+        "by_replica": [],
+        "gap_count": 0,
+        "missing_signer_count": 0,
+        "by_tree": [],
+        "by_direct_child": [],
+    }
+
+
+def test_v3_admits_and_counts_a_valid_required_branch_diagnostic(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+
+    legacy = validate_w16_output(root)
+    assert legacy["verdict"] == "FAIL"
+    assert legacy["reason_code"] == "unexpected_native_event"
+
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "PASS", result
+    assert result["kind"] == "kauri-w16-output-validation-v3"
+    assert result["required_branch_incomplete"] == {
+        "schema_version": 1,
+        "event_type": "aggregation.required_branch_incomplete",
+        "total_count": 1,
+        "pre_measurement_count": 0,
+        "in_measurement_count": 1,
+        "post_measurement_count": 0,
+        "by_replica": [{
+            "replica_id": 6,
+            "count": 1,
+            "pre_measurement_count": 0,
+            "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
+        "gap_count": 1,
+        "missing_signer_count": 1,
+        "by_tree": [{
+            "tree_id": 17,
+            "event_count": 1,
+            "pre_measurement_count": 0,
+            "in_measurement_count": 1,
+            "post_measurement_count": 0,
+        }],
+        "by_direct_child": [{
+            "replica_id": 4,
+            "gap_count": 1,
+            "missing_signer_count": 1,
+            "pre_measurement_gap_count": 0,
+            "in_measurement_gap_count": 1,
+            "post_measurement_gap_count": 0,
+        }],
+    }
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "label"),
+    (
+        ({"direct_child": 5}, "non-child direct reporter"),
+        ({"missing_signers": [5]}, "signer outside child subtree"),
+        ({"root_signer_count": 1, "global_quorum": 21}, "nonzero root quorum"),
+    ),
+)
+def test_v3_rejects_malformed_required_branch_diagnostic(
+    tmp_path: Path, kwargs: dict[str, object], label: str,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root, **kwargs)
+
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "FAIL", label
+    assert result["reason_code"] == "required_branch_incomplete"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        "wrong-epoch", "wrong-digest", "tree-out-of-range", "bad-block-hash",
+        "zero-context", "wrong-observer", "wait-exempt", "accepted", "absent",
+        "missing-optional", "rejection", "empty-gaps", "duplicate-gap-child",
+        "unsorted-gap-child",
+    ),
+)
+def test_v3_rejects_diagnostic_identity_and_schema_mutations(
+    tmp_path: Path, mutation: str,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(root)
+    _mutate_required_branch_payload(root, mutation)
+
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "FAIL", mutation
+    assert result["reason_code"] == "required_branch_incomplete"
+
+
+@pytest.mark.parametrize("mutation", ("duplicate", "unsorted", "out-of-range"))
+def test_v3_rejects_noncanonical_missing_signers(
+    tmp_path: Path, mutation: str,
+) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    _add_required_branch_incomplete(
+        root, replica=17, tree_id=17, direct_child=6, missing_signers=[0, 4],
+    )
+    path = root / "raw/replica-17.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    missing = next(
+        row["payload"]["required_branch_gaps"][0]["missing_required_signers"]
+        for row in rows if row["event_type"] == "aggregation.required_branch_incomplete"
+    )
+    if mutation == "duplicate":
+        missing.append(4)
+    elif mutation == "unsorted":
+        missing.reverse()
+    else:
+        missing.append(31)
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "FAIL", mutation
+    assert result["reason_code"] == "required_branch_incomplete"
+
+
+def test_v3_rejects_a_forged_successor_event(tmp_path: Path) -> None:
+    root = _build_output(tmp_path / "run", cpu_mode="heterogeneous")
+    path = root / "raw/replica-0.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    last = rows[-1]
+    rows.append(_envelope(
+        str(last["run_id"]), 0, int(last["source_sequence"]) + 1,
+        int(last["source_monotonic_ns"]) + 1, "epoch.activated",
+        {"epoch_number": 1},
+    ))
+    path.write_text("".join(
+        json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n" for row in rows
+    ), encoding="utf-8")
+    _reseal(root)
+
+    result = validate_w16_output_v3(root)
+    assert result["verdict"] == "FAIL"
+    assert result["reason_code"] == "unexpected_native_event"
 
 
 def test_cpu_output_accepts_mid_cycle_terminal_when_all_sources_settle_before_window(
