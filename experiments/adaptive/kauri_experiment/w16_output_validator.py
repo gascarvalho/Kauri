@@ -48,6 +48,12 @@ _COMMIT_KEYS = frozenset(
         "commit_batch_index",
     }
 )
+_OBSERVED_COMMIT_KEYS = frozenset(
+    {"block_height", "block_hash", "parent_hash", "transaction_count", "commit_batch_index"}
+)
+_UNAVAILABLE_COMMIT_KEYS = _OBSERVED_COMMIT_KEYS | frozenset(
+    {"reason", "convergence_identity_pending"}
+)
 _PROOF_KEYS = frozenset({"epoch_number", "tree_id", "epoch_digest", "block_hash"})
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
 _REVISION = re.compile(r"[0-9a-f]{40}\Z")
@@ -125,20 +131,32 @@ def _read_json(path: Path, label: str) -> dict[str, object]:
     return document
 
 
-def _read_jsonl(path: Path, label: str) -> list[dict[str, object]]:
+def _read_jsonl(
+    path: Path, label: str, *, reject_duplicate_keys: bool = False,
+) -> list[dict[str, object]]:
     if path.is_symlink() or not path.is_file():
         _fail("missing_artifact", f"{label} is not a regular file")
     rows: list[dict[str, object]] = []
+    def strict_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        value: dict[str, object] = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError(f"duplicate JSON key {key!r}")
+            value[key] = item
+        return value
     try:
         with path.open("r", encoding="utf-8") as source:
             for line_number, line in enumerate(source, 1):
                 if not line.endswith("\n"):
                     _fail("truncated_jsonl", f"{label}:{line_number} lacks a newline")
-                value = json.loads(line)
+                value = json.loads(
+                    line,
+                    object_pairs_hook=strict_object if reject_duplicate_keys else None,
+                )
                 if not isinstance(value, dict):
                     _fail("malformed_jsonl", f"{label}:{line_number} is not an object")
                 rows.append(value)
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
         _fail("malformed_jsonl", f"{label} is invalid JSONL: {exc}")
     if not rows:
         _fail("empty_jsonl", f"{label} is empty")
@@ -196,7 +214,7 @@ def _validate_inventory(root: Path, receipt: Mapping[str, object]) -> None:
         )
 
 
-def _validate_preflight(receipt: Mapping[str, object]) -> tuple[str, object]:
+def _validate_preflight(receipt: Mapping[str, object], *, version: int) -> tuple[str, object]:
     preflight = receipt.get("preflight")
     if not isinstance(preflight, dict):
         _fail("preflight", "receipt does not embed the exact preflight")
@@ -211,13 +229,14 @@ def _validate_preflight(receipt: Mapping[str, object]) -> tuple[str, object]:
     arm = preflight.get("arm")
     if arm not in {"slow-roots", "fast-roots"}:
         _fail("preflight", "preflight arm is invalid")
-    plan = feasibility.frozen_plan(arm=str(arm))
+    v8 = version == 8
+    plan = feasibility.frozen_plan(arm=str(arm), profile_version=8 if v8 else 1)
     binaries = preflight.get("binaries")
     binary_sha256 = preflight.get("binary_sha256")
     binary_names = {"app", "keygen", "tls_keygen", "native_digest"}
     if (
-        preflight.get("schema_version") != 1
-        or preflight.get("kind") != feasibility.SCHEMA
+        preflight.get("schema_version") != (8 if v8 else 1)
+        or preflight.get("kind") != (feasibility.SCHEMA_V8 if v8 else feasibility.SCHEMA)
         or preflight.get("verdict") != "PREFLIGHT_OK_NO_EXECUTION"
         or not isinstance(preflight.get("revision"), str)
         or _REVISION.fullmatch(str(preflight["revision"])) is None
@@ -291,8 +310,8 @@ def _validate_configuration(root: Path, receipt: Mapping[str, object], plan: obj
             "idx": str(replica),
             "structured-event-run-id": run_id,
             "structured-event-source-instance": f"{run_id}-replica-{replica}",
-            "structured-event-commit-observer-id": "replica-2",
-            "structured-event-commit-observer-instance": f"{run_id}-replica-2",
+            "structured-event-commit-observer-id": f"replica-{plan.profile.authoritative_observer}",
+            "structured-event-commit-observer-instance": f"{run_id}-replica-{plan.profile.authoritative_observer}",
         }
         for key, value in expected.items():
             if values.get(key) != [value]:
@@ -355,6 +374,307 @@ def _validate_commit(payload: object, *, digest: str, observer: bool) -> dict[st
     if "reporter_local_commit_monotonic_ns" in payload and not _integer(local, minimum=1):
         _fail("native_event_schema", "reporter-local commit timestamp is invalid")
     return payload
+
+
+def _physical_commit_identity(payload: object, *, code: str) -> tuple[int, str, str, int, int]:
+    if not isinstance(payload, dict) or not _OBSERVED_COMMIT_KEYS.issubset(payload):
+        _fail(code, "commit observation lacks its physical identity", observed=True)
+    height = payload.get("block_height")
+    transactions = payload.get("transaction_count")
+    batch = payload.get("commit_batch_index")
+    if (
+        not _integer(height, minimum=1)
+        or height >= 1 << 64
+        or not _digest(payload.get("block_hash"))
+        or not _digest(payload.get("parent_hash"))
+        or not _integer(transactions)
+        or transactions > 1000
+        or not _integer(batch)
+        or batch >= 1 << 64
+    ):
+        _fail(code, "commit observation has an invalid physical identity", observed=True)
+    return (height, str(payload["block_hash"]), str(payload["parent_hash"]), transactions, batch)
+
+
+def _validate_identity_gaps_v8(
+    records: Sequence[tuple[int, Mapping[str, object]]],
+    observer_events: Sequence[Mapping[str, object]], *,
+    digest: str, start_ns: int, end_ns: int, observer_replica: int,
+) -> dict[str, object]:
+    """Admit only one reporter-local gap backed by thirty matching rich peers.
+
+    This never supplies a commit to the throughput derivation. The native
+    marker states local identity unavailability, not a QC provenance claim.
+    """
+
+    # commit_batch_index is local to each reporter's commit queue. It must
+    # match the adjacent local pair but is not a cross-replica block identity.
+    observed: dict[tuple[int, str, str, int], list[tuple[int, Mapping[str, object]]]] = defaultdict(list)
+    rich: dict[tuple[int, str, str, int], list[tuple[int, Mapping[str, object]]]] = defaultdict(list)
+    markers: dict[tuple[int, str, str, int], list[tuple[int, Mapping[str, object]]]] = defaultdict(list)
+    per_replica: dict[int, list[tuple[str, tuple[int, str, str, int, int], int]]] = defaultdict(list)
+    committed_hashes_by_height: dict[int, set[str]] = defaultdict(set)
+    for replica, event in records:
+        kind = event["event_type"]
+        payload = event["payload"]
+        local_key = _physical_commit_identity(payload, code="commit_identity_gap")
+        key = local_key[:4]
+        per_replica[replica].append((str(kind), local_key, int(event["source_sequence"])))
+        if kind == "block.commit_observed":
+            if set(payload) != _OBSERVED_COMMIT_KEYS:
+                _fail("commit_identity_gap", "observed commit payload schema drifted", observed=True)
+            observed[key].append((replica, event))
+        elif kind == "block.committed":
+            rich[key].append((replica, event))
+            committed_hashes_by_height[key[0]].add(key[1])
+        elif kind == "block.commit_identity_unavailable":
+            if (
+                replica == observer_replica
+                or set(payload) != _UNAVAILABLE_COMMIT_KEYS
+                or payload.get("reason") != "no_authenticated_exact_identity_source"
+                or payload.get("convergence_identity_pending") is not False
+            ):
+                _fail("commit_identity_gap", "unavailable marker differs from the prospective contract", observed=True)
+            markers[key].append((replica, event))
+
+    # A physical commit is normally emitted as an adjacent
+    # observed/disposition pair.  The accepted historical streams additionally
+    # show one unanimous observed-only bridge: all 31 reporters observed the
+    # same physical identity but none emitted a rich/marker disposition.  It
+    # is admitted only before measurement and disclosed; it never contributes
+    # to throughput or fills in a rich-commit claim.
+    bridges = {
+        key: entries for key, entries in observed.items()
+        if key not in rich and key not in markers
+    }
+    bridge_details: list[dict[str, object]] = []
+    for key, entries in sorted(bridges.items()):
+        if (
+            len(entries) != 31
+            or {replica for replica, _event in entries} != set(range(31))
+            or any(int(event["source_monotonic_ns"]) >= start_ns for _replica, event in entries)
+        ):
+            _fail("commit_identity_gap", "observed-only bridge is not unanimous and pre-measurement", observed=True)
+        bridge_details.append({
+            "block_height": key[0], "block_hash": key[1],
+            "parent_hash": key[2], "transaction_count": key[3],
+            "observed_replica_count": 31,
+            "reason": "unknown_no_rich_disposition",
+        })
+
+    # Close the graph for every reporter record, not only a marked tuple.
+    for replica, stream in per_replica.items():
+        seen_heights: set[int] = set()
+        offset = 0
+        while offset < len(stream):
+            observed_kind, observed_key, observed_sequence = stream[offset]
+            if observed_kind != "block.commit_observed" or observed_key[0] in seen_heights:
+                _fail("commit_identity_gap", f"replica-{replica} has a conflicting commit record", observed=True)
+            seen_heights.add(observed_key[0])
+            if observed_key[:4] in bridges:
+                offset += 1
+                continue
+            if offset + 1 >= len(stream):
+                _fail("commit_identity_gap", f"replica-{replica} has an orphan commit record", observed=True)
+            disposition_kind, disposition_key, disposition_sequence = stream[offset + 1]
+            if (
+                disposition_kind not in {"block.committed", "block.commit_identity_unavailable"}
+                or observed_key != disposition_key
+                or disposition_sequence != observed_sequence + 1
+            ):
+                _fail("commit_identity_gap", f"replica-{replica} has a conflicting or unpaired commit", observed=True)
+            offset += 2
+    if any(len(hashes) != 1 for hashes in committed_hashes_by_height.values()):
+        _fail("commit_identity_gap", "reporters disagree on a committed hash at one height", observed=True)
+
+    observer_commits = [
+        event for event in observer_events if event["event_type"] == "block.committed"
+    ]
+    observer_keys = [
+        _physical_commit_identity(event["payload"], code="commit_identity_gap")
+        for event in observer_commits
+    ]
+    if not observer_keys or len(set(observer_keys)) != len(observer_keys):
+        _fail("commit_identity_gap", "observer full commit chain is empty or duplicated", observed=True)
+    observer_observed = [
+        _physical_commit_identity(event["payload"], code="commit_identity_gap")
+        for event in observer_events if event["event_type"] == "block.commit_observed"
+    ]
+    if not observer_observed or len({key[0] for key in observer_observed}) != len(observer_observed):
+        _fail("commit_identity_gap", "observer observations are empty or duplicate", observed=True)
+    for before, after in zip(observer_observed, observer_observed[1:]):
+        if after[0] != before[0] + 1 or after[2] != before[1]:
+            _fail("commit_identity_gap", "observer observation chain is discontinuous", observed=True)
+    undisputed_height_gaps: list[dict[str, int]] = []
+    for before, after in zip(observer_keys, observer_keys[1:]):
+        if after[0] <= before[0]:
+            _fail("commit_identity_gap", "observer full rich commit heights are not strictly increasing", observed=True)
+        if after[0] == before[0] + 1 and after[2] != before[1]:
+            _fail("commit_identity_gap", "adjacent observer commits break the parent chain", observed=True)
+        if after[0] > before[0] + 1:
+            undisputed_height_gaps.append({
+                "after_height": after[0],
+                "before_height": before[0],
+                "missing_height_count": after[0] - before[0] - 1,
+            })
+    observer_by_height = {
+        key[0]: event["payload"] for key, event in zip(observer_keys, observer_commits)
+    }
+    observer_final_observed = observer_observed[-1]
+    observer_final_rich = observer_keys[-1]
+    if observer_final_observed[:4] != observer_final_rich[:4]:
+        _fail("commit_identity_gap", "observer final observation and rich commit differ", observed=True)
+
+    # The authoritative observer's chain is intentionally the sole source of
+    # throughput.  A peer may finish a locally complete commit after that
+    # observer has stopped emitting commits, but only as a post-measurement
+    # extension of the observer's final physical block.  Partition those
+    # records before applying the normal observer-membership rule below.
+    observer_final_height, observer_final_hash = observer_final_rich[:2]
+    tail_keys_by_height: dict[int, set[tuple[int, str, str, int]]] = defaultdict(set)
+    tail_reporters: set[int] = set()
+    for collection in (observed, rich, markers):
+        for key, entries in collection.items():
+            for replica, event in entries:
+                if key[0] > observer_final_height:
+                    if replica == observer_replica or collection is markers:
+                        _fail("commit_identity_gap", "observer or marker record extends past its final commit", observed=True)
+                    if int(event["source_monotonic_ns"]) <= end_ns:
+                        _fail("commit_identity_gap", "peer-only tail is not strictly post-measurement", observed=True)
+                    tail_keys_by_height[key[0]].add(key)
+                    tail_reporters.add(replica)
+    for height, keys in tail_keys_by_height.items():
+        if len(keys) != 1:
+            _fail("commit_identity_gap", f"peer-only tail has conflicting physical identities at height {height}", observed=True)
+
+    tail_keys = {next(iter(keys)) for keys in tail_keys_by_height.values()}
+    tail_details: list[dict[str, object]] = []
+    for key in sorted(tail_keys):
+        tail_rich = rich.get(key, [])
+        tail_observed = observed.get(key, [])
+        if not tail_rich or not tail_observed:
+            _fail("commit_identity_gap", "peer-only tail lacks an observed/rich pair", observed=True)
+        reporters = {replica for replica, _event in tail_rich}
+        if reporters != {replica for replica, _event in tail_observed}:
+            _fail("commit_identity_gap", "peer-only tail observers and rich reporters differ", observed=True)
+        proof_identity: tuple[int, str, int] | None = None
+        for replica, event in tail_rich:
+            payload = _validate_commit(event["payload"], digest=digest, observer=False)
+            proof = payload["decision_proof"]
+            candidate = (proof["tree_id"], proof["epoch_digest"], payload["view_generation"])
+            if proof_identity is not None and proof_identity != candidate:
+                _fail("commit_identity_gap", "peer-only tail rich proofs differ", observed=True)
+            proof_identity = candidate
+        assert proof_identity is not None
+        tail_details.append({
+            "block_height": key[0], "block_hash": key[1],
+            "parent_hash": key[2], "transaction_count": key[3],
+            "reporters": sorted(reporters), "tree_id": proof_identity[0],
+            "view_generation": proof_identity[2],
+        })
+
+    # Every tail reporter begins at the exact observer successor and remains a
+    # contiguous local parent chain.  The generic pair closure below already
+    # proves adjacent observed/rich records and their local batch agreement.
+    for replica in sorted(tail_reporters):
+        local_tail = [key for _kind, key, _sequence in per_replica[replica] if key[:4] in tail_keys]
+        if not local_tail:
+            _fail("commit_identity_gap", "peer-only tail reporter has no local tail", observed=True)
+        first = local_tail[0]
+        if first[0] != observer_final_height + 1 or first[2] != observer_final_hash:
+            _fail("commit_identity_gap", "peer-only tail does not begin at the observer successor", observed=True)
+        # Each physical tail record appears twice locally (observed then rich).
+        local_physical = local_tail[::2]
+        if len(local_tail) != len(local_physical) * 2 or any(
+            local_tail[index] != local_tail[index + 1]
+            for index in range(0, len(local_tail), 2)
+        ):
+            _fail("commit_identity_gap", "peer-only tail is not locally paired", observed=True)
+        for before, after in zip(local_physical, local_physical[1:]):
+            if after[0] != before[0] + 1 or after[2] != before[1]:
+                _fail("commit_identity_gap", "peer-only tail is not a consecutive parent chain", observed=True)
+
+    for key, reporters in rich.items():
+        if key in tail_keys:
+            continue
+        observer = observer_by_height.get(key[0])
+        if observer is None or (
+            key[1] != observer["block_hash"]
+            or key[2] != observer["parent_hash"]
+            or key[3] != observer["transaction_count"]
+        ):
+            _fail("commit_identity_gap", "a peer rich commit is absent from the authoritative observer chain", observed=True)
+        for _replica, event in reporters:
+            peer = event["payload"]
+            if (
+                peer["decision_proof"] != observer["decision_proof"]
+                or peer["view_generation"] != observer["view_generation"]
+            ):
+                _fail("commit_identity_gap", "peer exact commit identity disagrees with observer", observed=True)
+
+    details: list[dict[str, object]] = []
+    for key, gaps in sorted(markers.items()):
+        if len(gaps) != 1:
+            _fail("commit_identity_gap", "a commit has more than one unavailable reporter", observed=True)
+        gap_replica, marker = gaps[0]
+        same_hash_records = [
+            other for group in (observed, rich, markers)
+            for other_key, entries in group.items()
+            if other_key[1] == key[1] and other_key != key
+            for other in entries
+        ]
+        if same_hash_records:
+            _fail("commit_identity_gap", "a marked block has conflicting physical identities", observed=True)
+        observations = observed.get(key, [])
+        rich_peers = rich.get(key, [])
+        if (
+            len(observations) != 31
+            or {replica for replica, _ in observations} != set(range(31))
+            or len(rich_peers) != 30
+            or {replica for replica, _ in rich_peers} != set(range(31)) - {gap_replica}
+            or sum(observer_key[:4] == key for observer_key in observer_keys) != 1
+        ):
+            _fail("commit_identity_gap", "marked commit lacks 31 observations and 30 exact rich peers", observed=True)
+        proof_identity: tuple[int, str, int] | None = None
+        for replica, event in rich_peers:
+            payload = event["payload"]
+            _validate_commit(payload, digest=digest, observer=replica == observer_replica)
+            proof = payload["decision_proof"]
+            candidate = (proof["tree_id"], proof["epoch_digest"], payload["view_generation"])
+            if (
+                payload["view_generation"] <= 0
+                or payload["view_generation"] >= 1 << 64
+                or (proof_identity is not None and proof_identity != candidate)
+            ):
+                _fail("commit_identity_gap", "rich peers disagree on exact Epoch-0 identity", observed=True)
+            proof_identity = candidate
+        timestamp = int(marker["source_monotonic_ns"])
+        details.append({
+            "replica_id": gap_replica,
+            "block_height": key[0],
+            "block_hash": key[1],
+            "transaction_count": key[3],
+            "phase": "pre_measurement" if timestamp < start_ns else
+                     "in_measurement" if timestamp < end_ns else "post_measurement",
+            "rich_peer_count": 30,
+            "observed_replica_count": 31,
+            "tree_id": proof_identity[0],
+            "view_generation": proof_identity[2],
+        })
+    return {
+        "schema_version": 1,
+        "event_type": "block.commit_identity_unavailable",
+        "total_count": len(details),
+        "in_measurement_count": sum(row["phase"] == "in_measurement" for row in details),
+        "details": details,
+        "undisputed_height_gaps": undisputed_height_gaps,
+        "unanimous_observed_bridges": bridge_details,
+        "post_measurement_peer_tails": {
+            "count": len(tail_details),
+            "reporters": sorted(tail_reporters),
+            "details": tail_details,
+        },
+    }
 
 
 def _strict_replica_ids(value: object) -> list[int] | None:
@@ -620,10 +940,10 @@ def _delta_triplet_summary(
 def _validate_streams(
     root: Path, receipt: Mapping[str, object], *, cpu_run: bool,
     plan: object, allow_required_branch_incomplete: bool, allow_delta_triplets: bool,
-    strict_schema_types: bool = False,
+    strict_schema_types: bool = False, allow_identity_unavailable: bool = False,
 ) -> tuple[
     list[dict[str, object]], int, int, int, list[_RequiredBranchEvent],
-    list[_DeltaTriplet], int, int,
+    list[_DeltaTriplet], int, int, list[tuple[int, Mapping[str, object]]],
 ]:
     run_id = receipt.get("run_id")
     digest = receipt.get("epoch_zero_digest")
@@ -635,6 +955,7 @@ def _validate_streams(
     }:
         _fail("raw_inventory", "raw_sha256 does not cover exactly 31 replicas")
 
+    observer_replica = plan.profile.authoritative_observer
     observer_events: list[dict[str, object]] | None = None
     observer_terminal_index = -1
     terminal_times: list[tuple[str, int]] = []
@@ -643,12 +964,13 @@ def _validate_streams(
     delta_triplets: list[_DeltaTriplet] = []
     lifecycle_starts: list[int] = []
     lifecycle_ends: list[int] = []
+    commit_records: list[tuple[int, Mapping[str, object]]] = []
     for replica in range(31):
         source = f"replica-{replica}"
         path = root / "raw" / f"{source}.jsonl"
         if raw_sha256[source] != _sha256_file(path):
             _fail("raw_hash_mismatch", f"{source} differs from raw_sha256", observed=True)
-        events = _read_jsonl(path, source)
+        events = _read_jsonl(path, source, reject_duplicate_keys=allow_identity_unavailable)
         active: list[tuple[int, int]] = []
         terminals: list[int] = []
         lifecycle: dict[str, list[int]] = defaultdict(list)
@@ -708,6 +1030,9 @@ def _validate_streams(
                     "aggregation.delta_reserved", "aggregation.delta_enqueued",
                     "aggregation.delta_committed",
                 }
+            ) and not (
+                allow_identity_unavailable
+                and event_type == "block.commit_identity_unavailable"
             ):
                 _fail(
                     "unexpected_native_event",
@@ -815,7 +1140,24 @@ def _validate_streams(
                     ))
                     pending_delta = None
             elif event_type == "block.committed":
-                _validate_commit(event["payload"], digest=str(digest), observer=(replica == 2))
+                _validate_commit(event["payload"], digest=str(digest), observer=(replica == observer_replica))
+            if allow_identity_unavailable and event_type in {
+                "block.commit_observed", "block.committed", "block.commit_identity_unavailable",
+            }:
+                if (
+                    len(lifecycle["process.ready"]) != 1
+                    or lifecycle["process.stopping"]
+                    or lifecycle["process.stopped"]
+                ):
+                    _fail("commit_identity_gap", f"{source} commit evidence lies outside ready/stopping", observed=True)
+                if event_type == "block.commit_identity_unavailable":
+                    if index == 0 or events[index - 1]["event_type"] != "block.commit_observed":
+                        _fail("commit_identity_gap", f"{source} marker is not immediately after an observation", observed=True)
+                    current = _physical_commit_identity(event["payload"], code="commit_identity_gap")
+                    previous = _physical_commit_identity(events[index - 1]["payload"], code="commit_identity_gap")
+                    if current != previous:
+                        _fail("commit_identity_gap", f"{source} marker differs from its observation", observed=True)
+                commit_records.append((replica, event))
         if pending_delta is not None:
             _fail("delta_triplet", f"{source} ends with an incomplete delta triplet", observed=True)
         if pending_initial is not None:
@@ -858,7 +1200,7 @@ def _validate_streams(
             )
         terminal_times.append((source, int(events[terminals[0]]["source_monotonic_ns"])))
         cycle_completion_times.append((source, initial_cycle_completion))
-        if replica == 2:
+        if replica == observer_replica:
             observer_events = events
             observer_terminal_index = terminals[0]
 
@@ -870,7 +1212,7 @@ def _validate_streams(
         return (
             observer_events, terminal_sequence, terminal_time, terminal_time,
             required_branch_events, delta_triplets,
-            min(lifecycle_starts), max(lifecycle_ends),
+            min(lifecycle_starts), max(lifecycle_ends), commit_records,
         )
 
     cycles = receipt.get("required_complete_cycles")
@@ -921,7 +1263,7 @@ def _validate_streams(
     return (
         observer_events, terminal_sequence, start_ns, end_ns,
         required_branch_events, delta_triplets,
-        min(lifecycle_starts), max(lifecycle_ends),
+        min(lifecycle_starts), max(lifecycle_ends), commit_records,
     )
 
 
@@ -1430,7 +1772,7 @@ def _validate_authorization(
 
 def _validate_campaign_authorization(
     root: Path, receipt: Mapping[str, object], *, arm: str, mode: str,
-    version: int = 2,
+    version: int = 2, cell_validator_version: int = 7,
 ) -> dict[str, object]:
     """Validate only the prospectively frozen six-block campaign receipt."""
 
@@ -1449,6 +1791,8 @@ def _validate_campaign_authorization(
             "executor_receipt_schema", "cell_validator_version",
             "process_cleanup_required",
         })
+        if cell_validator_version == 8:
+            expected_keys.add("authoritative_observer")
     forward = [
         "slow-roots:homogeneous", "fast-roots:homogeneous",
         "slow-roots:heterogeneous", "fast-roots:heterogeneous",
@@ -1479,8 +1823,9 @@ def _validate_campaign_authorization(
         or (version == 3 and (
             document.get("executor_receipt_schema") != _CAMPAIGN_RECEIPT_SCHEMA_V3
             or type(document.get("cell_validator_version")) is not int
-            or document.get("cell_validator_version") != 7
+            or document.get("cell_validator_version") != cell_validator_version
             or document.get("process_cleanup_required") is not True
+            or (cell_validator_version == 8 and document.get("authoritative_observer") != 27)
         ))
         or not isinstance(campaign_id, str)
         or re.fullmatch(r"w16-cpu-repeat-[a-z0-9][a-z0-9-]*", campaign_id) is None
@@ -1513,6 +1858,13 @@ def _validate_campaign_authorization(
         or receipt.get("authorization_sha256") != actual_sha
     ):
         _fail("cpu_authorization", "CPU authorization does not bind this exact campaign cell")
+    if cell_validator_version == 8 and (
+        re.fullmatch(r"w16-cpu-repeat-v8-[a-z0-9][a-z0-9-]*", campaign_id) is None
+        or root.parent.parent.name != campaign_id
+        or root.parent.name != f"block-{block_index:02d}"
+        or root.name != label.replace(":", "-")
+    ):
+        _fail("cpu_authorization", "v8 root is not the authorized fresh campaign slot")
     return {
         "sha256": actual_sha,
         "schema_version": version,
@@ -1711,7 +2063,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             _fail("receipt_outcome", "executor receipt does not prove one clean attempt")
 
         _validate_inventory(candidate, outcome)
-        arm, plan = _validate_preflight(outcome)
+        arm, plan = _validate_preflight(outcome, version=version)
         _validate_configuration(candidate, outcome, plan)
         if outcome.get("epoch_zero_digest") != _EPOCH_ZERO_DIGESTS[arm]:
             _fail("epoch_zero_identity", "native Epoch-0 digest differs from the frozen arm")
@@ -1722,11 +2074,12 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
         ):
             _fail("cpu_identity", "quota contract and cleanup presence disagree")
         (events, terminal_sequence, start_ns, end_ns, required_branch_events,
-         delta_triplets, lifecycle_start_ns, lifecycle_end_ns) = _validate_streams(
+         delta_triplets, lifecycle_start_ns, lifecycle_end_ns, commit_records) = _validate_streams(
             candidate, outcome, cpu_run=cpu_run, plan=plan,
             allow_required_branch_incomplete=version >= 3,
             allow_delta_triplets=version >= 4,
             strict_schema_types=version >= 7,
+            allow_identity_unavailable=version >= 8,
         )
         if version == 5 and not (
             int(outcome["started_monotonic_ns"]) <= start_ns
@@ -1778,6 +2131,8 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
         result["revision"] = outcome["preflight"]["revision"]
         result["arm"] = arm
         result["epoch_zero_digest"] = outcome["epoch_zero_digest"]
+        if version == 8:
+            result["authoritative_observer"] = plan.profile.authoritative_observer
         if version >= 3:
             result["required_branch_incomplete"] = _required_branch_diagnostic_summary(
                 required_branch_events, start_ns=start_ns, end_ns=end_ns,
@@ -1786,6 +2141,16 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             result["delta_success_triplets"] = _delta_triplet_summary(
                 delta_triplets, start_ns=start_ns, end_ns=end_ns,
             )
+        if version >= 8:
+            result["identity_unavailable"] = _validate_identity_gaps_v8(
+                commit_records, events,
+                digest=str(outcome["epoch_zero_digest"]),
+                start_ns=start_ns, end_ns=end_ns,
+                observer_replica=plan.profile.authoritative_observer,
+            )
+            result["post_measurement_peer_tails"] = result["identity_unavailable"][
+                "post_measurement_peer_tails"
+            ]
         if cpu_run:
             throughput = _derive_throughput(
                 events, start_ns=start_ns, end_ns=end_ns,
@@ -1809,7 +2174,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
                     )
                 result["authorization"] = _validate_campaign_authorization(
                     candidate, outcome, arm=arm, mode=str(result["quota"]["mode"]),
-                    version=3,
+                    version=3, cell_validator_version=version,
                 )
             elif version >= 5:
                 result["authorization"] = _validate_campaign_authorization(
@@ -1904,3 +2269,9 @@ def validate_w16_output_v7(root: Path) -> dict[str, object]:
     """Validate a prospective v3 campaign cell with exact shutdown proof."""
 
     return _validate_w16_output(root, version=7)
+
+
+def validate_w16_output_v8(root: Path) -> dict[str, object]:
+    """Validate a fresh v8 cell with bounded non-observer identity gaps."""
+
+    return _validate_w16_output(root, version=8)

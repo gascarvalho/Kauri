@@ -15,6 +15,7 @@ from kauri_experiment import n31_static_e0_feasibility as feasibility
 from kauri_experiment import n31_static_e0_local_executor as executor
 from kauri_experiment import static_e0_cpu_contract
 from kauri_experiment.w16_cpu_campaign_sequence_v7 import validate_freeze_v7
+from kauri_experiment.w16_cpu_campaign_sequence_v8 import validate_freeze_v8
 
 
 _W16_BLOCK_ORDER = (
@@ -26,6 +27,33 @@ _W16_BLOCK_ORDER = (
 _W16_REVERSE_ORDER = tuple(reversed(_W16_BLOCK_ORDER))
 _CAMPAIGN_ID = re.compile(r"w16-cpu-repeat-[a-z0-9][a-z0-9-]*\Z")
 _SHA256 = re.compile(r"[0-9a-f]{64}\Z")
+
+
+def _plan_from_preflight(preflight: object, *, arm: str) -> feasibility.FeasibilityPlan:
+    """Select a profile only from its sealed preflight identity.
+
+    V8 cannot silently run with the original observer-2 profile, and legacy
+    callers cannot relabel a v8 receipt as a v1 receipt.
+    """
+
+    if not isinstance(preflight, dict):
+        raise executor.LocalExecutorError("preflight must be one JSON object")
+    kind = preflight.get("kind")
+    schema_version = preflight.get("schema_version")
+    profile_id = preflight.get("profile_id")
+    if (
+        kind == feasibility.SCHEMA
+        and schema_version == 1
+        and profile_id == "n31-static-e0-local-feasibility-v1"
+    ):
+        return feasibility.frozen_plan(arm=arm)
+    if (
+        kind == feasibility.SCHEMA_V8
+        and schema_version == 8
+        and profile_id == "n31-static-e0-local-feasibility-v8"
+    ):
+        return feasibility.frozen_plan(arm=arm, profile_version=8)
+    raise executor.LocalExecutorError("preflight does not name an accepted W16 profile")
 
 
 def _read_campaign_cpu_authorization(
@@ -116,27 +144,35 @@ def _read_campaign_cpu_authorization_v3(
     hard_timeout_s: float, campaign_freeze_file: Path | None,
     campaign_approval_ref: str | None,
 ) -> bytes:
-    """Keep v2 immutable while binding the new cleanup-proof contract."""
+    """Bind v7/v8 cleanup-proof cells while preserving v2 and v7 semantics.
+
+    Version 8 deliberately retains authorization schema v3: the executor
+    receipt/cleanup contract is unchanged.  Its distinct freeze kind, digest,
+    campaign identifier, and validator version provide the prospective binding.
+    """
 
     contract_keys = {
         "executor_receipt_schema", "cell_validator_version",
         "process_cleanup_required",
     }
+    expected_keys = {
+        "schema_version", "kind", "campaign_id", "block_index",
+        "campaign_freeze_sha256", "block_id", "block_order", "cell_ordinal",
+        "revision", "profile_sha256", "arm", "quota_mode", "preflight_sha256",
+        "binary_sha256", "output_root", "required_complete_cycles",
+        "hard_timeout_s", "external_timeout_s", "automatic_retries",
+        "claim_eligible", "figure_eligible", "approval_ref", "approved_at_utc",
+    } | contract_keys
+    if document.get("cell_validator_version") == 8:
+        expected_keys.add("authoritative_observer")
     if (
-        set(document) != {
-            "schema_version", "kind", "campaign_id", "block_index",
-            "campaign_freeze_sha256", "block_id", "block_order", "cell_ordinal",
-            "revision", "profile_sha256", "arm", "quota_mode", "preflight_sha256",
-            "binary_sha256", "output_root", "required_complete_cycles",
-            "hard_timeout_s", "external_timeout_s", "automatic_retries",
-            "claim_eligible", "figure_eligible", "approval_ref", "approved_at_utc",
-        } | contract_keys
+        set(document) != expected_keys
         or type(document.get("schema_version")) is not int
         or document.get("schema_version") != 3
         or document.get("kind") != "kauri-w16-static-e0-campaign-authorization-v3"
         or document.get("executor_receipt_schema") != "kauri-n31-static-e0-local-executor-v3"
         or type(document.get("cell_validator_version")) is not int
-        or document.get("cell_validator_version") != 7
+        or document.get("cell_validator_version") not in (7, 8)
         or document.get("process_cleanup_required") is not True
         or campaign_freeze_file is None
         or campaign_freeze_file.is_symlink()
@@ -147,23 +183,57 @@ def _read_campaign_cpu_authorization_v3(
         freeze = json.loads(campaign_freeze_file.read_bytes())
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
         raise executor.LocalExecutorError("W16 v3 campaign freeze is unreadable") from error
-    freeze_verdict = validate_freeze_v7(freeze) if isinstance(freeze, dict) else {}
+    validator_version = document.get("cell_validator_version")
+    if validator_version == 8:
+        if (
+            preflight.get("schema_version") != 8
+            or preflight.get("kind") != feasibility.SCHEMA_V8
+            or preflight.get("profile_id") != "n31-static-e0-local-feasibility-v8"
+            or document.get("authoritative_observer") != 27
+        ):
+            raise executor.LocalExecutorError(
+                "W16 v8 authorization requires the neutral-observer preflight"
+            )
+    elif (
+        preflight.get("schema_version") != 1
+        or preflight.get("kind") != feasibility.SCHEMA
+        or preflight.get("profile_id") != "n31-static-e0-local-feasibility-v1"
+    ):
+        raise executor.LocalExecutorError(
+            "W16 v7 authorization requires the original preflight"
+        )
+    freeze_verdict = (
+        validate_freeze_v7(freeze)
+        if validator_version == 7 and isinstance(freeze, dict)
+        else validate_freeze_v8(freeze)
+        if validator_version == 8 and isinstance(freeze, dict)
+        else {}
+    )
+    expected_freeze_schema = 2 if validator_version == 7 else 3
+    expected_freeze_kind = (
+        "kauri-w16-cpu-repeat-freeze-v2"
+        if validator_version == 7
+        else "kauri-w16-cpu-repeat-freeze-v8-neutral-v1"
+    )
     if (
         not isinstance(freeze, dict)
         or freeze_verdict.get("verdict") != "PASS"
         or type(freeze.get("schema_version")) is not int
-        or freeze.get("schema_version") != 2
-        or freeze.get("kind") != "kauri-w16-cpu-repeat-freeze-v2"
+        or freeze.get("schema_version") != expected_freeze_schema
+        or freeze.get("kind") != expected_freeze_kind
         or freeze.get("campaign_id") != document.get("campaign_id")
         or freeze.get("revision") != document.get("revision")
         or freeze.get("authorization_schema_version") != 3
         or freeze.get("authorization_kind") != document.get("kind")
         or freeze.get("executor_receipt_schema") != document.get("executor_receipt_schema")
-        or freeze.get("cell_validator_version") != 7
+        or freeze.get("cell_validator_version") != validator_version
         or freeze.get("process_cleanup_required") is not True
     ):
         raise executor.LocalExecutorError("W16 v3 campaign freeze contract differs")
-    legacy_fields = {key: value for key, value in document.items() if key not in contract_keys}
+    legacy_fields = {
+        key: value for key, value in document.items()
+        if key not in contract_keys | {"authoritative_observer"}
+    }
     legacy_fields.update({
         "schema_version": 2,
         "kind": "kauri-w16-static-e0-campaign-authorization-v2",
@@ -262,7 +332,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         preflight_bytes = args.preflight.read_bytes()
         preflight = json.loads(preflight_bytes)
-        plan = feasibility.frozen_plan(arm=args.arm)
+        plan = _plan_from_preflight(preflight, arm=args.arm)
         if args.command == "run":
             if args.output is None or args.treegen is not None or args.run_id is not None:
                 parser.error("run requires --output and forbids --treegen/--run-id")

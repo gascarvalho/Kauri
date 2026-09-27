@@ -36,6 +36,9 @@ REQUIRED_BRANCH = "feature/adaptive-epoch-throughput"
 PINNED_MANAGER_HOST = "127.0.0.1"
 PINNED_MANAGER_PORT = 27991
 SCHEMA = "kauri-n31-static-e0-feasibility-preflight-v1"
+SCHEMA_V8 = "kauri-n31-static-e0-feasibility-preflight-v8"
+_V8_PROFILE_VERSION = 8
+_V8_AUTHORITATIVE_OBSERVER = 27
 
 
 class StaticE0FeasibilityError(RuntimeError):
@@ -135,10 +138,22 @@ def _assert_no_listener(endpoint: tuple[str, int]) -> None:
             )
 
 
-def frozen_plan(*, arm: str) -> FeasibilityPlan:
+def frozen_plan(*, arm: str, profile_version: int = 1) -> FeasibilityPlan:
     """Build the exact reviewed static file and retain only N=31/F5/P2 shape."""
 
-    profile = AllLiveProfile()
+    # The original profile is byte-stable for every v1--v7 caller.  V8 is a
+    # distinct experiment profile: its sole authoritative throughput observer
+    # is replica 27, which is a leaf in every frozen tree and receives the
+    # same 100% CPU quota in both treatment arms.
+    if profile_version == 1:
+        profile = AllLiveProfile()
+    elif profile_version == _V8_PROFILE_VERSION:
+        profile = AllLiveProfile(
+            profile_id="n31-static-e0-local-feasibility-v8",
+            authoritative_observer=_V8_AUTHORITATIVE_OBSERVER,
+        )
+    else:
+        raise StaticE0FeasibilityError("profile version must be 1 or 8")
     if (
         len(profile.replica_ids) != REPLICA_COUNT
         or profile.quorum != 21
@@ -149,7 +164,19 @@ def frozen_plan(*, arm: str) -> FeasibilityPlan:
         raise StaticE0FeasibilityError("profile is not the reviewed N31/F5/P2 shape")
     if arm not in {"slow-roots", "fast-roots"}:
         raise StaticE0FeasibilityError("arm must be slow-roots or fast-roots")
-    treegen_bytes = render_treegen_bytes(build_schedule(arm))
+    schedule = build_schedule(arm)
+    if profile_version == _V8_PROFILE_VERSION:
+        trees = schedule["trees"]
+        if not isinstance(trees, list) or any(
+            not isinstance(tree, Mapping)
+            or not isinstance(tree.get("members_breadth_first"), list)
+            or tree["members_breadth_first"].index(_V8_AUTHORITATIVE_OBSERVER) <= FANOUT
+            for tree in trees
+        ):
+            raise StaticE0FeasibilityError(
+                "v8 authoritative observer is not a leaf in every frozen tree"
+            )
+    treegen_bytes = render_treegen_bytes(schedule)
     if treegen_bytes.count(b"\n") != TREE_COUNT:
         raise StaticE0FeasibilityError("static tree artifact does not contain 21 trees")
     return FeasibilityPlan(
@@ -169,6 +196,7 @@ def preflight(
     tls_keygen_binary: Path,
     native_digest_binary: Path,
     arm: str,
+    profile_version: int = 1,
     endpoint_probe: Callable[[tuple[str, int]], None] = _assert_no_listener,
 ) -> dict[str, object]:
     """Return a reproducible local-only preflight receipt or fail before writes.
@@ -187,7 +215,7 @@ def preflight(
     remote = _git(repository, "rev-parse", f"origin/{REQUIRED_BRANCH}").strip()
     if revision != remote:
         raise StaticE0FeasibilityError("HEAD differs from the required remote revision")
-    plan = frozen_plan(arm=arm)
+    plan = frozen_plan(arm=arm, profile_version=profile_version)
     app = _require_executable(app_binary, "hotstuff-app")
     keygen = _require_executable(keygen_binary, "hotstuff-keygen")
     tls_keygen = _require_executable(tls_keygen_binary, "hotstuff-tls-keygen")
@@ -198,8 +226,8 @@ def preflight(
         "native_digest": native_digest,
     }
     return {
-        "schema_version": 1,
-        "kind": SCHEMA,
+        "schema_version": 1 if profile_version == 1 else 8,
+        "kind": SCHEMA if profile_version == 1 else SCHEMA_V8,
         "verdict": "PREFLIGHT_OK_NO_EXECUTION",
         "revision": revision,
         "profile_id": plan.profile.profile_id,

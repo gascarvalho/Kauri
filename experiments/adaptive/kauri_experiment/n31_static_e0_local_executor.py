@@ -103,7 +103,14 @@ def _validate_preflight(preflight: Mapping[str, object], plan: feasibility.Feasi
 
     if preflight.get("verdict") != "PREFLIGHT_OK_NO_EXECUTION":
         raise LocalExecutorError("preflight did not pass without execution")
-    if preflight.get("kind") != feasibility.SCHEMA:
+    v8_profile = plan.profile.profile_id == "n31-static-e0-local-feasibility-v8"
+    expected_kind = feasibility.SCHEMA_V8 if v8_profile else feasibility.SCHEMA
+    expected_schema_version = 8 if v8_profile else 1
+    if (
+        preflight.get("kind") != expected_kind
+        or (v8_profile and preflight.get("schema_version") != expected_schema_version)
+        or (not v8_profile and preflight.get("schema_version") not in (None, expected_schema_version))
+    ):
         raise LocalExecutorError("preflight schema is not the W16 schema")
     if preflight.get("arm") != plan.arm:
         raise LocalExecutorError("preflight arm differs from frozen plan")
@@ -497,7 +504,7 @@ def execute_once(
             raise LocalExecutorError("validated campaign authorization identity differs")
         if campaign_authorization_version == 3 and (
             authorization_document.get("executor_receipt_schema") != CAMPAIGN_SCHEMA_V3
-            or authorization_document.get("cell_validator_version") != 7
+            or authorization_document.get("cell_validator_version") not in (7, 8)
             or authorization_document.get("process_cleanup_required") is not True
         ):
             raise LocalExecutorError("validated v3 campaign authorization contract differs")
