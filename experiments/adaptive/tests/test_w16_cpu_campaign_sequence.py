@@ -288,7 +288,7 @@ def test_execute_sequence_stops_after_first_nonzero_without_retry(
     monkeypatch.setattr(sequence, "_verify_live_preflight", lambda *_args: None)
     monkeypatch.setattr(
         sequence,
-        "validate_w16_output_v5",
+        "validate_w16_output_v6",
         lambda root: (validation_calls.append(Path(root)) or {"verdict": "PASS"}),
     )
     result = sequence.execute_sequence(
@@ -316,7 +316,7 @@ def test_execute_sequence_stops_after_first_nonzero_without_retry(
         )
 
 
-def test_execute_sequence_stops_on_v5_failure_after_zero_wrapper(
+def test_execute_sequence_stops_on_v6_failure_after_zero_wrapper(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     sequence = _sequence_module()
@@ -349,7 +349,7 @@ def test_execute_sequence_stops_on_v5_failure_after_zero_wrapper(
 
     monkeypatch.setattr(sequence.subprocess, "Popen", fake_popen)
     monkeypatch.setattr(sequence, "_verify_live_preflight", lambda *_args: None)
-    monkeypatch.setattr(sequence, "validate_w16_output_v5", fake_validation)
+    monkeypatch.setattr(sequence, "validate_w16_output_v6", fake_validation)
     result = sequence.execute_sequence(
         manifest_path, manifest_sha256=_sha256(manifest_bytes),
         freeze_file=freeze_path, approval_ref=APPROVAL_REF,
@@ -386,7 +386,7 @@ def test_execute_sequence_never_returns_pass_when_terminal_record_write_fails(
         lambda _argv, **_kwargs: Process(3000),
     )
     monkeypatch.setattr(sequence, "_verify_live_preflight", lambda *_args: None)
-    monkeypatch.setattr(sequence, "validate_w16_output_v5", lambda _root: {"verdict": "PASS"})
+    monkeypatch.setattr(sequence, "validate_w16_output_v6", lambda _root: {"verdict": "PASS"})
     monkeypatch.setattr(sequence, "validate_w16_campaign_block", lambda _roots: {"verdict": "PASS"})
     monkeypatch.setattr(sequence, "validate_w16_cpu_campaign", lambda _blocks: {"verdict": "PASS"})
     original_write = sequence._write_new_json

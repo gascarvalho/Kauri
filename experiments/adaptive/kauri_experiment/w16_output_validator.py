@@ -22,6 +22,7 @@ from . import static_topology_n31
 
 
 _RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v1"
+_CAMPAIGN_RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v2"
 _TERMINAL = "adaptive_v2_reporting_terminal"
 _ENVELOPE_KEYS = frozenset(
     {
@@ -1533,7 +1534,10 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
         if receipt_path.exists() == abort_path.exists():
             _fail("outcome_cardinality", "output root must contain exactly one outcome")
         outcome = _read_json(receipt_path if receipt_path.exists() else abort_path, "executor outcome")
-        if outcome.get("schema") != _RECEIPT_SCHEMA:
+        expected_receipt_schema = (
+            _CAMPAIGN_RECEIPT_SCHEMA if version >= 6 else _RECEIPT_SCHEMA
+        )
+        if outcome.get("schema") != expected_receipt_schema:
             _fail("receipt_schema", "executor outcome schema is not W16")
         if abort_path.exists() or outcome.get("verdict") != "PASS":
             _fail("producer_abort", "executor sealed an abort, not evidence")
@@ -1547,6 +1551,11 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             "ended_monotonic_ns",
         }
         required_keys.add("authorization_sha256")
+        if version >= 6:
+            required_keys.update({
+                "raw_clock_id", "started_raw_monotonic_ns",
+                "ended_raw_monotonic_ns",
+            })
         if set(outcome) != required_keys:
             missing = sorted(required_keys - set(outcome))
             _fail("receipt_schema", f"executor receipt schema drifted; missing={missing}")
@@ -1578,7 +1587,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             allow_required_branch_incomplete=version >= 3,
             allow_delta_triplets=version >= 4,
         )
-        if version >= 5 and not (
+        if version == 5 and not (
             int(outcome["started_monotonic_ns"]) <= start_ns
             < end_ns <= int(outcome["ended_monotonic_ns"])
         ):
@@ -1586,7 +1595,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
                 "measurement_window",
                 "raw measurement window lies outside the producer process interval",
             )
-        if version >= 5:
+        if version == 5:
             if not (
                 int(outcome["started_monotonic_ns"]) <= lifecycle_start_ns
                 < start_ns < end_ns < lifecycle_end_ns
@@ -1599,6 +1608,30 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             result["native_lifecycle_span"] = {
                 "start_monotonic_ns": lifecycle_start_ns,
                 "end_monotonic_ns": lifecycle_end_ns,
+            }
+        if version >= 6:
+            raw_start = outcome.get("started_raw_monotonic_ns")
+            raw_end = outcome.get("ended_raw_monotonic_ns")
+            if (
+                outcome.get("raw_clock_id") != "CLOCK_MONOTONIC_RAW"
+                or not _integer(raw_start, minimum=1)
+                or not _integer(raw_end, minimum=1)
+                or not int(raw_start) <= lifecycle_start_ns
+                < start_ns < end_ns < lifecycle_end_ns <= int(raw_end)
+            ):
+                _fail(
+                    "raw_lifecycle_span",
+                    "native lifecycle and measurement window are not bounded "
+                    "by same-domain producer RAW clock samples",
+                )
+            result["native_lifecycle_span"] = {
+                "start_monotonic_ns": lifecycle_start_ns,
+                "end_monotonic_ns": lifecycle_end_ns,
+            }
+            result["producer_raw_clock_span"] = {
+                "clock_id": "CLOCK_MONOTONIC_RAW",
+                "start_monotonic_ns": raw_start,
+                "end_monotonic_ns": raw_end,
             }
         result["run_id"] = outcome["run_id"]
         result["revision"] = outcome["preflight"]["revision"]
@@ -1696,3 +1729,9 @@ def validate_w16_output_v5(root: Path) -> dict[str, object]:
     """Validate a prospective v2-authorized CPU campaign cell only."""
 
     return _validate_w16_output(root, version=5)
+
+
+def validate_w16_output_v6(root: Path) -> dict[str, object]:
+    """Validate a fresh campaign cell with explicit native RAW-clock bounds."""
+
+    return _validate_w16_output(root, version=6)

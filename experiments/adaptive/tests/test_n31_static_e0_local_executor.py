@@ -195,6 +195,133 @@ def test_execute_once_seals_keygen_failure_without_launch(
         )
 
 
+def test_execute_once_campaign_receipt_seals_raw_bounds_but_v1_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Campaign-v2 sealing records native RAW bounds without changing v1 receipts."""
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+
+    class Held:
+        def close(self) -> None:
+            pass
+
+    class Contract:
+        contract_sha256 = "a" * 64
+
+    monkeypatch.setattr(executor.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(executor, "reserve_no_listener", lambda **_kwargs: Held())
+    monkeypatch.setattr(
+        executor, "_generate_identities_bounded",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("keygen failed")),
+    )
+    raw_bounds = iter((1_000_000_000, 1_000_000_500))
+    monkeypatch.setattr(
+        executor.time, "clock_gettime_ns", lambda _clock: next(raw_bounds),
+    )
+    authorization = json.dumps({
+        "schema_version": 2,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v2",
+    }, sort_keys=True).encode()
+
+    campaign = executor.execute_once(
+        plan=plan, preflight=receipt, directory=tmp_path / "campaign-v2",
+        hard_timeout_s=21, quota_contract=Contract(),
+        authorization_bytes=authorization, campaign_authorization_validated=True,
+    )
+    assert campaign["verdict"] == "ABORT"
+    assert campaign["schema"] == executor.CAMPAIGN_SCHEMA
+    assert campaign["raw_clock_id"] == "CLOCK_MONOTONIC_RAW"
+    assert campaign["started_raw_monotonic_ns"] == 1_000_000_000
+    assert campaign["ended_raw_monotonic_ns"] == 1_000_000_500
+
+    monkeypatch.setattr(
+        executor.time, "clock_gettime_ns",
+        lambda _clock: (_ for _ in ()).throw(AssertionError("v1 must not probe RAW clock")),
+    )
+    v1 = executor.execute_once(
+        plan=plan, preflight=receipt, directory=tmp_path / "legacy-v1",
+        hard_timeout_s=21, quota_contract=Contract(), authorization_bytes=b"{}",
+    )
+    assert v1["verdict"] == "ABORT"
+    assert v1["schema"] == executor.SCHEMA
+    assert "raw_clock_id" not in v1
+    assert "started_raw_monotonic_ns" not in v1
+    assert "ended_raw_monotonic_ns" not in v1
+
+
+def test_campaign_raw_start_failure_leaves_no_output_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """The v2 path refuses an unavailable RAW clock before any output write."""
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+    monkeypatch.setattr(executor.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(
+        executor.time, "clock_gettime_ns",
+        lambda _clock: (_ for _ in ()).throw(OSError("RAW unavailable")),
+    )
+    output = tmp_path / "raw-start-unavailable"
+    authorization = json.dumps({
+        "schema_version": 2,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v2",
+    }, sort_keys=True).encode()
+
+    with pytest.raises(executor.LocalExecutorError, match="CLOCK_MONOTONIC_RAW is unavailable"):
+        executor.execute_once(
+            plan=plan, preflight=receipt, directory=output, hard_timeout_s=21,
+            quota_contract=object(), authorization_bytes=authorization,
+            campaign_authorization_validated=True,
+        )
+    assert not output.exists()
+
+
+def test_campaign_raw_end_failure_seals_v2_abort_without_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Once a v2 attempt exists, an unavailable end bound cannot yield PASS."""
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+
+    class Held:
+        def close(self) -> None:
+            pass
+
+    class Contract:
+        contract_sha256 = "b" * 64
+
+    raw_calls: list[object] = []
+
+    def raw_clock(clock: object) -> int:
+        raw_calls.append(clock)
+        if len(raw_calls) == 1:
+            return 1_000_000_000
+        raise OSError("RAW end unavailable")
+
+    monkeypatch.setattr(executor.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(executor, "reserve_no_listener", lambda **_kwargs: Held())
+    monkeypatch.setattr(
+        executor, "_generate_identities_bounded",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("keygen failed")),
+    )
+    monkeypatch.setattr(executor.time, "clock_gettime_ns", raw_clock)
+    output = tmp_path / "raw-end-unavailable"
+    authorization = json.dumps({
+        "schema_version": 2,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v2",
+    }, sort_keys=True).encode()
+
+    result = executor.execute_once(
+        plan=plan, preflight=receipt, directory=output, hard_timeout_s=21,
+        quota_contract=Contract(), authorization_bytes=authorization,
+        campaign_authorization_validated=True,
+    )
+    assert len(raw_calls) == 2
+    assert result["schema"] == executor.CAMPAIGN_SCHEMA
+    assert result["verdict"] == "ABORT"
+    assert result["verdict"] != "PASS"
+    assert result["ended_raw_monotonic_ns"] is None
+    assert (output / "feasibility-abort.json").is_file()
+    assert not (output / "feasibility-receipt.json").exists()
+
+
 def test_held_no_listener_reservation_binds_without_listening() -> None:
     feasibility, executor = _modules()
     calls: list[tuple[object, ...]] = []

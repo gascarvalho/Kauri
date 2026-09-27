@@ -22,7 +22,7 @@ from . import n31_static_e0_feasibility as feasibility
 from .w16_campaign_validator import (
     FORWARD, REVERSE, validate_w16_campaign_block, validate_w16_cpu_campaign,
 )
-from .w16_output_validator import validate_w16_output_v5
+from .w16_output_validator import validate_w16_output_v6
 
 
 REPOSITORY = Path(__file__).resolve().parents[3]
@@ -586,7 +586,7 @@ def execute_sequence(
     Output roots are never overwritten or retried.  Only GNU timeout may
     interrupt a child; this function itself never sends a signal or replaces
     an incomplete cell.  Native process lifecycle and cgroup cleanup are
-    checked by the independent v5 validator before advancing.
+    checked by the independent v6 validator before advancing.
     """
 
     result: dict[str, object] = {
@@ -686,7 +686,7 @@ def execute_sequence(
             outside.mkdir(parents=True, exist_ok=False)
             stdout_path = outside / "wrapper.stdout"
             stderr_path = outside / "wrapper.stderr"
-            validation_path = outside / "validation-v5.json"
+            validation_path = outside / "validation-v6.json"
             command = _fixed_command(
                 cell, freeze_file=freeze_file, approval_ref=approval_ref,
                 timeout_path=timeout_path,
@@ -784,7 +784,7 @@ def execute_sequence(
                     "exit_code": wrapper_exit_code,
                 })
                 break
-            validation = validate_w16_output_v5(output)
+            validation = validate_w16_output_v6(output)
             _write_new_json(validation_path, validation)
             record["validation_verdict"] = validation.get("verdict")
             _write_new_json(outside / "cell-result.json", record)

@@ -25,6 +25,7 @@ from .processes import ProcessRegistry
 
 
 SCHEMA = "kauri-n31-static-e0-local-executor-v1"
+CAMPAIGN_SCHEMA = "kauri-n31-static-e0-local-executor-v2"
 _BINARY_NAMES = ("app", "keygen", "tls_keygen", "native_digest")
 
 
@@ -352,6 +353,7 @@ def execute_once(
     quota_contract: cpu_quota.CpuQuotaContract | None = None,
     required_complete_cycles: int = 1,
     authorization_bytes: bytes | None = None,
+    campaign_authorization_validated: bool = False,
 ) -> dict[str, object]:
     """One no-manager, zero-retry feasibility attempt.
 
@@ -368,10 +370,34 @@ def execute_once(
         raise LocalExecutorError("CPU quota mode requires Linux")
     if (quota_contract is None) != (authorization_bytes is None):
         raise LocalExecutorError("CPU execution requires an exact authorization; CPU-free execution forbids it")
+    if campaign_authorization_validated:
+        try:
+            authorization_document = json.loads(authorization_bytes or b"")
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise LocalExecutorError("validated campaign authorization is malformed") from error
+        if (
+            quota_contract is None
+            or not isinstance(authorization_document, dict)
+            or authorization_document.get("schema_version") != 2
+            or authorization_document.get("kind")
+            != "kauri-w16-static-e0-campaign-authorization-v2"
+        ):
+            raise LocalExecutorError("validated campaign authorization identity differs")
     directory = directory.resolve()
     if directory.exists():
         raise LocalExecutorError("one attempt requires an exact fresh output directory")
     _validate_preflight(preflight, plan)
+    # A campaign receipt uses the same RAW clock as native structured events.
+    # Probe before the first output write: an unavailable clock must not leave
+    # an unsealed attempted root or accidentally fall back to MONOTONIC.
+    started_raw_ns: int | None = None
+    if campaign_authorization_validated:
+        try:
+            started_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        except (AttributeError, OSError, ValueError) as error:
+            raise LocalExecutorError("CLOCK_MONOTONIC_RAW is unavailable") from error
+        if type(started_raw_ns) is not int or started_raw_ns <= 0:
+            raise LocalExecutorError("CLOCK_MONOTONIC_RAW start is invalid")
     directory.mkdir(parents=True, mode=0o700)
     for subdirectory in ("config", "logs", "raw"):
         (directory / subdirectory).mkdir(mode=0o700)
@@ -585,8 +611,20 @@ def execute_once(
             failure = f"post-cleanup raw stream validation failed: {exc}"
     if failure is None and cleanup_error is not None:
         failure = "raw artifact inventory or cleanup is incomplete"
+    ended_raw_ns: int | None = None
+    if campaign_authorization_validated:
+        try:
+            ended_raw_ns = time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
+        except (AttributeError, OSError, ValueError) as error:
+            failure = failure or f"CLOCK_MONOTONIC_RAW end failed: {error}"
+        if (
+            type(ended_raw_ns) is not int or started_raw_ns is None
+            or ended_raw_ns <= started_raw_ns
+        ):
+            failure = failure or "CLOCK_MONOTONIC_RAW end is invalid"
     payload: dict[str, object] = {
-        "schema": SCHEMA, "run_id": run_id, "attempts": 1, "retries": 0,
+        "schema": CAMPAIGN_SCHEMA if campaign_authorization_validated else SCHEMA,
+        "run_id": run_id, "attempts": 1, "retries": 0,
         "verdict": "PASS" if failure is None else "ABORT",
         "failure": failure, "cleanup_error": cleanup_error,
         "registered_replica_ids": [record.replica_id for record in records],
@@ -609,6 +647,12 @@ def execute_once(
         "started_monotonic_ns": started_ns,
         "ended_monotonic_ns": time.monotonic_ns(),
     }
+    if campaign_authorization_validated:
+        payload.update({
+            "raw_clock_id": "CLOCK_MONOTONIC_RAW",
+            "started_raw_monotonic_ns": started_raw_ns,
+            "ended_raw_monotonic_ns": ended_raw_ns,
+        })
     name = "feasibility-receipt.json" if failure is None else "feasibility-abort.json"
     runtime.write_json_exclusive(directory / name, payload)
     return payload

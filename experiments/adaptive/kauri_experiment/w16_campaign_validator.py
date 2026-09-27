@@ -1,6 +1,6 @@
 """Read-only, prospective validation of the counterbalanced W16 CPU study.
 
-This module reconstructs each cell through the v5 raw validator.  A PASS here
+This module reconstructs each cell through the v6 raw validator.  A PASS here
 is technical completeness only: scheduler identity and durable archiving are
 external evidence gates, so this module never makes a thesis/figure claim.
 """
@@ -14,7 +14,7 @@ import math
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .w16_output_validator import validate_w16_output_v5
+from .w16_output_validator import validate_w16_output_v6
 
 
 FORWARD = (
@@ -23,7 +23,7 @@ FORWARD = (
 )
 REVERSE = tuple(reversed(FORWARD))
 _LABELS = frozenset(FORWARD)
-_CELL_KIND = "kauri-w16-output-validation-v5"
+_CELL_KIND = "kauri-w16-output-validation-v6"
 
 
 class _InvalidCampaign(RuntimeError):
@@ -79,7 +79,7 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
         _fail("sealed_cell", f"cell {ordinal} lacks a regular receipt/authorization")
     receipt_before = receipt_path.read_bytes()
     authorization_before = authorization_path.read_bytes()
-    validation = validate_w16_output_v5(root)
+    validation = validate_w16_output_v6(root)
     receipt = _read_unchanged(receipt_path, receipt_before, f"cell {ordinal} receipt")
     authorization = _read_unchanged(
         authorization_path, authorization_before, f"cell {ordinal} authorization"
@@ -100,11 +100,12 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
         or validation.get("claim_eligible") is not False
         or validation.get("figure_eligible") is not False
     ):
-        _fail("cell_validation_contract", f"cell {ordinal} is not a bounded v5 CPU cell")
+        _fail("cell_validation_contract", f"cell {ordinal} is not a bounded v6 CPU cell")
     preflight = _mapping(receipt.get("preflight"), "receipt preflight")
     binaries = _mapping(preflight.get("binary_sha256"), "preflight binaries")
     throughput = _mapping(validation.get("throughput"), "validated throughput")
     lifecycle = _mapping(validation.get("native_lifecycle_span"), "validated native lifecycle")
+    raw_span = _mapping(validation.get("producer_raw_clock_span"), "producer RAW clock span")
     quota = _mapping(validation.get("quota"), "validated CPU quota")
     auth_summary = _mapping(validation.get("authorization"), "validated authorization")
     start = receipt.get("started_monotonic_ns")
@@ -116,9 +117,11 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
     window_end = throughput.get("window_end_monotonic_ns")
     lifecycle_start = lifecycle.get("start_monotonic_ns")
     lifecycle_end = lifecycle.get("end_monotonic_ns")
+    raw_start = receipt.get("started_raw_monotonic_ns")
+    raw_end = receipt.get("ended_raw_monotonic_ns")
     label = f"{authorization.get('arm')}:{authorization.get('quota_mode')}"
     if (
-        receipt.get("schema") != "kauri-n31-static-e0-local-executor-v1"
+        receipt.get("schema") != "kauri-n31-static-e0-local-executor-v2"
         or receipt.get("attempts") != 1
         or receipt.get("retries") != 0
         or receipt.get("required_complete_cycles") != 5
@@ -126,6 +129,14 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
         or not receipt["run_id"]
         or not _positive_int(start) or not _positive_int(end)
         or int(end) <= int(start)
+        or receipt.get("raw_clock_id") != "CLOCK_MONOTONIC_RAW"
+        or not _positive_int(raw_start) or not _positive_int(raw_end)
+        or int(raw_end) <= int(raw_start)
+        or raw_span != {
+            "clock_id": "CLOCK_MONOTONIC_RAW",
+            "start_monotonic_ns": raw_start,
+            "end_monotonic_ns": raw_end,
+        }
         or validation.get("run_id") != receipt["run_id"]
         or validation.get("revision") != preflight.get("revision")
         or label != expected_label
@@ -150,11 +161,11 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
         or not _positive_int(transactions) or not _positive_int(duration)
         or not _positive_int(milli_tps)
         or not _positive_int(window_start) or not _positive_int(window_end)
-        or not int(start) <= int(window_start) < int(window_end) <= int(end)
+        or not int(raw_start) <= int(window_start) < int(window_end) <= int(raw_end)
         or set(lifecycle) != {"start_monotonic_ns", "end_monotonic_ns"}
         or not _positive_int(lifecycle_start) or not _positive_int(lifecycle_end)
-        or not int(start) <= int(lifecycle_start) < int(window_start)
-        or not int(window_end) < int(lifecycle_end) <= int(end)
+        or not int(raw_start) <= int(lifecycle_start) < int(window_start)
+        or not int(window_end) < int(lifecycle_end) <= int(raw_end)
         or int(duration) != int(window_end) - int(window_start)
         or int(milli_tps) != int(transactions) * 1_000_000_000_000 // int(duration)
     ):
@@ -172,6 +183,8 @@ def _one_cell(root: Path, *, ordinal: int, expected_label: str) -> dict[str, obj
         "ordinal": ordinal, "label": label, "root": str(root),
         "run_id": receipt["run_id"],
         "started_monotonic_ns": int(start), "ended_monotonic_ns": int(end),
+        "started_raw_monotonic_ns": int(raw_start),
+        "ended_raw_monotonic_ns": int(raw_end),
         "window_start_monotonic_ns": int(window_start),
         "window_end_monotonic_ns": int(window_end),
         "native_lifecycle_start_monotonic_ns": int(lifecycle_start),
@@ -234,6 +247,8 @@ def validate_w16_campaign_block(roots: Sequence[Path]) -> dict[str, object]:
             if (
                 int(current["started_monotonic_ns"])
                 <= int(previous["ended_monotonic_ns"])
+                or int(current["started_raw_monotonic_ns"])
+                <= int(previous["ended_raw_monotonic_ns"])
                 or int(current["window_start_monotonic_ns"])
                 <= int(previous["window_end_monotonic_ns"])
                 or int(current["native_lifecycle_start_monotonic_ns"])
@@ -353,6 +368,8 @@ def validate_w16_cpu_campaign(blocks: Sequence[Sequence[Path]]) -> dict[str, obj
             if (
                 int(current["started_monotonic_ns"])
                 <= int(previous["ended_monotonic_ns"])
+                or int(current["started_raw_monotonic_ns"])
+                <= int(previous["ended_raw_monotonic_ns"])
                 or int(current["window_start_monotonic_ns"])
                 <= int(previous["window_end_monotonic_ns"])
                 or int(current["native_lifecycle_start_monotonic_ns"])

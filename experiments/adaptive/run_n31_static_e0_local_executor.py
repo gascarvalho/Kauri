@@ -211,6 +211,9 @@ def main(argv: list[str] | None = None) -> int:
                     if args.quota_mode != "none" else None
                 ),
                 required_complete_cycles=(5 if args.quota_mode != "none" else 1),
+                campaign_authorization_validated=(
+                    args.campaign_freeze_file is not None
+                ),
             )
             outcome_file = (
                 "feasibility-receipt.json" if result["verdict"] == "PASS"

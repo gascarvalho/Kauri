@@ -1,6 +1,6 @@
 """Prospective contracts for the W16 N=31 counterbalanced CPU campaign.
 
-These tests intentionally target the versioned v2/v5/campaign entry points.
+These tests intentionally target the versioned v2/v6/campaign entry points.
 They must never cause the v1 authorization or v4/v3 block verdicts to be
 reinterpreted.
 """
@@ -110,17 +110,28 @@ def _campaign_root(
     _replace_run_id(root, f"campaign-{block_index}-run-{ordinal}", ordinal)
     receipt_path = root / "feasibility-receipt.json"
     receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-    # The unshifted synthetic raw stream lies near 1e9.  Only direct v5 tests
+    receipt["schema"] = "kauri-n31-static-e0-local-executor-v2"
+    # The unshifted synthetic raw stream lies near 1e9.  Only direct v6 tests
     # request a genuine producer interval; mocked block/campaign tests retain
     # artificial, sequential intervals to exercise chronology separately.
     if real_raw_interval:
-        receipt["started_monotonic_ns"] = 1
-        receipt["ended_monotonic_ns"] = 100_000_000_000
+        # Deliberately offset Python CLOCK_MONOTONIC by 37 seconds from the
+        # native RAW stream.  V6 must use explicit RAW bounds, never infer or
+        # compare cross-clock values directly.
+        receipt["started_monotonic_ns"] = 37_000_000_001
+        receipt["ended_monotonic_ns"] = 137_000_000_000
     else:
         receipt["started_monotonic_ns"] = (
             block_index * 1_000_000_000_000_000 + ordinal * 2_000_000_000_000
         )
         receipt["ended_monotonic_ns"] = receipt["started_monotonic_ns"] + 1_000_000_000_004
+    receipt["raw_clock_id"] = "CLOCK_MONOTONIC_RAW"
+    if real_raw_interval:
+        receipt["started_raw_monotonic_ns"] = 1
+        receipt["ended_raw_monotonic_ns"] = 100_000_000_000
+    else:
+        receipt["started_raw_monotonic_ns"] = receipt["started_monotonic_ns"]
+        receipt["ended_raw_monotonic_ns"] = receipt["ended_monotonic_ns"]
     preflight_bytes = feasibility.canonical_json(receipt["preflight"])
     authorization = _v2_authorization(
         preflight=receipt["preflight"], preflight_bytes=preflight_bytes,
@@ -267,76 +278,115 @@ def test_v2_authorization_requires_external_freeze_and_exact_approval(
         )
 
 
-def test_v5_accepts_v2_cell_but_v4_does_not_reinterpret_it(tmp_path: Path) -> None:
-    """Version 5 is prospective; older v4 stays immutable and rejects v2."""
+def test_v6_accepts_cross_clock_v2_cell_but_v5_remains_frozen(tmp_path: Path) -> None:
+    """Version 6 accepts explicit RAW bounds; frozen v5 rejects this schema."""
 
     module = importlib.import_module(
         "experiments.adaptive.kauri_experiment.w16_output_validator"
     )
     root = _campaign_root(tmp_path, order=FORWARD, ordinal=3, real_raw_interval=True)
+    receipt = json.loads((root / "feasibility-receipt.json").read_text())
+    assert receipt["started_monotonic_ns"] - receipt["started_raw_monotonic_ns"] == 37_000_000_000
 
-    v5 = module.validate_w16_output_v5(root)
-    assert v5["verdict"] == "PASS", v5
-    assert v5["kind"] == "kauri-w16-output-validation-v5"
-    assert v5["authorization"]["campaign_id"] == CAMPAIGN_ID
-    assert v5["claim_eligible"] is False
+    v6 = module.validate_w16_output_v6(root)
+    assert v6["verdict"] == "PASS", v6
+    assert v6["kind"] == "kauri-w16-output-validation-v6"
+    assert v6["authorization"]["campaign_id"] == CAMPAIGN_ID
+    assert v6["claim_eligible"] is False
+    assert module.validate_w16_output_v5(root)["verdict"] != "PASS"
     assert module.validate_w16_output_v4(root)["verdict"] != "PASS"
 
 
-def test_v5_rejects_receipt_interval_outside_derived_raw_window(tmp_path: Path) -> None:
+def test_v6_rejects_missing_or_narrow_raw_clock_bounds(tmp_path: Path) -> None:
+    module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.w16_output_validator"
+    )
+    missing = _campaign_root(
+        tmp_path / "missing", order=FORWARD, ordinal=3, real_raw_interval=True,
+    )
+    receipt_path = missing / "feasibility-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    del receipt["started_raw_monotonic_ns"]
+    _write_json(receipt_path, receipt)
+    _reseal(missing)
+    assert module.validate_w16_output_v6(missing)["verdict"] != "PASS"
+
+    narrow = _campaign_root(
+        tmp_path / "narrow", order=FORWARD, ordinal=3, real_raw_interval=True,
+    )
+    receipt_path = narrow / "feasibility-receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["started_raw_monotonic_ns"] = 10 ** 18
+    receipt["ended_raw_monotonic_ns"] = 10 ** 18 + 1
+    _write_json(receipt_path, receipt)
+    _reseal(narrow)
+    assert module.validate_w16_output_v6(narrow)["verdict"] != "PASS"
+
+
+def test_v1_receipt_remains_v4_compatible_without_raw_clock_fields(tmp_path: Path) -> None:
+    module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.w16_output_validator"
+    )
+    root = _build_output(tmp_path / "v1", cpu_mode="heterogeneous")
+    assert module.validate_w16_output_v4(root)["verdict"] == "PASS"
+    assert module.validate_w16_output_v5(root)["verdict"] != "PASS"
+    assert module.validate_w16_output_v6(root)["verdict"] != "PASS"
+
+
+def test_v6_rejects_receipt_interval_outside_derived_raw_window(tmp_path: Path) -> None:
     module = importlib.import_module(
         "experiments.adaptive.kauri_experiment.w16_output_validator"
     )
     root = _campaign_root(tmp_path, order=FORWARD, ordinal=3, real_raw_interval=True)
-    accepted = module.validate_w16_output_v5(root)
+    accepted = module.validate_w16_output_v6(root)
     assert accepted["verdict"] == "PASS", accepted
     receipt_path = root / "feasibility-receipt.json"
     receipt = json.loads(receipt_path.read_text())
-    receipt["started_monotonic_ns"] = int(
+    receipt["started_raw_monotonic_ns"] = int(
         accepted["throughput"]["window_end_monotonic_ns"]
     )
-    receipt["ended_monotonic_ns"] += 1
+    receipt["ended_raw_monotonic_ns"] = receipt["started_raw_monotonic_ns"] + 1
     _write_json(receipt_path, receipt)
     _reseal(root)
 
-    rejected = module.validate_w16_output_v5(root)
+    rejected = module.validate_w16_output_v6(root)
     assert rejected["verdict"] != "PASS"
-    assert rejected["reason_code"] == "measurement_window"
+    assert rejected["reason_code"] == "raw_lifecycle_span"
 
 
-def test_v5_rejects_receipt_that_excludes_native_lifecycle_span(tmp_path: Path) -> None:
+def test_v6_rejects_receipt_that_excludes_native_lifecycle_span(tmp_path: Path) -> None:
     module = importlib.import_module(
         "experiments.adaptive.kauri_experiment.w16_output_validator"
     )
     root = _campaign_root(tmp_path, order=FORWARD, ordinal=3, real_raw_interval=True)
-    accepted = module.validate_w16_output_v5(root)
+    accepted = module.validate_w16_output_v6(root)
     assert accepted["verdict"] == "PASS", accepted
     receipt_path = root / "feasibility-receipt.json"
     receipt = json.loads(receipt_path.read_text())
     # This still encloses the complete commit-derived measurement window, but
     # deliberately discards native process.started/stopped evidence.
-    receipt["started_monotonic_ns"] = int(
+    receipt["started_raw_monotonic_ns"] = int(
         accepted["throughput"]["window_start_monotonic_ns"]
     )
-    receipt["ended_monotonic_ns"] = int(
+    receipt["ended_raw_monotonic_ns"] = int(
         accepted["throughput"]["window_end_monotonic_ns"]
     )
     _write_json(receipt_path, receipt)
     _reseal(root)
 
-    rejected = module.validate_w16_output_v5(root)
+    rejected = module.validate_w16_output_v6(root)
     assert rejected["verdict"] != "PASS"
-    assert rejected["reason_code"] == "lifecycle_span"
+    assert rejected["reason_code"] == "raw_lifecycle_span"
 
 
-def _mock_v5_result(root: Path) -> dict[str, object]:
+def _mock_v6_result(root: Path) -> dict[str, object]:
     receipt = json.loads((root / "feasibility-receipt.json").read_text())
     authorization = json.loads((root / "authorization.json").read_text())
     arm = str(authorization["arm"]); mode = str(authorization["quota_mode"])
-    window_start = int(receipt["started_monotonic_ns"]) + 2
-    window_end = int(receipt["ended_monotonic_ns"]) - 2
+    window_start = int(receipt["started_raw_monotonic_ns"]) + 2
+    window_end = int(receipt["ended_raw_monotonic_ns"]) - 2
     return {
-        "schema_version": 1, "kind": "kauri-w16-output-validation-v5",
+        "schema_version": 1, "kind": "kauri-w16-output-validation-v6",
         "verdict": "PASS", "claim_eligible": False, "figure_eligible": False,
         "evidence_class": "CPU_QUOTA_SINGLE_ARM", "run_id": receipt["run_id"],
         "revision": receipt["preflight"]["revision"], "arm": arm,
@@ -356,8 +406,13 @@ def _mock_v5_result(root: Path) -> dict[str, object]:
             "throughput_milli_tps": 1_000_000,
         },
         "native_lifecycle_span": {
-            "start_monotonic_ns": int(receipt["started_monotonic_ns"]) + 1,
-            "end_monotonic_ns": int(receipt["ended_monotonic_ns"]) - 1,
+            "start_monotonic_ns": int(receipt["started_raw_monotonic_ns"]) + 1,
+            "end_monotonic_ns": int(receipt["ended_raw_monotonic_ns"]) - 1,
+        },
+        "producer_raw_clock_span": {
+            "clock_id": "CLOCK_MONOTONIC_RAW",
+            "start_monotonic_ns": receipt["started_raw_monotonic_ns"],
+            "end_monotonic_ns": receipt["ended_raw_monotonic_ns"],
         },
     }
 
@@ -370,7 +425,7 @@ def test_block_validator_maps_reverse_rates_by_label_and_rejects_relabelling(
         _campaign_root(tmp_path, order=REVERSE, ordinal=i, block_index=2)
         for i in range(1, 5)
     ]
-    results = {root.resolve(): _mock_v5_result(root) for root in roots}
+    results = {root.resolve(): _mock_v6_result(root) for root in roots}
     # B-X/A-X = 1.5; B-H/A-H = 1.0.  Roots remain in reverse execution order.
     rates = {
         "fast-roots:heterogeneous": 1_200_000,
@@ -383,7 +438,7 @@ def test_block_validator_maps_reverse_rates_by_label_and_rejects_relabelling(
         result["throughput"]["transaction_count"] = rates[label]
         result["throughput"]["throughput_milli_tps"] = rates[label]
     monkeypatch.setattr(
-        campaign, "validate_w16_output_v5",
+        campaign, "validate_w16_output_v6",
         lambda root: results[Path(root).resolve()],
     )
 
@@ -410,11 +465,11 @@ def test_campaign_requires_six_counterbalanced_complete_blocks(
         for index in range(1, 7)
     ]
     results = {
-        root.resolve(): _mock_v5_result(root)
+        root.resolve(): _mock_v6_result(root)
         for block in blocks for root in block
     }
     monkeypatch.setattr(
-        campaign, "validate_w16_output_v5",
+        campaign, "validate_w16_output_v6",
         lambda root: results[Path(root).resolve()],
     )
 
@@ -444,7 +499,7 @@ def test_campaign_positive_gate_requires_direct_and_adjusted_effects_per_order(
         for index in range(1, 7)
     ]
     results = {
-        root.resolve(): _mock_v5_result(root)
+        root.resolve(): _mock_v6_result(root)
         for block in blocks for root in block
     }
     # Five blocks satisfy both B-X/A-X > 1 and d > 0; block five fails both.
@@ -462,7 +517,7 @@ def test_campaign_positive_gate_requires_direct_and_adjusted_effects_per_order(
             result["throughput"]["transaction_count"] = rates[label]
             result["throughput"]["throughput_milli_tps"] = rates[label]
     monkeypatch.setattr(
-        campaign, "validate_w16_output_v5",
+        campaign, "validate_w16_output_v6",
         lambda root: results[Path(root).resolve()],
     )
 
@@ -487,7 +542,7 @@ def test_campaign_uses_exact_fraction_gate_not_rounded_geometric_mean(
         for index in range(1, 7)
     ]
     results = {
-        root.resolve(): _mock_v5_result(root)
+        root.resolve(): _mock_v6_result(root)
         for block in blocks for root in block
     }
     baseline = 10_000_000_000_000_000
@@ -503,7 +558,7 @@ def test_campaign_uses_exact_fraction_gate_not_rounded_geometric_mean(
         result["throughput"]["transaction_count"] = count
         result["throughput"]["throughput_milli_tps"] = count
     monkeypatch.setattr(
-        campaign, "validate_w16_output_v5",
+        campaign, "validate_w16_output_v6",
         lambda root: results[Path(root).resolve()],
     )
 
@@ -525,11 +580,11 @@ def test_campaign_rejects_duplicated_run_id_and_overlapping_blocks(
         for index in range(1, 7)
     ]
     results = {
-        root.resolve(): _mock_v5_result(root)
+        root.resolve(): _mock_v6_result(root)
         for block in blocks for root in block
     }
     monkeypatch.setattr(
-        campaign, "validate_w16_output_v5",
+        campaign, "validate_w16_output_v6",
         lambda root: results[Path(root).resolve()],
     )
     first = blocks[0][0]
@@ -542,7 +597,7 @@ def test_campaign_rejects_duplicated_run_id_and_overlapping_blocks(
     second_receipt["ended_monotonic_ns"] = first_receipt["ended_monotonic_ns"]
     _write_json(second_receipt_path, second_receipt)
     _reseal(second)
-    results[second.resolve()] = _mock_v5_result(second)
+    results[second.resolve()] = _mock_v6_result(second)
 
     result = campaign.validate_w16_cpu_campaign(blocks)
     assert result["verdict"] != "PASS", result
