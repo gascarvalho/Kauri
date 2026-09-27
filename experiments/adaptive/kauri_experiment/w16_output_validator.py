@@ -9,6 +9,7 @@ events inside a complete, post-terminal Epoch-0 measurement window.
 from __future__ import annotations
 
 from collections import defaultdict
+from datetime import datetime
 import hashlib
 import json
 from pathlib import Path, PurePosixPath
@@ -619,7 +620,7 @@ def _validate_streams(
     plan: object, allow_required_branch_incomplete: bool, allow_delta_triplets: bool,
 ) -> tuple[
     list[dict[str, object]], int, int, int, list[_RequiredBranchEvent],
-    list[_DeltaTriplet],
+    list[_DeltaTriplet], int, int,
 ]:
     run_id = receipt.get("run_id")
     digest = receipt.get("epoch_zero_digest")
@@ -637,6 +638,8 @@ def _validate_streams(
     cycle_completion_times: list[tuple[str, int]] = []
     required_branch_events: list[_RequiredBranchEvent] = []
     delta_triplets: list[_DeltaTriplet] = []
+    lifecycle_starts: list[int] = []
+    lifecycle_ends: list[int] = []
     for replica in range(31):
         source = f"replica-{replica}"
         path = root / "raw" / f"{source}.jsonl"
@@ -825,6 +828,12 @@ def _validate_streams(
             )
         ):
             _fail("lifecycle", f"{source} lifecycle is incomplete or reordered")
+        lifecycle_starts.append(
+            int(events[lifecycle["process.started"][0]]["source_monotonic_ns"])
+        )
+        lifecycle_ends.append(
+            int(events[lifecycle["process.stopped"][0]]["source_monotonic_ns"])
+        )
         initial_cycle_completion: int | None = None
         for offset in range(max(0, len(active) - 20)):
             candidate = active[offset:offset + 21]
@@ -854,7 +863,11 @@ def _validate_streams(
     terminal_sequence = int(terminal_event["source_sequence"])
     terminal_time = int(terminal_event["source_monotonic_ns"])
     if not cpu_run:
-        return observer_events, terminal_sequence, terminal_time, terminal_time, required_branch_events, delta_triplets
+        return (
+            observer_events, terminal_sequence, terminal_time, terminal_time,
+            required_branch_events, delta_triplets,
+            min(lifecycle_starts), max(lifecycle_ends),
+        )
 
     cycles = receipt.get("required_complete_cycles")
     if not _integer(cycles, minimum=1) or int(cycles) != 5:
@@ -901,7 +914,11 @@ def _validate_streams(
             "complete Epoch-0 cycle does not precede the global measurement start for "
             + ", ".join(late_cycle),
         )
-    return observer_events, terminal_sequence, start_ns, end_ns, required_branch_events, delta_triplets
+    return (
+        observer_events, terminal_sequence, start_ns, end_ns,
+        required_branch_events, delta_triplets,
+        min(lifecycle_starts), max(lifecycle_ends),
+    )
 
 
 def _derive_throughput(
@@ -1395,6 +1412,93 @@ def _validate_authorization(
     }
 
 
+def _validate_campaign_authorization(
+    root: Path, receipt: Mapping[str, object], *, arm: str, mode: str,
+) -> dict[str, object]:
+    """Validate only the prospectively frozen six-block campaign receipt."""
+
+    path = root / "authorization.json"
+    document = _read_json(path, "campaign CPU authorization")
+    expected_keys = {
+        "schema_version", "kind", "campaign_id", "block_index",
+        "campaign_freeze_sha256", "block_id", "block_order", "cell_ordinal",
+        "revision", "profile_sha256", "arm", "quota_mode", "preflight_sha256",
+        "binary_sha256", "output_root", "required_complete_cycles",
+        "hard_timeout_s", "external_timeout_s", "automatic_retries",
+        "claim_eligible", "figure_eligible", "approval_ref", "approved_at_utc",
+    }
+    forward = [
+        "slow-roots:homogeneous", "fast-roots:homogeneous",
+        "slow-roots:heterogeneous", "fast-roots:heterogeneous",
+    ]
+    block_index = document.get("block_index")
+    order = forward if type(block_index) is int and block_index % 2 else list(reversed(forward))
+    label = f"{arm}:{mode}"
+    preflight = receipt["preflight"]
+    actual_sha = _sha256_file(path)
+    canonical_preflight_sha = hashlib.sha256(feasibility.canonical_json(preflight)).hexdigest()
+    campaign_id = document.get("campaign_id")
+    approval_time = document.get("approved_at_utc")
+    try:
+        valid_approval_time = (
+            isinstance(approval_time, str)
+            and re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z", approval_time)
+            is not None
+            and datetime.strptime(approval_time, "%Y-%m-%dT%H:%M:%SZ")
+            .strftime("%Y-%m-%dT%H:%M:%SZ") == approval_time
+        )
+    except ValueError:
+        valid_approval_time = False
+    if (
+        set(document) != expected_keys
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 2
+        or document.get("kind") != "kauri-w16-static-e0-campaign-authorization-v2"
+        or not isinstance(campaign_id, str)
+        or re.fullmatch(r"w16-cpu-repeat-[a-z0-9][a-z0-9-]*", campaign_id) is None
+        or type(block_index) is not int or block_index not in range(1, 7)
+        or document.get("block_id") != f"{campaign_id}-block-{block_index:02d}"
+        or not _digest(document.get("campaign_freeze_sha256"))
+        or document.get("block_order") != order
+        or type(document.get("cell_ordinal")) is not int
+        or document.get("cell_ordinal") != order.index(label) + 1
+        or document.get("revision") != preflight["revision"]
+        or document.get("profile_sha256") != preflight["profile_sha256"]
+        or document.get("arm") != arm
+        or document.get("quota_mode") != mode
+        or document.get("preflight_sha256") != canonical_preflight_sha
+        or document.get("binary_sha256") != preflight["binary_sha256"]
+        or document.get("output_root") != str(root)
+        or type(document.get("required_complete_cycles")) is not int
+        or document.get("required_complete_cycles") != 5
+        or type(document.get("hard_timeout_s")) is not int
+        or document.get("hard_timeout_s") != 480
+        or type(document.get("external_timeout_s")) is not int
+        or document.get("external_timeout_s") != 720
+        or type(document.get("automatic_retries")) is not int
+        or document.get("automatic_retries") != 0
+        or document.get("claim_eligible") is not False
+        or document.get("figure_eligible") is not False
+        or not isinstance(document.get("approval_ref"), str)
+        or not document["approval_ref"]
+        or not valid_approval_time
+        or receipt.get("authorization_sha256") != actual_sha
+    ):
+        _fail("cpu_authorization", "CPU authorization does not bind this exact campaign cell")
+    return {
+        "sha256": actual_sha,
+        "campaign_id": campaign_id,
+        "block_index": block_index,
+        "campaign_freeze_sha256": document["campaign_freeze_sha256"],
+        "block_id": document["block_id"],
+        "block_order": order,
+        "cell_ordinal": document["cell_ordinal"],
+        "approval_ref": document["approval_ref"],
+        "approved_at_utc": document["approved_at_utc"],
+        "preflight_byte_hash_recheckable": True,
+    }
+
+
 def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
     """Validate one immutable W16 output root without modifying it.
 
@@ -1469,11 +1573,33 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
         ):
             _fail("cpu_identity", "quota contract and cleanup presence disagree")
         (events, terminal_sequence, start_ns, end_ns, required_branch_events,
-         delta_triplets) = _validate_streams(
+         delta_triplets, lifecycle_start_ns, lifecycle_end_ns) = _validate_streams(
             candidate, outcome, cpu_run=cpu_run, plan=plan,
             allow_required_branch_incomplete=version >= 3,
             allow_delta_triplets=version >= 4,
         )
+        if version >= 5 and not (
+            int(outcome["started_monotonic_ns"]) <= start_ns
+            < end_ns <= int(outcome["ended_monotonic_ns"])
+        ):
+            _fail(
+                "measurement_window",
+                "raw measurement window lies outside the producer process interval",
+            )
+        if version >= 5:
+            if not (
+                int(outcome["started_monotonic_ns"]) <= lifecycle_start_ns
+                < start_ns < end_ns < lifecycle_end_ns
+                <= int(outcome["ended_monotonic_ns"])
+            ):
+                _fail(
+                    "lifecycle_span",
+                    "validated native process lifecycle lies outside the producer interval",
+                )
+            result["native_lifecycle_span"] = {
+                "start_monotonic_ns": lifecycle_start_ns,
+                "end_monotonic_ns": lifecycle_end_ns,
+            }
         result["run_id"] = outcome["run_id"]
         result["revision"] = outcome["preflight"]["revision"]
         result["arm"] = arm
@@ -1494,12 +1620,18 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             result["quota"] = _validate_quota(
                 candidate, outcome, plan=plan, start_ns=start_ns, end_ns=end_ns
             )
-            result["authorization"] = _validate_authorization(
+            authorization_validator = (
+                _validate_campaign_authorization if version >= 5
+                else _validate_authorization
+            )
+            result["authorization"] = authorization_validator(
                 candidate, outcome, arm=arm, mode=str(result["quota"]["mode"])
             )
             result["throughput"] = throughput
             result["evidence_class"] = "CPU_QUOTA_SINGLE_ARM"
         else:
+            if version >= 5:
+                _fail("cpu_identity", "campaign validation requires CPU quota evidence")
             if outcome.get("required_complete_cycles") != 1:
                 _fail("measurement_window", "CPU-free feasibility is not bound to one cycle")
             if (
@@ -1558,3 +1690,9 @@ def validate_w16_output_v4(root: Path) -> dict[str, object]:
     """Prospectively validate a fresh W16 root with safe late-delta evidence."""
 
     return _validate_w16_output(root, version=4)
+
+
+def validate_w16_output_v5(root: Path) -> dict[str, object]:
+    """Validate a prospective v2-authorized CPU campaign cell only."""
+
+    return _validate_w16_output(root, version=5)
