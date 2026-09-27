@@ -99,6 +99,27 @@ class CleanupOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class CleanupSignalAttempt:
+    """One signal sent during bounded registry cleanup."""
+
+    signal_number: int
+    requested_monotonic_ns: int
+
+
+@dataclass(frozen=True, slots=True)
+class CleanupLedgerEntry:
+    """Immutable per-replica cleanup evidence, including unresolved exits."""
+
+    name: str
+    replica_id: int
+    pid: int
+    pgid: int
+    signal_attempts: tuple[CleanupSignalAttempt, ...]
+    final_monotonic_ns: int | None
+    returncode: int | None
+
+
+@dataclass(frozen=True, slots=True)
 class CleanupEscalationResult:
     """Diagnostic result returned before cleanup advances past SIGINT."""
 
@@ -159,6 +180,7 @@ class ProcessRegistry:
         self._confirmed_sigkill_replica_ids: set[int] = set()
         self._cleanup_started = False
         self._cleanup_outcomes: tuple[CleanupOutcome, ...] = ()
+        self._cleanup_ledger: tuple[CleanupLedgerEntry, ...] = ()
         self._cleanup_escalations: tuple[CleanupEscalationOutcome, ...] = ()
 
     @staticmethod
@@ -185,6 +207,12 @@ class ProcessRegistry:
         """Return diagnostics captured after SIGINT failed to stop a group."""
 
         return self._cleanup_escalations
+
+    @property
+    def cleanup_ledger(self) -> tuple[CleanupLedgerEntry, ...]:
+        """Return immutable, exact cleanup observations in registration order."""
+
+        return self._cleanup_ledger
 
     def record_for_replica(self, replica_id: int) -> ProcessRecord:
         """Return a registered replica or fail without accepting raw PIDs."""
@@ -535,7 +563,7 @@ class ProcessRegistry:
         )
 
     def cleanup(self, *, timeout_s: float) -> tuple[CleanupOutcome, ...]:
-        """Stop all still-live registered groups, escalating at most once."""
+        """Stop all still-live groups with one shared deadline per signal stage."""
 
         self._validate_timeout(timeout_s)
         if self._cleanup_started:
@@ -544,15 +572,62 @@ class ProcessRegistry:
 
         outcomes: list[CleanupOutcome] = []
         escalations: list[CleanupEscalationOutcome] = []
+        signal_attempts: dict[int, list[CleanupSignalAttempt]] = {
+            record.replica_id: [] for record in self.records
+        }
+        final_observations: dict[int, tuple[int, int]] = {}
+
+        def observe_exit(record: ProcessRecord) -> bool:
+            """Record an actual exit observed from poll, never an inferred one."""
+
+            if record.replica_id in final_observations:
+                return True
+            returncode = record.process.poll()
+            if returncode is None:
+                return False
+            final_observations[record.replica_id] = (
+                self._monotonic_ns(),
+                int(returncode),
+            )
+            return True
+
+        def active_records() -> list[ProcessRecord]:
+            return [
+                record
+                for record in self.records
+                if not observe_exit(record)
+            ]
+
+        def freeze_ledger() -> tuple[CleanupLedgerEntry, ...]:
+            return tuple(
+                CleanupLedgerEntry(
+                    name=record.name,
+                    replica_id=record.replica_id,
+                    pid=record.pid,
+                    pgid=record.pgid,
+                    signal_attempts=tuple(signal_attempts[record.replica_id]),
+                    final_monotonic_ns=(
+                        final_observations[record.replica_id][0]
+                        if record.replica_id in final_observations
+                        else None
+                    ),
+                    returncode=(
+                        final_observations[record.replica_id][1]
+                        if record.replica_id in final_observations
+                        else None
+                    ),
+                )
+                for record in self.records
+            )
+
         try:
             for signal_number in self._CLEANUP_SIGNALS:
-                active = [
-                    record
-                    for record in self.records
-                    if record.process.poll() is None
-                ]
+                active = active_records()
                 if not active:
                     break
+                stage_deadline_ns = self._monotonic_ns() + math.ceil(
+                    timeout_s * 1_000_000_000
+                )
 
                 if (
                     signal_number == int(signal.SIGTERM)
@@ -573,23 +648,39 @@ class ProcessRegistry:
                     except RuntimeError:
                         # A process may exit naturally between the active
                         # snapshot and the live identity check.
-                        if record.process.poll() is not None:
+                        if observe_exit(record):
                             continue
                         raise
                     try:
+                        signal_attempts[record.replica_id].append(
+                            CleanupSignalAttempt(
+                                signal_number=signal_number,
+                                requested_monotonic_ns=self._monotonic_ns(),
+                            )
+                        )
                         self._killpg(record.pgid, signal_number)
                     except ProcessLookupError:
+                        observe_exit(record)
                         continue
                     signalled.append(record)
 
                 for record in signalled:
+                    remaining_ns = stage_deadline_ns - self._monotonic_ns()
+                    if remaining_ns <= 0:
+                        observe_exit(record)
+                        continue
                     try:
                         returncode = self._wait_for_exit(
                             record.process,
-                            timeout_s,
+                            remaining_ns / 1_000_000_000,
                         )
                     except (subprocess.TimeoutExpired, TimeoutError):
+                        observe_exit(record)
                         continue
+                    final_observations[record.replica_id] = (
+                        self._monotonic_ns(),
+                        int(returncode),
+                    )
                     outcomes.append(
                         CleanupOutcome(
                             name=record.name,
@@ -601,11 +692,7 @@ class ProcessRegistry:
                         )
                     )
 
-            remaining = [
-                record.name
-                for record in self.records
-                if record.process.poll() is None
-            ]
+            remaining = [record.name for record in active_records()]
             if remaining:
                 raise RuntimeError(
                     "registered process groups remained after cleanup: "
@@ -613,11 +700,13 @@ class ProcessRegistry:
                 )
 
             self._cleanup_outcomes = tuple(outcomes)
+            self._cleanup_ledger = freeze_ledger()
             self._cleanup_escalations = tuple(escalations)
             return self._cleanup_outcomes
         finally:
             if not self._cleanup_outcomes:
                 self._cleanup_outcomes = tuple(outcomes)
+            self._cleanup_ledger = freeze_ledger()
             if not self._cleanup_escalations:
                 self._cleanup_escalations = tuple(escalations)
 

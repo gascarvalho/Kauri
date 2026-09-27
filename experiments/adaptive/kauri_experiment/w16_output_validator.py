@@ -23,6 +23,7 @@ from . import static_topology_n31
 
 _RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v1"
 _CAMPAIGN_RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v2"
+_CAMPAIGN_RECEIPT_SCHEMA_V3 = "kauri-n31-static-e0-local-executor-v3"
 _TERMINAL = "adaptive_v2_reporting_terminal"
 _ENVELOPE_KEYS = frozenset(
     {
@@ -619,6 +620,7 @@ def _delta_triplet_summary(
 def _validate_streams(
     root: Path, receipt: Mapping[str, object], *, cpu_run: bool,
     plan: object, allow_required_branch_incomplete: bool, allow_delta_triplets: bool,
+    strict_schema_types: bool = False,
 ) -> tuple[
     list[dict[str, object]], int, int, int, list[_RequiredBranchEvent],
     list[_DeltaTriplet], int, int,
@@ -665,6 +667,7 @@ def _validate_streams(
                 _fail("native_event_schema", f"{source} envelope schema drifted")
             if (
                 event.get("event_schema_version") != 1
+                or (strict_schema_types and type(event.get("event_schema_version")) is not int)
                 or event.get("run_id") != run_id
                 or event.get("source_kind") != "replica"
                 or event.get("source_id") != source
@@ -1031,9 +1034,11 @@ def _contract_document(contract: object) -> dict[str, object]:
 
 def _validate_quota(
     root: Path, receipt: Mapping[str, object], *, plan: object,
-    start_ns: int, end_ns: int,
+    start_ns: int, end_ns: int, strict_schema_types: bool = False,
 ) -> dict[str, object]:
     contract_doc = _read_json(root / "runtime/cpu-quota-contract.json", "CPU contract")
+    if strict_schema_types and type(contract_doc.get("schema_version")) is not int:
+        _fail("cpu_contract", "v7 CPU contract schema requires an exact integer")
     contract_id = contract_doc.get("contract_id")
     if contract_id == "w16-e0-heterogeneous-v1":
         mode = "heterogeneous"
@@ -1048,6 +1053,8 @@ def _validate_quota(
         _fail("cpu_contract", "receipt CPU contract hash differs from semantic contract")
 
     launch = _read_json(root / "runtime/cpu-quota-launch.json", "CPU launch receipt")
+    if strict_schema_types and type(launch.get("schema_version")) is not int:
+        _fail("cpu_launch", "v7 CPU launch schema requires an exact integer")
     if set(launch) != {
         "schema_version", "launcher", "contract_id", "contract_sha256",
         "manager_visibility", "replicas",
@@ -1107,6 +1114,8 @@ def _validate_quota(
     observed_stat_keys: set[str] | None = None
     by_time: dict[int, dict[int, dict[str, int]]] = defaultdict(dict)
     for row in samples:
+        if strict_schema_types and type(row.get("schema_version")) is not int:
+            _fail("cpu_samples", "v7 CPU sample schema requires an exact integer")
         if set(row) != sample_keys:
             _fail("cpu_samples", "active CPU sample schema drifted")
         replica = row.get("replica_id")
@@ -1187,6 +1196,8 @@ def _validate_quota(
     if len(rounds) != len(timestamps):
         _fail("cpu_monitor", "monitor-round count differs from CPU sample groups")
     for ordinal, row in enumerate(rounds):
+        if strict_schema_types and type(row.get("schema_version")) is not int:
+            _fail("cpu_monitor", "v7 CPU monitor schema requires an exact integer")
         if (
             set(row) != round_keys or row.get("schema_version") != 1
             or row.get("round_ordinal") != ordinal
@@ -1198,6 +1209,8 @@ def _validate_quota(
             _fail("cpu_monitor", "CPU monitor cadence receipt drifted", observed=True)
 
     cleanup = _read_json(root / "runtime/cpu-quota-cleanup.json", "CPU cleanup")
+    if strict_schema_types and type(cleanup.get("schema_version")) is not int:
+        _fail("cpu_cleanup", "v7 CPU cleanup schema requires an exact integer")
     if receipt.get("quota_cleanup") != cleanup:
         _fail("cpu_cleanup", "receipt cleanup does not equal cleanup artifact")
     if set(cleanup) != {"schema_version", "complete", "monitor", "units"}:
@@ -1237,6 +1250,8 @@ def _validate_quota(
         root / "runtime/cpu-quota-scope-termination.json",
         "CPU owned-scope termination",
     )
+    if strict_schema_types and type(scope_cleanup.get("schema_version")) is not int:
+        _fail("cpu_scope_cleanup", "v7 CPU scope schema requires an exact integer")
     if receipt.get("quota_scope_cleanup") != scope_cleanup:
         _fail("cpu_scope_cleanup", "receipt scope cleanup differs from its artifact")
     scope_keys = {
@@ -1415,6 +1430,7 @@ def _validate_authorization(
 
 def _validate_campaign_authorization(
     root: Path, receipt: Mapping[str, object], *, arm: str, mode: str,
+    version: int = 2,
 ) -> dict[str, object]:
     """Validate only the prospectively frozen six-block campaign receipt."""
 
@@ -1428,6 +1444,11 @@ def _validate_campaign_authorization(
         "hard_timeout_s", "external_timeout_s", "automatic_retries",
         "claim_eligible", "figure_eligible", "approval_ref", "approved_at_utc",
     }
+    if version == 3:
+        expected_keys.update({
+            "executor_receipt_schema", "cell_validator_version",
+            "process_cleanup_required",
+        })
     forward = [
         "slow-roots:homogeneous", "fast-roots:homogeneous",
         "slow-roots:heterogeneous", "fast-roots:heterogeneous",
@@ -1453,8 +1474,14 @@ def _validate_campaign_authorization(
     if (
         set(document) != expected_keys
         or type(document.get("schema_version")) is not int
-        or document.get("schema_version") != 2
-        or document.get("kind") != "kauri-w16-static-e0-campaign-authorization-v2"
+        or document.get("schema_version") != version
+        or document.get("kind") != f"kauri-w16-static-e0-campaign-authorization-v{version}"
+        or (version == 3 and (
+            document.get("executor_receipt_schema") != _CAMPAIGN_RECEIPT_SCHEMA_V3
+            or type(document.get("cell_validator_version")) is not int
+            or document.get("cell_validator_version") != 7
+            or document.get("process_cleanup_required") is not True
+        ))
         or not isinstance(campaign_id, str)
         or re.fullmatch(r"w16-cpu-repeat-[a-z0-9][a-z0-9-]*", campaign_id) is None
         or type(block_index) is not int or block_index not in range(1, 7)
@@ -1488,6 +1515,7 @@ def _validate_campaign_authorization(
         _fail("cpu_authorization", "CPU authorization does not bind this exact campaign cell")
     return {
         "sha256": actual_sha,
+        "schema_version": version,
         "campaign_id": campaign_id,
         "block_index": block_index,
         "campaign_freeze_sha256": document["campaign_freeze_sha256"],
@@ -1497,6 +1525,105 @@ def _validate_campaign_authorization(
         "approval_ref": document["approval_ref"],
         "approved_at_utc": document["approved_at_utc"],
         "preflight_byte_hash_recheckable": True,
+    }
+
+
+def _validate_process_cleanup_v3(
+    root: Path, receipt: Mapping[str, object]
+) -> dict[str, object]:
+    """Bind 31 clean wrapper exits to exact, timestamped cleanup evidence."""
+
+    relative = "runtime/process-cleanup.json"
+    if receipt.get("process_cleanup_path") != relative:
+        _fail("process_cleanup", "receipt does not name the fixed cleanup ledger")
+    path = root / relative
+    digest = receipt.get("process_cleanup_sha256")
+    if not _digest(digest) or _sha256_file(path) != digest:
+        _fail("process_cleanup", "cleanup ledger hash differs from receipt")
+    if receipt["artifact_sha256"].get(relative) != digest:
+        _fail("process_cleanup", "cleanup ledger is not identically inventory-bound")
+    document = _read_json(path, "process cleanup ledger")
+    if (
+        set(document) != {"schema_version", "replicas"}
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 1
+    ):
+        _fail("process_cleanup", "cleanup ledger schema is invalid")
+    rows = document.get("replicas")
+    if not isinstance(rows, list) or len(rows) != 31:
+        _fail("process_cleanup", "cleanup ledger needs exactly 31 replicas")
+    launch = _read_json(root / "runtime/cpu-quota-launch.json", "CPU quota launch")
+    launch_rows = launch.get("replicas")
+    if not isinstance(launch_rows, list) or len(launch_rows) != 31:
+        _fail("process_cleanup", "CPU launch cannot bind 31 cleanup identities")
+    owned: dict[int, tuple[int, int]] = {}
+    for launched in launch_rows:
+        if not isinstance(launched, dict):
+            _fail("process_cleanup", "CPU launch replica is malformed")
+        replica = launched.get("replica_id")
+        pid = launched.get("owned_pid")
+        pgid = launched.get("owned_pgid")
+        if (
+            not _integer(replica) or int(replica) not in range(31)
+            or not _integer(pid, minimum=1) or not _integer(pgid, minimum=1)
+            or replica in owned
+        ):
+            _fail("process_cleanup", "CPU launch has duplicate or invalid ownership")
+        owned[int(replica)] = (int(pid), int(pgid))
+    if set(owned) != set(range(31)):
+        _fail("process_cleanup", "CPU launch owner set is incomplete")
+
+    producer_start = int(receipt["started_monotonic_ns"])
+    producer_end = int(receipt["ended_monotonic_ns"])
+    term_count = 0
+    pids: set[int] = set()
+    pgids: set[int] = set()
+    for replica, row in enumerate(rows):
+        if not isinstance(row, dict) or set(row) != {
+            "replica_id", "pid", "pgid", "signal_attempts",
+            "confirmed_monotonic_ns", "returncode",
+        }:
+            _fail("process_cleanup", f"replica {replica} cleanup row is malformed")
+        pid = row.get("pid")
+        pgid = row.get("pgid")
+        confirmed = row.get("confirmed_monotonic_ns")
+        attempts = row.get("signal_attempts")
+        if (
+            type(row.get("replica_id")) is not int or row.get("replica_id") != replica
+            or not _integer(pid, minimum=1) or not _integer(pgid, minimum=1)
+            or (pid, pgid) != owned[replica]
+            or pid in pids or pgid in pgids
+            or type(row.get("returncode")) is not int or row["returncode"] != 0
+            or not _integer(confirmed, minimum=1)
+            or not isinstance(attempts, list) or not 1 <= len(attempts) <= 2
+        ):
+            _fail("process_cleanup", f"replica {replica} cleanup is not a clean owned exit")
+        pids.add(int(pid))
+        pgids.add(int(pgid))
+        numbers: list[int] = []
+        previous = producer_start - 1
+        for attempt in attempts:
+            if not isinstance(attempt, dict) or set(attempt) != {
+                "signal_number", "requested_monotonic_ns",
+            }:
+                _fail("process_cleanup", f"replica {replica} signal entry is malformed")
+            number = attempt.get("signal_number")
+            requested = attempt.get("requested_monotonic_ns")
+            if (
+                type(number) is not int or number not in (2, 15)
+                or not _integer(requested, minimum=1)
+                or not previous < int(requested) <= int(confirmed) <= producer_end
+            ):
+                _fail("process_cleanup", f"replica {replica} signal chronology is invalid")
+            numbers.append(number)
+            previous = int(requested)
+        if numbers not in ([2], [2, 15]):
+            _fail("process_cleanup", f"replica {replica} cleanup escalated out of order")
+        term_count += int(numbers == [2, 15])
+    return {
+        "sha256": digest, "replica_count": 31,
+        "sigint_count": 31, "sigterm_count": term_count,
+        "sigkill_count": 0, "all_returncodes_zero": True,
     }
 
 
@@ -1535,6 +1662,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             _fail("outcome_cardinality", "output root must contain exactly one outcome")
         outcome = _read_json(receipt_path if receipt_path.exists() else abort_path, "executor outcome")
         expected_receipt_schema = (
+            _CAMPAIGN_RECEIPT_SCHEMA_V3 if version >= 7 else
             _CAMPAIGN_RECEIPT_SCHEMA if version >= 6 else _RECEIPT_SCHEMA
         )
         if outcome.get("schema") != expected_receipt_schema:
@@ -1556,9 +1684,21 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
                 "raw_clock_id", "started_raw_monotonic_ns",
                 "ended_raw_monotonic_ns",
             })
+        if version >= 7:
+            required_keys.update({
+                "process_cleanup_path", "process_cleanup_sha256",
+            })
         if set(outcome) != required_keys:
             missing = sorted(required_keys - set(outcome))
             _fail("receipt_schema", f"executor receipt schema drifted; missing={missing}")
+        if version >= 7 and (
+            type(outcome.get("attempts")) is not int
+            or type(outcome.get("retries")) is not int
+            or type(outcome.get("required_complete_cycles")) is not int
+            or any(type(replica) is not int
+                   for replica in outcome.get("registered_replica_ids", []))
+        ):
+            _fail("receipt_outcome", "v7 receipt counters and IDs require exact integers")
         if (
             outcome.get("attempts") != 1 or outcome.get("retries") != 0
             or outcome.get("failure") is not None or outcome.get("cleanup_error") is not None
@@ -1586,6 +1726,7 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
             candidate, outcome, cpu_run=cpu_run, plan=plan,
             allow_required_branch_incomplete=version >= 3,
             allow_delta_triplets=version >= 4,
+            strict_schema_types=version >= 7,
         )
         if version == 5 and not (
             int(outcome["started_monotonic_ns"]) <= start_ns
@@ -1651,15 +1792,37 @@ def _validate_w16_output(root: Path, *, version: int) -> dict[str, object]:
                 digest=str(outcome["epoch_zero_digest"]),
             )
             result["quota"] = _validate_quota(
-                candidate, outcome, plan=plan, start_ns=start_ns, end_ns=end_ns
+                candidate, outcome, plan=plan, start_ns=start_ns, end_ns=end_ns,
+                strict_schema_types=version >= 7,
             )
-            authorization_validator = (
-                _validate_campaign_authorization if version >= 5
-                else _validate_authorization
-            )
-            result["authorization"] = authorization_validator(
-                candidate, outcome, arm=arm, mode=str(result["quota"]["mode"])
-            )
+            if version >= 7:
+                scope_rows = outcome["quota_scope_cleanup"]["units"]
+                if any(
+                    row.get("status") != "already_inactive"
+                    or row.get("kill_attempted") is not False
+                    for row in scope_rows
+                ):
+                    _fail(
+                        "process_cleanup",
+                        "v7 requires every owned scope to exit without cgroup kill",
+                        observed=True,
+                    )
+                result["authorization"] = _validate_campaign_authorization(
+                    candidate, outcome, arm=arm, mode=str(result["quota"]["mode"]),
+                    version=3,
+                )
+            elif version >= 5:
+                result["authorization"] = _validate_campaign_authorization(
+                    candidate, outcome, arm=arm, mode=str(result["quota"]["mode"]),
+                )
+            else:
+                result["authorization"] = _validate_authorization(
+                    candidate, outcome, arm=arm, mode=str(result["quota"]["mode"]),
+                )
+            if version >= 7:
+                result["process_cleanup"] = _validate_process_cleanup_v3(
+                    candidate, outcome
+                )
             result["throughput"] = throughput
             result["evidence_class"] = "CPU_QUOTA_SINGLE_ARM"
         else:
@@ -1735,3 +1898,9 @@ def validate_w16_output_v6(root: Path) -> dict[str, object]:
     """Validate a fresh campaign cell with explicit native RAW-clock bounds."""
 
     return _validate_w16_output(root, version=6)
+
+
+def validate_w16_output_v7(root: Path) -> dict[str, object]:
+    """Validate a prospective v3 campaign cell with exact shutdown proof."""
+
+    return _validate_w16_output(root, version=7)

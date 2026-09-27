@@ -6,6 +6,7 @@ import hashlib
 import importlib
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -105,6 +106,107 @@ def test_seal_rejects_incomplete_cleanup_and_never_relaunches(tmp_path: Path) ->
         executor.seal_outcome(directory=tmp_path, inputs=inputs, cleanup=cleanup, streams={})
 
 
+def _clean_lifecycle_stream() -> list[dict[str, object]]:
+    return [
+        {"event_type": "process.started"},
+        {"event_type": "process.ready"},
+        {"event_type": "adaptive_v2_reporting_terminal"},
+        {"event_type": "process.stopping"},
+        {"event_type": "process.stopped"},
+    ]
+
+
+def _clean_cleanup_ledger() -> tuple[SimpleNamespace, ...]:
+    return tuple(
+        SimpleNamespace(
+            name=f"replica-{replica}", replica_id=replica, pid=1000 + replica,
+            pgid=1000 + replica, signal_attempts=(
+                SimpleNamespace(signal_number=2, requested_monotonic_ns=5_000 + replica),
+            ),
+            final_monotonic_ns=10_000 + replica, returncode=0,
+        )
+        for replica in range(31)
+    )
+
+
+def _closure_kwargs() -> dict[str, object]:
+    return {
+        "launch": {"replicas": [
+            {"replica_id": replica, "owned_pid": 1000 + replica,
+             "owned_pgid": 1000 + replica}
+            for replica in range(31)
+        ]},
+        "producer_start_ns": 1_000,
+        "producer_end_ns": 20_000,
+    }
+
+
+def test_process_cleanup_document_is_exact_and_lifecycle_is_clean() -> None:
+    _f, executor = _modules()
+    ledger = _clean_cleanup_ledger()
+    document = executor._process_cleanup_document(ledger)
+    assert document == {
+        "schema_version": 1,
+        "replicas": [
+            {
+                "replica_id": replica, "pid": 1000 + replica,
+                "pgid": 1000 + replica, "signal_attempts": [{
+                    "signal_number": 2,
+                    "requested_monotonic_ns": 5_000 + replica,
+                }],
+                "confirmed_monotonic_ns": 10_000 + replica, "returncode": 0,
+            }
+            for replica in range(31)
+        ],
+    }
+    executor._assert_clean_process_closure(
+        ledger,
+        {f"replica-{replica}": _clean_lifecycle_stream() for replica in range(31)},
+        **_closure_kwargs(),
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    (
+        (lambda ledger: ledger[:-1], "exactly 31"),
+        (lambda ledger: ledger[:4] + (ledger[4].__class__(**{**vars(ledger[4]), "returncode": -9}),) + ledger[5:], "returncode"),
+        (lambda ledger: ledger[:7] + (ledger[7].__class__(**{**vars(ledger[7]), "signal_attempts": (SimpleNamespace(signal_number=9, requested_monotonic_ns=7_000),)}),) + ledger[8:], "signal order"),
+        (lambda ledger: ledger[:7] + (ledger[7].__class__(**{**vars(ledger[7]), "signal_attempts": ()}),) + ledger[8:], "signal order"),
+        (lambda ledger: ledger[:7] + (ledger[7].__class__(**{**vars(ledger[7]), "signal_attempts": (SimpleNamespace(signal_number=2, requested_monotonic_ns=5_007), SimpleNamespace(signal_number=2, requested_monotonic_ns=6_007))}),) + ledger[8:], "signal order"),
+        (lambda ledger: ledger[:7] + (ledger[7].__class__(**{**vars(ledger[7]), "pid": 9999}),) + ledger[8:], "ownership"),
+        (lambda ledger: ledger[:7] + (ledger[7].__class__(**{**vars(ledger[7]), "final_monotonic_ns": 4_000}),) + ledger[8:], "chronology"),
+    ),
+)
+def test_process_closure_rejects_incomplete_killed_or_nonzero_cleanup(
+    mutate, message: str,
+) -> None:
+    _f, executor = _modules()
+    with pytest.raises(executor.LocalExecutorError, match=message):
+        executor._assert_clean_process_closure(
+            mutate(_clean_cleanup_ledger()),
+            {f"replica-{replica}": _clean_lifecycle_stream() for replica in range(31)},
+            **_closure_kwargs(),
+        )
+
+
+def test_process_closure_rejects_duplicate_or_reordered_raw_lifecycle() -> None:
+    _f, executor = _modules()
+    streams = {f"replica-{replica}": _clean_lifecycle_stream() for replica in range(31)}
+    streams["replica-3"] = [
+        {"event_type": "process.started"},
+        {"event_type": "process.ready"},
+        {"event_type": "adaptive_v2_reporting_terminal"},
+        {"event_type": "process.stopped"},
+        {"event_type": "process.stopping"},
+        {"event_type": "process.stopped"},
+    ]
+    with pytest.raises(executor.LocalExecutorError, match="lifecycle"):
+        executor._assert_clean_process_closure(
+            _clean_cleanup_ledger(), streams, **_closure_kwargs(),
+        )
+
+
 def test_execute_once_rejects_unbound_preflight_before_creating_output(tmp_path: Path) -> None:
     _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
     del receipt["binary_sha256"]
@@ -195,10 +297,10 @@ def test_execute_once_seals_keygen_failure_without_launch(
         )
 
 
-def test_execute_once_campaign_receipt_seals_raw_bounds_but_v1_is_unchanged(
+def test_execute_once_campaign_receipt_v3_seals_cleanup_ledger_but_v1_is_unchanged(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
-    """Campaign-v2 sealing records native RAW bounds without changing v1 receipts."""
+    """Campaign-v3 sealing binds cleanup truth without changing v1 receipts."""
     _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
 
     class Held:
@@ -219,20 +321,34 @@ def test_execute_once_campaign_receipt_seals_raw_bounds_but_v1_is_unchanged(
         executor.time, "clock_gettime_ns", lambda _clock: next(raw_bounds),
     )
     authorization = json.dumps({
-        "schema_version": 2,
-        "kind": "kauri-w16-static-e0-campaign-authorization-v2",
+        "schema_version": 3,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v3",
+        "executor_receipt_schema": executor.CAMPAIGN_SCHEMA_V3,
+        "cell_validator_version": 7,
+        "process_cleanup_required": True,
     }, sort_keys=True).encode()
 
     campaign = executor.execute_once(
-        plan=plan, preflight=receipt, directory=tmp_path / "campaign-v2",
+        plan=plan, preflight=receipt, directory=tmp_path / "campaign-v3",
         hard_timeout_s=21, quota_contract=Contract(),
         authorization_bytes=authorization, campaign_authorization_validated=True,
     )
     assert campaign["verdict"] == "ABORT"
-    assert campaign["schema"] == executor.CAMPAIGN_SCHEMA
+    assert campaign["schema"] == executor.CAMPAIGN_SCHEMA_V3
     assert campaign["raw_clock_id"] == "CLOCK_MONOTONIC_RAW"
     assert campaign["started_raw_monotonic_ns"] == 1_000_000_000
     assert campaign["ended_raw_monotonic_ns"] == 1_000_000_500
+    ledger_path = tmp_path / "campaign-v3" / "runtime" / "process-cleanup.json"
+    assert json.loads(ledger_path.read_text(encoding="utf-8")) == {
+        "schema_version": 1, "replicas": [],
+    }
+    assert campaign["process_cleanup_path"] == "runtime/process-cleanup.json"
+    assert campaign["process_cleanup_sha256"] == hashlib.sha256(
+        ledger_path.read_bytes()
+    ).hexdigest()
+    assert campaign["artifact_sha256"]["runtime/process-cleanup.json"] == campaign[
+        "process_cleanup_sha256"
+    ]
 
     monkeypatch.setattr(
         executor.time, "clock_gettime_ns",
@@ -247,6 +363,66 @@ def test_execute_once_campaign_receipt_seals_raw_bounds_but_v1_is_unchanged(
     assert "raw_clock_id" not in v1
     assert "started_raw_monotonic_ns" not in v1
     assert "ended_raw_monotonic_ns" not in v1
+    assert "process_cleanup_path" not in v1
+    assert "process_cleanup_sha256" not in v1
+
+
+def test_execute_once_uses_campaign_cleanup_stage_budget_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """Campaign v3 reserves two seconds per cleanup signal stage, not v1."""
+    _f, executor, plan, _tree, _binaries, receipt = _inputs(tmp_path)
+    cleanup_timeouts: list[float] = []
+
+    class Registry:
+        records = ()
+        cleanup_ledger = ()
+
+        def cleanup(self, *, timeout_s: float) -> tuple[object, ...]:
+            cleanup_timeouts.append(timeout_s)
+            return ()
+
+    class Held:
+        def close(self) -> None:
+            pass
+
+    class Contract:
+        contract_sha256 = "c" * 64
+
+    monkeypatch.setattr(executor.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(executor, "ProcessRegistry", Registry)
+    monkeypatch.setattr(executor, "reserve_no_listener", lambda **_kwargs: Held())
+    monkeypatch.setattr(
+        executor, "_generate_identities_bounded",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("keygen failed")),
+    )
+    raw_bounds = iter((1_000_000_000, 1_000_000_500))
+    monkeypatch.setattr(
+        executor.time, "clock_gettime_ns", lambda _clock: next(raw_bounds),
+    )
+    authorization = json.dumps({
+        "schema_version": 3,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v3",
+        "executor_receipt_schema": executor.CAMPAIGN_SCHEMA_V3,
+        "cell_validator_version": 7,
+        "process_cleanup_required": True,
+    }, sort_keys=True).encode()
+
+    campaign = executor.execute_once(
+        plan=plan, preflight=receipt, directory=tmp_path / "campaign",
+        hard_timeout_s=21, quota_contract=Contract(),
+        authorization_bytes=authorization, campaign_authorization_validated=True,
+    )
+    assert campaign["verdict"] == "ABORT"
+    assert cleanup_timeouts == [2.0]
+
+    cleanup_timeouts.clear()
+    legacy = executor.execute_once(
+        plan=plan, preflight=receipt, directory=tmp_path / "legacy",
+        hard_timeout_s=21, quota_contract=Contract(), authorization_bytes=b"{}",
+    )
+    assert legacy["verdict"] == "ABORT"
+    assert cleanup_timeouts == [0.2]
 
 
 def test_campaign_raw_start_failure_leaves_no_output_root(

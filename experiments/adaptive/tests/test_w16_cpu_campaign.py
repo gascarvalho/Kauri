@@ -146,6 +146,78 @@ def _campaign_root(
     return root
 
 
+def _campaign_root_v3(tmp_path: Path) -> Path:
+    """Make a fresh synthetic CPU cell with the prospective cleanup proof."""
+
+    root = _campaign_root(
+        tmp_path, order=FORWARD, ordinal=3, real_raw_interval=True,
+    )
+    cleanup = {
+        "schema_version": 1,
+        "replicas": [
+            {
+                "replica_id": replica,
+                "pid": 1000 + replica,
+                "pgid": 1000 + replica,
+                "signal_attempts": [{
+                    "signal_number": 2,
+                    "requested_monotonic_ns": 38_000_000_000 + replica,
+                }],
+                "confirmed_monotonic_ns": 39_000_000_000 + replica,
+                "returncode": 0,
+            }
+            for replica in range(31)
+        ],
+    }
+    cleanup_path = root / "runtime/process-cleanup.json"
+    _write_json(cleanup_path, cleanup)
+    receipt_path = root / "feasibility-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    scope_cleanup = receipt["quota_scope_cleanup"]
+    for row in scope_cleanup["units"]:
+        row.pop("worker_live_at_cleanup")
+        row.pop("member_pids_before_kill")
+        row.update({
+            "identity_revalidated": False,
+            "kill_attempted": False,
+            "populated_after_kill": None,
+            "cgroup_removed_after_kill": False,
+            "status": "already_inactive",
+        })
+    _write_json(root / "runtime/cpu-quota-scope-termination.json", scope_cleanup)
+    authorization_path = root / "authorization.json"
+    authorization = json.loads(authorization_path.read_text(encoding="utf-8"))
+    authorization.update({
+        "schema_version": 3,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v3",
+        "executor_receipt_schema": "kauri-n31-static-e0-local-executor-v3",
+        "cell_validator_version": 7,
+        "process_cleanup_required": True,
+    })
+    _write_json(authorization_path, authorization)
+    receipt["schema"] = "kauri-n31-static-e0-local-executor-v3"
+    receipt["authorization_sha256"] = hashlib.sha256(
+        authorization_path.read_bytes()
+    ).hexdigest()
+    receipt["process_cleanup_path"] = "runtime/process-cleanup.json"
+    receipt["process_cleanup_sha256"] = hashlib.sha256(
+        cleanup_path.read_bytes()
+    ).hexdigest()
+    _write_json(receipt_path, receipt)
+    _reseal(root)
+    return root
+
+
+def _reseal_v3_cleanup(root: Path) -> None:
+    receipt_path = root / "feasibility-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["process_cleanup_sha256"] = hashlib.sha256(
+        (root / "runtime/process-cleanup.json").read_bytes()
+    ).hexdigest()
+    _write_json(receipt_path, receipt)
+    _reseal(root)
+
+
 def test_v2_authorization_accepts_each_declared_order_and_rejects_cross_binding(
     tmp_path: Path,
 ) -> None:
@@ -601,3 +673,142 @@ def test_campaign_rejects_duplicated_run_id_and_overlapping_blocks(
 
     result = campaign.validate_w16_cpu_campaign(blocks)
     assert result["verdict"] != "PASS", result
+
+
+def test_v7_accepts_only_a_v3_receipt_with_complete_cleanup_proof(
+    tmp_path: Path,
+) -> None:
+    module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.w16_output_validator"
+    )
+    root = _campaign_root_v3(tmp_path)
+
+    result = module.validate_w16_output_v7(root)
+    assert result["verdict"] == "PASS", result
+    assert result["kind"] == "kauri-w16-output-validation-v7"
+    assert result["process_cleanup"]["replica_count"] == 31
+    assert result["claim_eligible"] is False
+    assert result["figure_eligible"] is False
+    assert module.validate_w16_output_v6(root)["verdict"] != "PASS"
+
+
+@pytest.mark.parametrize("mutation", (
+    "missing-replica", "duplicate-replica", "nonzero-returncode", "sigkill",
+    "missing-signal", "timestamp-regression", "wrong-pid", "wrong-hash",
+    "missing-ledger", "missing-stopped", "forced-cgroup-kill",
+    "bool-attempts", "bool-retries", "float-cycles", "bool-ledger-schema",
+))
+def test_v7_rejects_missing_forged_or_unclean_shutdown_evidence(
+    tmp_path: Path, mutation: str,
+) -> None:
+    module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.w16_output_validator"
+    )
+    root = _campaign_root_v3(tmp_path)
+    cleanup_path = root / "runtime/process-cleanup.json"
+    receipt_path = root / "feasibility-receipt.json"
+    cleanup = json.loads(cleanup_path.read_text(encoding="utf-8"))
+    if mutation == "missing-replica":
+        cleanup["replicas"].pop()
+    elif mutation == "bool-ledger-schema":
+        cleanup["schema_version"] = True
+    elif mutation == "duplicate-replica":
+        cleanup["replicas"][1]["replica_id"] = 0
+    elif mutation == "nonzero-returncode":
+        cleanup["replicas"][0]["returncode"] = -9
+    elif mutation == "sigkill":
+        cleanup["replicas"][0]["signal_attempts"].append({
+            "signal_number": 9,
+            "requested_monotonic_ns": 38_500_000_000,
+        })
+    elif mutation == "missing-signal":
+        cleanup["replicas"][0]["signal_attempts"] = []
+    elif mutation == "timestamp-regression":
+        cleanup["replicas"][0]["confirmed_monotonic_ns"] = 37_999_999_999
+    elif mutation == "wrong-pid":
+        cleanup["replicas"][0]["pid"] = 999_999
+    elif mutation == "missing-stopped":
+        path = root / "raw/replica-0.jsonl"
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        rows = [row for row in rows if row["event_type"] != "process.stopped"]
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in rows),
+            encoding="utf-8",
+        )
+    elif mutation == "forced-cgroup-kill":
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        scope = receipt["quota_scope_cleanup"]
+        row = scope["units"][0]
+        row.update({
+            "worker_live_at_cleanup": True,
+            "member_pids_before_kill": [row["worker_pid"]],
+            "identity_revalidated": True,
+            "kill_attempted": True,
+            "populated_after_kill": 0,
+            "status": "killed_and_empty",
+        })
+        _write_json(root / "runtime/cpu-quota-scope-termination.json", scope)
+        _write_json(receipt_path, receipt)
+    elif mutation in {"bool-attempts", "bool-retries", "float-cycles"}:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if mutation == "bool-attempts":
+            receipt["attempts"] = True
+        elif mutation == "bool-retries":
+            receipt["retries"] = False
+        else:
+            receipt["required_complete_cycles"] = 5.0
+        _write_json(receipt_path, receipt)
+    elif mutation == "missing-ledger":
+        cleanup_path.unlink()
+    elif mutation == "wrong-hash":
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt["process_cleanup_sha256"] = "f" * 64
+        _write_json(receipt_path, receipt)
+    if mutation not in {"missing-stopped", "missing-ledger", "wrong-hash", "forced-cgroup-kill", "bool-attempts", "bool-retries", "float-cycles"}:
+        _write_json(cleanup_path, cleanup)
+        _reseal_v3_cleanup(root)
+    else:
+        _reseal(root)
+
+    result = module.validate_w16_output_v7(root)
+    assert result["verdict"] != "PASS", (mutation, result)
+
+
+@pytest.mark.parametrize(("relative", "schema_key", "receipt_copy"), (
+    ("runtime/cpu-quota-contract.json", "schema_version", None),
+    ("runtime/cpu-quota-launch.json", "schema_version", None),
+    ("raw/cpu-quota-samples.jsonl", "schema_version", None),
+    ("raw/cpu-quota-monitor-rounds.jsonl", "schema_version", None),
+    ("runtime/cpu-quota-cleanup.json", "schema_version", "quota_cleanup"),
+    ("runtime/cpu-quota-scope-termination.json", "schema_version", "quota_scope_cleanup"),
+    ("raw/replica-0.jsonl", "event_schema_version", None),
+))
+def test_v7_rejects_boolean_schema_version_in_bound_artifacts(
+    tmp_path: Path, relative: str, schema_key: str, receipt_copy: str | None,
+) -> None:
+    module = importlib.import_module(
+        "experiments.adaptive.kauri_experiment.w16_output_validator"
+    )
+    root = _campaign_root_v3(tmp_path)
+    path = root / relative
+    if path.suffix == ".jsonl":
+        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        rows[0][schema_key] = True
+        path.write_text(
+            "".join(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n"
+                    for row in rows),
+            encoding="utf-8",
+        )
+    else:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        document[schema_key] = True
+        _write_json(path, document)
+        if receipt_copy is not None:
+            receipt_path = root / "feasibility-receipt.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt[receipt_copy] = document
+            _write_json(receipt_path, receipt)
+    _reseal(root)
+    result = module.validate_w16_output_v7(root)
+    assert result["verdict"] != "PASS", (relative, result)

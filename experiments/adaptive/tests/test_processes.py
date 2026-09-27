@@ -459,7 +459,7 @@ def test_cleanup_samples_after_sigint_timeout_before_sigterm_and_keeps_cleaning(
 
     def wait_for_exit(managed: FakeProcess, timeout: float) -> int:
         assert managed is process
-        assert timeout == 0.01
+        assert 0 < timeout <= 0.01
         operations.append(("wait", int(last_signal or 0)))
         if last_signal == int(signal.SIGINT):
             raise subprocess.TimeoutExpired("replica-0", timeout)
@@ -496,6 +496,110 @@ def test_cleanup_samples_after_sigint_timeout_before_sigterm_and_keeps_cleaning(
     assert outcomes[0].signal_number == int(signal.SIGTERM)
     assert registry.cleanup_escalations[0].status == "failed"
     assert registry.cleanup_escalations[0].error == "sample unavailable"
+
+
+def test_cleanup_shares_the_sigint_deadline_across_31_replicas() -> None:
+    """A slow first exit must not consume one timeout per replica."""
+
+    processes = _processes()
+    now_ns = [0]
+    signals: list[tuple[int, int]] = []
+
+    class DelayedProcess(FakeProcess):
+        def wait(self, timeout: float) -> int:
+            self.wait_calls.append(timeout)
+            if self.pid == 100:
+                assert timeout >= 0.8
+                now_ns[0] += 800_000_000
+            self.returncode = 0
+            return 0
+
+    registry = processes.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        killpg=lambda pgid, signal_number: signals.append((pgid, signal_number)),
+        get_launcher_pgid=lambda: 9999,
+        monotonic_ns=lambda: now_ns[0],
+        wait_for_exit=lambda process, timeout: process.wait(timeout=timeout),
+    )
+    for replica_id in range(31):
+        registry.register(
+            name=f"replica-{replica_id}",
+            replica_id=replica_id,
+            process=DelayedProcess(pid=100 + replica_id),
+        )
+
+    outcomes = registry.cleanup(timeout_s=2.0)
+
+    assert len(outcomes) == 31
+    assert {outcome.returncode for outcome in outcomes} == {0}
+    assert {signal_number for _, signal_number in signals} == {int(signal.SIGINT)}
+    assert now_ns[0] == 800_000_000
+    assert len(registry.cleanup_ledger) == 31
+    assert all(entry.returncode == 0 for entry in registry.cleanup_ledger)
+    assert all(
+        [attempt.signal_number for attempt in entry.signal_attempts]
+        == [int(signal.SIGINT)]
+        for entry in registry.cleanup_ledger
+    )
+
+
+def test_cleanup_escalates_stuck_process_and_records_nonzero_returncode() -> None:
+    processes = _processes()
+    signals: list[int] = []
+    process = FakeProcess(pid=100, wait_result=-int(signal.SIGKILL))
+
+    def killpg(_pgid: int, signal_number: int) -> None:
+        signals.append(signal_number)
+        if signal_number == int(signal.SIGKILL):
+            process.returncode = -int(signal.SIGKILL)
+
+    def wait_for_exit(managed: FakeProcess, timeout: float) -> int:
+        if signals[-1] != int(signal.SIGKILL):
+            raise subprocess.TimeoutExpired("replica-0", timeout)
+        return managed.wait(timeout)
+
+    registry = processes.ProcessRegistry(
+        getpgid=lambda pid: pid,
+        killpg=killpg,
+        get_launcher_pgid=lambda: 9999,
+        monotonic_ns=iter(range(100, 1_000, 10)).__next__,
+        wait_for_exit=wait_for_exit,
+    )
+    registry.register(name="replica-0", replica_id=0, process=process)
+
+    outcomes = registry.cleanup(timeout_s=0.1)
+
+    assert signals == [
+        int(signal.SIGINT),
+        int(signal.SIGTERM),
+        int(signal.SIGKILL),
+    ]
+    assert outcomes == (
+        processes.CleanupOutcome(
+            name="replica-0",
+            replica_id=0,
+            pid=100,
+            pgid=100,
+            signal_number=int(signal.SIGKILL),
+            returncode=-int(signal.SIGKILL),
+        ),
+    )
+    assert registry.cleanup_ledger[0].returncode == -int(signal.SIGKILL)
+    assert [
+        attempt.signal_number for attempt in registry.cleanup_ledger[0].signal_attempts
+    ] == [int(signal.SIGINT), int(signal.SIGTERM), int(signal.SIGKILL)]
+
+
+def test_cleanup_of_an_empty_registry_has_an_empty_immutable_ledger() -> None:
+    processes = _processes()
+    registry = _registry(
+        processes,
+        getpgid=lambda pid: pid,
+        killpg=lambda _pgid, _signal_number: None,
+    )
+
+    assert registry.cleanup(timeout_s=0.1) == ()
+    assert registry.cleanup_ledger == ()
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX process groups")

@@ -26,6 +26,7 @@ from .processes import ProcessRegistry
 
 SCHEMA = "kauri-n31-static-e0-local-executor-v1"
 CAMPAIGN_SCHEMA = "kauri-n31-static-e0-local-executor-v2"
+CAMPAIGN_SCHEMA_V3 = "kauri-n31-static-e0-local-executor-v3"
 _BINARY_NAMES = ("app", "keygen", "tls_keygen", "native_digest")
 
 
@@ -237,6 +238,113 @@ def assert_exactly_31_registered(registry: ProcessRegistry) -> None:
         raise LocalExecutorError("launcher did not register exactly the 31 replica groups")
 
 
+def _process_cleanup_document(entries: object) -> dict[str, object]:
+    """Serialize the registry's immutable cleanup truth without inference."""
+
+    if not isinstance(entries, tuple):
+        raise LocalExecutorError("process cleanup ledger is not immutable")
+    replicas: list[dict[str, object]] = []
+    for entry in entries:
+        try:
+            attempts = tuple(entry.signal_attempts)
+            replicas.append({
+                "replica_id": entry.replica_id,
+                "pid": entry.pid,
+                "pgid": entry.pgid,
+                "signal_attempts": [
+                    {
+                        "signal_number": attempt.signal_number,
+                        "requested_monotonic_ns": attempt.requested_monotonic_ns,
+                    }
+                    for attempt in attempts
+                ],
+                "confirmed_monotonic_ns": entry.final_monotonic_ns,
+                "returncode": entry.returncode,
+            })
+        except AttributeError as exc:
+            raise LocalExecutorError("process cleanup ledger entry is malformed") from exc
+    return {"schema_version": 1, "replicas": replicas}
+
+
+def _assert_clean_process_closure(
+    entries: object, streams: Mapping[str, list[Mapping[str, object]]], *,
+    launch: Mapping[str, object], producer_start_ns: int, producer_end_ns: int,
+) -> None:
+    """Match the v7 validator's owned exit and native lifecycle contract."""
+
+    document = _process_cleanup_document(entries)
+    replicas = document["replicas"]
+    assert isinstance(replicas, list)
+    if (
+        any(type(entry["replica_id"]) is not int for entry in replicas)
+        or [entry["replica_id"] for entry in replicas]
+        != list(range(feasibility.REPLICA_COUNT))
+    ):
+        raise LocalExecutorError("process cleanup ledger must contain exactly 31 ordered replicas")
+    launch_rows = launch.get("replicas")
+    if (
+        type(producer_start_ns) is not int or type(producer_end_ns) is not int
+        or producer_start_ns <= 0 or producer_end_ns <= producer_start_ns
+        or not isinstance(launch_rows, list) or len(launch_rows) != 31
+        or any(not isinstance(row, dict) or type(row.get("replica_id")) is not int
+               for row in launch_rows)
+        or [row.get("replica_id") for row in launch_rows]
+        != list(range(feasibility.REPLICA_COUNT))
+    ):
+        raise LocalExecutorError("CPU launch cannot bind exact process cleanup ownership")
+    lifecycle = (
+        "process.started", "process.ready", "adaptive_v2_reporting_terminal",
+        "process.stopping", "process.stopped",
+    )
+    pids: set[int] = set()
+    pgids: set[int] = set()
+    for entry, launched in zip(replicas, launch_rows):
+        replica = entry["replica_id"]
+        pid, pgid = entry["pid"], entry["pgid"]
+        confirmed = entry["confirmed_monotonic_ns"]
+        if (
+            type(replica) is not int or type(pid) is not int or type(pgid) is not int
+            or pid <= 0 or pgid <= 0 or pid in pids or pgid in pgids
+            or launched.get("owned_pid") != pid or launched.get("owned_pgid") != pgid
+            or type(confirmed) is not int
+            or not producer_start_ns < confirmed <= producer_end_ns
+        ):
+            raise LocalExecutorError(f"replica {replica} cleanup ownership or chronology differs")
+        pids.add(pid)
+        pgids.add(pgid)
+        if type(entry["returncode"]) is not int or entry["returncode"] != 0:
+            raise LocalExecutorError(f"replica {replica} cleanup returncode is not zero")
+        attempts = entry["signal_attempts"]
+        assert isinstance(attempts, list)
+        numbers = [attempt["signal_number"] for attempt in attempts]
+        if (
+            any(type(number) is not int for number in numbers)
+            or numbers not in ([int(signal.SIGINT)], [int(signal.SIGINT), int(signal.SIGTERM)])
+        ):
+            raise LocalExecutorError(f"replica {replica} cleanup signal order is invalid")
+        previous = producer_start_ns
+        for attempt in attempts:
+            requested = attempt["requested_monotonic_ns"]
+            if type(requested) is not int or not previous < requested <= confirmed:
+                raise LocalExecutorError(f"replica {replica} cleanup signal chronology is invalid")
+            previous = requested
+        source = f"replica-{replica}"
+        events = streams.get(source)
+        if not isinstance(events, list):
+            raise LocalExecutorError(f"{source} raw lifecycle is unavailable")
+        indices: list[int] = []
+        for event_type in lifecycle:
+            matches = [
+                index for index, event in enumerate(events)
+                if event.get("event_type") == event_type
+            ]
+            if len(matches) != 1:
+                raise LocalExecutorError(f"{source} raw lifecycle lacks exactly one {event_type}")
+            indices.append(matches[0])
+        if indices != sorted(indices):
+            raise LocalExecutorError(f"{source} raw lifecycle is reordered")
+
+
 def seal_outcome(
     *,
     directory: Path,
@@ -370,19 +478,29 @@ def execute_once(
         raise LocalExecutorError("CPU quota mode requires Linux")
     if (quota_contract is None) != (authorization_bytes is None):
         raise LocalExecutorError("CPU execution requires an exact authorization; CPU-free execution forbids it")
+    campaign_authorization_version: int | None = None
     if campaign_authorization_validated:
         try:
             authorization_document = json.loads(authorization_bytes or b"")
         except (UnicodeError, json.JSONDecodeError) as error:
             raise LocalExecutorError("validated campaign authorization is malformed") from error
-        if (
-            quota_contract is None
-            or not isinstance(authorization_document, dict)
-            or authorization_document.get("schema_version") != 2
-            or authorization_document.get("kind")
-            != "kauri-w16-static-e0-campaign-authorization-v2"
+        if quota_contract is None or not isinstance(authorization_document, dict):
+            raise LocalExecutorError("validated campaign authorization identity differs")
+        campaign_authorization_version = authorization_document.get("schema_version")
+        if type(campaign_authorization_version) is not int or (
+            campaign_authorization_version,
+            authorization_document.get("kind"),
+        ) not in (
+            (2, "kauri-w16-static-e0-campaign-authorization-v2"),
+            (3, "kauri-w16-static-e0-campaign-authorization-v3"),
         ):
             raise LocalExecutorError("validated campaign authorization identity differs")
+        if campaign_authorization_version == 3 and (
+            authorization_document.get("executor_receipt_schema") != CAMPAIGN_SCHEMA_V3
+            or authorization_document.get("cell_validator_version") != 7
+            or authorization_document.get("process_cleanup_required") is not True
+        ):
+            raise LocalExecutorError("validated v3 campaign authorization contract differs")
     directory = directory.resolve()
     if directory.exists():
         raise LocalExecutorError("one attempt requires an exact fresh output directory")
@@ -399,7 +517,7 @@ def execute_once(
         if type(started_raw_ns) is not int or started_raw_ns <= 0:
             raise LocalExecutorError("CLOCK_MONOTONIC_RAW start is invalid")
     directory.mkdir(parents=True, mode=0o700)
-    for subdirectory in ("config", "logs", "raw"):
+    for subdirectory in ("config", "logs", "raw", "runtime"):
         (directory / subdirectory).mkdir(mode=0o700)
     if authorization_bytes is not None:
         with (directory / "authorization.json").open("xb") as authorization_file:
@@ -420,6 +538,7 @@ def execute_once(
     quota_scope_cleanup: dict[str, object] | None = None
     raw_hashes: dict[str, str] = {}
     artifact_hashes: dict[str, str] = {}
+    process_cleanup_sha256: str | None = None
     old_alarm = signal.getsignal(signal.SIGALRM)
 
     def _alarm(_signal: int, _frame: object) -> None:
@@ -532,7 +651,7 @@ def execute_once(
             if not stopped or monitor_error is not None:
                 cleanup_error = f"CPU quota monitor failed: {monitor_error or 'did not stop'}"
         try:
-            registry.cleanup(timeout_s=0.2)
+            registry.cleanup(timeout_s=2.0 if campaign_authorization_version == 3 else 0.2)
         except BaseException as exc:
             cleanup_error = (cleanup_error or "") + (
                 f"; process registry cleanup failed: {str(exc).strip() or type(exc).__name__}"
@@ -578,6 +697,17 @@ def execute_once(
                 cleanup_error = (cleanup_error or "") + (
                     f"; cannot hash replica {replica} raw stream: {exc}"
                 )
+        if campaign_authorization_version == 3:
+            try:
+                cleanup_document = _process_cleanup_document(registry.cleanup_ledger)
+                cleanup_path = directory / "runtime" / "process-cleanup.json"
+                runtime.write_json_exclusive(cleanup_path, cleanup_document)
+                process_cleanup_sha256 = _sha256(cleanup_path)
+            except BaseException as exc:
+                cleanup_error = (cleanup_error or "") + (
+                    "; cannot persist process cleanup ledger: "
+                    f"{str(exc).strip() or type(exc).__name__}"
+                )
         try:
             for path in sorted(directory.rglob("*")):
                 if path.is_symlink():
@@ -592,6 +722,7 @@ def execute_once(
     complete = tuple(sorted(record.replica_id for record in records)) == tuple(range(31))
     if failure is None and not (complete and all_exited and cleanup_error is None):
         failure = "owned process cleanup did not prove all 31 replica exits"
+    final_streams: dict[str, list[Mapping[str, object]]] | None = None
     if failure is None and inputs is not None:
         try:
             final_streams = {
@@ -609,6 +740,37 @@ def execute_once(
                 failure = f"post-cleanup exact stream gate failed: {detail}"
         except BaseException as exc:
             failure = f"post-cleanup raw stream validation failed: {exc}"
+    if failure is None and campaign_authorization_version == 3:
+        try:
+            if final_streams is None:
+                raise LocalExecutorError("final raw streams are unavailable for closure")
+            launch = json.loads(
+                (directory / "runtime" / "cpu-quota-launch.json").read_bytes()
+            )
+            if not isinstance(launch, dict):
+                raise LocalExecutorError("CPU launch ownership document is malformed")
+            _assert_clean_process_closure(
+                registry.cleanup_ledger, final_streams, launch=launch,
+                producer_start_ns=started_ns, producer_end_ns=time.monotonic_ns(),
+            )
+            scope_rows = (
+                quota_scope_cleanup.get("units")
+                if isinstance(quota_scope_cleanup, dict) else None
+            )
+            if (
+                not isinstance(scope_rows, list) or len(scope_rows) != 31
+                or any(not isinstance(row, dict) or type(row.get("replica_id")) is not int
+                       for row in scope_rows)
+                or {row.get("replica_id") for row in scope_rows} != set(range(31))
+                or any(
+                    row.get("status") != "already_inactive"
+                    or row.get("kill_attempted") is not False
+                    for row in scope_rows
+                )
+            ):
+                raise LocalExecutorError("v3 cleanup required cgroup kill or lost scope identity")
+        except BaseException as exc:
+            failure = f"process closure gate failed: {str(exc).strip() or type(exc).__name__}"
     if failure is None and cleanup_error is not None:
         failure = "raw artifact inventory or cleanup is incomplete"
     ended_raw_ns: int | None = None
@@ -623,7 +785,10 @@ def execute_once(
         ):
             failure = failure or "CLOCK_MONOTONIC_RAW end is invalid"
     payload: dict[str, object] = {
-        "schema": CAMPAIGN_SCHEMA if campaign_authorization_validated else SCHEMA,
+        "schema": (
+            CAMPAIGN_SCHEMA_V3 if campaign_authorization_version == 3 else
+            CAMPAIGN_SCHEMA if campaign_authorization_validated else SCHEMA
+        ),
         "run_id": run_id, "attempts": 1, "retries": 0,
         "verdict": "PASS" if failure is None else "ABORT",
         "failure": failure, "cleanup_error": cleanup_error,
@@ -652,6 +817,11 @@ def execute_once(
             "raw_clock_id": "CLOCK_MONOTONIC_RAW",
             "started_raw_monotonic_ns": started_raw_ns,
             "ended_raw_monotonic_ns": ended_raw_ns,
+        })
+    if campaign_authorization_version == 3:
+        payload.update({
+            "process_cleanup_path": "runtime/process-cleanup.json",
+            "process_cleanup_sha256": process_cleanup_sha256,
         })
     name = "feasibility-receipt.json" if failure is None else "feasibility-abort.json"
     runtime.write_json_exclusive(directory / name, payload)

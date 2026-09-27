@@ -14,6 +14,7 @@ import sys
 from kauri_experiment import n31_static_e0_feasibility as feasibility
 from kauri_experiment import n31_static_e0_local_executor as executor
 from kauri_experiment import static_e0_cpu_contract
+from kauri_experiment.w16_cpu_campaign_sequence_v7 import validate_freeze_v7
 
 
 _W16_BLOCK_ORDER = (
@@ -109,6 +110,72 @@ def _read_campaign_cpu_authorization(
     return payload
 
 
+def _read_campaign_cpu_authorization_v3(
+    payload: bytes, document: dict[str, object], *, preflight_bytes: bytes,
+    preflight: dict[str, object], arm: str, quota_mode: str, output: Path,
+    hard_timeout_s: float, campaign_freeze_file: Path | None,
+    campaign_approval_ref: str | None,
+) -> bytes:
+    """Keep v2 immutable while binding the new cleanup-proof contract."""
+
+    contract_keys = {
+        "executor_receipt_schema", "cell_validator_version",
+        "process_cleanup_required",
+    }
+    if (
+        set(document) != {
+            "schema_version", "kind", "campaign_id", "block_index",
+            "campaign_freeze_sha256", "block_id", "block_order", "cell_ordinal",
+            "revision", "profile_sha256", "arm", "quota_mode", "preflight_sha256",
+            "binary_sha256", "output_root", "required_complete_cycles",
+            "hard_timeout_s", "external_timeout_s", "automatic_retries",
+            "claim_eligible", "figure_eligible", "approval_ref", "approved_at_utc",
+        } | contract_keys
+        or type(document.get("schema_version")) is not int
+        or document.get("schema_version") != 3
+        or document.get("kind") != "kauri-w16-static-e0-campaign-authorization-v3"
+        or document.get("executor_receipt_schema") != "kauri-n31-static-e0-local-executor-v3"
+        or type(document.get("cell_validator_version")) is not int
+        or document.get("cell_validator_version") != 7
+        or document.get("process_cleanup_required") is not True
+        or campaign_freeze_file is None
+        or campaign_freeze_file.is_symlink()
+        or not campaign_freeze_file.is_file()
+    ):
+        raise executor.LocalExecutorError("W16 v3 campaign CPU authorization contract differs")
+    try:
+        freeze = json.loads(campaign_freeze_file.read_bytes())
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise executor.LocalExecutorError("W16 v3 campaign freeze is unreadable") from error
+    freeze_verdict = validate_freeze_v7(freeze) if isinstance(freeze, dict) else {}
+    if (
+        not isinstance(freeze, dict)
+        or freeze_verdict.get("verdict") != "PASS"
+        or type(freeze.get("schema_version")) is not int
+        or freeze.get("schema_version") != 2
+        or freeze.get("kind") != "kauri-w16-cpu-repeat-freeze-v2"
+        or freeze.get("campaign_id") != document.get("campaign_id")
+        or freeze.get("revision") != document.get("revision")
+        or freeze.get("authorization_schema_version") != 3
+        or freeze.get("authorization_kind") != document.get("kind")
+        or freeze.get("executor_receipt_schema") != document.get("executor_receipt_schema")
+        or freeze.get("cell_validator_version") != 7
+        or freeze.get("process_cleanup_required") is not True
+    ):
+        raise executor.LocalExecutorError("W16 v3 campaign freeze contract differs")
+    legacy_fields = {key: value for key, value in document.items() if key not in contract_keys}
+    legacy_fields.update({
+        "schema_version": 2,
+        "kind": "kauri-w16-static-e0-campaign-authorization-v2",
+    })
+    return _read_campaign_cpu_authorization(
+        payload, legacy_fields, preflight_bytes=preflight_bytes,
+        preflight=preflight, arm=arm, quota_mode=quota_mode, output=output,
+        hard_timeout_s=hard_timeout_s, campaign_freeze_file=campaign_freeze_file,
+        campaign_approval_ref=campaign_approval_ref,
+    )
+
+
 def _read_cpu_authorization(
     path: Path, *, preflight_bytes: bytes, preflight: dict[str, object],
     arm: str, quota_mode: str, output: Path, hard_timeout_s: float,
@@ -117,7 +184,17 @@ def _read_cpu_authorization(
 ) -> bytes:
     payload = path.read_bytes()
     document = json.loads(payload)
-    if isinstance(document, dict) and document.get("schema_version") == 2:
+    if isinstance(document, dict) and type(document.get("schema_version")) is int and document["schema_version"] == 3:
+        if path.is_symlink():
+            raise executor.LocalExecutorError("W16 v3 campaign CPU authorization is a symlink")
+        return _read_campaign_cpu_authorization_v3(
+            payload, document, preflight_bytes=preflight_bytes,
+            preflight=preflight, arm=arm, quota_mode=quota_mode,
+            output=output, hard_timeout_s=hard_timeout_s,
+            campaign_freeze_file=campaign_freeze_file,
+            campaign_approval_ref=campaign_approval_ref,
+        )
+    if isinstance(document, dict) and type(document.get("schema_version")) is int and document["schema_version"] == 2:
         if path.is_symlink():
             raise executor.LocalExecutorError("W16 campaign CPU authorization is a symlink")
         return _read_campaign_cpu_authorization(
