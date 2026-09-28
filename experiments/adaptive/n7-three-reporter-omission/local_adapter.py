@@ -20,6 +20,7 @@ KAURI = HERE.parents[2]
 PROFILE_V2_FILE = HERE / "profile-v2.json"
 PROFILE_V2_SHA256 = "1c4f44a9290440fe0290ceacbb9719e85581246a9c423413c4e898aac15b76fa"
 V2_MANAGER_ARGS = ("--required-nonresponsive", "1")
+EXACT_TIMEOUT_EVIDENCE_OPTION = b"experiment-exact-timeout-attempt-evidence-v3 = true\n"
 
 
 def _load(name: str, path: Path):
@@ -39,6 +40,23 @@ comparison = _load("n7_comparison_lifecycle", KAURI / "experiments" / "adaptive"
 
 class AdapterError(ValueError):
     pass
+
+
+def _enable_exact_timeout_attempt_evidence_v3(configs: Sequence[Path]) -> None:
+    """Enable the evidence schema required by the frozen six-timeout validator."""
+    if len(configs) != 7 or len(set(configs)) != 7:
+        raise AdapterError("replica timeout-evidence configuration drifted")
+    payloads = []
+    for path in configs:
+        try:
+            payload = path.read_bytes()
+        except OSError as exc:
+            raise AdapterError("replica timeout-evidence configuration drifted") from exc
+        if not payload.endswith(b"\n") or b"experiment-exact-timeout-attempt-evidence-v3" in payload:
+            raise AdapterError("replica timeout-evidence configuration drifted")
+        payloads.append(payload)
+    for path, payload in zip(configs, payloads, strict=True):
+        path.write_bytes(payload + EXACT_TIMEOUT_EVIDENCE_OPTION)
 
 
 def _load_frozen_v2_profile(path: Path = PROFILE_V2_FILE) -> dict[str, Any]:
@@ -178,6 +196,16 @@ def _verify_executable_local_plan(
             raise AdapterError("local plan artifact has schema drift")
         if base.sha256_file(_under_run_root(run_directory, artifact["path"])) != artifact["sha256"]:
             raise AdapterError("local plan artifact hash changed")
+    replica_configs = plan.get("replica_configs")
+    if (not isinstance(replica_configs, list) or len(replica_configs) != 7 or
+        not all(isinstance(relative, str) for relative in replica_configs) or
+        len(set(replica_configs)) != 7):
+        raise AdapterError("local plan lacks seven v3 replica configurations")
+    for relative in replica_configs:
+        payload = _under_run_root(run_directory, relative).read_bytes()
+        if (not payload.endswith(EXACT_TIMEOUT_EVIDENCE_OPTION) or
+            payload.count(EXACT_TIMEOUT_EVIDENCE_OPTION) != 1):
+            raise AdapterError("local plan replica lacks exact v3 timeout evidence")
 
     if not isinstance(plan.get("e0_identity_receipt"), str) or not isinstance(plan.get("e0_identity_receipt_sha256"), str):
         raise AdapterError("local plan lacks E0 identity receipt binding")
@@ -227,6 +255,18 @@ def _verify_executable_local_plan(
         raise AdapterError("manager command drifted from archived launch arguments")
     if any(by_source[f"replica-{replica}"] != list(command) for replica, command in enumerate(replica_commands)):
         raise AdapterError("replica command drifted from archived launch arguments")
+    for replica_id, command in enumerate(replica_commands):
+        config = _under_run_root(run_directory, replica_configs[replica_id])
+        positions = [index for index, argument in enumerate(command) if argument == "--conf"]
+        if (len(positions) != 2 or positions[1] + 1 >= len(command) or
+            Path(command[positions[1] + 1]).resolve() != config):
+            raise AdapterError("replica command config path drifted")
+        process = next(process for process in processes if process["source_id"] == f"replica-{replica_id}")
+        options = process.get("effective_options")
+        if (not isinstance(options, Mapping) or
+            options.get("replica_config_sha256") != base.sha256_file(config) or
+            options.get("experiment_exact_timeout_attempt_evidence_v3") is not True):
+            raise AdapterError("replica config hash or v3 option drifted")
     try:
         tree_arg = manager_command.index("--epoch-zero-tree-file")
     except ValueError as exc:
@@ -334,6 +374,7 @@ def prepare_local_inputs(
         manager_binary=manager_binary, initial_tree_file=runner.TREE_FILE,
         manager_extra_args=(*base.FULL_RUN_MANAGER_EXTRA_ARGS, *V2_MANAGER_ARGS),
     )
+    _enable_exact_timeout_attempt_evidence_v3(replica_configs)
     if "tree-switch-period = 2" not in main_config.read_text(encoding="utf-8"):
         raise AdapterError("base writer did not apply frozen v2 tree switch period")
     if manager_command.count("--required-nonresponsive") != 1 or manager_command[manager_command.index("--required-nonresponsive") + 1] != "1":
@@ -373,6 +414,10 @@ def prepare_local_inputs(
             process["effective_options"]["experiment_three_reporter_omission"] = True
         elif isinstance(process.get("source_id"), str) and process["source_id"].startswith("replica-"):
             process["effective_options"]["experiment_three_reporter_omission"] = False
+        if isinstance(process.get("source_id"), str) and process["source_id"].startswith("replica-"):
+            replica_id = int(process["source_id"].removeprefix("replica-"))
+            process["effective_options"]["replica_config_sha256"] = base.sha256_file(replica_configs[replica_id])
+            process["effective_options"]["experiment_exact_timeout_attempt_evidence_v3"] = True
     base._replace_json(argv_path, document)
     artifacts = [
         base._runtime_artifact(run_directory, argv_path, kind="launch_arguments", replica_id=None)
