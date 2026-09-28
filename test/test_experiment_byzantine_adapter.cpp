@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -238,7 +239,9 @@ std::string sha256_hex(const std::string &bytes)
 
 std::string temporary_path()
 {
-    std::string pattern = "/private/tmp/kauri-n7-gate-XXXXXX";
+    std::string pattern =
+        (std::filesystem::temp_directory_path() /
+         "kauri-n7-gate-XXXXXX").string();
     std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
     mutable_pattern.push_back('\0');
     const auto descriptor = ::mkstemp(mutable_pattern.data());
