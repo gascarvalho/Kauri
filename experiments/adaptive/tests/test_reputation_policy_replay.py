@@ -131,6 +131,34 @@ def test_independent_validator_reconstructs_both_rankings() -> None:
         assert independently_reconstructed == produced
 
 
+def test_in_memory_scalar_projection_ignores_reporter_field() -> None:
+    """The ranking function scores observed replicas, not report sources.
+
+    This is a policy-unit invariant, not a valid signed-stream mutation.
+    """
+
+    profile = _profile()
+    observations = _tradeoff_observations()
+    relabelled_reporters: list[dict[str, object]] = []
+    for observation in observations:
+        observed = int(observation["observed_replica_id"])
+        reporter = (int(observation["reporter_id"]) + 2) % 7
+        if reporter == observed:
+            reporter = (reporter + 1) % 7
+        relabelled_reporters.append({**observation, "reporter_id": reporter})
+
+    assert all(
+        original["reporter_id"] != relabelled["reporter_id"]
+        for original, relabelled in zip(observations, relabelled_reporters)
+    )
+
+    for mechanism in ("responsiveness", "latency-priority"):
+        original = rank_replicas(observations, profile, mechanism)
+        relabelled = rank_replicas(relabelled_reporters, profile, mechanism)
+        assert relabelled["ranking"] == original["ranking"]
+        assert relabelled["role_projection"] == original["role_projection"]
+
+
 def test_policy_rejects_a_timeout_that_claims_response_latency() -> None:
     observations = _tradeoff_observations()
     observations[0]["response_duration_us"] = 1
