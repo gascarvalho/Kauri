@@ -443,7 +443,7 @@ def _render(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     left.grid(axis="y", color="#DCE3E8", linewidth=0.7)
     left.set_axisbelow(True)
     left.spines[["top", "right"]].set_visible(False)
-    left.set_title("(a) Containment restores throughput", loc="left", pad=10)
+    left.set_title("(a) Phase throughput", loc="left", pad=10)
     pair_x = list(range(1, 6))
     adaptive_ratio = [float(row["adaptive_ratio"]) for row in rows]
     paired_ratio = [float(row["paired_ratio"]) for row in rows]
