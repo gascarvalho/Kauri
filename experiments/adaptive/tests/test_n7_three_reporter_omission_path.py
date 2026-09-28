@@ -181,6 +181,29 @@ def test_partial_raw_validator_requires_arm_six_attempts_and_all_seven_commit_wi
     assert verdict["selected_replica_proof"] == "UNAVAILABLE_IN_KNOWN_RAW_EVENT_SCHEMA"
 
 
+def test_prearm_common_commit_skips_non_designated_rich_events():
+    streams = _replica_streams()
+    for event in streams["replica-0"]:
+        event["source_sequence"] += 1
+    non_designated = deepcopy(streams["replica-0"][0])
+    non_designated["source_sequence"] = 1
+    non_designated["source_monotonic_ns"] = 49
+    non_designated["payload"]["designated_observer"] = False
+    streams["replica-0"].insert(0, non_designated)
+
+    assert validator._common_e0_commit_before_arm(
+        streams, epoch_digest="a" * 64, arm_start_ns=101
+    ) == (9, "0" * 63 + "1")
+    verdict = validator.validate_known_raw_events(
+        runner.preflight("a" * 64),
+        [_arm(), *_six_events(), _snapshot(8)],
+        streams,
+        _arm(),
+        run_id="run-1",
+    )
+    assert verdict["verdict"] == "PARTIAL_ONLY"
+
+
 def test_partial_raw_validator_rejects_prearm_timeout():
     manager = [_arm(), *_six_events(), _snapshot(8)]
     manager[1]["payload"]["observation"]["attempt_start_monotonic_ns"] = 100

@@ -432,8 +432,12 @@ def _common_e0_commit_before_arm(
             payload = event["payload"]
             if not isinstance(payload, Mapping) or set(payload) != _COMMIT_FIELDS:
                 raise ValidationError("E0 block.committed payload has schema drift")
+            if type(payload["designated_observer"]) is not bool:
+                raise ValidationError("E0 block.committed observer flag is invalid")
+            if payload["designated_observer"] is False:
+                continue
             proof = payload["decision_proof"]
-            if (payload["designated_observer"] is not True or not isinstance(proof, Mapping) or
+            if (not isinstance(proof, Mapping) or
                     set(proof) != _DECISION_PROOF_FIELDS or proof.get("epoch_number") != 0 or
                     proof.get("epoch_digest") != epoch_digest or proof.get("block_hash") != payload.get("block_hash")):
                 raise ValidationError("authoritative pre-arm E0 commit has wrong decision proof")
