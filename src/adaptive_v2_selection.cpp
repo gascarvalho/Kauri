@@ -165,7 +165,8 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
     const std::vector<std::uint32_t> &required_tree_ids,
     bool restrict_proposal_keys_to_required_trees,
     bool require_all_required_tree_anchors,
-    bool exact_timeout_attempts = false)
+    bool exact_timeout_attempts = false,
+    bool aggregate_relay_only = false)
 {
     PostFaultProposalCoverage result;
     result.audit.fault_evidence_start_monotonic_ns =
@@ -210,6 +211,9 @@ PostFaultProposalCoverage evaluate_post_fault_proposal_coverage(
                  ? (observation.schema_version !=
                         kResponseObservationSchemaVersionV3 ||
                     observation.outcome != ResponseOutcome::timeout ||
+                    (aggregate_relay_only &&
+                     observation.expected_message_type !=
+                         ExpectedMessageType::aggregate_relay) ||
                     observation.attempt_start_monotonic_ns <
                         fault_evidence_start_monotonic_ns)
                  : !post_fault_direct_vote_proposal_anchor(
@@ -470,11 +474,13 @@ struct OutstandingTimeout
 {
     ReplicaID reporter_id{0};
     ReplicaID target_id{0};
+    std::uint32_t tree_id{0};
 };
 
 using ReporterTimeoutCounts = std::map<ReplicaID, std::uint64_t>;
+using TreeTimeoutCounts = std::map<std::uint32_t, ReporterTimeoutCounts>;
 using TargetTimeoutCounts =
-    std::map<ReplicaID, ReporterTimeoutCounts>;
+    std::map<ReplicaID, TreeTimeoutCounts>;
 
 enum class TimeoutReplayStatus : std::uint8_t
 {
@@ -556,12 +562,14 @@ TimeoutReplayStatus replay_post_baseline_timeouts(
                 observation.observation_id,
                 OutstandingTimeout{
                     observation.reporter_id,
-                    observation.observed_replica_id});
+                    observation.observed_replica_id,
+                    observation.configuration.tree_id});
         }
 
         for (const auto &entry : outstanding)
         {
             auto &count = counts[entry.second.target_id]
+                                 [entry.second.tree_id]
                                  [entry.second.reporter_id];
             if (count == std::numeric_limits<std::uint64_t>::max())
                 return TimeoutReplayStatus::capacity_exceeded;
@@ -921,6 +929,12 @@ struct AdaptiveV2ByzantineSelection::State
                 !config.fault_window_arm.has_value()
                 ? AdaptiveV2TimeoutAuditBasis::
                       unfiltered_post_baseline
+                : config.fault_window_arm.has_value() &&
+                          config.fault_window_arm->snapshot_evidence_basis ==
+                              AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                                  exact_post_fault_path_timeout_quorum_v1
+                ? AdaptiveV2TimeoutAuditBasis::
+                      post_fault_path_timeout_quorum
                 : AdaptiveV2TimeoutAuditBasis::
                       post_fault_proposal_filtered,
             config.cardinality_policy};
@@ -993,6 +1007,11 @@ struct AdaptiveV2ByzantineSelection::State
             AdaptiveV2SelectionStatus::insufficient_guarded_candidates,
             evidence_cutoff);
         output.snapshot = std::move(snapshot);
+        const bool path_local_relay_basis =
+            config.fault_window_arm.has_value() &&
+            config.fault_window_arm->snapshot_evidence_basis ==
+                AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                    exact_post_fault_path_timeout_quorum_v1;
         try
         {
             std::map<ReplicaID, const ReplicaAdaptationResult *>
@@ -1041,30 +1060,94 @@ struct AdaptiveV2ByzantineSelection::State
                     ? guard_drawdowns[index] : (*causal_drawdowns)[index];
 
                 const auto target_found = timeout_counts.find(replica_id);
+                bool required_path_coverage_satisfied = true;
+                std::set<ReplicaID> qualifying_reporter_ids;
+                ReporterTimeoutCounts reporter_totals;
                 if (target_found != timeout_counts.end())
                 {
-                    for (const auto &reporter : target_found->second)
+                    for (const auto &tree : target_found->second)
                     {
-                        if (std::numeric_limits<std::uint64_t>::max() -
-                                audit.total_uncompensated_timeouts <
-                            reporter.second)
+                        bool tree_has_qualifying_reporter = false;
+                        for (const auto &reporter : tree.second)
                         {
-                            healthy = false;
-                            output.status =
-                                AdaptiveV2SelectionStatus::capacity_exceeded;
-                            output.eligible_candidates.clear();
-                            return output;
+                            // A path-local fault requires independent
+                            // observers; a target can never establish its own
+                            // quorum.
+                            if (path_local_relay_basis &&
+                                reporter.first == replica_id)
+                                continue;
+                            if (std::numeric_limits<std::uint64_t>::max() -
+                                    audit.total_uncompensated_timeouts <
+                                reporter.second)
+                            {
+                                healthy = false;
+                                output.status =
+                                    AdaptiveV2SelectionStatus::capacity_exceeded;
+                                output.eligible_candidates.clear();
+                                return output;
+                            }
+                            audit.total_uncompensated_timeouts +=
+                                reporter.second;
+                            auto &reporter_total =
+                                reporter_totals[reporter.first];
+                            if (std::numeric_limits<std::uint64_t>::max() -
+                                    reporter_total < reporter.second)
+                            {
+                                healthy = false;
+                                output.status =
+                                    AdaptiveV2SelectionStatus::capacity_exceeded;
+                                output.eligible_candidates.clear();
+                                return output;
+                            }
+                            reporter_total += reporter.second;
+                            if (path_local_relay_basis &&
+                                reporter.second >=
+                                config.minimum_timeouts_per_reporter)
+                            {
+                                qualifying_reporter_ids.insert(
+                                    reporter.first);
+                                tree_has_qualifying_reporter = true;
+                            }
                         }
-                        audit.total_uncompensated_timeouts +=
-                            reporter.second;
+                        if (path_local_relay_basis &&
+                            std::find(config.fault_window_arm->required_tree_ids.begin(),
+                                      config.fault_window_arm->required_tree_ids.end(),
+                                      tree.first) !=
+                                config.fault_window_arm->required_tree_ids.end() &&
+                            !tree_has_qualifying_reporter)
+                            required_path_coverage_satisfied = false;
+                    }
+                }
+
+                if (!path_local_relay_basis)
+                    for (const auto &reporter : reporter_totals)
                         if (reporter.second >=
                             config.minimum_timeouts_per_reporter)
+                            qualifying_reporter_ids.insert(reporter.first);
+
+                if (path_local_relay_basis)
+                {
+                    // The coverage gate is candidate-local: witnesses for a
+                    // different target cannot supply this candidate's missing
+                    // predecessor-tree path.
+                    for (const auto tree_id :
+                         config.fault_window_arm->required_tree_ids)
+                    {
+                        if (target_found == timeout_counts.end() ||
+                            target_found->second.find(tree_id) ==
+                                target_found->second.end())
                         {
-                            audit.qualifying_reporters.push_back(
-                                reporter.first);
+                            required_path_coverage_satisfied = false;
+                            break;
                         }
                     }
                 }
+                audit.qualifying_reporters.assign(
+                    qualifying_reporter_ids.begin(),
+                    qualifying_reporter_ids.end());
+                audit.path_local_coverage_satisfied =
+                    path_local_relay_basis &&
+                    required_path_coverage_satisfied;
 
                 audit.snapshot_nonresponsive =
                     audit.snapshot_classification ==
@@ -1087,11 +1170,14 @@ struct AdaptiveV2ByzantineSelection::State
                     audit.qualifying_reporters.size() >=
                     static_cast<std::size_t>(
                         quorum.fault_threshold + 1U);
-                audit.guarded_eligible =
-                    audit.snapshot_nonresponsive &&
-                    audit.score_drop_satisfied &&
-                    eligible_drawdown_satisfied &&
-                    audit.reporter_guard_satisfied;
+                audit.guarded_eligible = path_local_relay_basis
+                    ? eligible_drawdown_satisfied &&
+                        audit.reporter_guard_satisfied &&
+                        required_path_coverage_satisfied
+                    : audit.snapshot_nonresponsive &&
+                        audit.score_drop_satisfied &&
+                        eligible_drawdown_satisfied &&
+                        audit.reporter_guard_satisfied;
                 if (audit.guarded_eligible)
                 {
                     output.eligible_candidates.push_back(
@@ -1377,9 +1463,12 @@ bool AdaptiveV2ByzantineSelection::arm_fault_window(
     {
         return false;
     }
-    if (arm.snapshot_evidence_basis ==
-            AdaptiveV2FaultWindowSnapshotEvidenceBasis::
-                exact_post_fault_attempt_start_v1 &&
+    if ((arm.snapshot_evidence_basis ==
+             AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                 exact_post_fault_attempt_start_v1 ||
+         arm.snapshot_evidence_basis ==
+             AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                 exact_post_fault_path_timeout_quorum_v1) &&
         arm.evidence_basis !=
             AdaptiveV2FaultWindowEvidenceBasis::
                 exact_timeout_attempt_id_v1)
@@ -1401,9 +1490,22 @@ bool AdaptiveV2ByzantineSelection::arm_fault_window(
         (arm.evidence_basis !=
              AdaptiveV2FaultWindowEvidenceBasis::
                  exact_timeout_attempt_id_v1 ||
-         arm.snapshot_evidence_basis !=
-             AdaptiveV2FaultWindowSnapshotEvidenceBasis::
-                 exact_post_fault_attempt_start_v1))
+         (arm.snapshot_evidence_basis !=
+              AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                  exact_post_fault_attempt_start_v1 &&
+          arm.snapshot_evidence_basis !=
+              AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                  exact_post_fault_path_timeout_quorum_v1)))
+        return false;
+    if (arm.snapshot_evidence_basis ==
+            AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_path_timeout_quorum_v1 &&
+        (arm.evidence_basis !=
+             AdaptiveV2FaultWindowEvidenceBasis::
+                 exact_timeout_attempt_id_v1 ||
+         arm.cardinality_policy !=
+             AdaptiveV2FaultWindowCardinalityPolicy::
+                 all_guarded_up_to_fault_bound_v1))
         return false;
     const auto tree_count = state.membership.size();
     if (arm.required_tree_ids.size() > tree_count)
@@ -1491,6 +1593,12 @@ AdaptiveV2ByzantineSelection::select_through(
         arm != nullptr && arm->snapshot_evidence_basis ==
             AdaptiveV2FaultWindowSnapshotEvidenceBasis::
                 exact_post_fault_attempt_start_v1;
+    const bool path_local_relay_basis =
+        arm != nullptr && arm->snapshot_evidence_basis ==
+            AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_path_timeout_quorum_v1;
+    const bool post_arm_snapshot_basis =
+        causal_snapshot_basis || path_local_relay_basis;
     try
     {
         std::vector<std::uint32_t> required_tree_ids;
@@ -1518,7 +1626,8 @@ AdaptiveV2ByzantineSelection::select_through(
             required_tree_ids,
             arm != nullptr,
             arm == nullptr,
-            exact_timeout_attempt_basis);
+            exact_timeout_attempt_basis,
+            path_local_relay_basis);
     }
     catch (...)
     {
@@ -1571,7 +1680,7 @@ AdaptiveV2ByzantineSelection::select_through(
     std::vector<std::int64_t> causal_drawdowns;
     try
     {
-        if (causal_snapshot_basis)
+        if (post_arm_snapshot_basis)
         {
             std::vector<AcceptedEvidenceRecord> causal_accepted;
             causal_accepted.reserve(accepted.size());
@@ -1664,7 +1773,7 @@ AdaptiveV2ByzantineSelection::select_through(
                    : AdaptiveV2SelectionStatus::projection_failed,
             evidence_cutoff);
     }
-    if (causal_snapshot_basis)
+    if (post_arm_snapshot_basis)
     {
         state.current_cutoff = evidence_cutoff;
         return state.select_candidates(

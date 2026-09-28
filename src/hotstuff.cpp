@@ -10978,6 +10978,7 @@ namespace hotstuff
             adaptive_v2_response_evidence->bind_deadline_scheduler(
                 [this](
                     const ProposalKey &,
+                    std::uint64_t attempt_start_monotonic_ns,
                     std::uint64_t deadline_duration_us,
                     EvidenceDeadlineCallback deadline,
                     EvidenceDeadlineFailureCallback failure) {
@@ -10985,21 +10986,37 @@ namespace hotstuff
                         1000;
                     const auto maximum_delay = static_cast<std::uint64_t>(
                         AggregationScheduler::Duration::max().count());
-                    if (deadline_duration_us == 0 ||
+                    if (attempt_start_monotonic_ns == 0 ||
+                        deadline_duration_us == 0 ||
                         deadline_duration_us >
                             maximum_delay /
                                 nanoseconds_per_microsecond)
                         return EvidenceDeadlineCancellation{};
-                    const auto delay = AggregationScheduler::Duration(
+                    const auto duration_ns =
                         static_cast<
                             AggregationScheduler::Duration::rep>(
                             deadline_duration_us *
-                            nanoseconds_per_microsecond));
+                            nanoseconds_per_microsecond);
+                    if (attempt_start_monotonic_ns >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            static_cast<std::uint64_t>(duration_ns))
+                        return EvidenceDeadlineCancellation{};
+                    const auto raw_deadline =
+                        attempt_start_monotonic_ns +
+                        static_cast<std::uint64_t>(duration_ns);
+                    const auto raw_now =
+                        adaptive_evidence_monotonic_now_ns();
+                    if (raw_now == 0)
+                        return EvidenceDeadlineCancellation{};
+                    const auto remaining_ns = raw_now >= raw_deadline
+                        ? std::uint64_t{0}
+                        : raw_deadline - raw_now;
+                    const auto delay = AggregationScheduler::Duration(
+                        static_cast<AggregationScheduler::Duration::rep>(
+                            remaining_ns));
                     const auto now =
                         aggregation_scheduler->monotonic_now();
-                    if (delay <=
-                            AggregationScheduler::Duration::zero() ||
-                        now >
+                    if (now >
                             AggregationScheduler::Duration::max() - delay)
                         return EvidenceDeadlineCancellation{};
                     const auto access = exact_runtime_access;
@@ -11062,6 +11079,7 @@ namespace hotstuff
             adaptive_v2_response_evidence->bind_deadline_scheduler(
                 [this](
                     const ProposalKey &,
+                    std::uint64_t attempt_start_monotonic_ns,
                     std::uint64_t deadline_duration_us,
                     EvidenceDeadlineCallback deadline,
                     EvidenceDeadlineFailureCallback failure) {
@@ -11069,17 +11087,34 @@ namespace hotstuff
                         1000;
                     const auto maximum_delay = static_cast<std::uint64_t>(
                         AggregationScheduler::Duration::max().count());
-                    if (deadline_duration_us == 0 ||
+                    if (attempt_start_monotonic_ns == 0 ||
+                        deadline_duration_us == 0 ||
                         deadline_duration_us >
                             maximum_delay / nanoseconds_per_microsecond)
                         return EvidenceDeadlineCancellation{};
-                    const auto delay = AggregationScheduler::Duration(
+                    const auto duration_ns =
                         static_cast<AggregationScheduler::Duration::rep>(
                             deadline_duration_us *
-                            nanoseconds_per_microsecond));
+                            nanoseconds_per_microsecond);
+                    if (attempt_start_monotonic_ns >
+                        std::numeric_limits<std::uint64_t>::max() -
+                            static_cast<std::uint64_t>(duration_ns))
+                        return EvidenceDeadlineCancellation{};
+                    const auto raw_deadline =
+                        attempt_start_monotonic_ns +
+                        static_cast<std::uint64_t>(duration_ns);
+                    const auto raw_now =
+                        adaptive_evidence_monotonic_now_ns();
+                    if (raw_now == 0)
+                        return EvidenceDeadlineCancellation{};
+                    const auto remaining_ns = raw_now >= raw_deadline
+                        ? std::uint64_t{0}
+                        : raw_deadline - raw_now;
+                    const auto delay = AggregationScheduler::Duration(
+                        static_cast<AggregationScheduler::Duration::rep>(
+                            remaining_ns));
                     const auto now = aggregation_scheduler->monotonic_now();
-                    if (delay <= AggregationScheduler::Duration::zero() ||
-                        now > AggregationScheduler::Duration::max() - delay)
+                    if (now > AggregationScheduler::Duration::max() - delay)
                         return EvidenceDeadlineCancellation{};
                     const auto access = exact_runtime_access;
                     return schedule_at_or_after_deadline(

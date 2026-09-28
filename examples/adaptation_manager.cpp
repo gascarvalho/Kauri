@@ -180,6 +180,7 @@ struct CycleAuditContext
     std::uint64_t current_evidence_cutoff{0};
     bool shape_decision_emitted{false};
     bool evidence_snapshot_emitted{false};
+    bool selection_decided_emitted{false};
     bool fault_containment_coverage_ready_emitted{false};
     bool cross_commit_retention_ready_emitted{false};
 };
@@ -420,8 +421,12 @@ public:
                 (schema == 4 && bindings_.domain != "kauri-focused-fault-window-arm-v4") ||
                 clock != "same_host_clock_monotonic_raw" ||
                 basis != "exact_timeout_attempt_id_v1" || obs_schema != 3 ||
-                ((schema == 3 || schema == 4) &&
+                (schema == 3 &&
                  (!snapshot_basis_present || snapshot_basis != "exact_post_fault_attempt_start_v1")) ||
+                (schema == 4 &&
+                 (!snapshot_basis_present ||
+                  (snapshot_basis != "exact_post_fault_attempt_start_v1" &&
+                   snapshot_basis != "exact_post_fault_path_timeout_quorum_v1"))) ||
                 ((schema == 3 || schema == 4) &&
                  snapshot_basis != bindings_.snapshot_evidence_basis) ||
                 (schema == 2 && (snapshot_basis_present ||
@@ -445,8 +450,18 @@ public:
                 if (digest.size() != 64 || !std::all_of(digest.begin(), digest.end(), [](unsigned char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); })) fail("digest is invalid");
             for (std::size_t i = 0; i < trees.size(); ++i)
                 if (trees[i] != (prefault + i) % bindings_.tree_count) fail("required trees are not the canonical prefix");
+            const auto snapshot_evidence_basis =
+                schema == 2
+                    ? hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                          legacy_all_accepted_v1
+                    : snapshot_basis ==
+                              "exact_post_fault_path_timeout_quorum_v1"
+                    ? hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                          exact_post_fault_path_timeout_quorum_v1
+                    : hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                          exact_post_fault_attempt_start_v1;
             result.arm = {epoch_number, hotstuff::uint256_t(parse_hex(epoch_digest, "fault-window epoch digest", 64)), start, prefault, std::move(trees), hotstuff::AdaptiveV2FaultWindowEvidenceBasis::exact_timeout_attempt_id_v1,
-                schema >= 3 ? hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::exact_post_fault_attempt_start_v1 : hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::legacy_all_accepted_v1,
+                snapshot_evidence_basis,
                 schema == 4 ? hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::all_guarded_up_to_fault_bound_v1 : hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::exact_required_v1};
             result.sha256 = fault_window_sha256(text_);
             result.event.schema_version = schema; result.event.kind = kind; result.event.run_id = run;
@@ -2658,7 +2673,9 @@ ManagerOptions parse_options(int argc, char **argv)
               arm.timeout_evidence_basis != "exact_timeout_attempt_id_v1" ||
               arm.required_observation_schema != 3 ||
               arm.clock_domain != "same_host_clock_monotonic_raw" ||
-              arm.snapshot_evidence_basis != "exact_post_fault_attempt_start_v1" ||
+              (arm.snapshot_evidence_basis != "exact_post_fault_attempt_start_v1" &&
+               arm.snapshot_evidence_basis !=
+                   "exact_post_fault_path_timeout_quorum_v1") ||
               arm.selection_cardinality_policy !=
                   "all_guarded_up_to_fault_bound_v1")) ||
             arm.path.empty() || arm.path.front() != '/' || arm.run_id.empty() ||
@@ -5706,6 +5723,65 @@ private:
         audit.evidence_snapshot_emitted = true;
     }
 
+    void emit_path_timeout_quorum_selection_decided(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+    {
+        if (!options_.fault_window_arm.has_value() ||
+            options_.fault_window_arm->snapshot_evidence_basis !=
+                "exact_post_fault_path_timeout_quorum_v1")
+            return;
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1)
+        {
+            throw std::logic_error(
+                "selection decision has no exact cycle audit context");
+        }
+        auto &audit = cycle_audits_.back();
+        if (audit.selection_decided_emitted ||
+            audit.transition_artifact_id != request.transition_artifact_id)
+        {
+            throw std::logic_error(
+                "selection decision was duplicated or rebound");
+        }
+        const auto *const selection = session_.selection_audit();
+        const auto &predecessor = session_.ingress().current_epoch();
+        const auto &definition = bundle.definition();
+        if (selection == nullptr ||
+            selection->status != hotstuff::AdaptiveV2SelectionStatus::selected ||
+            selection->metadata.baseline_cutoff != audit.baseline_evidence_cutoff ||
+            selection->metadata.evidence_cutoff != audit.current_evidence_cutoff ||
+            selection->metadata.evidence_cutoff != definition.evidence_cutoff ||
+            predecessor.epoch_number() != request.predecessor_epoch_number ||
+            predecessor.epoch_digest() != definition.previous_epoch_digest ||
+            definition.evidence_snapshot_id.empty() ||
+            selection->selected_replicas.empty())
+        {
+            throw std::logic_error(
+                "selection decision does not bind the successor bundle");
+        }
+        hotstuff::AdaptiveV2SelectionDecidedStructuredEvent event;
+        event.cycle_ordinal = request_sequence_.cursor();
+        event.predecessor_epoch_number = predecessor.epoch_number();
+        event.predecessor_epoch_digest = predecessor.epoch_digest();
+        event.baseline_cutoff = selection->metadata.baseline_cutoff;
+        event.evidence_cutoff = selection->metadata.evidence_cutoff;
+        event.evidence_snapshot_id = hotstuff::uint256_t(parse_hex(
+            definition.evidence_snapshot_id,
+            "selection decision evidence snapshot id", 64));
+        event.snapshot_evidence_basis =
+            options_.fault_window_arm->snapshot_evidence_basis;
+        event.selection_cardinality_policy =
+            options_.fault_window_arm->selection_cardinality_policy;
+        event.selected_replicas = selection->selected_replicas;
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{std::move(event)});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+            throw std::runtime_error("selection decision audit drain failed");
+        audit.selection_decided_emitted = true;
+    }
+
     void emit_new_session_terminals() noexcept
     {
         try
@@ -6379,6 +6455,7 @@ private:
             cancel_pending_evaluation();
             const auto output_path = transition_bundle_output_path(
                 *request, *bundle, session_);
+            emit_path_timeout_quorum_selection_decided(*request, *bundle);
             write_exclusive_bundle(
                 output_path, bundle->canonical_bytes());
             emit_shape_decision(*request, *bundle);

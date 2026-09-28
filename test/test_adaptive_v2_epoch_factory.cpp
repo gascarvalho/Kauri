@@ -1410,6 +1410,41 @@ TEST_CASE(
         CHECK(result.bundle == nullptr);
     }
 
+    SECTION("path-local timeout quorum requires candidate-local coverage")
+    {
+        fixture.selection.metadata.timeout_audit_basis =
+            AdaptiveV2TimeoutAuditBasis::
+                post_fault_path_timeout_quorum;
+        auto &candidate = fixture.selection.eligible_candidates.front();
+        candidate.snapshot_classification = ResponsivenessClass::responsive;
+        candidate.snapshot_nonresponsive = false;
+        candidate.score_drop_satisfied = false;
+        candidate.guard_drawdown = 0;
+        candidate.path_local_coverage_satisfied = false;
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
+    SECTION("path-local timeout quorum rejects a self-reporting candidate")
+    {
+        fixture.selection.metadata.timeout_audit_basis =
+            AdaptiveV2TimeoutAuditBasis::
+                post_fault_path_timeout_quorum;
+        auto &candidate = fixture.selection.eligible_candidates.front();
+        candidate.snapshot_classification = ResponsivenessClass::responsive;
+        candidate.snapshot_nonresponsive = false;
+        candidate.score_drop_satisfied = false;
+        candidate.guard_drawdown = 0;
+        candidate.path_local_coverage_satisfied = true;
+        candidate.qualifying_reporters.front() = candidate.replica_id;
+        const auto result = fixture.build();
+        CHECK(result.status ==
+              AdaptiveV2EpochFactoryStatus::invalid_selection);
+        CHECK(result.bundle == nullptr);
+    }
+
     SECTION("membership cannot change")
     {
         fixture.placement.membership.back() = 7;

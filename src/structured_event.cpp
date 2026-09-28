@@ -522,6 +522,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 3:
             type = StructuredEventType::adaptive_v2_evidence_snapshot;
             return true;
+        case 16:
+            type = StructuredEventType::adaptive_v2_selection_decided;
+            return true;
         case 4:
             type = StructuredEventType::adaptive_v2_session_terminal;
             return true;
@@ -1257,6 +1260,34 @@ bool valid_evidence_snapshot_payload(
     return true;
 }
 
+bool valid_selection_decided_payload(
+    const AdaptiveV2SelectionDecidedStructuredEvent &event) noexcept
+{
+    if (event.schema_version != 1 ||
+        event.predecessor_epoch_digest == uint256_t{} ||
+        event.baseline_cutoff == 0 ||
+        event.evidence_cutoff <= event.baseline_cutoff ||
+        event.evidence_snapshot_id == uint256_t{} ||
+        event.snapshot_evidence_basis !=
+            "exact_post_fault_path_timeout_quorum_v1" ||
+        event.selection_cardinality_policy !=
+            "all_guarded_up_to_fault_bound_v1" ||
+        event.selected_replicas.empty() ||
+        event.selected_replicas.size() > kMaximumTreePolicyTrees)
+    {
+        return false;
+    }
+    for (std::size_t index = 0; index < event.selected_replicas.size(); ++index)
+    {
+        if (std::find(event.selected_replicas.begin(),
+                      event.selected_replicas.begin() + index,
+                      event.selected_replicas[index]) !=
+            event.selected_replicas.begin() + index)
+            return false;
+    }
+    return true;
+}
+
 bool valid_manager_session_terminal_payload(
     const AdaptiveV2ManagerSessionTerminalStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
@@ -1533,8 +1564,10 @@ bool valid_fault_window_armed_payload(
         event.clock_domain == "same_host_clock_monotonic_raw" &&
         event.required_observation_schema == 3 &&
         event.timeout_evidence_basis == "exact_timeout_attempt_id_v1" &&
-        event.snapshot_evidence_basis ==
-            "exact_post_fault_attempt_start_v1" &&
+        (event.snapshot_evidence_basis ==
+             "exact_post_fault_attempt_start_v1" ||
+         event.snapshot_evidence_basis ==
+             "exact_post_fault_path_timeout_quorum_v1") &&
         event.selection_cardinality_policy ==
             "all_guarded_up_to_fault_bound_v1";
     return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
@@ -2081,6 +2114,10 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 15:
             return valid_fault_aggregate_omitted_payload(
                 std::get<FaultAggregateOmittedStructuredEvent>(payload), config);
+        case 16:
+            return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
+                valid_selection_decided_payload(
+                    std::get<AdaptiveV2SelectionDecidedStructuredEvent>(payload));
         default:
             return false;
     }
@@ -2877,6 +2914,40 @@ void append_evidence_snapshot_payload(
     builder.append("]}");
 }
 
+void append_selection_decided_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2SelectionDecidedStructuredEvent &event)
+{
+    builder.append("{\"schema_version\":");
+    builder.append_integer(event.schema_version);
+    builder.append(",\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"baseline_cutoff\":");
+    builder.append_integer(event.baseline_cutoff);
+    builder.append(",\"evidence_cutoff\":");
+    builder.append_integer(event.evidence_cutoff);
+    builder.append(",\"evidence_snapshot_id\":");
+    builder.append_escaped(event.evidence_snapshot_id.to_hex());
+    builder.append(",\"snapshot_evidence_basis\":");
+    builder.append_escaped(event.snapshot_evidence_basis);
+    builder.append(",\"selection_cardinality_policy\":");
+    builder.append_escaped(event.selection_cardinality_policy);
+    builder.append(",\"selected_replicas\":[");
+    bool first = true;
+    for (const auto replica : event.selected_replicas)
+    {
+        if (!first)
+            builder.append(',');
+        builder.append_integer(replica);
+        first = false;
+    }
+    builder.append("]}");
+}
+
 void append_shape_decision_payload(
     JsonLineBuilder &builder,
     const AdaptiveV2ShapeDecisionStructuredEvent &event)
@@ -3479,6 +3550,11 @@ std::string serialize_audit_event(
             append_fault_aggregate_omitted_payload(
                 builder, std::get<FaultAggregateOmittedStructuredEvent>(event));
             break;
+        case 16:
+            append_selection_decided_payload(
+                builder,
+                std::get<AdaptiveV2SelectionDecidedStructuredEvent>(event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -3975,6 +4051,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2_reporting_terminal";
         case StructuredEventType::adaptive_v2_evidence_snapshot:
             return "adaptive_v2_evidence_snapshot";
+        case StructuredEventType::adaptive_v2_selection_decided:
+            return "adaptive_v2.selection_decided";
         case StructuredEventType::adaptive_v2_session_terminal:
             return "adaptive_v2_session_terminal";
         case StructuredEventType::evidence_observation_accepted:

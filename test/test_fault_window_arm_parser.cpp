@@ -211,6 +211,14 @@ FaultWindowArmBindings v4_bindings()
     return result;
 }
 
+FaultWindowArmBindings v4_path_timeout_quorum_bindings()
+{
+    auto result = v4_bindings();
+    result.snapshot_evidence_basis =
+        "exact_post_fault_path_timeout_quorum_v1";
+    return result;
+}
+
 std::string canonical_v4_arm()
 {
     auto result = canonical_v3_arm();
@@ -222,6 +230,13 @@ std::string canonical_v4_arm()
         "\"schema_version\":4,\"selection_cardinality_policy\":"
         "\"all_guarded_up_to_fault_bound_v1\",");
     return result;
+}
+
+std::string canonical_v4_path_timeout_quorum_arm()
+{
+    return replace_once(
+        canonical_v4_arm(), "exact_post_fault_attempt_start_v1",
+        "exact_post_fault_path_timeout_quorum_v1");
 }
 
 FaultWindowArmBindings n31_bindings()
@@ -406,6 +421,23 @@ TEST_CASE("fault-window v4 parser binds full guarded cohort selection",
     contaminated.selection_cardinality_policy =
         "all_guarded_up_to_fault_bound_v1";
     require_invalid(canonical_v3_arm(), contaminated);
+}
+
+TEST_CASE("fault-window v4 parser binds the path timeout quorum snapshot basis",
+          "[adaptive-v2][fault-window-arm][v4][path-timeout-quorum][parser]")
+{
+    const auto text = canonical_v4_path_timeout_quorum_arm();
+    const auto document = FaultWindowArmJsonParser(
+        text, v4_path_timeout_quorum_bindings()).parse();
+    CHECK(document.arm.snapshot_evidence_basis ==
+          hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+              exact_post_fault_path_timeout_quorum_v1);
+    CHECK(document.event.snapshot_evidence_basis ==
+          "exact_post_fault_path_timeout_quorum_v1");
+    require_invalid(canonical_v4_arm(), v4_path_timeout_quorum_bindings());
+    require_invalid(replace_once(
+        text, "exact_post_fault_path_timeout_quorum_v1", "unknown"),
+        v4_path_timeout_quorum_bindings());
 }
 
 TEST_CASE("fault-window v1 parser rejects newer binding contamination",

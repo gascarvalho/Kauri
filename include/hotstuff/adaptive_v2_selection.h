@@ -30,6 +30,10 @@ enum class AdaptiveV2FaultWindowSnapshotEvidenceBasis : std::uint8_t
 {
     legacy_all_accepted_v1 = 1,
     exact_post_fault_attempt_start_v1,
+    // A path-local relay fault leaves the normal post-arm responsiveness
+    // snapshot intact for successor roots.  Only candidate containment uses
+    // exact aggregate-relay timeout witnesses on the armed tree paths.
+    exact_post_fault_path_timeout_quorum_v1,
 };
 
 /** Arm-bound meaning of required_nonresponsive. */
@@ -155,6 +159,7 @@ enum class AdaptiveV2TimeoutAuditBasis : std::uint8_t
 {
     unfiltered_post_baseline = 1,
     post_fault_proposal_filtered,
+    post_fault_path_timeout_quorum,
 };
 
 struct AdaptiveV2SelectionMetadata
@@ -209,6 +214,8 @@ struct AdaptiveV2CandidateAudit
     bool snapshot_nonresponsive{false};
     bool score_drop_satisfied{false};
     bool reporter_guard_satisfied{false};
+    /** Every arm-required tree has this candidate's qualifying path witness. */
+    bool path_local_coverage_satisfied{false};
     bool guarded_eligible{false};
 };
 

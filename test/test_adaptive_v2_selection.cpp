@@ -11,6 +11,7 @@
 
 #include "catch.hpp"
 #include "hotstuff/adaptation.h"
+#include "hotstuff/adaptive_v2_epoch_factory.h"
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/configuration.h"
 #include "hotstuff/epoch_store.h"
@@ -21,6 +22,7 @@ namespace
 
 using hotstuff::AdaptationEpochId;
 using hotstuff::AdaptiveV2ByzantineSelection;
+using hotstuff::AdaptiveV2EpochFactoryStatus;
 using hotstuff::AdaptiveV2CandidateAudit;
 using hotstuff::AdaptiveV2ReplicaScore;
 using hotstuff::AdaptiveV2SelectionConfig;
@@ -1808,6 +1810,276 @@ TEST_CASE(
           AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
     CHECK(matching_late.selected_replicas.empty());
     CHECK(matching_late.eligible_candidates.empty());
+}
+
+TEST_CASE(
+    "path-local relay quorum contains an actor despite unrelated healthy paths",
+    "[adaptive-v2][selection][fault-window-arm][path-local][n7][relay]")
+{
+    constexpr ReplicaID kRelay = 1;
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, n7_three_reporter_omission_trees());
+
+    // The new arm is v3-only, including its baseline.  Every nonselected
+    // replica has ordinary post-arm response evidence; relay 1 additionally
+    // has successful direct votes on unrelated paths.  Those direct votes
+    // must not erase exact aggregate-relay fault evidence.
+    for (const auto member : fixture.members)
+        fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                   kEvidenceStartNs - 1'000U);
+
+    auto config = selection_config(6, 2, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    config.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 4;
+    arm.required_tree_ids = {4, 5, 6};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_path_timeout_quorum_v1;
+    arm.cardinality_policy = config.cardinality_policy;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    for (const auto member : fixture.members)
+        fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                   kEvidenceStartNs + 1'000U);
+    for (std::uint32_t attempt = 0; attempt < 16; ++attempt)
+        fixture.on_time_v3_in_tree(kRelay, 2,
+                                   kEvidenceStartNs + 2'000U + attempt);
+
+    const auto first = fixture.aggregate_timeout_in_tree(
+        4, kRelay, 4, kEvidenceStartNs + 2'100'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        4, kRelay, 4, kEvidenceStartNs + 2'250'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        5, kRelay, 5, kEvidenceStartNs + 2'400'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        5, kRelay, 5, kEvidenceStartNs + 2'550'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        6, kRelay, 6, kEvidenceStartNs + 2'700'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        6, kRelay, 6, kEvidenceStartNs + 2'850'000U, 100);
+    // The relay remains globally responsive after the witnessed path faults.
+    fixture.on_time_v3_in_tree(kRelay, 2, kEvidenceStartNs + 2'900'000U);
+
+    const auto selected = selector.select_through(fixture.ledger->high_watermark());
+    REQUIRE(selected.status == AdaptiveV2SelectionStatus::selected);
+    REQUIRE(selected.selected_replicas == std::vector<ReplicaID>{kRelay});
+    REQUIRE(selected.eligible_candidates.size() == 1);
+    const auto &audit = selected.eligible_candidates.front();
+    CHECK_FALSE(audit.snapshot_nonresponsive);
+    CHECK(audit.qualifying_reporters == std::vector<ReplicaID>{4, 5, 6});
+    CHECK(audit.total_uncompensated_timeouts == 6);
+    CHECK(selected.eligible_roots.size() == 5);
+    CHECK(selected.metadata.timeout_audit_basis ==
+          AdaptiveV2TimeoutAuditBasis::post_fault_path_timeout_quorum);
+    CHECK(audit.path_local_coverage_satisfied);
+    CHECK(audit.reporter_guard_satisfied);
+    CHECK(audit.guarded_eligible);
+    CHECK(audit.qualifying_reporters.size() >=
+          selected.metadata.required_qualifying_reporters);
+    CHECK(audit.total_uncompensated_timeouts >=
+          audit.qualifying_reporters.size() *
+              selected.metadata.minimum_timeouts_per_reporter);
+    CHECK(static_cast<std::int64_t>(audit.current_score) -
+              static_cast<std::int64_t>(audit.baseline_score) ==
+          audit.baseline_score_delta);
+    CHECK(selected.metadata.replica_count == 7);
+    CHECK(selected.metadata.fault_threshold == 2);
+    CHECK(selected.metadata.quorum == 5);
+    CHECK(selected.metadata.baseline_cutoff < selected.metadata.evidence_cutoff);
+
+    // Feed the actual selector result, rather than a hand-built audit, into
+    // the epoch factory. The containment bundle must preserve Q=5 and make
+    // the selected relay a wait-exempt leaf in every successor tree.
+    const auto *const current = fixture.epochs.find_epoch(
+        fixture.epoch.epoch_number);
+    REQUIRE(current != nullptr);
+    hotstuff::TreePlacementInput placement{
+        fixture.members,
+        hotstuff::TreeShape{2, 2, 5},
+        0xA2'5EED,
+        "adaptive-v2-path-local-factory-test"};
+    hotstuff::PrivKeySecp256k1 issuer_key;
+    issuer_key.from_hex(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    const hotstuff::EpochChangeBundleLimits bundle_limits{
+        64 * 1024,
+        4096,
+        hotstuff::EpochWireLimits{32 * 1024, 8, 8, 128, 2}};
+    hotstuff::AdaptiveV2TransitionPolicy transition;
+    transition.intent = hotstuff::TreePolicyKind::fault_containment;
+    transition.containment_baseline_roots = {
+        hotstuff::BaselineRoot{0, 0}, hotstuff::BaselineRoot{1, 1},
+        hotstuff::BaselineRoot{2, 2}, hotstuff::BaselineRoot{3, 3},
+        hotstuff::BaselineRoot{4, 4}};
+    const auto built = hotstuff::build_adaptive_v2_successor_bundle(
+        *current, selected, transition, placement, 5, 17, issuer_key,
+        bundle_limits);
+    REQUIRE(built.status == AdaptiveV2EpochFactoryStatus::success);
+    REQUIRE(built.bundle != nullptr);
+    CHECK(built.bundle->definition().trees.size() == 5);
+    for (const auto &tree : built.bundle->definition().trees)
+    {
+        CHECK(std::find(tree.wait_exempt_leaves.begin(),
+                        tree.wait_exempt_leaves.end(), kRelay) !=
+              tree.wait_exempt_leaves.end());
+        const auto position = std::find(tree.members_breadth_first.begin(),
+                                        tree.members_breadth_first.end(),
+                                        kRelay);
+        REQUIRE(position != tree.members_breadth_first.end());
+        CHECK(static_cast<std::size_t>(std::distance(
+                  tree.members_breadth_first.begin(), position)) >=
+              ((tree.members_breadth_first.size() - 2) / tree.fanout) + 1);
+    }
+
+    // Exact late compensation removes one reporter's second witness and
+    // therefore invalidates the path-local quorum.
+    fixture.late_v3(first, kEvidenceStartNs + 3'100'000U);
+    const auto compensated = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(compensated.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(compensated.selected_replicas.empty());
+}
+
+TEST_CASE(
+    "path-local relay quorum rejects weak and colluding reporter sets",
+    "[adaptive-v2][selection][fault-window-arm][path-local][n7][negative]")
+{
+    constexpr ReplicaID kRelay = 1;
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    const auto run = [&](const std::vector<std::pair<ReplicaID, std::uint32_t>> &witnesses) {
+        Fixture fixture(256, n7_three_reporter_omission_trees());
+        for (const auto member : fixture.members)
+            fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                       kEvidenceStartNs - 1'000U);
+        auto config = selection_config(6, 2, 128);
+        config.required_nonresponsive = 1;
+        config.fault_window_arm_required = true;
+        config.cardinality_policy =
+            hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+                all_guarded_up_to_fault_bound_v1;
+        AdaptiveV2ByzantineSelection selector(
+            *fixture.ledger, fixture.members, fixture.epoch, config);
+        REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+                AdaptiveV2SelectionStatus::baseline_frozen);
+        AdaptiveV2FaultWindowArm arm;
+        arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+        arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+        arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+        arm.prefault_tree_id = 4;
+        arm.required_tree_ids = {4, 5, 6};
+        arm.evidence_basis =
+            hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+                exact_timeout_attempt_id_v1;
+        arm.snapshot_evidence_basis =
+            hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+                exact_post_fault_path_timeout_quorum_v1;
+        arm.cardinality_policy = config.cardinality_policy;
+        REQUIRE(selector.arm_fault_window(arm));
+        for (const auto member : fixture.members)
+            fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                       kEvidenceStartNs + 1'000U);
+        for (const auto &[reporter, tree] : witnesses)
+            (void)fixture.aggregate_timeout_in_tree(
+                reporter, kRelay, tree,
+                kEvidenceStartNs + 2'100'000U + fixture.attempt_number,
+                100);
+        return selector.select_through(fixture.ledger->high_watermark());
+    };
+
+    SECTION("one weak reporter cannot reach its two-witness threshold")
+    {
+        const auto result = run({{4, 4}, {4, 4}, {5, 5}, {5, 5}, {6, 6}});
+        CHECK(result.status ==
+              AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+        CHECK(result.selected_replicas.empty());
+    }
+
+    SECTION("six reports from only two identities cannot form f plus one quorum")
+    {
+        const auto result = run({{4, 4}, {4, 4}, {4, 4},
+                                 {5, 5}, {5, 5}, {5, 5}});
+        CHECK(result.status ==
+              AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+        CHECK(result.selected_replicas.empty());
+    }
+}
+
+TEST_CASE(
+    "path-local relay quorum does not borrow another target's tree coverage",
+    "[adaptive-v2][selection][fault-window-arm][path-local][n7][negative]")
+{
+    constexpr ReplicaID kRelay = 1;
+    constexpr ReplicaID kOtherTarget = 4;
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, n7_three_reporter_omission_trees());
+    for (const auto member : fixture.members)
+        fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                   kEvidenceStartNs - 1'000U);
+
+    auto config = selection_config(6, 2, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    config.cardinality_policy =
+        hotstuff::AdaptiveV2FaultWindowCardinalityPolicy::
+            all_guarded_up_to_fault_bound_v1;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    arm.prefault_tree_id = 3;
+    arm.required_tree_ids = {3, 4, 5, 6};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            exact_post_fault_path_timeout_quorum_v1;
+    arm.cardinality_policy = config.cardinality_policy;
+    REQUIRE(selector.arm_fault_window(arm));
+    for (const auto member : fixture.members)
+        fixture.on_time_v3_in_tree(member, (member + 1U) % 7U,
+                                   kEvidenceStartNs + 1'000U);
+
+    // Relay 1 has f+1 qualifying aggregate parents in T4--T6, but no T3
+    // witness. Target 4 supplies a valid T3 relay timeout, making the global
+    // coverage audit ready; it must not make relay 1 eligible.
+    for (const auto [reporter, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {4, 4}, {4, 4}, {5, 5}, {5, 5}, {6, 6}, {6, 6},
+             {3, 3}, {3, 3}})
+    {
+        const auto target = tree == 3 ? kOtherTarget : kRelay;
+        (void)fixture.aggregate_timeout_in_tree(
+            reporter, target, tree,
+            kEvidenceStartNs + 2'100'000U + fixture.attempt_number, 100);
+    }
+
+    const auto result = selector.select_through(fixture.ledger->high_watermark());
+    CHECK(result.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(result.selected_replicas.empty());
+    CHECK(result.eligible_candidates.empty());
 }
 
 TEST_CASE(

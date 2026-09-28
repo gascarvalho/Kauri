@@ -77,6 +77,7 @@ bool exact_selection_metadata(
     {
     case AdaptiveV2TimeoutAuditBasis::unfiltered_post_baseline:
     case AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered:
+    case AdaptiveV2TimeoutAuditBasis::post_fault_path_timeout_quorum:
         break;
     default:
         return false;
@@ -128,6 +129,7 @@ bool valid_candidate_timeout_audit(
                        1U <=
                    candidate.total_uncompensated_timeouts;
     case AdaptiveV2TimeoutAuditBasis::post_fault_proposal_filtered:
+    case AdaptiveV2TimeoutAuditBasis::post_fault_path_timeout_quorum:
     {
         if (metadata.minimum_timeouts_per_reporter == 0 ||
             candidate.qualifying_reporters.size() >
@@ -158,22 +160,27 @@ bool valid_guarded_candidates(
         return false;
 
     std::set<ReplicaID> candidate_ids;
+    const bool path_local_timeout_quorum =
+        selection.metadata.timeout_audit_basis ==
+        AdaptiveV2TimeoutAuditBasis::post_fault_path_timeout_quorum;
     for (const auto &candidate : selection.eligible_candidates)
     {
         if (membership.count(candidate.replica_id) == 0 ||
             !candidate_ids.insert(candidate.replica_id).second ||
-            candidate.snapshot_classification !=
-                ResponsivenessClass::nonresponsive ||
-            !candidate.snapshot_nonresponsive ||
-            !candidate.score_drop_satisfied ||
             !candidate.reporter_guard_satisfied ||
             !candidate.guarded_eligible ||
             candidate.qualifying_reporters.size() <
                 selection.metadata.required_qualifying_reporters ||
-            candidate.guard_drawdown >
-                -static_cast<std::int64_t>(
-                    selection.metadata.minimum_score_drop) ||
-            candidate.guard_drawdown > 0 ||
+            (path_local_timeout_quorum
+                 ? !candidate.path_local_coverage_satisfied
+                 : (candidate.snapshot_classification !=
+                        ResponsivenessClass::nonresponsive ||
+                    !candidate.snapshot_nonresponsive ||
+                    !candidate.score_drop_satisfied ||
+                    candidate.guard_drawdown >
+                        -static_cast<std::int64_t>(
+                            selection.metadata.minimum_score_drop) ||
+                    candidate.guard_drawdown > 0)) ||
             !valid_candidate_timeout_audit(
                 candidate, selection.metadata) ||
             static_cast<std::int64_t>(candidate.current_score) -
@@ -188,7 +195,9 @@ bool valid_guarded_candidates(
             return false;
         for (const auto reporter : reporters)
         {
-            if (membership.count(reporter) == 0)
+            if (membership.count(reporter) == 0 ||
+                (path_local_timeout_quorum &&
+                 reporter == candidate.replica_id))
                 return false;
         }
     }
@@ -305,6 +314,9 @@ AdaptiveV2EpochFactoryStatus validate_selection(
     std::vector<ReplicaID> &canonical_wait_exempt,
     std::vector<ReplicaID> &snapshot_roots)
 {
+    const bool path_local_timeout_quorum =
+        selection.metadata.timeout_audit_basis ==
+        AdaptiveV2TimeoutAuditBasis::post_fault_path_timeout_quorum;
     if (selection.status != AdaptiveV2SelectionStatus::selected ||
         selection.snapshot == nullptr ||
         !exact_selection_metadata(selection, quorum))
@@ -418,6 +430,7 @@ AdaptiveV2EpochFactoryStatus validate_selection(
             if (selection.constraint_basis ==
                     AdaptiveV2SelectionConstraintBasis::
                         guarded_evidence &&
+                !path_local_timeout_quorum &&
                 (entry.classification !=
                      ResponsivenessClass::nonresponsive ||
                  entry.eligible))
@@ -437,7 +450,8 @@ AdaptiveV2EpochFactoryStatus validate_selection(
     }
 
     if (selection.constraint_basis ==
-        AdaptiveV2SelectionConstraintBasis::guarded_evidence)
+            AdaptiveV2SelectionConstraintBasis::guarded_evidence &&
+        !path_local_timeout_quorum)
     {
         for (const auto selected_replica : canonical_wait_exempt)
         {

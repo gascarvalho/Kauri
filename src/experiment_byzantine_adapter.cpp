@@ -72,6 +72,14 @@ constexpr const char *kTieredOmissionModeV2 =
     "tiered_persistent_responsive_omission_v2";
 constexpr const char *kN7StaticAggregateGateKind =
     "kauri-n7-static-aggregate-omission-gate-v1";
+constexpr const char *kN7ThreeReporterProfileV2 =
+    "n7-three-reporter-relay-omission-v2";
+constexpr const char *kN7PathTimeoutQuorumProfileV3 =
+    "n7-path-local-timeout-quorum-v3";
+constexpr const char *kExactPostFaultAttemptStartBasis =
+    "exact_post_fault_attempt_start_v1";
+constexpr const char *kExactPostFaultPathTimeoutQuorumBasis =
+    "exact_post_fault_path_timeout_quorum_v1";
 constexpr std::size_t kMaximumActivationGateBytes = 4096;
 
 bool valid_sha256_hex(const std::string &value) noexcept
@@ -395,24 +403,28 @@ struct ExperimentByzantineAdapter::State
             [](const ConfigurationId &left, const ConfigurationId &right)
             { return left.tree_id == right.tree_id; }) != omission_configurations.end())
             throw std::invalid_argument("additional omission configurations must be distinct");
+        const bool three_by_two_limits =
+            options.maximum_omission_contexts_per_configuration == 2 &&
+            options.maximum_omission_contexts == 6;
+        const bool three_by_three_limits =
+            options.maximum_omission_contexts_per_configuration == 3 &&
+            options.maximum_omission_contexts == 9;
         if (options.maximum_omission_contexts_per_configuration != 0 &&
             (!options.omit_outbound_aggregate ||
              omission_configurations.size() != 2 ||
-             options.maximum_omission_contexts_per_configuration != 2 ||
-             options.maximum_omission_contexts != 6))
+             (!three_by_two_limits && !three_by_three_limits)))
             throw std::invalid_argument(
                 "per-configuration omission requires exactly three "
-                "configurations, two contexts each, and a global limit of six");
-        const bool n7_three_by_two_static =
+                "configurations with a supported static quota");
+        const bool n7_static =
             options.omit_outbound_aggregate &&
             options.configuration.epoch_number == 0 &&
             options.configuration.tree_id == 4 &&
             omission_configurations.size() == 2 &&
             omission_configurations[0].tree_id == 5 &&
             omission_configurations[1].tree_id == 6 &&
-            options.maximum_omission_contexts == 6 &&
-            options.maximum_omission_contexts_per_configuration == 2;
-        if (n7_three_by_two_static && !options.activation_gate.has_value())
+            (three_by_two_limits || three_by_three_limits);
+        if (n7_static && !options.activation_gate.has_value())
             throw std::invalid_argument(
                 "N7 three-by-two static aggregate omission requires an activation gate");
         if (options.activation_gate.has_value())
@@ -420,8 +432,7 @@ struct ExperimentByzantineAdapter::State
             const auto &gate = *options.activation_gate;
             if (!options.omit_outbound_aggregate ||
                 options.rotating_omission.has_value() ||
-                options.maximum_omission_contexts != 6 ||
-                options.maximum_omission_contexts_per_configuration != 2 ||
+                (!three_by_two_limits && !three_by_three_limits) ||
                 gate.local_replica != 1 || gate.path.empty() ||
                 gate.manager_event_path.empty() || gate.run_id.empty() ||
                 gate.manager_source_instance.empty() ||
@@ -429,7 +440,7 @@ struct ExperimentByzantineAdapter::State
                 !valid_sha256_hex(gate.tree_file_sha256) ||
                 !valid_sha256_hex(gate.launch_argv_sha256))
                 throw std::invalid_argument(
-                    "activation gate is limited to the N7 three-by-two static aggregate omission profile");
+                    "activation gate is limited to a supported N7 static aggregate omission profile");
         }
         if (options.rotating_omission.has_value())
         {
@@ -882,10 +893,25 @@ struct ExperimentByzantineAdapter::State
             }
             const auto payload = line.substr(monotonic_end +
                 payload_prefix.size());
-            const auto canonical_arm_prefix = std::string{
-                "{\"schema_version\":4,\"kind\":\"kauri-focused-fault-window-arm-v4\",\"run_id\":\""} +
-                gate.run_id + "\",\"profile_id\":\"n7-three-reporter-relay-omission-v2\",\"profile_sha256\":\"" +
-                gate.profile_sha256 + "\",\"topology_proof_sha256\":\"";
+            const auto arm_contract = [&]()
+                -> std::optional<std::pair<std::string, const char *>> {
+                const auto prefix_for = [&gate](const char *profile_id) {
+                    return std::string{
+                        "{\"schema_version\":4,\"kind\":\"kauri-focused-fault-window-arm-v4\",\"run_id\":\""} +
+                        gate.run_id + "\",\"profile_id\":\"" + profile_id +
+                        "\",\"profile_sha256\":\"" + gate.profile_sha256 +
+                        "\",\"topology_proof_sha256\":\"";
+                };
+                const auto v2 = prefix_for(kN7ThreeReporterProfileV2);
+                if (payload.rfind(v2, 0) == 0)
+                    return std::make_pair(
+                        std::move(v2), kExactPostFaultAttemptStartBasis);
+                const auto v3 = prefix_for(kN7PathTimeoutQuorumProfileV3);
+                if (payload.rfind(v3, 0) == 0)
+                    return std::make_pair(
+                        std::move(v3), kExactPostFaultPathTimeoutQuorumBasis);
+                return std::nullopt;
+            }();
             const auto after_topology = std::string{
                 "\",\"request_sha256\":\""};
             const auto after_request = std::string{
@@ -895,11 +921,24 @@ struct ExperimentByzantineAdapter::State
             const auto after_receipt = std::string{
                 "\",\"evidence_start_monotonic_ns\":"};
             const auto after_evidence = std::string{
-                ",\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\""};
+                ",\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\""} +
+                (arm_contract.has_value() ? arm_contract->second : "") +
+                "\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\"";
             const auto canonical_payload = [&]() {
-                if (payload.rfind(canonical_arm_prefix, 0) != 0)
+                if (!arm_contract.has_value())
                     return false;
-                auto position = canonical_arm_prefix.size();
+                const bool quota_matches_profile =
+                    (arm_contract->second ==
+                         kExactPostFaultAttemptStartBasis &&
+                     options.maximum_omission_contexts_per_configuration == 2 &&
+                     options.maximum_omission_contexts == 6) ||
+                    (arm_contract->second ==
+                         kExactPostFaultPathTimeoutQuorumBasis &&
+                     options.maximum_omission_contexts_per_configuration == 3 &&
+                     options.maximum_omission_contexts == 9);
+                if (!quota_matches_profile)
+                    return false;
+                auto position = arm_contract->first.size();
                 const auto consume_sha256 = [&payload, &position]() {
                     if (position + 64 > payload.size() ||
                         !valid_sha256_hex(payload.substr(position, 64)))

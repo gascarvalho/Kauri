@@ -596,6 +596,14 @@ bool AdaptiveV2ManagerSession::arm_fault_window(
         state.controller->arm_fault_window(std::move(arm));
 }
 
+const AdaptiveV2SelectionResult *
+AdaptiveV2ManagerSession::selection_audit() const noexcept
+{
+    return state_->controller == nullptr
+               ? nullptr
+               : state_->controller->selection_audit();
+}
+
 const AdaptiveV2EpochChangeBundle *
 AdaptiveV2ManagerSession::successor_bundle() const noexcept
 {

@@ -298,6 +298,25 @@ struct AdaptiveV2EvidenceSnapshotStructuredEvent
     std::vector<ReplicaID> eligible_ranking;
 };
 
+/**
+ * Manager-only audit of the new path-timeout-quorum containment decision.
+ * This record grants no consensus authority and is emitted before the
+ * already-constructed successor bundle is published or delivered.
+ */
+struct AdaptiveV2SelectionDecidedStructuredEvent
+{
+    std::uint32_t schema_version{1};
+    std::uint64_t cycle_ordinal{0};
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint64_t baseline_cutoff{0};
+    std::uint64_t evidence_cutoff{0};
+    uint256_t evidence_snapshot_id;
+    std::string snapshot_evidence_basis;
+    std::string selection_cardinality_policy;
+    std::vector<ReplicaID> selected_replicas;
+};
+
 /** Canonical manager-owned audit for one pure shape-v1 decision. */
 struct AdaptiveV2ShapeDecisionStructuredEvent
 {
@@ -529,7 +548,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV3ReadinessStructuredEvent,
     AdaptiveV3CommandTerminalStructuredEvent,
     FaultInjectionArmedStructuredEvent,
-    FaultAggregateOmittedStructuredEvent>;
+    FaultAggregateOmittedStructuredEvent,
+    AdaptiveV2SelectionDecidedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -626,6 +646,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v2_convergence_failure,
     adaptive_v2_reporting_terminal,
     adaptive_v2_evidence_snapshot,
+    adaptive_v2_selection_decided,
     adaptive_v2_session_terminal,
     evidence_observation_accepted,
     adaptive_v2_shape_decision,

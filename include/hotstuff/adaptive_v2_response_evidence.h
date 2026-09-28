@@ -54,6 +54,7 @@ struct AdaptiveV2ResponseEvidenceDiagnostics
     std::uint64_t deadline_delivery_failures{0};
     std::uint64_t deadline_cancellations{0};
     std::uint64_t deadline_cancellation_failures{0};
+    std::uint64_t deadline_early_wake_reschedules{0};
     std::uint64_t response_facts{0};
     std::uint64_t idempotent_duplicate_responses{0};
     std::uint64_t timeout_facts{0};
@@ -88,6 +89,7 @@ using EvidenceDeadlineCancellation = std::function<void()>;
 using EvidenceDeadlineScheduler =
     std::function<EvidenceDeadlineCancellation(
         const ProposalKey &,
+        std::uint64_t,
         std::uint64_t,
         EvidenceDeadlineCallback,
         EvidenceDeadlineFailureCallback)>;
@@ -244,6 +246,7 @@ public:
 private:
     bool schedule_deadline(
         const ProposalKey &proposal,
+        std::uint64_t attempt_start_monotonic_ns,
         std::uint64_t deadline_duration_us) noexcept;
     void dispatch_deadline(
         const ProposalKey &proposal,

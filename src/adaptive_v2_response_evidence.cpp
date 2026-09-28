@@ -49,6 +49,9 @@ struct BoundAttempt
 struct BoundDeadline
 {
     std::uint64_t generation{0};
+    std::uint64_t attempt_start_monotonic_ns{0};
+    std::uint64_t absolute_deadline_monotonic_ns{0};
+    std::uint64_t early_wake_reschedules{0};
     std::uint64_t reporter_local_commit_monotonic_ns{0};
     bool consensus_context_closed{false};
     bool fired{false};
@@ -465,6 +468,7 @@ struct AdaptiveV2ResponseEvidenceBridge::State
     std::uint64_t deadline_delivery_failures{0};
     std::uint64_t deadline_cancellations{0};
     std::uint64_t deadline_cancellation_failures{0};
+    std::uint64_t deadline_early_wake_reschedules{0};
     std::uint64_t response_facts{0};
     std::uint64_t idempotent_duplicate_responses{0};
     std::uint64_t timeout_facts{0};
@@ -730,7 +734,8 @@ bool AdaptiveV2ResponseEvidenceBridge::arm_with_deadline(
             proposal, EvidenceDeadlineResult::failed);
         return false;
     }
-    if (schedule_deadline(proposal, deadline_duration_us))
+    if (schedule_deadline(
+            proposal, start_monotonic_ns, deadline_duration_us))
         return true;
     static_cast<void>(retire(proposal));
     return false;
@@ -738,8 +743,34 @@ bool AdaptiveV2ResponseEvidenceBridge::arm_with_deadline(
 
 bool AdaptiveV2ResponseEvidenceBridge::schedule_deadline(
     const ProposalKey &proposal,
+    std::uint64_t attempt_start_monotonic_ns,
     std::uint64_t deadline_duration_us) noexcept
 {
+    constexpr std::uint64_t nanoseconds_per_microsecond = 1'000;
+    if (attempt_start_monotonic_ns == 0 ||
+        deadline_duration_us >
+            std::numeric_limits<std::uint64_t>::max() /
+                nanoseconds_per_microsecond)
+    {
+        increment(state_->deadline_schedule_failures);
+        state_->healthy = false;
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    const auto deadline_duration_ns =
+        deadline_duration_us * nanoseconds_per_microsecond;
+    if (attempt_start_monotonic_ns >
+        std::numeric_limits<std::uint64_t>::max() - deadline_duration_ns)
+    {
+        increment(state_->deadline_schedule_failures);
+        state_->healthy = false;
+        notify_deadline_result(
+            proposal, EvidenceDeadlineResult::failed);
+        return false;
+    }
+    const auto absolute_deadline_monotonic_ns =
+        attempt_start_monotonic_ns + deadline_duration_ns;
     if (state_->stopped || !state_->deadline_scheduler ||
         deadline_duration_us == 0 ||
         state_->deadlines.size() >= state_->limits.maximum_handles ||
@@ -761,7 +792,9 @@ bool AdaptiveV2ResponseEvidenceBridge::schedule_deadline(
     {
         const auto inserted = state_->deadlines.emplace(
             proposal,
-            BoundDeadline{generation});
+            BoundDeadline{generation,
+                          attempt_start_monotonic_ns,
+                          absolute_deadline_monotonic_ns});
         if (!inserted.second)
         {
             increment(state_->deadline_schedule_failures);
@@ -777,6 +810,7 @@ bool AdaptiveV2ResponseEvidenceBridge::schedule_deadline(
             state_->callback_lifetime;
         auto cancellation = state_->deadline_scheduler(
             proposal,
+            attempt_start_monotonic_ns,
             deadline_duration_us,
             [this, lifetime, proposal, generation](
                 std::uint64_t now_ns) {
@@ -844,19 +878,79 @@ void AdaptiveV2ResponseEvidenceBridge::dispatch_deadline(
         found->second.generation != generation)
         return;
 
-    found->second.fired = true;
-    found->second.dispatching = true;
-    found->second.cancellation = {};
-    increment(state_->fired_deadlines);
-
     if (timeout_monotonic_ns == 0)
     {
         increment(state_->deadline_callback_failures);
         state_->healthy = false;
-        found->second.dispatching = false;
         fail_deadline_delivery(proposal, generation);
         return;
     }
+
+    if (timeout_monotonic_ns <
+        found->second.absolute_deadline_monotonic_ns)
+    {
+        constexpr std::uint64_t maximum_early_wake_reschedules = 8;
+        if (found->second.early_wake_reschedules ==
+                maximum_early_wake_reschedules ||
+            !state_->deadline_scheduler)
+        {
+            increment(state_->deadline_callback_failures);
+            state_->healthy = false;
+            fail_deadline_delivery(proposal, generation);
+            return;
+        }
+
+        ++found->second.early_wake_reschedules;
+        const auto attempt_start =
+            found->second.attempt_start_monotonic_ns;
+        const auto deadline_duration_us =
+            (found->second.absolute_deadline_monotonic_ns - attempt_start) /
+            1'000;
+        const std::weak_ptr<const bool> lifetime =
+            state_->callback_lifetime;
+        try
+        {
+            auto cancellation = state_->deadline_scheduler(
+                proposal,
+                attempt_start,
+                deadline_duration_us,
+                [this, lifetime, proposal, generation](
+                    std::uint64_t now_ns) {
+                    if (!lifetime.expired())
+                        dispatch_deadline(proposal, generation, now_ns);
+                },
+                [this, lifetime, proposal, generation] {
+                    if (!lifetime.expired())
+                        fail_deadline(proposal, generation);
+                });
+            auto active = state_->deadlines.find(proposal);
+            if (!cancellation || active == state_->deadlines.end() ||
+                active->second.generation != generation)
+            {
+                if (cancellation)
+                    cancellation();
+                if (active != state_->deadlines.end() &&
+                    active->second.generation == generation)
+                    fail_deadline_delivery(proposal, generation);
+                return;
+            }
+            active->second.cancellation = std::move(cancellation);
+            increment(state_->deadline_early_wake_reschedules);
+            return;
+        }
+        catch (...)
+        {
+            increment(state_->deadline_callback_failures);
+            state_->healthy = false;
+            fail_deadline_delivery(proposal, generation);
+            return;
+        }
+    }
+
+    found->second.fired = true;
+    found->second.dispatching = true;
+    found->second.cancellation = {};
+    increment(state_->fired_deadlines);
 
     std::set<ReplicaID> unanswered_required_children;
     try
@@ -1752,6 +1846,8 @@ AdaptiveV2ResponseEvidenceBridge::diagnostics() const noexcept
         state_->deadline_cancellations;
     result.deadline_cancellation_failures =
         state_->deadline_cancellation_failures;
+    result.deadline_early_wake_reschedules =
+        state_->deadline_early_wake_reschedules;
     result.response_facts = state_->response_facts;
     result.idempotent_duplicate_responses =
         state_->idempotent_duplicate_responses;

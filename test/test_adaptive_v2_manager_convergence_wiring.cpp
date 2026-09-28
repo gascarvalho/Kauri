@@ -1902,3 +1902,31 @@ TEST_CASE(
               "select_adaptive_v2_cross_commit_retention_admission") !=
           std::string::npos);
 }
+
+TEST_CASE(
+    "path-timeout quorum selection audit is source-bound before publication and convergence",
+    "[adaptive-v2][manager][selection][audit][path-timeout-quorum][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+    REQUIRE(owns_manager_session(manager));
+
+    const auto emit = function_body(
+        manager, "void emit_path_timeout_quorum_selection_decided(");
+    REQUIRE_FALSE(emit.empty());
+    CHECK(emit.find("session_.selection_audit()") != std::string::npos);
+    CHECK(emit.find("request_sequence_.cursor()") != std::string::npos);
+    CHECK(emit.find("predecessor.epoch_digest()") != std::string::npos);
+    CHECK(emit.find("definition.evidence_snapshot_id") != std::string::npos);
+    CHECK(emit.find("selection->selected_replicas") != std::string::npos);
+    CHECK(raw_manager.find("exact_post_fault_path_timeout_quorum_v1") !=
+          std::string::npos);
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    CHECK(contains_in_order(
+        evaluate,
+        {"emit_path_timeout_quorum_selection_decided(*request, *bundle)",
+         "write_exclusive_bundle(",
+         "session_.start_convergence("}));
+}

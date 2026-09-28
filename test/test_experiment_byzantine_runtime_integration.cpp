@@ -612,6 +612,7 @@ public:
         runtime.adaptive_v2_response_evidence->bind_deadline_scheduler(
             [](const ProposalKey &,
                std::uint64_t,
+               std::uint64_t,
                EvidenceDeadlineCallback,
                EvidenceDeadlineFailureCallback) {
                 return EvidenceDeadlineCancellation{};

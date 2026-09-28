@@ -543,6 +543,7 @@ using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
 using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
+using hotstuff::AdaptiveV2SelectionDecidedStructuredEvent;
 using hotstuff::AdaptiveV2FaultContainmentCoverageReadyStructuredEvent;
 using hotstuff::AdaptiveV2CrossCommitRetentionReadyStructuredEvent;
 using hotstuff::AdaptiveV2EpochChangeIdentity;
@@ -898,6 +899,23 @@ AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
     event.evidence_snapshot_id = digest("selected-evidence-snapshot");
     event.accepted_prefix_count = 2;
     event.eligible_ranking = {2, 3, 4, 5, 6};
+    return event;
+}
+
+AdaptiveV2SelectionDecidedStructuredEvent selection_decided_event()
+{
+    AdaptiveV2SelectionDecidedStructuredEvent event;
+    event.cycle_ordinal = 0;
+    event.predecessor_epoch_number = 0;
+    event.predecessor_epoch_digest = digest("selection-decided-predecessor");
+    event.baseline_cutoff = 17;
+    event.evidence_cutoff = 31;
+    event.evidence_snapshot_id = digest("selection-decided-snapshot");
+    event.snapshot_evidence_basis =
+        "exact_post_fault_path_timeout_quorum_v1";
+    event.selection_cardinality_policy =
+        "all_guarded_up_to_fault_bound_v1";
+    event.selected_replicas = {1};
     return event;
 }
 
@@ -2144,8 +2162,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 16,
-        "the audit capability appends adaptive-v3 readiness and command terminal evidence");
+        std::variant_size<AuditStructuredEventPayload>::value == 17,
+        "the audit capability appends the path-timeout selection decision");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -2675,6 +2693,36 @@ TEST_CASE("AE01 serializes exact command and accepted reputation identities",
         CHECK(tight_output.bytes().empty());
     }
 
+    SECTION("path-timeout selection decision is manager-owned and canonical")
+    {
+        const auto event = selection_decided_event();
+        const auto expected =
+            std::string{"{\"event_schema_version\":1,"} +
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7004,"
+            "\"event_type\":\"adaptive_v2.selection_decided\","
+            "\"payload\":{\"schema_version\":1,\"cycle_ordinal\":0,"
+            "\"predecessor_epoch_number\":0,\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"baseline_cutoff\":17,\"evidence_cutoff\":31,"
+            "\"evidence_snapshot_id\":\"" +
+            event.evidence_snapshot_id.to_hex() + "\","
+            "\"snapshot_evidence_basis\":\"exact_post_fault_path_timeout_quorum_v1\","
+            "\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\","
+            "\"selected_replicas\":[1]}}\n";
+        FakeClock clock({7004});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output) == expected);
+    }
+
     SECTION("session terminal binds intent artifact evidence and winner")
     {
         const auto event = manager_terminal_event();
@@ -3101,6 +3149,25 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
             std::length_error);
     }
 
+    SECTION("path-timeout selection decision rejects noncanonical bindings")
+    {
+        auto invalid = selection_decided_event();
+        invalid.snapshot_evidence_basis = "exact_post_fault_attempt_start_v1";
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = selection_decided_event();
+        invalid.selection_cardinality_policy = "exact_required_v1";
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = selection_decided_event();
+        invalid.evidence_cutoff = invalid.baseline_cutoff;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = selection_decided_event();
+        invalid.selected_replicas = {1, 1};
+        CHECK(rejects(manager_event_config(), invalid));
+    }
+
     SECTION("session terminal is exact and manager-owned")
     {
         auto invalid = manager_terminal_event();
@@ -3226,6 +3293,22 @@ TEST_CASE("fault-window armed events partition schema-only fields",
                              "\"all_guarded_up_to_fault_bound_v1\"") !=
                    std::string::npos) == (schema == 4));
         }
+    }
+
+    auto path_timeout_quorum = fault_window_armed_event(4);
+    path_timeout_quorum.snapshot_evidence_basis =
+        "exact_post_fault_path_timeout_quorum_v1";
+    {
+        FakeClock clock({8'106});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{
+            std::move(path_timeout_quorum)});
+        sink.shutdown();
+        CHECK(sink.health().healthy);
+        CHECK(rendered(output).find(
+                  "exact_post_fault_path_timeout_quorum_v1") !=
+              std::string::npos);
     }
 
     auto invalid = fault_window_armed_event(1);

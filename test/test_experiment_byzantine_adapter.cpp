@@ -943,25 +943,36 @@ TEST_CASE(
         const auto arm = std::string(64, 'e');
         const auto run_id = std::string{"n7-test-run"};
         const auto source_instance = std::string{"n7-test-manager-instance"};
-        const auto manager_line =
-            std::string{"{\"event_schema_version\":1,\"run_id\":\""} + run_id +
+        const auto manager_line_for = [&options, &profile, &receipt, &arm,
+                                        &run_id, &source_instance](
+                                          const std::string &profile_id,
+                                          const std::string &snapshot_basis) {
+            return std::string{"{\"event_schema_version\":1,\"run_id\":\""} + run_id +
             "\",\"source_kind\":\"adaptation_manager\",\"source_id\":\"adaptive-manager\",\"source_instance\":\"" +
             source_instance + "\",\"source_sequence\":7,\"source_monotonic_ns\":91,\"event_type\":\"fault_window_armed\",\"payload\":{\"schema_version\":4,\"kind\":\"kauri-focused-fault-window-arm-v4\",\"run_id\":\"" +
-            run_id + "\",\"profile_id\":\"n7-three-reporter-relay-omission-v2\",\"profile_sha256\":\"" +
+            run_id + "\",\"profile_id\":\"" + profile_id + "\",\"profile_sha256\":\"" +
             profile + "\",\"topology_proof_sha256\":\"" + std::string(64, 'f') +
             "\",\"request_sha256\":\"" + std::string(64, '1') +
             "\",\"epoch_number\":0,\"epoch_digest\":\"" +
             options.configuration.epoch_digest.to_hex() +
             "\",\"fault_receipt_sha256\":\"" + receipt +
-            "\",\"evidence_start_monotonic_ns\":90,\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\"" + arm + "\"}}";
-        write_file(manager_path, manager_line + "\n");
-        const auto gate_bytes =
-            std::string{"{\"schema_version\":1,\"kind\":\"kauri-n7-static-aggregate-omission-gate-v1\",\"profile_sha256\":\""} + profile +
+            "\",\"evidence_start_monotonic_ns\":90,\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\"" + snapshot_basis + "\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\"" + arm + "\"}}";
+        };
+        const auto gate_bytes_for = [&profile, &tree, &argv, &run_id,
+                                     &source_instance, &options](
+                                        const std::string &manager_line) {
+            return std::string{"{\"schema_version\":1,\"kind\":\"kauri-n7-static-aggregate-omission-gate-v1\",\"profile_sha256\":\""} + profile +
             "\",\"tree_file_sha256\":\"" + tree + "\",\"epoch_digest\":\"" +
             options.configuration.epoch_digest.to_hex() + "\",\"replica_id\":1,\"launch_argv_sha256\":\"" + argv +
             "\",\"manager_run_id\":\"" + run_id + "\",\"manager_source_instance\":\"" +
             source_instance + "\",\"manager_source_sequence\":7,\"fault_window_arm_event_sha256\":\"" +
             sha256_hex(manager_line) + "\",\"activation_monotonic_ns\":92}\n";
+        };
+        const auto manager_line = manager_line_for(
+            "n7-three-reporter-relay-omission-v2",
+            "exact_post_fault_attempt_start_v1");
+        write_file(manager_path, manager_line + "\n");
+        const auto gate_bytes = gate_bytes_for(manager_line);
         write_file(gate_path, gate_bytes);
         options.activation_gate = ExperimentOmissionActivationGate{
             gate_path, manager_path, run_id, source_instance, profile, tree, argv, 1};
@@ -1019,6 +1030,47 @@ TEST_CASE(
             first, ExperimentReplicaRole::internal));
         CHECK_FALSE(malformed_adapter.consume_outbound_aggregate(
             first, ExperimentReplicaRole::internal));
+
+        // The path-timeout-quorum v3 profile is an explicit compatible
+        // profile/basis pair, not a relaxation of the legacy v2 contract.
+        const auto v3_line = manager_line_for(
+            "n7-path-local-timeout-quorum-v3",
+            "exact_post_fault_path_timeout_quorum_v1");
+        write_file(manager_path, v3_line + "\n");
+        write_file(gate_path, gate_bytes_for(v3_line));
+        auto v3_options = options;
+        v3_options.maximum_omission_contexts = 9;
+        v3_options.maximum_omission_contexts_per_configuration = 3;
+        ExperimentByzantineAdapter v3_adapter(v3_options);
+        CHECK(v3_adapter.consume_outbound_aggregate(
+            context("v3-after-arm", options.configuration),
+            ExperimentReplicaRole::internal));
+
+        // Neither profile may borrow the other profile's quota.
+        ExperimentByzantineAdapter v3_with_v2_quota(options);
+        CHECK_FALSE(v3_with_v2_quota.consume_outbound_aggregate(
+            context("v3-with-v2-quota", options.configuration),
+            ExperimentReplicaRole::internal));
+        const auto v2_line = manager_line_for(
+            "n7-three-reporter-relay-omission-v2",
+            "exact_post_fault_attempt_start_v1");
+        write_file(manager_path, v2_line + "\n");
+        write_file(gate_path, gate_bytes_for(v2_line));
+        ExperimentByzantineAdapter v2_with_v3_quota(v3_options);
+        CHECK_FALSE(v2_with_v3_quota.consume_outbound_aggregate(
+            context("v2-with-v3-quota", options.configuration),
+            ExperimentReplicaRole::internal));
+
+        // Cross-pairing the v3 identity with the legacy basis must not arm.
+        const auto mismatched_line = manager_line_for(
+            "n7-path-local-timeout-quorum-v3",
+            "exact_post_fault_attempt_start_v1");
+        write_file(manager_path, mismatched_line + "\n");
+        write_file(gate_path, gate_bytes_for(mismatched_line));
+        ExperimentByzantineAdapter mismatched_adapter(options);
+        CHECK_FALSE(mismatched_adapter.consume_outbound_aggregate(
+            context("mismatched-after-arm", options.configuration),
+            ExperimentReplicaRole::internal));
     }
     catch (...)
     {
@@ -1040,6 +1092,16 @@ TEST_CASE(
     valid.maximum_omission_contexts = 6;
     valid.maximum_omission_contexts_per_configuration = 2;
     CHECK_NOTHROW(ExperimentByzantineAdapter(valid));
+
+    auto path_v3 = valid;
+    path_v3.maximum_omission_contexts = 9;
+    path_v3.maximum_omission_contexts_per_configuration = 3;
+    CHECK_NOTHROW(ExperimentByzantineAdapter(path_v3));
+
+    auto cross_pair = path_v3;
+    cross_pair.maximum_omission_contexts = 6;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(cross_pair), std::invalid_argument);
 
     auto wrong_per_configuration = valid;
     wrong_per_configuration.maximum_omission_contexts_per_configuration = 1;

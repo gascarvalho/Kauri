@@ -153,6 +153,7 @@ public:
         const AdaptiveV2TransitionPolicy &policy) noexcept;
     AdaptiveV2ManagerControllerStatus evaluate() noexcept;
     bool arm_fault_window(AdaptiveV2FaultWindowArm arm) noexcept;
+    const AdaptiveV2SelectionResult *selection_audit() const noexcept;
     const AdaptiveV2EpochChangeBundle *successor_bundle() const noexcept;
 
     bool start_convergence(std::uint64_t logical_start_tick) noexcept;

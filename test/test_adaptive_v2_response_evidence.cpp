@@ -104,6 +104,26 @@ ProposalTreeSnapshot response_tree()
     return tree;
 }
 
+ProposalTreeSnapshot n7_t5_reporter_five_tree()
+{
+    // T5 from experiments/adaptive/n7-three-reporter-omission/epoch0.tree:
+    // 5 -> {1, 6}; 1 -> {0, 2}; 6 -> {3, 4}.
+    ProposalTreeSnapshot tree;
+    tree.local_replica = 5;
+    tree.root = 5;
+    tree.direct_children = {1, 6};
+    tree.assigned_subtree = {5, 1, 6, 0, 2, 3, 4};
+    tree.child_subtrees = {
+        {1, {1, 0, 2}},
+        {6, {6, 3, 4}}};
+    tree.required_subtree = {5, 1, 6, 0, 2, 3, 4};
+    tree.required_child_subtrees = {
+        {1, {1, 0, 2}},
+        {6, {6, 3, 4}}};
+    tree.fanout = 2;
+    return tree;
+}
+
 AdaptiveV2ResponseEvidenceLimits limits(
     std::size_t maximum_handles = 16,
     std::size_t maximum_pending_reports = 16,
@@ -243,6 +263,7 @@ class ManualEvidenceDeadlineScheduler final
 public:
     struct Job
     {
+        std::uint64_t attempt_start_ns{0};
         std::uint64_t duration_us{0};
         hotstuff::EvidenceDeadlineCallback deadline;
         hotstuff::EvidenceDeadlineFailureCallback failure;
@@ -254,11 +275,13 @@ public:
         bridge.bind_deadline_scheduler(
             [this](
                 const ProposalKey &,
+                std::uint64_t attempt_start_ns,
                 std::uint64_t duration_us,
                 hotstuff::EvidenceDeadlineCallback deadline,
                 hotstuff::EvidenceDeadlineFailureCallback failure) {
                 const auto index = jobs.size();
                 jobs.push_back(Job{
+                    attempt_start_ns,
                     duration_us,
                     std::move(deadline),
                     std::move(failure),
@@ -1605,6 +1628,7 @@ TEST_CASE(
         bridge.bind_deadline_scheduler(
             [](const ProposalKey &,
                std::uint64_t,
+               std::uint64_t,
                hotstuff::EvidenceDeadlineCallback,
                hotstuff::EvidenceDeadlineFailureCallback) {
                 return hotstuff::EvidenceDeadlineCancellation{};
@@ -1664,6 +1688,7 @@ TEST_CASE(
         bridge.bind_deadline_scheduler(
             [](const ProposalKey &,
                std::uint64_t,
+               std::uint64_t,
                hotstuff::EvidenceDeadlineCallback,
                hotstuff::EvidenceDeadlineFailureCallback failure) {
                 failure();
@@ -1696,6 +1721,7 @@ TEST_CASE(
             });
         bridge.bind_deadline_scheduler(
             [](const ProposalKey &,
+               std::uint64_t,
                std::uint64_t,
                hotstuff::EvidenceDeadlineCallback,
                hotstuff::EvidenceDeadlineFailureCallback failure)
@@ -1738,6 +1764,7 @@ TEST_CASE(
             });
         bridge.bind_deadline_scheduler(
             [&](const ProposalKey &,
+                std::uint64_t,
                 std::uint64_t,
                 hotstuff::EvidenceDeadlineCallback deadline,
                 hotstuff::EvidenceDeadlineFailureCallback failure) {
@@ -1993,6 +2020,142 @@ TEST_CASE(
            std::vector<hotstuff::ReplicaID>{1, 3, 4}));
     CHECK(delivered[0].observation.observation_id ==
           delivered[1].observation.observation_id);
+}
+
+TEST_CASE(
+    "adaptive-v2 reschedules T5 reporter callback before raw deadline",
+    "[adaptive-v2][response-evidence][timeout][retirement][n7][clock]")
+{
+    // Model the archived T5 shape with only aggregate child 1 unanswered.
+    // An early scheduler wake must not pass a fabricated timestamp to the
+    // tracker: it rebinds the same exact raw deadline and only records when
+    // the raw clock reaches it.
+    AdaptiveV2ResponseEvidenceBridge bridge(5, limits());
+    ManualEvidenceDeadlineScheduler scheduler;
+    scheduler.bind(bridge);
+    bridge.bind_transport(
+        [](const EvidenceReportEnvelope &) {
+            return EvidenceTransportResult::accepted;
+        });
+    const auto key = proposal("n7-t5-reporter5-target1-early-callback");
+    REQUIRE(bridge.arm_with_deadline(
+        key, n7_t5_reporter_five_tree(), kStartNs, kDeadlineUs));
+
+    REQUIRE(bridge.record_verified_response(
+        key,
+        6,
+        ExpectedMessageType::aggregate_relay,
+        {3, 4, 6},
+        after_us(50)));
+    REQUIRE(scheduler.fire(0, after_us(kDeadlineUs) - 1));
+    CHECK(scheduler.jobs.size() == 2);
+    CHECK(scheduler.jobs[1].attempt_start_ns == kStartNs);
+    CHECK(bridge.diagnostics().deadline_early_wake_reschedules == 1);
+    CHECK(bridge.diagnostics().timeout_tracker_rejections == 0);
+    CHECK(bridge.diagnostics().active_handles == 2);
+    CHECK(bridge.diagnostics().healthy);
+
+    REQUIRE(scheduler.fire(1, after_us(kDeadlineUs)));
+    CHECK(bridge.diagnostics().timeout_facts == 1);
+    CHECK(bridge.diagnostics().timeout_tracker_rejections == 0);
+    CHECK(bridge.diagnostics().healthy);
+}
+
+TEST_CASE(
+    "adaptive-v3 early rearm emits schema-v3 timeout at T5 reporter raw deadline",
+    "[adaptive-v2][response-evidence][timeout][n7][clock][v3]")
+{
+    AdaptiveV2ResponseEvidenceBridge bridge(5, limits());
+    REQUIRE(bridge.enable_exact_timeout_attempt_evidence_v3());
+    ManualEvidenceDeadlineScheduler scheduler;
+    scheduler.bind(bridge);
+    std::vector<EvidenceReportEnvelope> delivered;
+    bridge.bind_transport(
+        [&delivered](const EvidenceReportEnvelope &envelope) {
+            delivered.push_back(envelope);
+            return EvidenceTransportResult::accepted;
+        });
+    const auto key = proposal("n7-t5-reporter5-target1-v3-early-rearm");
+    REQUIRE(bridge.arm_with_deadline(
+        key, n7_t5_reporter_five_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(bridge.record_verified_response(
+        key,
+        6,
+        ExpectedMessageType::aggregate_relay,
+        {3, 4, 6},
+        after_us(50)));
+
+    REQUIRE(scheduler.fire(0, after_us(kDeadlineUs) - 1));
+    REQUIRE(scheduler.jobs.size() == 2);
+    CHECK(scheduler.jobs[1].attempt_start_ns == kStartNs);
+    CHECK(bridge.diagnostics().deadline_early_wake_reschedules == 1);
+    CHECK(std::none_of(
+        delivered.begin(), delivered.end(), [](const auto &envelope) {
+            return envelope.observation.observed_replica_id == 1 &&
+                   envelope.observation.outcome == ResponseOutcome::timeout;
+        }));
+
+    REQUIRE(scheduler.fire(1, after_us(kDeadlineUs)));
+    const auto timeout = std::find_if(
+        delivered.begin(), delivered.end(), [](const auto &envelope) {
+            return envelope.observation.observed_replica_id == 1 &&
+                   envelope.observation.outcome == ResponseOutcome::timeout;
+        });
+    REQUIRE(timeout != delivered.end());
+    CHECK(timeout->observation.schema_version ==
+          hotstuff::kResponseObservationSchemaVersionV3);
+    CHECK(timeout->observation.expected_message_type ==
+          ExpectedMessageType::aggregate_relay);
+    CHECK(timeout->observation.attempt_start_monotonic_ns == kStartNs);
+    CHECK(bridge.diagnostics().timeout_tracker_rejections == 0);
+    CHECK(bridge.diagnostics().timeout_facts == 1);
+    CHECK(bridge.diagnostics().healthy);
+}
+
+TEST_CASE(
+    "adaptive-v2 fails closed after the bounded ninth early raw wake",
+    "[adaptive-v2][response-evidence][timeout][retirement][n7][clock][fail-closed]")
+{
+    AdaptiveV2ResponseEvidenceBridge bridge(5, limits());
+    ManualEvidenceDeadlineScheduler scheduler;
+    scheduler.bind(bridge);
+    std::vector<EvidenceDeadlineResult> results;
+    bridge.bind_deadline_result_callback(
+        [&results](const ProposalKey &, EvidenceDeadlineResult result) {
+            results.push_back(result);
+        });
+    bridge.bind_transport(
+        [](const EvidenceReportEnvelope &) {
+            return EvidenceTransportResult::accepted;
+        });
+    const auto key = proposal("n7-t5-reporter5-target1-bounded-early-wake");
+    REQUIRE(bridge.arm_with_deadline(
+        key, n7_t5_reporter_five_tree(), kStartNs, kDeadlineUs));
+    REQUIRE(bridge.record_verified_response(
+        key,
+        6,
+        ExpectedMessageType::aggregate_relay,
+        {3, 4, 6},
+        after_us(50)));
+
+    // Eight early wakes rearm the original absolute RAW deadline. The ninth
+    // cannot spin the event loop indefinitely and therefore retires the
+    // evidence fence without creating a timeout observation.
+    for (std::size_t index = 0; index != 9; ++index)
+        REQUIRE(scheduler.fire(index, after_us(kDeadlineUs) - 1));
+
+    const auto diagnostics = bridge.diagnostics();
+    CHECK(scheduler.jobs.size() == 9);
+    CHECK(diagnostics.deadline_early_wake_reschedules == 8);
+    CHECK(diagnostics.deadline_callback_failures == 1);
+    CHECK(diagnostics.deadline_delivery_failures == 1);
+    CHECK(diagnostics.timeout_facts == 0);
+    CHECK(diagnostics.timeout_tracker_rejections == 0);
+    CHECK(diagnostics.active_deadlines == 0);
+    CHECK(diagnostics.active_handles == 0);
+    CHECK_FALSE(diagnostics.healthy);
+    CHECK(results ==
+          std::vector<EvidenceDeadlineResult>{EvidenceDeadlineResult::failed});
 }
 
 TEST_CASE(
