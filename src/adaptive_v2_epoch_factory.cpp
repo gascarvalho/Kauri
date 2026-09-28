@@ -1072,6 +1072,84 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     }
 }
 
+AdaptiveV3EpochFactoryResult build_operator_capacity_epoch1_bundle(
+    const EpochDefinition &current_epoch,
+    const std::vector<ReplicaID> &membership,
+    const AdaptationSnapshot &responsiveness_snapshot,
+    const OperatorCapacityPolicyConfig &capacity_config,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept
+{
+    try
+    {
+        const auto current_members = current_membership(current_epoch);
+        if (!current_members || *current_members != membership ||
+            activation_delay_blocks == 0 ||
+            current_epoch.epoch_number() == std::numeric_limits<std::uint32_t>::max())
+            return {AdaptiveV2EpochFactoryStatus::invalid_current_epoch, nullptr};
+        const auto quorum = derive_byzantine_quorum(membership.size());
+        const auto exact_baseline = [&]() {
+            const auto &current = current_epoch.trees();
+            const auto &baseline = capacity_config.baseline_trees;
+            if (current.size() != baseline.size()) return false;
+            for (std::size_t index = 0; index < current.size(); ++index)
+                if (current[index].tree_id != baseline[index].tree_id ||
+                    current[index].fanout != baseline[index].fanout ||
+                    current[index].pipeline_stretch != baseline[index].pipeline_stretch ||
+                    current[index].members_breadth_first != baseline[index].members_breadth_first ||
+                    current[index].wait_exempt_leaves != baseline[index].wait_exempt_leaves)
+                    return false;
+            return true;
+        };
+        if (current_epoch.epoch_number() != 0 || !quorum ||
+            quorum->fault_threshold == 0 ||
+            !exact_baseline() ||
+            std::any_of(current_epoch.trees().begin(), current_epoch.trees().end(),
+                [](const auto &tree) { return !tree.wait_exempt_leaves.empty(); }) ||
+            capacity_config.tree_count != quorum->quorum)
+            return {AdaptiveV2EpochFactoryStatus::invalid_current_epoch, nullptr};
+        const AdaptationEpochId predecessor{
+            current_epoch.epoch_number(), current_epoch.epoch_digest()};
+        if (responsiveness_snapshot.epoch().epoch_number != predecessor.epoch_number ||
+            responsiveness_snapshot.epoch().epoch_digest != predecessor.epoch_digest ||
+            capacity_config.capacity_snapshot.predecessor.epoch_number != predecessor.epoch_number ||
+            capacity_config.capacity_snapshot.predecessor.epoch_digest != predecessor.epoch_digest)
+            return {AdaptiveV2EpochFactoryStatus::epoch_mismatch, nullptr};
+        const auto placement = build_operator_capacity_placement(
+            membership, responsiveness_snapshot, capacity_config);
+        if (!placement)
+            return {AdaptiveV2EpochFactoryStatus::placement_failed, nullptr};
+        EpochDefinitionInput successor;
+        successor.schema_version = kEpochDefinitionSchemaVersionV2;
+        successor.epoch_number = current_epoch.epoch_number() + 1U;
+        successor.previous_epoch_digest = current_epoch.epoch_digest();
+        successor.membership_digest = current_epoch.membership_digest();
+        successor.trees = placement.trees;
+        successor.activation_height = 0;
+        successor.generation_seed = 0;
+        successor.policy_version = "operator-capacity-epoch-v1";
+        // This ID commits responsiveness identity/cutoff, capacity digest,
+        // arm, and every selected tree through policy_snapshot_id().
+        successor.evidence_snapshot_id = placement.policy_snapshot_id;
+        successor.evidence_cutoff = responsiveness_snapshot.evidence_cutoff();
+        successor.epoch_digest.reset();
+        const auto digest = compute_epoch_digest(successor);
+        successor.epoch_digest = digest;
+        const EpochChangePayload payload{successor.epoch_number,
+            current_epoch.epoch_digest(), digest, activation_delay_blocks};
+        const auto command = authorize_epoch_change_v3(payload, issuer_id,
+                                                     issuer_private_key);
+        return {AdaptiveV2EpochFactoryStatus::success,
+            std::make_unique<const AdaptiveV3EpochChangeBundle>(
+                command, std::move(successor), bundle_limits)};
+    }
+    catch (const std::length_error &) { return {AdaptiveV2EpochFactoryStatus::capacity_exceeded, nullptr}; }
+    catch (const std::bad_alloc &) { return {AdaptiveV2EpochFactoryStatus::capacity_exceeded, nullptr}; }
+    catch (...) { return {AdaptiveV2EpochFactoryStatus::bundle_failed, nullptr}; }
+}
+
 AdaptiveV3EpochFactoryResult build_adaptive_v3_successor_bundle(
     const EpochDefinition &current_epoch,
     const AdaptiveV2SelectionResult &selection,

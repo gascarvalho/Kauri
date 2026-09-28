@@ -103,6 +103,31 @@ struct ExperimentOmissionMarker final
     std::optional<ReplicaID> authenticated_proposal_source_replica;
 };
 
+/**
+ * Immutable, local-only activation gate for the N=7 static aggregate-
+ * omission experiment.  This is deliberately not a consensus input: until
+ * the exact gate is present, the static selector forwards every aggregate.
+ */
+struct ExperimentOmissionActivationGate final
+{
+    std::string path;
+    std::string manager_event_path;
+    std::string run_id;
+    std::string manager_source_instance;
+    std::string profile_sha256;
+    std::string tree_file_sha256;
+    std::string launch_argv_sha256;
+    ReplicaID local_replica{0};
+};
+
+struct ExperimentOmissionActivation final
+{
+    ReplicaID actor{0};
+    std::string gate_sha256;
+    std::string manager_fault_window_arm_event_sha256;
+    std::uint64_t activation_monotonic_ns{0};
+};
+
 std::string format_experiment_omission_marker(
     const ExperimentOmissionMarker &marker);
 
@@ -110,18 +135,24 @@ struct ExperimentByzantineOptions final
 {
     bool enabled{false};
     ConfigurationId configuration;
+    // Legacy singular spelling remains supported; new contexts are additive.
     std::optional<ConfigurationId> additional_omission_configuration;
+    std::vector<ConfigurationId> additional_omission_configurations;
     std::string diagnostic_window;
     std::optional<ReplicaID> false_report_target;
     bool omit_outbound_aggregate{false};
     bool omit_outbound_direct_vote{false};
     std::size_t maximum_false_report_contexts{0};
     std::size_t maximum_omission_contexts{0};
+    std::size_t maximum_omission_contexts_per_configuration{0};
     std::size_t maximum_direct_vote_omission_contexts{0};
     std::optional<ExperimentRotatingOmissionOptions> rotating_omission;
+    std::optional<ExperimentOmissionActivationGate> activation_gate;
     std::string response_evidence_duplicate_probe;
     std::function<void(const ExperimentOmissionMarker &)>
         omission_marker_emitter;
+    std::function<void(const ExperimentOmissionActivation &)>
+        omission_activation_emitter;
 };
 
 /**
@@ -184,6 +215,8 @@ public:
         const ProposalKey &proposal) const;
     bool rotating_omission_enabled() const noexcept;
     bool scheduled_omission_enabled() const noexcept;
+    std::optional<ExperimentOmissionActivation>
+    active_static_omission_gate() const noexcept;
     /**
      * Read-only experiment diagnostic membership. This grants no consensus,
      * topology, timing, or omission authority.

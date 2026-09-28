@@ -361,6 +361,29 @@ struct FaultWindowArmedStructuredEvent
     std::string fault_window_arm_sha256;
 };
 
+/** Replica-local acknowledgement that the N7 omission gate became valid. */
+struct FaultInjectionArmedStructuredEvent
+{
+    ReplicaID actor{0};
+    std::string gate_sha256;
+    std::string manager_fault_window_arm_event_sha256;
+    std::string profile_sha256;
+    std::string tree_file_sha256;
+    std::string launch_argv_sha256;
+    std::uint64_t activation_monotonic_ns{0};
+};
+
+/** Exact replica-local static aggregate omission after a validated N7 gate. */
+struct FaultAggregateOmittedStructuredEvent
+{
+    ReplicaID actor{0};
+    ReplicaID parent_replica{0};
+    ConfigurationId configuration;
+    uint256_t block_hash;
+    std::string gate_sha256;
+    bool first_for_context{false};
+};
+
 /** Canonical JSON object containing every independently scored candidate. */
 std::string serialize_adaptive_v2_shape_decision_payload(
     const AdaptiveV2ShapeDecisionStructuredEvent &event,
@@ -504,7 +527,9 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2CrossCommitRetentionReadyStructuredEvent,
     FaultWindowArmedStructuredEvent,
     AdaptiveV3ReadinessStructuredEvent,
-    AdaptiveV3CommandTerminalStructuredEvent>;
+    AdaptiveV3CommandTerminalStructuredEvent,
+    FaultInjectionArmedStructuredEvent,
+    FaultAggregateOmittedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -623,6 +648,8 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v3_certificate_acknowledged,
     adaptive_v3_e2_eligibility,
     adaptive_v3_terminal,
+    fault_injection_armed,
+    fault_aggregate_omitted,
     adaptive_v3_wire_rejected,
     adaptive_v3_command_terminal,
     adaptive_v3_observation_retry_exhausted,

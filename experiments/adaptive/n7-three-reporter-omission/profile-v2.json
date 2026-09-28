@@ -1,0 +1,39 @@
+{
+  "schema_version": 1,
+  "profile_id": "n7-three-reporter-relay-omission-v2",
+  "frozen": true,
+  "replica_ids": [0, 1, 2, 3, 4, 5, 6],
+  "fault_threshold": 2,
+  "quorum": 5,
+  "crash_targets": [],
+  "transition_requests": [
+    {
+      "policy_intent": "fault_containment",
+      "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+      "transition_artifact_id": "e0-to-e1-containment",
+      "bundle_path": "transitions/e0-to-e1-containment/successor.bundle",
+      "evidence_snapshot_path": "transitions/e0-to-e1-containment/evidence-snapshot.json",
+      "predecessor_epoch_number": 0,
+      "successor_epoch_number": 1,
+      "minimum_predecessor_residency_ms": 0,
+      "containment_baseline_root_source": "live_predecessor_roots",
+      "policy_parameters": {}
+    }
+  ],
+  "fanout": 2,
+  "pipeline_depth": 2,
+  "block_size": 1,
+  "tree_switch_period_blocks": 2,
+  "aggregation_timeout_s": 0.5,
+  "leader_progress_timeout_s": 5.0,
+  "leader_activation_grace_s": 1.0,
+  "activation_delay_blocks": 5,
+  "snapshot_seed": 41719,
+  "required_nonresponsive": 1,
+  "epoch0_tree_sha256": "38a2baa37b7fcec43f5c58423be068d807cc253fedbdc379520a3e42428dffcc",
+  "throughput_windows": [
+    {"phase": "baseline", "epoch_number": 0, "bucket_count": 1},
+    {"phase": "degraded", "epoch_number": 0, "bucket_count": 1},
+    {"phase": "containment", "epoch_number": 1, "bucket_count": 1}
+  ]
+}

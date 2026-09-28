@@ -1971,6 +1971,12 @@ namespace hotstuff
             const ConfigurationId &configuration) noexcept;
         void emit_fault_contribution_opportunity(
             const ExperimentOmissionMarker &marker) noexcept;
+        bool emit_fault_injection_armed(
+            const ExperimentOmissionActivation &activation,
+            const ExperimentOmissionActivationGate &gate) noexcept;
+        void emit_fault_aggregate_omitted(
+            const ProposalKey &key, ReplicaID parent, bool first_for_context,
+            const ExperimentOmissionActivation &activation) noexcept;
         void emit_root_qc_queue_blocked_event(
             const ProposalContextLease &candidate_lease,
             const block_t &candidate) noexcept;

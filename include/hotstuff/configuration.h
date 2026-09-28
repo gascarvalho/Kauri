@@ -104,6 +104,12 @@ EpochDefinitionInput adaptive_v2_epoch_zero_input(
     const std::vector<ReplicaID> &membership,
     std::vector<EpochTreeDefinition> trees);
 
+// Parse the legacy fan:<n> pipe:<n> bootstrap schedule into one or more exact
+// adaptive-v2 Epoch-0 tree definitions. Default cyclic callers do not read it.
+std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
+    const std::string &path,
+    const std::vector<ReplicaID> &membership);
+
 bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input);
 
 uint256_t compute_epoch_digest(const EpochDefinitionInput &input);

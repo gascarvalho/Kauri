@@ -133,6 +133,9 @@ add_kauri_catch_test(
 add_kauri_catch_test(
     test_configuration
     test_configuration.cpp)
+target_compile_definitions(
+    test_configuration PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 add_kauri_catch_test(
     test_epoch_change
     test_epoch_change.cpp)
@@ -159,6 +162,9 @@ add_kauri_catch_test(
 add_kauri_catch_test(
     test_adaptive_v3_manager_session
     test_adaptive_v3_manager_session.cpp)
+add_kauri_catch_test(
+    test_operator_capacity_manager_session
+    test_operator_capacity_manager_session.cpp)
 add_kauri_catch_test(
     test_cert13_v13_fixture_exporter
     test_cert13_v13_fixture_exporter.cpp)
@@ -296,6 +302,20 @@ target_compile_definitions(
 set_tests_properties(
     test_adaptation PROPERTIES
     LABELS "unit;adaptive;intentional-red;adaptation"
+    TIMEOUT 5)
+add_kauri_catch_test(
+    test_operator_capacity_policy
+    test_operator_capacity_policy.cpp)
+set_tests_properties(
+    test_operator_capacity_policy PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;policy"
+    TIMEOUT 5)
+add_kauri_catch_test(
+    test_operator_capacity_authorization
+    test_operator_capacity_authorization.cpp)
+set_tests_properties(
+    test_operator_capacity_authorization PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;authorization"
     TIMEOUT 5)
 add_kauri_catch_test(
     test_adaptive_v2_selection
@@ -444,6 +464,9 @@ set_tests_properties(
 add_kauri_catch_test(
     test_fault_window_arm_parser
     test_fault_window_arm_parser.cpp)
+target_compile_definitions(
+    test_fault_window_arm_parser PRIVATE
+    KAURI_PROJECT_SOURCE_DIR="${PROJECT_SOURCE_DIR}")
 set_tests_properties(
     test_fault_window_arm_parser PROPERTIES
     LABELS "unit;adaptive;adaptation-manager;fault-window-arm;v4"

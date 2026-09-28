@@ -3152,6 +3152,11 @@ TEST_CASE("adaptive v2 startup is pinned and bootstraps a schedule-free epoch",
         {"kEpochDefinitionSchemaVersion",
          "static_cast<std::uint64_t>(input.epoch_number) * 1000"}));
     REQUIRE_FALSE(tree_config.empty());
+    CHECK(contains_in_order(
+        tree_config,
+        {"EpochProtocolMode::adaptive_v2",
+         "EpochProtocolMode::adaptive_v3",
+         "parse_adaptive_v2_epoch_zero_tree_file("}));
     CHECK(tree_config.find("register_initial_epoch(epochs.back())") !=
           std::string::npos);
     CHECK(tree_config.find("register_legacy_epoch(epochs.back())") ==
@@ -3426,6 +3431,62 @@ TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
         CHECK(missing.output.find("replica idx out of range") ==
               std::string::npos);
         CHECK(missing.output.find("adaptive-v2") != std::string::npos);
+    }
+}
+
+TEST_CASE(
+    "adaptive v2 executable enforces the exact three-by-two omission quota",
+    "[adaptive-v2][experiment][byzantine][cli][subprocess]")
+{
+    constexpr const char *digest =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    constexpr const char *quota_error =
+        "per-configuration omission requires exactly three configurations, "
+        "two contexts each, and a global limit of six";
+    const auto make_arguments = [digest](
+        const std::string &additional_configurations,
+        const std::string &global_limit,
+        const std::string &per_configuration_limit)
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        arguments.values.insert(
+            arguments.values.end(),
+            {"--replica", "127.0.0.1:10000,00,00",
+             "--experiment-byzantine-configuration",
+             std::string("7:4:") + digest,
+             "--experiment-omission-additional-configurations",
+             additional_configurations,
+             "--experiment-byzantine-window", "n7-three-reporter",
+             "--experiment-omit-outbound-aggregate",
+             "--experiment-byzantine-context-limit", global_limit,
+             "--experiment-omission-contexts-per-configuration",
+             per_configuration_limit});
+        return arguments;
+    };
+
+    const auto additional =
+        std::string("7:5:") + digest + ",7:6:" + digest;
+    const auto accepted = run_hotstuff_app(
+        make_arguments(additional, "6", "2").values);
+    CAPTURE(accepted.output);
+    CHECK(accepted.status != 0);
+    CHECK(accepted.output.find(quota_error) == std::string::npos);
+    CHECK(accepted.output.find(
+              "adaptive-v2 epoch manager address is required") !=
+          std::string::npos);
+
+    for (const auto &rejected_arguments : {
+             make_arguments(additional, "6", "1"),
+             make_arguments(additional, "5", "2"),
+             make_arguments(std::string("7:5:") + digest, "6", "2")})
+    {
+        const auto rejected = run_hotstuff_app(rejected_arguments.values);
+        CAPTURE(rejected.output);
+        CHECK(rejected.status != 0);
+        CHECK(rejected.output.find(quota_error) != std::string::npos);
+        CHECK(rejected.output.find(
+                  "adaptive-v2 epoch manager address is required") ==
+              std::string::npos);
     }
 }
 

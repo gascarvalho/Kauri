@@ -33,6 +33,8 @@
 #define KAURI_HAS_C04_CONFIGURATION_API 1
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <type_traits>
 #include <typeindex>
 #include <unordered_set>
@@ -743,6 +745,62 @@ TEST_CASE("legacy static epoch zero grammar adapts into a validated definition",
           hotstuff::compute_epoch_digest(input));
     CHECK(store.find_tree(0, 0) != nullptr);
     CHECK(store.find_tree(0, 1) != nullptr);
+}
+
+TEST_CASE("manager tree-file bootstrap has the replica Epoch-0 identity",
+          "[adaptive-v2][configuration][n7][epoch-zero]")
+{
+    const auto path = std::filesystem::path{KAURI_PROJECT_SOURCE_DIR} /
+        "experiments/adaptive/n7-three-reporter-omission/epoch0.tree";
+    REQUIRE(std::filesystem::is_regular_file(path));
+
+    const auto manager_trees =
+        hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+            path.string(), membership7());
+    const std::vector<EpochTreeDefinition> replica_trees{
+        tree(0, {0, 2, 3, 1, 4, 5, 6}),
+        tree(1, {1, 2, 3, 4, 5, 6, 0}),
+        tree(2, {2, 3, 4, 0, 1, 5, 6}),
+        tree(3, {3, 4, 5, 6, 0, 1, 2}),
+        tree(4, {4, 1, 5, 0, 2, 3, 6}),
+        tree(5, {5, 1, 6, 0, 2, 3, 4}),
+        tree(6, {6, 1, 0, 2, 3, 4, 5})};
+    CHECK(hotstuff::compute_epoch_digest(
+              hotstuff::adaptive_v2_epoch_zero_input(membership7(), manager_trees)) ==
+          hotstuff::compute_epoch_digest(
+              hotstuff::adaptive_v2_epoch_zero_input(membership7(), replica_trees)));
+}
+
+TEST_CASE("adaptive replica tree-file bootstrap rejects malformed input",
+          "[adaptive-v2][configuration][n7][epoch-zero]")
+{
+    const std::string malformed =
+        "fan:2 pipe:2 0 1 2 3 4 5\n";
+    const auto path = std::filesystem::temp_directory_path() /
+        ("kauri-n7-malformed-e0-" +
+         std::to_string(reinterpret_cast<std::uintptr_t>(&malformed)) +
+         ".tree");
+    {
+        std::ofstream output(path);
+        REQUIRE(output.is_open());
+        output << malformed;
+    }
+    CHECK_THROWS_AS(
+        hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+            path.string(), membership7()),
+        std::invalid_argument);
+    std::filesystem::remove(path);
+}
+
+TEST_CASE("adaptive replica tree-file bootstrap preserves one-tree fixtures",
+          "[adaptive-v2][configuration][epoch-zero][regression]")
+{
+    const auto path = std::filesystem::path{KAURI_PROJECT_SOURCE_DIR} /
+        "experiments/adaptive/seven-replica-smoke/epoch0.tree";
+    const auto trees = hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+        path.string(), membership7());
+    REQUIRE(trees.size() == 1);
+    CHECK(trees.front().members_breadth_first.size() == membership7().size());
 }
 
 #endif

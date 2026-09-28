@@ -153,6 +153,8 @@ TEST_CASE("adaptive manager facade exposes v3 fault and audit ownership without 
     REQUIRE(facade.v2() == nullptr);
     REQUIRE(facade.v3() != nullptr);
     REQUIRE(facade.v3_status() == AdaptiveV3ManagerSessionStatus::idle);
+    REQUIRE_FALSE(facade.v3_begin_operator_capacity_epoch1());
+    REQUIRE(facade.v3_operator_capacity_baseline_snapshot() == nullptr);
     REQUIRE(facade.begin_cycle(
         containment_policy(initial, shape.tree_shape.tree_count)));
     REQUIRE(facade.v3_arm_hard_deadline(1'000'000));

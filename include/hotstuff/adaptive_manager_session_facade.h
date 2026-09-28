@@ -62,6 +62,14 @@ public:
         const AuthenticatedReporter &, const MsgProposalLifecycleNotice &,
         std::uint64_t manager_tick) noexcept;
     bool v3_begin_readiness(std::uint64_t logical_tick) noexcept;
+    // Operator-capacity is a v3-only, single-cycle path.  It deliberately
+    // has no v2 fallback and accepts the raw signed authorization so the v3
+    // session can verify it against its pinned issuer and membership.
+    bool v3_begin_operator_capacity_epoch1() noexcept;
+    bool v3_authorize_operator_capacity_epoch1(
+        const OperatorCapacityAuthorization &) noexcept;
+    const AdaptationSnapshot *
+    v3_operator_capacity_baseline_snapshot() const noexcept;
     AdaptiveV3ManagerObservationResult v3_observe_readiness(
         ReplicaID tls_peer, std::uint64_t logical_tick,
         const bytearray_t &) noexcept;

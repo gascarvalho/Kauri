@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <fstream>
 #include <limits>
 #include <set>
 #include <sstream>
@@ -244,6 +245,52 @@ EpochDefinitionInput adaptive_v2_epoch_zero_input(
     input.evidence_cutoff = 0;
     input.epoch_digest.reset();
     return input;
+}
+
+std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
+    const std::string &path,
+    const std::vector<ReplicaID> &membership)
+{
+    if (path.empty() || membership.empty())
+        throw std::invalid_argument("adaptive-v2 epoch-zero tree file and membership are required");
+    std::ifstream file(path);
+    if (!file.is_open())
+        throw std::invalid_argument("cannot open adaptive-v2 epoch-zero tree file");
+    auto expected_members = membership;
+    std::sort(expected_members.begin(), expected_members.end());
+    if (std::adjacent_find(expected_members.begin(), expected_members.end()) != expected_members.end())
+        throw std::invalid_argument("adaptive-v2 epoch-zero membership must be unique");
+    std::vector<EpochTreeDefinition> trees;
+    std::string line;
+    while (std::getline(file, line))
+    {
+        const auto line_number = trees.size() + 1;
+        if (line.empty() || trees.size() >= membership.size())
+            throw std::invalid_argument("invalid adaptive-v2 epoch-zero tree-file line " + std::to_string(line_number));
+        std::istringstream fields(line);
+        std::string fanout_token, pipeline_token;
+        if (!(fields >> fanout_token >> pipeline_token))
+            throw std::invalid_argument("invalid adaptive-v2 epoch-zero tree-file header");
+        const auto fanout = parse_legacy_tree_option(fanout_token, "fan:", "fanout", line_number, 1);
+        const auto pipeline_stretch = parse_legacy_tree_option(pipeline_token, "pipe:", "pipeline stretch", line_number, 1);
+        std::vector<ReplicaID> members;
+        std::string member_token;
+        while (fields >> member_token)
+        {
+            const auto member = parse_decimal(member_token, "replica id", line_number);
+            if (member > std::numeric_limits<ReplicaID>::max())
+                throw std::invalid_argument("adaptive-v2 epoch-zero tree-file replica id is out of range");
+            members.push_back(static_cast<ReplicaID>(member));
+        }
+        auto canonical_members = members;
+        std::sort(canonical_members.begin(), canonical_members.end());
+        if (canonical_members != expected_members)
+            throw std::invalid_argument("adaptive-v2 epoch-zero tree-file membership differs from replicas");
+        trees.push_back(EpochTreeDefinition{static_cast<std::uint32_t>(trees.size()), fanout, pipeline_stretch, std::move(members), {}});
+    }
+    if (!file.eof() || trees.empty())
+        throw std::invalid_argument("adaptive-v2 epoch-zero tree file must contain at least one valid tree");
+    return trees;
 }
 
 bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)

@@ -285,11 +285,13 @@ parse_experiment_byzantine_options(
     const std::string &fault_mode,
     const std::string &raw_configuration,
     const std::string &raw_additional_omission_configuration,
+    const std::string &raw_additional_omission_configurations,
     const std::string &diagnostic_window,
     const std::string &raw_false_report_target,
     bool omit_outbound_aggregate,
     bool omit_outbound_direct_vote,
     int context_limit,
+    int omission_contexts_per_configuration,
     const std::string &raw_rotating_omission_actors,
     const std::string &raw_responsive_degraded_omission_actors,
     int responsive_omission_period,
@@ -297,7 +299,14 @@ parse_experiment_byzantine_options(
     const std::string &raw_window_end_monotonic_ns,
     int max_omissions_per_proposal,
     int maximum_rotating_contexts,
-    const std::string &raw_response_evidence_duplicate_probe)
+    const std::string &raw_response_evidence_duplicate_probe,
+    const std::string &raw_activation_gate_path,
+    const std::string &raw_activation_gate_manager_events,
+    const std::string &raw_activation_gate_run_id,
+    const std::string &raw_activation_gate_manager_source_instance,
+    const std::string &raw_activation_gate_profile_sha256,
+    const std::string &raw_activation_gate_tree_sha256,
+    const std::string &raw_activation_gate_launch_argv_sha256)
 {
     const bool scheduled_argument_present =
         !raw_rotating_omission_actors.empty() ||
@@ -308,15 +317,26 @@ parse_experiment_byzantine_options(
         max_omissions_per_proposal != 0 ||
         maximum_rotating_contexts != 0 ||
         !raw_response_evidence_duplicate_probe.empty();
+    const bool activation_gate_argument_present =
+        !raw_activation_gate_path.empty() ||
+        !raw_activation_gate_manager_events.empty() ||
+        !raw_activation_gate_run_id.empty() ||
+        !raw_activation_gate_manager_source_instance.empty() ||
+        !raw_activation_gate_profile_sha256.empty() ||
+        !raw_activation_gate_tree_sha256.empty() ||
+        !raw_activation_gate_launch_argv_sha256.empty();
     const bool requested =
         !fault_mode.empty() ||
         !raw_configuration.empty() ||
         !raw_additional_omission_configuration.empty() ||
+        !raw_additional_omission_configurations.empty() ||
         !diagnostic_window.empty() ||
         !raw_false_report_target.empty() ||
         omit_outbound_aggregate ||
         omit_outbound_direct_vote ||
-        context_limit != 0 || scheduled_argument_present;
+        context_limit != 0 ||
+        omission_contexts_per_configuration != 0 ||
+        scheduled_argument_present || activation_gate_argument_present;
     if (!requested)
         return std::nullopt;
     if (protocol_mode != "adaptive_v2")
@@ -356,7 +376,9 @@ parse_experiment_byzantine_options(
                 "unsupported experiment Byzantine mode");
         if (!raw_configuration.empty() ||
             !raw_additional_omission_configuration.empty() ||
-            context_limit != 0)
+            !raw_additional_omission_configurations.empty() ||
+            context_limit != 0 ||
+            omission_contexts_per_configuration != 0)
             throw HotStuffError(
                 "scheduled omission does not accept static configuration "
                 "or a context limit");
@@ -385,11 +407,17 @@ parse_experiment_byzantine_options(
                 "experiment Byzantine context limit must be positive");
     }
     if (omit_outbound_direct_vote &&
-        !raw_additional_omission_configuration.empty())
+        (!raw_additional_omission_configuration.empty() ||
+         !raw_additional_omission_configurations.empty()))
         throw HotStuffError(
             "direct-vote omission does not accept an additional "
             "configuration");
     if (!raw_additional_omission_configuration.empty() &&
+        !raw_additional_omission_configurations.empty())
+        throw HotStuffError(
+            "singular and plural additional omission configuration options are mutually exclusive");
+    if ((!raw_additional_omission_configuration.empty() ||
+         !raw_additional_omission_configurations.empty()) &&
         !omit_outbound_aggregate)
         throw HotStuffError(
             "additional experiment omission configuration requires "
@@ -569,6 +597,26 @@ parse_experiment_byzantine_options(
                 "use a distinct tree");
         options.additional_omission_configuration = additional;
     }
+    if (!raw_additional_omission_configurations.empty())
+    {
+        const auto additional_values = trim_all(
+            split(raw_additional_omission_configurations, ","));
+        if (additional_values.empty() || additional_values.size() > 2)
+            throw HotStuffError(
+                "additional experiment omission configurations must contain one or two contexts");
+        for (const auto &raw_additional : additional_values)
+        {
+            const auto additional = parse_configuration(
+                raw_additional,
+                "additional experiment omission configuration");
+            if (additional.epoch_number != options.configuration.epoch_number ||
+                additional.epoch_digest != options.configuration.epoch_digest ||
+                additional.tree_id == options.configuration.tree_id)
+                throw HotStuffError(
+                    "additional experiment omission configurations must share epoch/digest and use distinct trees");
+            options.additional_omission_configurations.push_back(additional);
+        }
+    }
     if (!raw_false_report_target.empty())
     {
         const auto target =
@@ -594,6 +642,72 @@ parse_experiment_byzantine_options(
         options.omit_outbound_direct_vote = true;
         options.maximum_direct_vote_omission_contexts =
             static_cast<std::size_t>(context_limit);
+    }
+    const auto omission_configuration_count =
+        std::size_t{1} +
+        static_cast<std::size_t>(
+            options.additional_omission_configuration.has_value()) +
+        options.additional_omission_configurations.size();
+    if (omission_contexts_per_configuration != 0)
+    {
+        if (!omit_outbound_aggregate ||
+            omission_contexts_per_configuration != 2 ||
+            context_limit != 6 ||
+            omission_configuration_count != 3)
+            throw HotStuffError(
+                "per-configuration omission requires exactly three configurations, two contexts each, and a global limit of six");
+        options.maximum_omission_contexts_per_configuration = 2;
+    }
+    const bool activation_gate_requested = !raw_activation_gate_path.empty() ||
+        !raw_activation_gate_manager_events.empty() ||
+        !raw_activation_gate_run_id.empty() ||
+        !raw_activation_gate_manager_source_instance.empty() ||
+        !raw_activation_gate_profile_sha256.empty() ||
+        !raw_activation_gate_tree_sha256.empty() ||
+        !raw_activation_gate_launch_argv_sha256.empty();
+    const auto is_n7_three_by_two_static = [&options, omission_contexts_per_configuration,
+                                              context_limit, omission_configuration_count] {
+        if (!options.omit_outbound_aggregate || options.configuration.epoch_number != 0 ||
+            options.configuration.tree_id != 4 || omission_contexts_per_configuration != 2 ||
+            context_limit != 6 || omission_configuration_count != 3 ||
+            options.additional_omission_configurations.size() != 2)
+            return false;
+        const auto &first = options.additional_omission_configurations[0];
+        const auto &second = options.additional_omission_configurations[1];
+        return ((first.tree_id == 5 && second.tree_id == 6) ||
+                (first.tree_id == 6 && second.tree_id == 5)) &&
+               first.epoch_number == 0 && second.epoch_number == 0 &&
+               first.epoch_digest == options.configuration.epoch_digest &&
+               second.epoch_digest == options.configuration.epoch_digest;
+    }();
+    if (is_n7_three_by_two_static && !activation_gate_requested)
+        throw HotStuffError(
+            "N7 three-by-two static aggregate omission requires an activation gate");
+    if (activation_gate_requested)
+    {
+        const auto valid_sha256 = [](const std::string &value) {
+            return value.size() == 64 && std::all_of(
+                value.begin(), value.end(), [](unsigned char character) {
+                    return (character >= '0' && character <= '9') ||
+                           (character >= 'a' && character <= 'f');
+                });
+        };
+        if (!omit_outbound_aggregate || local_replica != 1 || replica_count != 7 ||
+            omission_configuration_count != 3 || context_limit != 6 ||
+            omission_contexts_per_configuration != 2 || raw_activation_gate_path.empty() ||
+            raw_activation_gate_manager_events.empty() ||
+            raw_activation_gate_run_id.empty() ||
+            raw_activation_gate_manager_source_instance.empty() ||
+            !valid_sha256(raw_activation_gate_profile_sha256) ||
+            !valid_sha256(raw_activation_gate_tree_sha256) ||
+            !valid_sha256(raw_activation_gate_launch_argv_sha256))
+            throw HotStuffError(
+                "activation gate is limited to replica 1 of the N7 three-by-two aggregate omission profile");
+        options.activation_gate = hotstuff::ExperimentOmissionActivationGate{
+            raw_activation_gate_path, raw_activation_gate_manager_events,
+            raw_activation_gate_run_id, raw_activation_gate_manager_source_instance,
+            raw_activation_gate_profile_sha256, raw_activation_gate_tree_sha256,
+            raw_activation_gate_launch_argv_sha256, local_replica};
     }
     return options;
 }
@@ -1011,6 +1125,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_omission_additional_configuration =
         Config::OptValStr::create("");
+    auto opt_experiment_omission_additional_configurations =
+        Config::OptValStr::create("");
     auto opt_experiment_byzantine_window =
         Config::OptValStr::create("");
     auto opt_experiment_false_report_target =
@@ -1020,6 +1136,8 @@ int main(int argc, char **argv)
     auto opt_experiment_omit_outbound_direct_vote =
         Config::OptValFlag::create(false);
     auto opt_experiment_byzantine_context_limit =
+        Config::OptValInt::create(0);
+    auto opt_experiment_omission_contexts_per_configuration =
         Config::OptValInt::create(0);
     auto opt_experiment_rotating_omission_actors =
         Config::OptValStr::create("");
@@ -1036,6 +1154,20 @@ int main(int argc, char **argv)
     auto opt_experiment_rotating_omission_context_limit =
         Config::OptValInt::create(0);
     auto opt_experiment_response_evidence_duplicate_probe =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_path =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_manager_events =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_run_id =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_manager_source_instance =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_profile_sha256 =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_tree_sha256 =
+        Config::OptValStr::create("");
+    auto opt_experiment_omission_activation_gate_launch_argv_sha256 =
         Config::OptValStr::create("");
     auto opt_experiment_responsive_cross_commit_retention_v2 =
         Config::OptValFlag::create(false);
@@ -1229,6 +1361,12 @@ int main(int argc, char **argv)
         -1,
         "optional second exact epoch:tree:digest for aggregate omission");
     config.add_opt(
+        "experiment-omission-additional-configurations",
+        opt_experiment_omission_additional_configurations,
+        Config::SET_VAL,
+        -1,
+        "one or two comma-separated exact epoch:tree:digest contexts for aggregate omission");
+    config.add_opt(
         "experiment-byzantine-window",
         opt_experiment_byzantine_window,
         Config::SET_VAL,
@@ -1258,6 +1396,33 @@ int main(int argc, char **argv)
         Config::SET_VAL,
         -1,
         "maximum exact proposal contexts affected by the fault");
+    config.add_opt(
+        "experiment-omission-contexts-per-configuration",
+        opt_experiment_omission_contexts_per_configuration,
+        Config::SET_VAL,
+        -1,
+        "exact omission contexts permitted per configured tree");
+    config.add_opt("experiment-omission-activation-gate-path",
+        opt_experiment_omission_activation_gate_path, Config::SET_VAL, -1,
+        "N7 static omission gate path; omission remains disabled until validated");
+    config.add_opt("experiment-omission-activation-gate-manager-events",
+        opt_experiment_omission_activation_gate_manager_events, Config::SET_VAL, -1,
+        "same-host manager JSONL used to bind the N7 omission gate");
+    config.add_opt("experiment-omission-activation-gate-run-id",
+        opt_experiment_omission_activation_gate_run_id, Config::SET_VAL, -1,
+        "exact manager structured-event run ID bound by the N7 omission gate");
+    config.add_opt("experiment-omission-activation-gate-manager-source-instance",
+        opt_experiment_omission_activation_gate_manager_source_instance, Config::SET_VAL, -1,
+        "exact manager structured-event source instance bound by the N7 omission gate");
+    config.add_opt("experiment-omission-activation-gate-profile-sha256",
+        opt_experiment_omission_activation_gate_profile_sha256, Config::SET_VAL, -1,
+        "frozen N7 profile SHA-256 bound by the omission gate");
+    config.add_opt("experiment-omission-activation-gate-tree-sha256",
+        opt_experiment_omission_activation_gate_tree_sha256, Config::SET_VAL, -1,
+        "copied N7 tree-file SHA-256 bound by the omission gate");
+    config.add_opt("experiment-omission-activation-gate-launch-argv-sha256",
+        opt_experiment_omission_activation_gate_launch_argv_sha256, Config::SET_VAL, -1,
+        "archived replica launch argv SHA-256 bound by the omission gate");
     config.add_opt(
         "experiment-rotating-omission-actors",
         opt_experiment_rotating_omission_actors,
@@ -1439,11 +1604,13 @@ int main(int argc, char **argv)
             opt_experiment_byzantine_mode->get(),
             opt_experiment_byzantine_configuration->get(),
             opt_experiment_omission_additional_configuration->get(),
+            opt_experiment_omission_additional_configurations->get(),
             opt_experiment_byzantine_window->get(),
             opt_experiment_false_report_target->get(),
             opt_experiment_omit_outbound_aggregate->get(),
             opt_experiment_omit_outbound_direct_vote->get(),
             opt_experiment_byzantine_context_limit->get(),
+            opt_experiment_omission_contexts_per_configuration->get(),
             opt_experiment_rotating_omission_actors->get(),
             opt_experiment_responsive_degraded_omission_actors->get(),
             opt_experiment_responsive_omission_period->get(),
@@ -1451,7 +1618,14 @@ int main(int argc, char **argv)
             opt_experiment_byzantine_window_end_monotonic_ns->get(),
             opt_experiment_byzantine_max_omissions_per_proposal->get(),
             opt_experiment_rotating_omission_context_limit->get(),
-            opt_experiment_response_evidence_duplicate_probe->get());
+            opt_experiment_response_evidence_duplicate_probe->get(),
+            opt_experiment_omission_activation_gate_path->get(),
+            opt_experiment_omission_activation_gate_manager_events->get(),
+            opt_experiment_omission_activation_gate_run_id->get(),
+            opt_experiment_omission_activation_gate_manager_source_instance->get(),
+            opt_experiment_omission_activation_gate_profile_sha256->get(),
+            opt_experiment_omission_activation_gate_tree_sha256->get(),
+            opt_experiment_omission_activation_gate_launch_argv_sha256->get());
     const auto experiment_post_qc_audit_options =
         parse_experiment_post_qc_audit_options(
             opt_epoch_protocol_mode->get(),

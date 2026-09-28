@@ -4,7 +4,9 @@
 #include "catch.hpp"
 
 #include <algorithm>
+#include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -154,19 +156,31 @@ struct Fixture {
             BlsMembershipConstruction membership_construction =
                 BlsMembershipConstruction::random,
             std::uint64_t tick_scale = 1,
-            bool exact_v13_fault_window_contract = false)
+            bool exact_v13_fault_window_contract = false,
+            std::optional<OperatorCapacityIssuer> operator_capacity_issuer =
+                std::nullopt,
+            std::optional<EpochDefinitionInput> initial_override = std::nullopt,
+            std::function<std::uint64_t()> operator_capacity_raw_clock_now_ns =
+                {})
         : tick_scale(tick_scale),
           exact_v13_fault_window_contract(exact_v13_fault_window_contract),
           replicas(members(count)),
           shape(*derive_adaptive_v2_manager_runtime_shape(
               replicas, count == 7 ? 2 : 5, 2)),
-          initial(*derive_adaptive_v2_cyclic_epoch_zero(
-              replicas, count == 7 ? 2 : 5, 2)),
+          initial([&] {
+              if (initial_override) return *initial_override;
+              return *derive_adaptive_v2_cyclic_epoch_zero(
+                  replicas, count == 7 ? 2 : 5, 2);
+          }()),
           bls(count, membership_construction), config([&] {
               auto result = config_for(
                   replicas, shape, initial, bls, surviving.size(), tick_scale,
                   exact_v13_fault_window_contract);
               result.expected_cycle_count = expected_cycle_count;
+              result.operator_capacity_issuer =
+                  std::move(operator_capacity_issuer);
+              result.operator_capacity_raw_clock_now_ns =
+                  std::move(operator_capacity_raw_clock_now_ns);
               return result;
           }()),
           session(replicas, initial, config),

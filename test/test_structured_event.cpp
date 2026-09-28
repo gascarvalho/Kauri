@@ -572,6 +572,7 @@ using hotstuff::ExperimentReplicaRole;
 using hotstuff::ExclusiveFileStructuredEventOutput;
 using hotstuff::ExpectedMessageType;
 using hotstuff::FaultWindowArmedStructuredEvent;
+using hotstuff::FaultAggregateOmittedStructuredEvent;
 using hotstuff::FaultContributionOpportunityStructuredEvent;
 using hotstuff::MonotonicRawStructuredEventClock;
 using hotstuff::ProcessLifecycleEvent;
@@ -956,6 +957,13 @@ FaultWindowArmedStructuredEvent fault_window_armed_event(
         event.selection_cardinality_policy =
             "all_guarded_up_to_fault_bound_v1";
     return event;
+}
+
+FaultAggregateOmittedStructuredEvent fault_aggregate_omitted_event()
+{
+    return FaultAggregateOmittedStructuredEvent{
+        1, 4, configuration(0, 4, "n7-static-epoch"),
+        digest("n7-static-block"), digest("n7-static-gate").to_hex(), true};
 }
 
 AdaptiveV2CrossCommitRetentionReadyStructuredEvent
@@ -2136,7 +2144,7 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 14,
+        std::variant_size<AuditStructuredEventPayload>::value == 16,
         "the audit capability appends adaptive-v3 readiness and command terminal evidence");
     static_assert(
         std::is_same<
@@ -3242,6 +3250,27 @@ TEST_CASE("fault-window armed events partition schema-only fields",
     invalid.selection_cardinality_policy =
         "all_guarded_up_to_fault_bound_v1";
     CHECK(rejects(std::move(invalid)));
+}
+
+TEST_CASE("N7 static aggregate omission has a source-sequenced audit marker",
+          "[structured-event][n7][omission]")
+{
+    auto config = event_config();
+    config.source.logical_id = "replica-1";
+    config.source.instance_id = "n7-replica-1";
+    FakeClock clock({9'001});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+    sink.emit_audit(AuditStructuredEventPayload{fault_aggregate_omitted_event()});
+    sink.shutdown();
+    CHECK(sink.health().healthy);
+    const auto text = rendered(output);
+    CHECK(text.find("\"event_type\":\"fault.aggregate_omitted\"") !=
+          std::string::npos);
+    CHECK(text.find("\"actor\":1") != std::string::npos);
+    CHECK(text.find("\"parent_replica\":4") != std::string::npos);
+    CHECK(text.find("\"tree_id\":4") != std::string::npos);
+    CHECK(text.find("\"first_for_context\":true") != std::string::npos);
 }
 
 template<typename Event>

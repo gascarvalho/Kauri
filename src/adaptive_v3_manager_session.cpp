@@ -1,5 +1,7 @@
 #include "hotstuff/adaptive_v3_manager_session.h"
 
+#include "hotstuff/operator_capacity_authorization.h"
+
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -30,6 +32,9 @@ struct AdaptiveV3ManagerSession::State
     AdaptiveV2ManagerIngress ingress;
     std::unique_ptr<AdaptiveV2ManagerController> controller;
     std::optional<AdaptiveV3TransitionProjection> projection;
+    std::unique_ptr<const AdaptiveV3EpochChangeBundle>
+        operator_capacity_successor;
+    bool operator_capacity_epoch1{false};
     std::unique_ptr<AdaptiveV3ManagerReadinessCollector> collector;
     std::unique_ptr<AdaptiveV3CertificateOutbox> outbox;
     AdaptiveV3ManagerSessionStatus phase{AdaptiveV3ManagerSessionStatus::idle};
@@ -91,7 +96,9 @@ struct AdaptiveV3ManagerSession::State
         collector.reset();
         outbox.reset();
         projection.reset();
+        operator_capacity_successor.reset();
         controller.reset();
+        operator_capacity_epoch1 = false;
         phase = next;
     }
 
@@ -340,6 +347,126 @@ bool AdaptiveV3ManagerSession::begin_cycle(
     }
 }
 
+bool AdaptiveV3ManagerSession::begin_operator_capacity_epoch1() noexcept
+{
+    auto &s = *state_;
+    if (s.phase != AdaptiveV3ManagerSessionStatus::idle ||
+        s.cycle_ordinal != 0 || s.config.expected_cycle_count != 1 ||
+        s.ingress.current_epoch().epoch_number() != 0 ||
+        !s.config.operator_capacity_issuer ||
+        !s.config.operator_capacity_raw_clock_now_ns ||
+        s.config.operator_capacity_issuer->issuer_id == 0 ||
+        s.config.operator_capacity_issuer->issuer_reference.empty() ||
+        s.ingress.current_epoch().trees().empty() ||
+        std::any_of(s.ingress.current_epoch().trees().begin(),
+                    s.ingress.current_epoch().trees().end(),
+                    [](const auto &tree) {
+                        return !tree.wait_exempt_leaves.empty();
+                    }))
+    {
+        return false;
+    }
+
+    AdaptiveV2TransitionPolicy baseline_policy;
+    baseline_policy.intent = TreePolicyKind::fault_containment;
+    try
+    {
+        baseline_policy.containment_baseline_roots.reserve(
+            s.ingress.current_epoch().trees().size());
+        for (const auto &tree : s.ingress.current_epoch().trees())
+        {
+            if (tree.members_breadth_first.empty())
+                return false;
+            baseline_policy.containment_baseline_roots.push_back(
+                {tree.tree_id, tree.members_breadth_first.front()});
+        }
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (!begin_cycle(baseline_policy))
+        return false;
+    s.operator_capacity_epoch1 = true;
+    return true;
+}
+
+bool AdaptiveV3ManagerSession::authorize_operator_capacity_epoch1(
+    const OperatorCapacityAuthorization &authorization) noexcept
+{
+    auto &s = *state_;
+    if (s.expire_hard_deadline(s.last_tick) ||
+        s.phase != AdaptiveV3ManagerSessionStatus::selecting ||
+        !s.operator_capacity_epoch1 || !s.controller || s.projection ||
+        s.operator_capacity_successor)
+    {
+        return false;
+    }
+    const auto *snapshot = s.controller->baseline_audit_snapshot();
+    const auto &issuer = *s.config.operator_capacity_issuer;
+    const auto verified = verify_operator_capacity_authorization(
+        authorization, issuer, s.ingress.membership());
+    std::uint64_t raw_clock_now = 0;
+    try
+    {
+        raw_clock_now = s.config.operator_capacity_raw_clock_now_ns();
+    }
+    catch (...)
+    {
+        return false;
+    }
+    if (snapshot == nullptr || !verified ||
+        verified->issuer_id() != issuer.issuer_id ||
+        verified->capacity_digest() != issuer.approved_capacity_digest ||
+        verified->policy().capacity_snapshot.issuer_reference !=
+            issuer.issuer_reference ||
+        verified->policy().capacity_snapshot.predecessor != snapshot->epoch() ||
+        verified->policy().expected_responsiveness_snapshot_id !=
+            snapshot->snapshot_id() ||
+        verified->policy().expected_evidence_cutoff !=
+            snapshot->evidence_cutoff() ||
+        verified->policy().decision_clock_domain !=
+            OperatorCapacityClockDomain::monotonic_raw_ns ||
+        verified->policy().decision_monotonic_ns == 0 ||
+        raw_clock_now == 0 ||
+        raw_clock_now < verified->policy().decision_monotonic_ns ||
+        raw_clock_now >
+            verified->policy().capacity_snapshot.valid_until_monotonic_ns)
+        return false;
+    try
+    {
+        auto built = build_operator_capacity_epoch1_bundle(
+            s.ingress.current_epoch(), s.ingress.membership(), *snapshot,
+            verified->policy(), s.config.controller.activation_delay_blocks,
+            s.config.controller.issuer_id, s.config.controller.issuer_private_key,
+            s.config.controller.bundle_limits);
+        if (!built || !built.bundle)
+            return false;
+        auto projection = make_adaptive_v3_transition_projection(
+            *built.bundle, s.ingress.current_epoch(), s.cycle_ordinal,
+            s.config.readiness_membership);
+        if (!projection)
+            return false;
+        s.operator_capacity_successor = std::move(built.bundle);
+        s.projection = std::move(projection);
+        s.phase = AdaptiveV3ManagerSessionStatus::successor_available;
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
+const AdaptationSnapshot *
+AdaptiveV3ManagerSession::operator_capacity_baseline_snapshot() const noexcept
+{
+    const auto &s = *state_;
+    return s.operator_capacity_epoch1 && s.controller
+               ? s.controller->baseline_audit_snapshot()
+               : nullptr;
+}
+
 bool AdaptiveV3ManagerSession::arm_fault_window(
     AdaptiveV2FaultWindowArm arm) noexcept
 {
@@ -367,7 +494,14 @@ AdaptiveV2ManagerControllerStatus AdaptiveV3ManagerSession::evaluate() noexcept
     {
         return AdaptiveV2ManagerControllerStatus::unhealthy;
     }
+    // Capacity Epoch-1 uses the controller only to freeze its authenticated,
+    // all-responsive baseline.  It must never fall through to the guarded
+    // fault selector while awaiting an externally verified authorization.
+    if (s.operator_capacity_epoch1 && s.controller->baseline_audit_snapshot())
+        return AdaptiveV2ManagerControllerStatus::baseline_frozen;
     const auto result = s.controller->evaluate();
+    if (s.operator_capacity_epoch1)
+        return result;
     const bool successor_ready =
         result == AdaptiveV2ManagerControllerStatus::successor_ready ||
         result == AdaptiveV2ManagerControllerStatus::already_ready;
@@ -420,9 +554,9 @@ AdaptiveV3ManagerSession::controller_failure_detail() const noexcept
 const AdaptiveV3EpochChangeBundle *
 AdaptiveV3ManagerSession::successor_bundle() const noexcept
 {
-    return state_->controller
-               ? state_->controller->successor_bundle_v3()
-               : nullptr;
+    if (state_->operator_capacity_successor)
+        return state_->operator_capacity_successor.get();
+    return state_->controller ? state_->controller->successor_bundle_v3() : nullptr;
 }
 bool AdaptiveV3ManagerSession::begin_readiness(std::uint64_t tick) noexcept
 {

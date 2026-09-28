@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <ctime>
@@ -13,6 +14,10 @@
 #include <string>
 #include <type_traits>
 #include <vector>
+
+#include <unistd.h>
+
+#include <openssl/sha.h>
 
 #include "catch.hpp"
 #include "hotstuff/configuration.h"
@@ -69,12 +74,14 @@ struct ExperimentByzantineOptions final
     bool enabled{false};
     ConfigurationId configuration;
     std::optional<ConfigurationId> additional_omission_configuration;
+    std::vector<ConfigurationId> additional_omission_configurations;
     std::string diagnostic_window;
     std::optional<ReplicaID> false_report_target;
     bool omit_outbound_aggregate{false};
     bool omit_outbound_direct_vote{false};
     std::size_t maximum_false_report_contexts{0};
     std::size_t maximum_omission_contexts{0};
+    std::size_t maximum_omission_contexts_per_configuration{0};
     std::size_t maximum_direct_vote_omission_contexts{0};
 };
 
@@ -198,6 +205,7 @@ using hotstuff::ExperimentByzantineOptions;
 using hotstuff::ExperimentDirectVoteDisposition;
 using hotstuff::ExperimentFalseTimeoutFenceTestAccess;
 using hotstuff::ExperimentOmissionAction;
+using hotstuff::ExperimentOmissionActivationGate;
 using hotstuff::ExperimentOmissionCohort;
 using hotstuff::ExperimentOmissionMarker;
 using hotstuff::ExperimentReplicaRole;
@@ -210,6 +218,44 @@ using hotstuff::uint256_t;
 uint256_t digest(const std::string &label)
 {
     return DataStream(label).get_hash();
+}
+
+std::string sha256_hex(const std::string &bytes)
+{
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest_bytes{};
+    SHA256(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size(),
+           digest_bytes.data());
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest_bytes.size() * 2);
+    for (const auto byte : digest_bytes)
+    {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
+std::string temporary_path()
+{
+    std::string pattern = "/private/tmp/kauri-n7-gate-XXXXXX";
+    std::vector<char> mutable_pattern(pattern.begin(), pattern.end());
+    mutable_pattern.push_back('\0');
+    const auto descriptor = ::mkstemp(mutable_pattern.data());
+    if (descriptor < 0)
+        throw std::runtime_error("cannot allocate temporary N7 gate file");
+    ::close(descriptor);
+    return mutable_pattern.data();
+}
+
+void write_file(const std::string &path, const std::string &contents)
+{
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    if (!stream)
+        throw std::runtime_error("cannot write temporary N7 gate fixture");
+    stream << contents;
+    if (!stream)
+        throw std::runtime_error("cannot flush temporary N7 gate fixture");
 }
 
 std::uint64_t monotonic_raw_now_ns()
@@ -770,6 +816,275 @@ TEST_CASE(
         "wrong-window",
         configuration(7, 0, "shared-epoch"),
         "diagnostic-window-2")));
+}
+
+TEST_CASE(
+    "aggregate omission accepts exactly three same-epoch digest tree contexts",
+    "[adaptive-v2][experiment][byzantine][omission][three-context]")
+{
+    auto options = aggregate_omission_options();
+    options.configuration = configuration(7, 0, "shared-epoch");
+    options.additional_omission_configurations = {
+        configuration(7, 2, "shared-epoch"),
+        configuration(7, 6, "shared-epoch")};
+    options.maximum_omission_contexts = 3;
+    ExperimentByzantineAdapter adapter(options);
+
+    CHECK(adapter.consume_outbound_aggregate(context(
+        "tree-0", configuration(7, 0, "shared-epoch"))));
+    CHECK(adapter.consume_outbound_aggregate(context(
+        "tree-2", configuration(7, 2, "shared-epoch"))));
+    CHECK(adapter.consume_outbound_aggregate(context(
+        "tree-6", configuration(7, 6, "shared-epoch"))));
+    CHECK(adapter.consume_outbound_aggregate(context(
+        "tree-0", configuration(7, 0, "shared-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "tree-2-later", configuration(7, 2, "shared-epoch"))));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(context(
+        "other-tree", configuration(7, 4, "shared-epoch"))));
+}
+
+TEST_CASE(
+    "aggregate omission can bound each of three configurations independently",
+    "[adaptive-v2][experiment][byzantine][omission][per-configuration]")
+{
+    auto options = aggregate_omission_options();
+    options.configuration = configuration(7, 4, "shared-epoch");
+    options.additional_omission_configurations = {
+        configuration(7, 5, "shared-epoch"),
+        configuration(7, 6, "shared-epoch")};
+    options.maximum_omission_contexts = 6;
+    options.maximum_omission_contexts_per_configuration = 2;
+    ExperimentByzantineAdapter adapter(options);
+
+    for (const auto tree_id : std::vector<std::uint32_t>{4, 5, 6})
+    {
+        const auto exact = configuration(7, tree_id, "shared-epoch");
+        const auto first = context(
+            "tree-" + std::to_string(tree_id) + "-first", exact);
+        const auto second = context(
+            "tree-" + std::to_string(tree_id) + "-second", exact);
+        const auto third = context(
+            "tree-" + std::to_string(tree_id) + "-third", exact);
+
+        CHECK(adapter.consume_outbound_aggregate(first));
+        CHECK(adapter.consume_outbound_aggregate_marker(first));
+        CHECK(adapter.consume_outbound_aggregate(second));
+        CHECK(adapter.consume_outbound_aggregate_marker(second));
+        CHECK_FALSE(adapter.consume_outbound_aggregate(third));
+        // Retries for an already selected proposal remain omitted without
+        // consuming another per-configuration or global slot.
+        CHECK(adapter.consume_outbound_aggregate(first));
+        CHECK_FALSE(adapter.consume_outbound_aggregate_marker(first));
+    }
+}
+
+TEST_CASE(
+    "N7 static aggregate omission forwards before a validated activation gate",
+    "[adaptive-v2][experiment][byzantine][omission][activation-gate]")
+{
+    auto options = aggregate_omission_options();
+    options.configuration = configuration(0, 4, "shared-epoch");
+    options.additional_omission_configurations = {
+        configuration(0, 5, "shared-epoch"),
+        configuration(0, 6, "shared-epoch")};
+    options.maximum_omission_contexts = 6;
+    options.maximum_omission_contexts_per_configuration = 2;
+    options.activation_gate = ExperimentOmissionActivationGate{
+        "/definitely-missing-kauri-n7-gate", "/definitely-missing-kauri-manager-events",
+        "n7-test-run", "n7-test-manager-instance",
+        std::string(64, 'a'), std::string(64, 'b'), std::string(64, 'c'), 1};
+    ExperimentByzantineAdapter adapter(options);
+
+    const auto first = context("before-gate", configuration(0, 4, "shared-epoch"));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        first, ExperimentReplicaRole::internal));
+    // The failed pre-gate attempt did not consume either static quota slot.
+    CHECK_FALSE(adapter.consume_outbound_aggregate_marker(first));
+}
+
+TEST_CASE(
+    "N7 three-by-two static omission requires a complete activation gate",
+    "[adaptive-v2][experiment][byzantine][omission][activation-gate]")
+{
+    auto options = aggregate_omission_options();
+    options.configuration = configuration(0, 4, "shared-epoch");
+    options.additional_omission_configurations = {
+        configuration(0, 5, "shared-epoch"),
+        configuration(0, 6, "shared-epoch")};
+    options.maximum_omission_contexts = 6;
+    options.maximum_omission_contexts_per_configuration = 2;
+    CHECK_THROWS_AS(ExperimentByzantineAdapter(options), std::invalid_argument);
+}
+
+TEST_CASE(
+    "N7 activation gate binds one canonical manager arm before omission",
+    "[adaptive-v2][experiment][byzantine][omission][activation-gate]")
+{
+    const auto manager_path = temporary_path();
+    const auto gate_path = temporary_path();
+    const auto cleanup = [&] {
+        std::remove(manager_path.c_str());
+        std::remove(gate_path.c_str());
+    };
+    try
+    {
+        auto options = aggregate_omission_options();
+        options.configuration = configuration(0, 4, "shared-epoch");
+        options.additional_omission_configurations = {
+            configuration(0, 5, "shared-epoch"),
+            configuration(0, 6, "shared-epoch")};
+        options.maximum_omission_contexts = 6;
+        options.maximum_omission_contexts_per_configuration = 2;
+        const auto profile = std::string(64, 'a');
+        const auto tree = std::string(64, 'b');
+        const auto argv = std::string(64, 'c');
+        const auto receipt = std::string(64, 'd');
+        const auto arm = std::string(64, 'e');
+        const auto run_id = std::string{"n7-test-run"};
+        const auto source_instance = std::string{"n7-test-manager-instance"};
+        const auto manager_line =
+            std::string{"{\"event_schema_version\":1,\"run_id\":\""} + run_id +
+            "\",\"source_kind\":\"adaptation_manager\",\"source_id\":\"adaptive-manager\",\"source_instance\":\"" +
+            source_instance + "\",\"source_sequence\":7,\"source_monotonic_ns\":91,\"event_type\":\"fault_window_armed\",\"payload\":{\"schema_version\":4,\"kind\":\"kauri-focused-fault-window-arm-v4\",\"run_id\":\"" +
+            run_id + "\",\"profile_id\":\"n7-three-reporter-relay-omission-v2\",\"profile_sha256\":\"" +
+            profile + "\",\"topology_proof_sha256\":\"" + std::string(64, 'f') +
+            "\",\"request_sha256\":\"" + std::string(64, '1') +
+            "\",\"epoch_number\":0,\"epoch_digest\":\"" +
+            options.configuration.epoch_digest.to_hex() +
+            "\",\"fault_receipt_sha256\":\"" + receipt +
+            "\",\"evidence_start_monotonic_ns\":90,\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\"" + arm + "\"}}";
+        write_file(manager_path, manager_line + "\n");
+        const auto gate_bytes =
+            std::string{"{\"schema_version\":1,\"kind\":\"kauri-n7-static-aggregate-omission-gate-v1\",\"profile_sha256\":\""} + profile +
+            "\",\"tree_file_sha256\":\"" + tree + "\",\"epoch_digest\":\"" +
+            options.configuration.epoch_digest.to_hex() + "\",\"replica_id\":1,\"launch_argv_sha256\":\"" + argv +
+            "\",\"manager_run_id\":\"" + run_id + "\",\"manager_source_instance\":\"" +
+            source_instance + "\",\"manager_source_sequence\":7,\"fault_window_arm_event_sha256\":\"" +
+            sha256_hex(manager_line) + "\",\"activation_monotonic_ns\":92}\n";
+        write_file(gate_path, gate_bytes);
+        options.activation_gate = ExperimentOmissionActivationGate{
+            gate_path, manager_path, run_id, source_instance, profile, tree, argv, 1};
+        std::size_t activation_events = 0;
+        options.omission_activation_emitter = [&activation_events](const auto &) {
+            ++activation_events;
+        };
+        ExperimentByzantineAdapter adapter(options);
+        const auto first = context("after-arm", options.configuration);
+        CHECK(adapter.consume_outbound_aggregate(
+            first, ExperimentReplicaRole::internal));
+        CHECK(adapter.consume_outbound_aggregate_marker(first));
+        CHECK(activation_events == 1);
+
+        // A replaced gate cannot reuse the cached authorization.
+        write_file(gate_path, gate_bytes + " ");
+        const auto second = context("after-mutation", options.configuration);
+        CHECK_FALSE(adapter.consume_outbound_aggregate(
+            second, ExperimentReplicaRole::internal));
+
+        // An activation-audit exception leaves the static quota unconsumed.
+        options.omission_activation_emitter = [](const auto &) {
+            throw std::runtime_error("audit output failed");
+        };
+        write_file(gate_path, gate_bytes);
+        ExperimentByzantineAdapter failing_adapter(options);
+        CHECK_FALSE(failing_adapter.consume_outbound_aggregate(
+            first, ExperimentReplicaRole::internal));
+        CHECK_FALSE(failing_adapter.consume_outbound_aggregate_marker(first));
+
+        // A hash-bound but forged source envelope is not an arm record.
+        options.omission_activation_emitter = [](const auto &) {};
+        auto forged_line = manager_line;
+        const auto source_id = std::string{"\"source_id\":\"adaptive-manager\""};
+        forged_line.replace(
+            forged_line.find(source_id), source_id.size(),
+            "\"source_id\":\"forged-manager\"");
+        auto forged_gate = gate_bytes;
+        const auto manager_hash = sha256_hex(manager_line);
+        forged_gate.replace(
+            forged_gate.find(manager_hash), manager_hash.size(),
+            sha256_hex(forged_line));
+        write_file(manager_path, forged_line + "\n");
+        write_file(gate_path, forged_gate);
+        ExperimentByzantineAdapter forged_adapter(options);
+        CHECK_FALSE(forged_adapter.consume_outbound_aggregate(
+            first, ExperimentReplicaRole::internal));
+
+        // A malformed raw JSONL row is rejected without escaping the noexcept
+        // selector (and therefore cannot terminate a replica).
+        write_file(manager_path, "not-json\n");
+        write_file(gate_path, gate_bytes);
+        ExperimentByzantineAdapter malformed_adapter(options);
+        CHECK_NOTHROW(malformed_adapter.consume_outbound_aggregate(
+            first, ExperimentReplicaRole::internal));
+        CHECK_FALSE(malformed_adapter.consume_outbound_aggregate(
+            first, ExperimentReplicaRole::internal));
+    }
+    catch (...)
+    {
+        cleanup();
+        throw;
+    }
+    cleanup();
+}
+
+TEST_CASE(
+    "per-configuration omission quota is the exact opt-in three-by-two contract",
+    "[adaptive-v2][experiment][byzantine][omission][per-configuration][validation]")
+{
+    auto valid = aggregate_omission_options();
+    valid.configuration = configuration(7, 4, "shared-epoch");
+    valid.additional_omission_configurations = {
+        configuration(7, 5, "shared-epoch"),
+        configuration(7, 6, "shared-epoch")};
+    valid.maximum_omission_contexts = 6;
+    valid.maximum_omission_contexts_per_configuration = 2;
+    CHECK_NOTHROW(ExperimentByzantineAdapter(valid));
+
+    auto wrong_per_configuration = valid;
+    wrong_per_configuration.maximum_omission_contexts_per_configuration = 1;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(wrong_per_configuration),
+        std::invalid_argument);
+
+    auto wrong_global = valid;
+    wrong_global.maximum_omission_contexts = 5;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(wrong_global), std::invalid_argument);
+
+    auto only_two_configurations = valid;
+    only_two_configurations.additional_omission_configurations.pop_back();
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(only_two_configurations),
+        std::invalid_argument);
+
+    auto direct_vote = direct_vote_omission_options();
+    direct_vote.maximum_omission_contexts_per_configuration = 2;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(direct_vote), std::invalid_argument);
+}
+
+TEST_CASE(
+    "aggregate omission rejects ambiguous additional context sets",
+    "[adaptive-v2][experiment][byzantine][omission][three-context]")
+{
+    auto too_many = aggregate_omission_options();
+    too_many.additional_omission_configurations = {
+        configuration(7, 0, "diagnostic-epoch"),
+        configuration(7, 1, "diagnostic-epoch"),
+        configuration(7, 2, "diagnostic-epoch")};
+    CHECK_THROWS_AS(ExperimentByzantineAdapter(too_many), std::invalid_argument);
+
+    auto duplicate = aggregate_omission_options();
+    duplicate.additional_omission_configurations = {
+        configuration(7, 0, "diagnostic-epoch"),
+        configuration(7, 0, "diagnostic-epoch")};
+    CHECK_THROWS_AS(ExperimentByzantineAdapter(duplicate), std::invalid_argument);
+
+    auto wrong_epoch = aggregate_omission_options();
+    wrong_epoch.additional_omission_configurations = {
+        configuration(8, 0, "diagnostic-epoch")};
+    CHECK_THROWS_AS(ExperimentByzantineAdapter(wrong_epoch), std::invalid_argument);
 }
 
 TEST_CASE(
@@ -2283,6 +2598,10 @@ TEST_CASE(
             "\"experiment-omission-additional-configuration\"") !=
         std::string::npos);
     CHECK(
+        application.find(
+            "\"experiment-omission-additional-configurations\"") !=
+        std::string::npos);
+    CHECK(
         application.find("\"experiment-byzantine-window\"") !=
         std::string::npos);
     CHECK(
@@ -2297,6 +2616,10 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         application.find("\"experiment-byzantine-context-limit\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
+            "\"experiment-omission-contexts-per-configuration\"") !=
         std::string::npos);
     CHECK(
         application.find(
@@ -2335,6 +2658,15 @@ TEST_CASE(
         application,
         "parse_experiment_byzantine_options(",
         "hotstuff::PubKeySecp256k1 parse_adaptive_v2_issuer_public_key");
+    CHECK(parser.find("raw_additional_omission_configurations") !=
+          std::string::npos);
+    CHECK(parser.find("omission_contexts_per_configuration") !=
+          std::string::npos);
+    CHECK(parser.find(
+              "per-configuration omission requires exactly three configurations, two contexts each, and a global limit of six") !=
+          std::string::npos);
+    CHECK(parser.find("singular and plural additional omission configuration options are mutually exclusive") !=
+          std::string::npos);
     CHECK(
         parser.find("bool omit_outbound_direct_vote") !=
         std::string::npos);
@@ -2688,10 +3020,12 @@ TEST_CASE(
         occurrences(
             implementation,
             "adaptive_evidence_monotonic_now_ns()") >= 6);
+    // Reporting flush has its own targeted clock assertion below; terminal
+    // reporting events may also use this clock without changing fault timing.
     CHECK(
         occurrences(
             implementation,
-            "adaptive_monotonic_now_ns()") == 2);
+            "adaptive_monotonic_now_ns()") >= 2);
     const auto reporting_flush = source_slice(
         implementation,
         "void HotStuffBase::flush_adaptive_v2_reporting",

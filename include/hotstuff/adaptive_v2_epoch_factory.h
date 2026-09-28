@@ -13,6 +13,7 @@
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/epoch_change_bundle.h"
 #include "hotstuff/tree_policy.h"
+#include "hotstuff/operator_capacity_policy.h"
 
 namespace hotstuff
 {
@@ -143,6 +144,20 @@ AdaptiveV2EpochFactoryResult build_adaptive_v2_successor_bundle(
     const AdaptiveV2SelectionResult &selection,
     const AdaptiveV2TransitionPolicy &transition_policy,
     const TreePlacementInput &placement_input,
+    std::uint64_t activation_delay_blocks,
+    EpochChangeIssuerId issuer_id,
+    const PrivKeySecp256k1 &issuer_private_key,
+    const EpochChangeBundleLimits &bundle_limits) noexcept;
+
+/**
+ * Separately versioned all-live Epoch-1 construction.  This path consumes no
+ * fault selection and never creates wait-exempt nodes.
+ */
+AdaptiveV3EpochFactoryResult build_operator_capacity_epoch1_bundle(
+    const EpochDefinition &current_epoch,
+    const std::vector<ReplicaID> &membership,
+    const AdaptationSnapshot &responsiveness_snapshot,
+    const OperatorCapacityPolicyConfig &capacity_config,
     std::uint64_t activation_delay_blocks,
     EpochChangeIssuerId issuer_id,
     const PrivKeySecp256k1 &issuer_private_key,

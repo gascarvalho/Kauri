@@ -1,7 +1,9 @@
 #include "hotstuff/experiment_byzantine_adapter.h"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
+#include <fcntl.h>
 #include <limits>
 #include <map>
 #include <set>
@@ -9,6 +11,11 @@
 #include <stdexcept>
 #include <tuple>
 #include <utility>
+#include <unistd.h>
+
+#include <sys/stat.h>
+
+#include <openssl/sha.h>
 
 namespace hotstuff
 {
@@ -47,7 +54,12 @@ bool exact_omission_context(
            (context.proposal.configuration == options.configuration ||
             (options.additional_omission_configuration.has_value() &&
              context.proposal.configuration ==
-                 *options.additional_omission_configuration));
+                 *options.additional_omission_configuration) ||
+            std::find(
+                options.additional_omission_configurations.begin(),
+                options.additional_omission_configurations.end(),
+                context.proposal.configuration) !=
+                options.additional_omission_configurations.end());
 }
 
 constexpr const char *kRotatingOmissionMode =
@@ -58,6 +70,66 @@ constexpr const char *kTieredOmissionModeV1 =
     "tiered_persistent_responsive_omission_v1";
 constexpr const char *kTieredOmissionModeV2 =
     "tiered_persistent_responsive_omission_v2";
+constexpr const char *kN7StaticAggregateGateKind =
+    "kauri-n7-static-aggregate-omission-gate-v1";
+constexpr std::size_t kMaximumActivationGateBytes = 4096;
+
+bool valid_sha256_hex(const std::string &value) noexcept
+{
+    return value.size() == 64 && std::all_of(
+        value.begin(), value.end(), [](unsigned char character) {
+            return (character >= '0' && character <= '9') ||
+                   (character >= 'a' && character <= 'f');
+        });
+}
+
+std::string sha256_hex(const std::string &bytes)
+{
+    std::array<unsigned char, SHA256_DIGEST_LENGTH> digest{};
+    SHA256(reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size(),
+           digest.data());
+    static constexpr char digits[] = "0123456789abcdef";
+    std::string result;
+    result.reserve(digest.size() * 2);
+    for (const auto byte : digest)
+    {
+        result.push_back(digits[byte >> 4]);
+        result.push_back(digits[byte & 0x0f]);
+    }
+    return result;
+}
+
+std::optional<std::string> read_regular_file_no_follow(
+    const std::string &path, std::size_t maximum_bytes) noexcept
+{
+    const auto fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return std::nullopt;
+    struct stat metadata {};
+    if (::fstat(fd, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
+        metadata.st_size < 0 ||
+        static_cast<std::uintmax_t>(metadata.st_size) > maximum_bytes)
+    {
+        ::close(fd);
+        return std::nullopt;
+    }
+    std::string bytes(static_cast<std::size_t>(metadata.st_size), '\0');
+    std::size_t offset = 0;
+    while (offset < bytes.size())
+    {
+        const auto count = ::read(fd, bytes.data() + offset, bytes.size() - offset);
+        if (count <= 0)
+        {
+            ::close(fd);
+            return std::nullopt;
+        }
+        offset += static_cast<std::size_t>(count);
+    }
+    const bool stable = ::fstat(fd, &metadata) == 0 &&
+        static_cast<std::size_t>(metadata.st_size) == bytes.size();
+    ::close(fd);
+    return stable ? std::optional<std::string>{std::move(bytes)} : std::nullopt;
+}
 
 bool is_rotating_omission_mode(const std::string &mode) noexcept
 {
@@ -253,16 +325,22 @@ struct ExperimentByzantineAdapter::State
     explicit State(ExperimentByzantineOptions configured)
         : options(std::move(configured))
     {
-        if (options.additional_omission_configuration.has_value() &&
+        if ((options.additional_omission_configuration.has_value() ||
+             !options.additional_omission_configurations.empty()) &&
             options.omit_outbound_direct_vote)
             throw std::invalid_argument(
                 "direct-vote omission does not accept an additional "
                 "configuration");
-        if (options.additional_omission_configuration.has_value() &&
+        if ((options.additional_omission_configuration.has_value() ||
+             !options.additional_omission_configurations.empty()) &&
             (!options.enabled || !options.omit_outbound_aggregate))
             throw std::invalid_argument(
                 "additional omission configuration requires enabled "
                 "aggregate omission");
+        if (options.maximum_omission_contexts_per_configuration != 0 &&
+            !options.enabled)
+            throw std::invalid_argument(
+                "per-configuration omission requires an enabled adapter");
         if (!options.enabled)
             return;
         if (options.diagnostic_window.empty())
@@ -289,21 +367,69 @@ struct ExperimentByzantineAdapter::State
             options.maximum_direct_vote_omission_contexts == 0)
             throw std::invalid_argument(
                 "direct-vote omission context bound must be positive");
+        std::vector<ConfigurationId> omission_configurations;
         if (options.additional_omission_configuration.has_value())
+            omission_configurations.push_back(
+                *options.additional_omission_configuration);
+        omission_configurations.insert(
+            omission_configurations.end(),
+            options.additional_omission_configurations.begin(),
+            options.additional_omission_configurations.end());
+        if (omission_configurations.size() > 2)
+            throw std::invalid_argument(
+                "aggregate omission supports at most three contexts");
+        for (const auto &additional : omission_configurations)
         {
-            const auto &additional =
-                *options.additional_omission_configuration;
-            if (additional.epoch_number !=
-                    options.configuration.epoch_number ||
-                additional.epoch_digest !=
-                    options.configuration.epoch_digest)
+            if (additional.epoch_number != options.configuration.epoch_number ||
+                additional.epoch_digest != options.configuration.epoch_digest)
                 throw std::invalid_argument(
-                    "additional omission configuration must share the "
-                    "primary epoch and digest");
+                    "additional omission configuration must share the primary epoch and digest");
             if (additional.tree_id == options.configuration.tree_id)
                 throw std::invalid_argument(
-                    "additional omission configuration must use a "
-                    "distinct tree");
+                    "additional omission configuration must use a distinct tree");
+        }
+        std::sort(omission_configurations.begin(), omission_configurations.end(),
+            [](const ConfigurationId &left, const ConfigurationId &right)
+            { return left.tree_id < right.tree_id; });
+        if (std::adjacent_find(omission_configurations.begin(), omission_configurations.end(),
+            [](const ConfigurationId &left, const ConfigurationId &right)
+            { return left.tree_id == right.tree_id; }) != omission_configurations.end())
+            throw std::invalid_argument("additional omission configurations must be distinct");
+        if (options.maximum_omission_contexts_per_configuration != 0 &&
+            (!options.omit_outbound_aggregate ||
+             omission_configurations.size() != 2 ||
+             options.maximum_omission_contexts_per_configuration != 2 ||
+             options.maximum_omission_contexts != 6))
+            throw std::invalid_argument(
+                "per-configuration omission requires exactly three "
+                "configurations, two contexts each, and a global limit of six");
+        const bool n7_three_by_two_static =
+            options.omit_outbound_aggregate &&
+            options.configuration.epoch_number == 0 &&
+            options.configuration.tree_id == 4 &&
+            omission_configurations.size() == 2 &&
+            omission_configurations[0].tree_id == 5 &&
+            omission_configurations[1].tree_id == 6 &&
+            options.maximum_omission_contexts == 6 &&
+            options.maximum_omission_contexts_per_configuration == 2;
+        if (n7_three_by_two_static && !options.activation_gate.has_value())
+            throw std::invalid_argument(
+                "N7 three-by-two static aggregate omission requires an activation gate");
+        if (options.activation_gate.has_value())
+        {
+            const auto &gate = *options.activation_gate;
+            if (!options.omit_outbound_aggregate ||
+                options.rotating_omission.has_value() ||
+                options.maximum_omission_contexts != 6 ||
+                options.maximum_omission_contexts_per_configuration != 2 ||
+                gate.local_replica != 1 || gate.path.empty() ||
+                gate.manager_event_path.empty() || gate.run_id.empty() ||
+                gate.manager_source_instance.empty() ||
+                !valid_sha256_hex(gate.profile_sha256) ||
+                !valid_sha256_hex(gate.tree_file_sha256) ||
+                !valid_sha256_hex(gate.launch_argv_sha256))
+                throw std::invalid_argument(
+                    "activation gate is limited to the N7 three-by-two static aggregate omission profile");
         }
         if (options.rotating_omission.has_value())
         {
@@ -312,8 +438,10 @@ struct ExperimentByzantineAdapter::State
                 throw std::invalid_argument(
                     "unsupported scheduled omission mode");
             if (options.additional_omission_configuration.has_value() ||
+                !options.additional_omission_configurations.empty() ||
                 options.maximum_false_report_contexts != 0 ||
                 options.maximum_omission_contexts != 0 ||
+                options.maximum_omission_contexts_per_configuration != 0 ||
                 options.maximum_direct_vote_omission_contexts != 0)
                 throw std::invalid_argument(
                     "scheduled omission cannot be combined with static "
@@ -661,6 +789,171 @@ struct ExperimentByzantineAdapter::State
         options.omission_marker_emitter(marker);
     }
 
+    bool static_gate_allows_omission() noexcept
+    {
+        if (!options.activation_gate.has_value())
+            return true;
+        const auto &gate = *options.activation_gate;
+        const auto gate_bytes = read_regular_file_no_follow(
+            gate.path, kMaximumActivationGateBytes);
+        if (!gate_bytes.has_value())
+            return false;
+        const auto required_prefix = std::string{"{\"schema_version\":1,\"kind\":\""} +
+            kN7StaticAggregateGateKind + "\",\"profile_sha256\":\"" +
+            gate.profile_sha256 + "\",\"tree_file_sha256\":\"" +
+            gate.tree_file_sha256 + "\",\"epoch_digest\":\"" +
+            options.configuration.epoch_digest.to_hex() + "\",\"replica_id\":" +
+            std::to_string(gate.local_replica) + ",\"launch_argv_sha256\":\"" +
+            gate.launch_argv_sha256 + "\",\"manager_run_id\":\"" +
+            gate.run_id + "\",\"manager_source_instance\":\"" +
+            gate.manager_source_instance + "\",\"manager_source_sequence\":";
+        const auto hash_prefix = std::string{
+            ",\"fault_window_arm_event_sha256\":\""};
+        if (gate_bytes->size() < required_prefix.size() + hash_prefix.size() + 97 ||
+            gate_bytes->compare(0, required_prefix.size(), required_prefix) != 0 ||
+            gate_bytes->back() != '\n')
+            return false;
+        const auto sequence_end = gate_bytes->find(hash_prefix, required_prefix.size());
+        if (sequence_end == std::string::npos)
+            return false;
+        const auto sequence_text = gate_bytes->substr(
+            required_prefix.size(), sequence_end - required_prefix.size());
+        if (sequence_text.empty() || sequence_text.front() == '0' || !std::all_of(
+                sequence_text.begin(), sequence_text.end(), [](unsigned char value) {
+                    return value >= '0' && value <= '9';
+                }))
+            return false;
+        const auto event_hash_start = sequence_end + hash_prefix.size();
+        const auto event_hash = gate_bytes->substr(event_hash_start, 64);
+        const auto suffix = gate_bytes->substr(event_hash_start + 64);
+        const auto activation_prefix = std::string{"\",\"activation_monotonic_ns\":"};
+        if (!valid_sha256_hex(event_hash) || suffix.rfind(activation_prefix, 0) != 0 ||
+            suffix.size() <= activation_prefix.size() + 1 || suffix.back() != '\n' ||
+            suffix[suffix.size() - 2] != '}')
+            return false;
+        const auto timestamp = suffix.substr(
+            activation_prefix.size(), suffix.size() - activation_prefix.size() - 2);
+        if (timestamp.empty() || timestamp.front() == '0' || !std::all_of(
+                timestamp.begin(), timestamp.end(), [](unsigned char value) {
+                    return value >= '0' && value <= '9';
+                }))
+            return false;
+        std::uint64_t activation_ns = 0;
+        for (const auto digit : timestamp)
+        {
+            const auto value = static_cast<std::uint64_t>(digit - '0');
+            if (activation_ns >
+                (std::numeric_limits<std::uint64_t>::max() - value) / 10)
+                return false;
+            activation_ns = activation_ns * 10 + value;
+        }
+        const auto manager = read_regular_file_no_follow(
+            gate.manager_event_path, 16 * 1024 * 1024);
+        if (!manager.has_value())
+            return false;
+        bool found = false;
+        std::size_t offset = 0;
+        while (offset < manager->size())
+        {
+            const auto end = manager->find('\n', offset);
+            if (end == std::string::npos)
+                return false;
+            const auto line = manager->substr(offset, end - offset);
+            const auto envelope_prefix = std::string{
+                "{\"event_schema_version\":1,\"run_id\":\""} + gate.run_id +
+                "\",\"source_kind\":\"adaptation_manager\",\"source_id\":\"adaptive-manager\",\"source_instance\":\"" +
+                gate.manager_source_instance + "\",\"source_sequence\":" +
+                sequence_text + ",\"source_monotonic_ns\":";
+            const auto payload_prefix = std::string{
+                ",\"event_type\":\"fault_window_armed\",\"payload\":"};
+            const auto monotonic_start = envelope_prefix.size();
+            const auto monotonic_end = line.find(payload_prefix, monotonic_start);
+            const bool canonical_envelope = line.rfind(envelope_prefix, 0) == 0 &&
+                monotonic_end != std::string::npos && monotonic_end > monotonic_start &&
+                std::all_of(line.begin() + static_cast<std::ptrdiff_t>(monotonic_start),
+                    line.begin() + static_cast<std::ptrdiff_t>(monotonic_end),
+                    [](unsigned char value) { return value >= '0' && value <= '9'; }) &&
+                line[monotonic_start] != '0' &&
+                line.size() > monotonic_end + payload_prefix.size() && line.back() == '}';
+            if (!canonical_envelope)
+            {
+                offset = end + 1;
+                continue;
+            }
+            const auto payload = line.substr(monotonic_end +
+                payload_prefix.size());
+            const auto canonical_arm_prefix = std::string{
+                "{\"schema_version\":4,\"kind\":\"kauri-focused-fault-window-arm-v4\",\"run_id\":\""} +
+                gate.run_id + "\",\"profile_id\":\"n7-three-reporter-relay-omission-v2\",\"profile_sha256\":\"" +
+                gate.profile_sha256 + "\",\"topology_proof_sha256\":\"";
+            const auto after_topology = std::string{
+                "\",\"request_sha256\":\""};
+            const auto after_request = std::string{
+                "\",\"epoch_number\":0,\"epoch_digest\":\""} +
+                options.configuration.epoch_digest.to_hex() +
+                "\",\"fault_receipt_sha256\":\"";
+            const auto after_receipt = std::string{
+                "\",\"evidence_start_monotonic_ns\":"};
+            const auto after_evidence = std::string{
+                ",\"prefault_tree_id\":4,\"required_tree_positions\":3,\"required_tree_ids\":[4,5,6],\"clock_domain\":\"same_host_clock_monotonic_raw\",\"required_observation_schema\":3,\"snapshot_evidence_basis\":\"exact_post_fault_attempt_start_v1\",\"selection_cardinality_policy\":\"all_guarded_up_to_fault_bound_v1\",\"timeout_evidence_basis\":\"exact_timeout_attempt_id_v1\",\"fault_window_arm_sha256\":\""};
+            const auto canonical_payload = [&]() {
+                if (payload.rfind(canonical_arm_prefix, 0) != 0)
+                    return false;
+                auto position = canonical_arm_prefix.size();
+                const auto consume_sha256 = [&payload, &position]() {
+                    if (position + 64 > payload.size() ||
+                        !valid_sha256_hex(payload.substr(position, 64)))
+                        return false;
+                    position += 64;
+                    return true;
+                };
+                const auto consume = [&payload, &position](const std::string &literal) {
+                    if (payload.compare(position, literal.size(), literal) != 0)
+                        return false;
+                    position += literal.size();
+                    return true;
+                };
+                if (!consume_sha256() || !consume(after_topology) ||
+                    !consume_sha256() || !consume(after_request) ||
+                    !consume_sha256() || !consume(after_receipt))
+                    return false;
+                const auto evidence_start = position;
+                while (position < payload.size() &&
+                       payload[position] >= '0' && payload[position] <= '9')
+                    ++position;
+                if (position == evidence_start || payload[evidence_start] == '0' ||
+                    !consume(after_evidence) || !consume_sha256())
+                    return false;
+                return position + 3 == payload.size() &&
+                       payload[position] == '"' && payload[position + 1] == '}' &&
+                       payload[position + 2] == '}';
+            }();
+            if (sha256_hex(line) == event_hash && canonical_payload)
+            {
+                found = true;
+                break;
+            }
+            offset = end + 1;
+        }
+        if (!found)
+            return false;
+        const auto gate_sha256 = sha256_hex(*gate_bytes);
+        if (static_gate_sha256.has_value() && *static_gate_sha256 != gate_sha256)
+            return false;
+        if (!static_gate_sha256.has_value())
+        {
+            if (!options.omission_activation_emitter)
+                return false;
+            const ExperimentOmissionActivation activation{
+                gate.local_replica, gate_sha256, event_hash, activation_ns};
+            try { options.omission_activation_emitter(activation); }
+            catch (...) { return false; }
+            static_gate_sha256 = gate_sha256;
+            static_gate_activation = activation;
+        }
+        return true;
+    }
+
     ExperimentByzantineOptions options;
     std::map<
         ExperimentByzantineContext,
@@ -668,6 +961,10 @@ struct ExperimentByzantineAdapter::State
         ContextLess>
         false_reports;
     std::set<ExperimentByzantineContext, ContextLess> omissions;
+    std::optional<std::string> static_gate_sha256;
+    std::optional<ExperimentOmissionActivation> static_gate_activation;
+    std::map<std::uint32_t, std::size_t>
+        omission_contexts_by_tree;
     std::set<ExperimentByzantineContext, ContextLess> omission_markers;
     std::set<ExperimentByzantineContext, ContextLess>
         direct_vote_omissions;
@@ -809,12 +1106,31 @@ bool ExperimentByzantineAdapter::consume_outbound_aggregate(
         role != ExperimentReplicaRole::internal ||
         !exact_omission_context(state_->options, context))
         return false;
+    // The gate is deliberately checked before recording a context: a missing,
+    // malformed, replaced, or unbound gate forwards the contribution and does
+    // not consume the frozen two-per-tree quota.
+    if (!state_->static_gate_allows_omission())
+        return false;
     if (state_->omissions.find(context) != state_->omissions.end())
         return true;
     if (state_->omissions.size() >=
         state_->options.maximum_omission_contexts)
         return false;
-    return state_->omissions.insert(context).second;
+    if (state_->options.maximum_omission_contexts_per_configuration != 0)
+    {
+        const auto found = state_->omission_contexts_by_tree.find(
+            context.proposal.configuration.tree_id);
+        if (found != state_->omission_contexts_by_tree.end() &&
+            found->second >=
+                state_->options.maximum_omission_contexts_per_configuration)
+            return false;
+    }
+    if (!state_->omissions.insert(context).second)
+        return false;
+    if (state_->options.maximum_omission_contexts_per_configuration != 0)
+        ++state_->omission_contexts_by_tree[
+            context.proposal.configuration.tree_id];
+    return true;
 }
 
 bool ExperimentByzantineAdapter::consume_outbound_aggregate_marker(
@@ -905,6 +1221,12 @@ bool ExperimentByzantineAdapter::scheduled_omission_enabled() const noexcept
            state_->options.rotating_omission.has_value() &&
            is_scheduled_omission_mode(
                state_->options.rotating_omission->mode);
+}
+
+std::optional<ExperimentOmissionActivation>
+ExperimentByzantineAdapter::active_static_omission_gate() const noexcept
+{
+    return state_->static_gate_activation;
 }
 
 bool ExperimentByzantineAdapter::

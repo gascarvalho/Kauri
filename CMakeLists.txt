@@ -215,6 +215,8 @@ include_directories(include)
 add_library(hotstuff
     OBJECT
     src/adaptation.cpp
+    src/operator_capacity_authorization.cpp
+    src/operator_capacity_policy.cpp
     src/activation_readiness_wire.cpp
     src/adaptation_manager.cpp
     src/adaptation_manager_profile.cpp

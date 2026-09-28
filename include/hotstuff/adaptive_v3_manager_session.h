@@ -1,6 +1,7 @@
 #ifndef HOTSTUFF_ADAPTIVE_V3_MANAGER_SESSION_H_INCLUDED
 #define HOTSTUFF_ADAPTIVE_V3_MANAGER_SESSION_H_INCLUDED
 
+#include <functional>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -9,6 +10,7 @@
 #include "hotstuff/adaptive_v2_manager_session.h"
 #include "hotstuff/adaptive_v3_manager_readiness.h"
 #include "hotstuff/adaptive_v3_reporting_outbox.h"
+#include "hotstuff/operator_capacity_authorization.h"
 
 namespace hotstuff
 {
@@ -34,6 +36,10 @@ struct AdaptiveV3ManagerSessionConfig
     std::uint64_t e2_reserve_ticks{90000};
     std::uint64_t expected_cycle_count{2};
     ActivationReadinessWireLimits wire_limits;
+    /** Separately pinned capacity-input signer for the all-live Epoch-1 path. */
+    std::optional<OperatorCapacityIssuer> operator_capacity_issuer;
+    /** Trusted raw-monotonic clock for capacity-input expiry binding. */
+    std::function<std::uint64_t()> operator_capacity_raw_clock_now_ns;
 };
 
 enum class AdaptiveV3ManagerSessionStatus : std::uint8_t
@@ -117,6 +123,21 @@ public:
     AdaptiveV2ManagerEvidenceResult ingest_evidence(
         const AuthenticatedReporter &, const bytearray_t &) noexcept;
     bool begin_cycle(const AdaptiveV2TransitionPolicy &) noexcept;
+    /**
+     * Start the separately versioned all-live capacity path.  This shares
+     * authenticated ingress and baseline construction with v3 sessions, but
+     * deliberately never enters the guarded-fault selector.
+     */
+    bool begin_operator_capacity_epoch1() noexcept;
+    /**
+     * Verify a snapshot-bound authorization against the session's pinned
+     * capacity issuer and build the signed v3 successor.  A rejected input
+     * leaves the session without a successor or activation state.
+     */
+    bool authorize_operator_capacity_epoch1(
+        const OperatorCapacityAuthorization &) noexcept;
+    /** Borrowed immutable all-live baseline retained until authorization. */
+    const AdaptationSnapshot *operator_capacity_baseline_snapshot() const noexcept;
     bool arm_fault_window(AdaptiveV2FaultWindowArm) noexcept;
     bool arm_hard_deadline(std::uint64_t hard_deadline_tick) noexcept;
     AdaptiveV2ManagerControllerStatus evaluate() noexcept;

@@ -56,6 +56,7 @@
 #include "hotstuff/adaptive_v2_response_evidence.h"
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/adaptive_v3_manager_session.h"
+#include "hotstuff/configuration.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
 
@@ -242,6 +243,7 @@ struct ManagerOptions
     PeerId local_peer_id;
     std::vector<ReplicaEndpoint> replicas;
     std::vector<ReplicaID> membership;
+    std::optional<std::string> epoch_zero_tree_file;
     AdaptiveV2ManagerRuntimeShape runtime_shape;
     std::uint32_t required_nonresponsive{0};
     hotstuff::EpochChangeIssuerId issuer_id{0};
@@ -1688,6 +1690,13 @@ AdaptiveV3ManagerOptions parse_adaptive_v3_options(int argc, char **argv)
 
 EpochDefinitionInput manager_epoch_zero(const ManagerOptions &options)
 {
+    if (options.epoch_zero_tree_file.has_value())
+    {
+        return hotstuff::adaptive_v2_epoch_zero_input(
+            options.membership,
+            hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+                *options.epoch_zero_tree_file, options.membership));
+    }
     auto epoch = hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
         options.membership,
         options.runtime_shape.tree_shape.fanout,
@@ -2123,6 +2132,7 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create("5000");
     auto opt_tree_fanout = Config::OptValStr::create("2");
     auto opt_pipeline_stretch = Config::OptValStr::create("2");
+    auto opt_epoch_zero_tree_file = Config::OptValStr::create();
     auto opt_shape_candidate_fanouts =
         Config::OptValStr::create("2,3,5");
     auto opt_shape_deterministic_seed =
@@ -2252,6 +2262,8 @@ ManagerOptions parse_options(int argc, char **argv)
         "tree-fanout", opt_tree_fanout, Config::SET_VAL);
     config.add_opt(
         "pipeline-stretch", opt_pipeline_stretch, Config::SET_VAL);
+    config.add_opt(
+        "epoch-zero-tree-file", opt_epoch_zero_tree_file, Config::SET_VAL);
     config.add_opt(
         "shape-candidate-fanouts",
         opt_shape_candidate_fanouts,
@@ -2506,6 +2518,8 @@ ManagerOptions parse_options(int argc, char **argv)
             "replicas and topology must define a bounded contiguous N=3f+1 adaptive-v2 manager shape");
     }
     options.runtime_shape = *runtime_shape;
+    if (!opt_epoch_zero_tree_file->get().empty())
+        options.epoch_zero_tree_file = opt_epoch_zero_tree_file->get();
     options.required_nonresponsive =
         opt_required_nonresponsive->get().empty()
             ? options.runtime_shape.required_nonresponsive

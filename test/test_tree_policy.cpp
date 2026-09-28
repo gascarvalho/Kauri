@@ -251,7 +251,10 @@ AdaptationSnapshot make_snapshot(
     const std::set<ReplicaID> &ineligible = {},
     std::uint32_t attempts_per_replica = 8,
     std::uint64_t snapshot_seed = 0xA0910,
-    bool reverse_healthy_ranks = false)
+    bool reverse_healthy_ranks = false,
+    const std::set<ReplicaID> &slow_replicas = {},
+    hotstuff::ReputationMechanism mechanism =
+        hotstuff::ReputationMechanism::responsiveness)
 {
     const AdaptationEpochId epoch{
         41, fixture_digest("t10-adaptation-epoch")};
@@ -267,7 +270,11 @@ AdaptationSnapshot make_snapshot(
     {
         if (ineligible.count(replica) == 0)
         {
-            eligible_latency.emplace(replica, next_latency);
+            eligible_latency.emplace(
+                replica,
+                slow_replicas.count(replica) != 0
+                    ? 100'000 + replica
+                    : next_latency);
             if (reverse_healthy_ranks)
                 next_latency -= 10;
             else
@@ -322,12 +329,14 @@ AdaptationSnapshot make_snapshot(
         }
     }
 
+    auto policy = snapshot_policy(attempts_per_replica);
+    policy.reputation_mechanism = mechanism;
     return hotstuff::build_adaptation_snapshot(
         membership,
         epoch,
         evidence_view(records),
         ingestion_sequence,
-        snapshot_policy(attempts_per_replica),
+        policy,
         snapshot_seed);
 }
 
@@ -441,7 +450,8 @@ void check_tree_semantics(
     const TreePlacementResult &result,
     const TreePlacementInput &input,
     const AdaptationSnapshot &snapshot,
-    TreePolicyKind expected_kind)
+    TreePolicyKind expected_kind,
+    const std::set<ReplicaID> &constrained_leaves = {})
 {
     REQUIRE(result.trees().size() == input.shape.tree_count);
     REQUIRE(result.explanation().root_decisions.size() ==
@@ -528,7 +538,9 @@ void check_tree_semantics(
             {
                 CHECK(decision.role == TreeReplicaRole::leaf);
                 CHECK(decision.reason ==
-                      (score.eligible
+                      (constrained_leaves.count(replica) != 0
+                           ? ReplicaPlacementReason::policy_constrained_leaf
+                           : score.eligible
                            ? ReplicaPlacementReason::seeded_eligible_leaf
                            : ReplicaPlacementReason::
                                  constrained_ineligible_leaf));
@@ -925,6 +937,75 @@ TEST_CASE("optimization chooses exactly the highest-ranked eligible roots",
         CHECK_FALSE(decision.requested_baseline_root.has_value());
         CHECK(decision.reason ==
               RootSelectionReason::highest_ranked_eligible);
+    }
+}
+
+TEST_CASE(
+    "N31 optimization promotes low-latency survivors in a synthetic CPU-style profile",
+    "[t10][tree-policy][optimization][synthetic-heterogeneity][n31]")
+{
+    const auto members = sequential_members(31);
+    const std::set<ReplicaID> crashed{21, 22, 23};
+    const std::set<ReplicaID> slow{0, 1, 2, 3, 4, 5};
+    // Latencies are synthetic accepted-evidence inputs, not measured CPU
+    // service or an inference about live throughput.
+    const auto uniform_snapshot = make_snapshot(
+        members, crashed, 8, 0xC025);
+    const auto snapshot = make_snapshot(
+        members, crashed, 8, 0xC025, false, slow);
+    const auto latency_snapshot = make_snapshot(
+        members, crashed, 8, 0xC025, false, slow,
+        hotstuff::ReputationMechanism::latency_priority);
+    const auto input = placement_input(
+        members, 2, 21, 0xC025, "cpu-heterogeneity-optimization-v1");
+
+    const auto uniform = hotstuff::build_tree_placement(
+        input, uniform_snapshot, PerformanceOptimizationPolicy{});
+    const auto ranked_roots = selected_roots(hotstuff::build_tree_placement(
+        input, snapshot, PerformanceOptimizationPolicy{}));
+    const auto latency_roots = selected_roots(hotstuff::build_tree_placement(
+        input, latency_snapshot, PerformanceOptimizationPolicy{}));
+    CHECK(latency_roots == ranked_roots);
+    std::vector<ReplicaID> constrained_leaves;
+    for (const auto replica : members)
+        if (std::find(ranked_roots.begin(), ranked_roots.end(), replica) ==
+            ranked_roots.end())
+            constrained_leaves.push_back(replica);
+    const auto result = hotstuff::build_tree_placement(
+        input, snapshot, PerformanceOptimizationPolicy{constrained_leaves});
+
+    const auto uniform_roots = selected_roots(uniform);
+    for (const auto replica : slow)
+        CHECK(std::find(uniform_roots.begin(), uniform_roots.end(), replica) !=
+              uniform_roots.end());
+    const auto roots = selected_roots(result);
+    REQUIRE(roots.size() == 21);
+    for (const auto root : roots)
+    {
+        CHECK(slow.count(root) == 0);
+        CHECK(crashed.count(root) == 0);
+    }
+    check_tree_semantics(
+        result,
+        input,
+        snapshot,
+        TreePolicyKind::performance_optimization,
+        std::set<ReplicaID>(constrained_leaves.begin(),
+                            constrained_leaves.end()));
+    for (const auto &tree : result.trees())
+    {
+        const auto leaf_start = first_leaf_index(
+            tree.members_breadth_first.size(), tree.fanout);
+        for (const auto replica : constrained_leaves)
+        {
+            const auto position = std::find(
+                tree.members_breadth_first.begin(),
+                tree.members_breadth_first.end(), replica);
+            REQUIRE(position != tree.members_breadth_first.end());
+            CHECK(static_cast<std::size_t>(std::distance(
+                      tree.members_breadth_first.begin(), position)) >=
+                  leaf_start);
+        }
     }
 }
 

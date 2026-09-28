@@ -555,6 +555,12 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 13:
             type = StructuredEventType::adaptive_v3_command_terminal;
             return true;
+        case 14:
+            type = StructuredEventType::fault_injection_armed;
+            return true;
+        case 15:
+            type = StructuredEventType::fault_aggregate_omitted;
+            return true;
         default:
             return false;
     }
@@ -1546,6 +1552,41 @@ bool valid_fault_window_armed_payload(
         valid_digest(event.fault_window_arm_sha256);
 }
 
+bool valid_fault_injection_armed_payload(
+    const FaultInjectionArmedStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto valid_digest = [](const std::string &value) {
+        return value.size() == 64 && std::all_of(
+            value.begin(), value.end(), [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                       (character >= 'a' && character <= 'f');
+            });
+    };
+    return replica_source_matches(config, event.actor) && event.actor == 1 &&
+        event.activation_monotonic_ns != 0 && valid_digest(event.gate_sha256) &&
+        valid_digest(event.manager_fault_window_arm_event_sha256) &&
+        valid_digest(event.profile_sha256) && valid_digest(event.tree_file_sha256) &&
+        valid_digest(event.launch_argv_sha256);
+}
+
+bool valid_fault_aggregate_omitted_payload(
+    const FaultAggregateOmittedStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto valid_digest = [](const std::string &value) {
+        return value.size() == 64 && std::all_of(
+            value.begin(), value.end(), [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                       (character >= 'a' && character <= 'f');
+            });
+    };
+    return replica_source_matches(config, event.actor) && event.actor == 1 &&
+        event.parent_replica != event.actor &&
+        event.configuration.epoch_digest != uint256_t{} &&
+        event.block_hash != uint256_t{} && valid_digest(event.gate_sha256);
+}
+
 bool valid_adaptive_v3_identity(
     const ActivationReadyIdentityV1 &identity,
     const StructuredEventConfig &config) noexcept
@@ -2034,6 +2075,12 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
             return valid_adaptive_v3_command_terminal_payload(
                 std::get<AdaptiveV3CommandTerminalStructuredEvent>(payload),
                 config.source.kind);
+        case 14:
+            return valid_fault_injection_armed_payload(
+                std::get<FaultInjectionArmedStructuredEvent>(payload), config);
+        case 15:
+            return valid_fault_aggregate_omitted_payload(
+                std::get<FaultAggregateOmittedStructuredEvent>(payload), config);
         default:
             return false;
     }
@@ -2758,6 +2805,38 @@ void append_fault_window_armed_payload(
     builder.append('}');
 }
 
+void append_fault_injection_armed_payload(
+    JsonLineBuilder &builder, const FaultInjectionArmedStructuredEvent &event)
+{
+    builder.append("{\"actor\":"); builder.append_integer(event.actor);
+    builder.append(",\"gate_sha256\":"); builder.append_escaped(event.gate_sha256);
+    builder.append(",\"manager_fault_window_arm_event_sha256\":");
+    builder.append_escaped(event.manager_fault_window_arm_event_sha256);
+    builder.append(",\"profile_sha256\":"); builder.append_escaped(event.profile_sha256);
+    builder.append(",\"tree_file_sha256\":"); builder.append_escaped(event.tree_file_sha256);
+    builder.append(",\"launch_argv_sha256\":"); builder.append_escaped(event.launch_argv_sha256);
+    builder.append(",\"activation_monotonic_ns\":");
+    builder.append_integer(event.activation_monotonic_ns);
+    builder.append("}");
+}
+
+void append_fault_aggregate_omitted_payload(
+    JsonLineBuilder &builder, const FaultAggregateOmittedStructuredEvent &event)
+{
+    builder.append("{\"actor\":"); builder.append_integer(event.actor);
+    builder.append(",\"parent_replica\":"); builder.append_integer(event.parent_replica);
+    builder.append(",\"epoch_number\":");
+    builder.append_integer(event.configuration.epoch_number);
+    builder.append(",\"tree_id\":"); builder.append_integer(event.configuration.tree_id);
+    builder.append(",\"epoch_digest\":");
+    builder.append_escaped(event.configuration.epoch_digest.to_hex());
+    builder.append(",\"block_hash\":"); builder.append_escaped(event.block_hash.to_hex());
+    builder.append(",\"gate_sha256\":"); builder.append_escaped(event.gate_sha256);
+    builder.append(",\"first_for_context\":");
+    builder.append(event.first_for_context ? "true" : "false");
+    builder.append("}");
+}
+
 void append_evidence_snapshot_payload(
     JsonLineBuilder &builder,
     const AdaptiveV2EvidenceSnapshotStructuredEvent &event)
@@ -3392,6 +3471,14 @@ std::string serialize_audit_event(
                 builder,
                 std::get<AdaptiveV3CommandTerminalStructuredEvent>(event));
             break;
+        case 14:
+            append_fault_injection_armed_payload(
+                builder, std::get<FaultInjectionArmedStructuredEvent>(event));
+            break;
+        case 15:
+            append_fault_aggregate_omitted_payload(
+                builder, std::get<FaultAggregateOmittedStructuredEvent>(event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -3906,6 +3993,10 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2.cross_commit_retention_ready";
         case StructuredEventType::fault_window_armed:
             return "fault_window_armed";
+        case StructuredEventType::fault_injection_armed:
+            return "fault.injection_armed";
+        case StructuredEventType::fault_aggregate_omitted:
+            return "fault.aggregate_omitted";
         case StructuredEventType::adaptive_v3_activation_prepared:
             return "epoch.activation_prepared";
         case StructuredEventType::adaptive_v3_activation_ready_signed:

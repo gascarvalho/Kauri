@@ -20,6 +20,86 @@ import run as campaign
 import synthetic_run
 
 
+class _SpawnFailureProcess:
+    def __init__(self, pid: int = 43_210) -> None:
+        self.pid = pid
+        self.killed = 0
+        self.waited = 0
+
+    def kill(self) -> None:
+        self.killed += 1
+
+    def wait(self, timeout: float | None = None) -> int:
+        assert timeout == 5.0
+        self.waited += 1
+        return -signal.SIGKILL
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [OSError("synthetic getpgid failure"), KeyboardInterrupt()],
+)
+def test_spawn_process_reaps_exact_child_when_getpgid_is_interrupted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: BaseException,
+) -> None:
+    process = _SpawnFailureProcess()
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(campaign.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(
+        campaign.os,
+        "getpgid",
+        lambda _pid: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(
+        campaign.os,
+        "killpg",
+        lambda pgid, signum: group_signals.append((pgid, signum)),
+    )
+
+    with pytest.raises(type(failure), match=("synthetic" if isinstance(failure, OSError) else None)):
+        campaign.spawn_process(
+            "replica-0",
+            ("synthetic-app",),
+            tmp_path / "replica-0.log",
+            tmp_path,
+            replica_id=0,
+        )
+
+    assert process.killed == 1
+    assert process.waited == 1
+    assert group_signals == []
+
+
+def test_spawn_process_uses_pid_kill_for_unsafe_observed_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    process = _SpawnFailureProcess()
+    group_signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(campaign.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(campaign.os, "getpgid", lambda _pid: 55_555)
+    monkeypatch.setattr(campaign.os, "getpgrp", lambda: 66_666)
+    monkeypatch.setattr(
+        campaign.os,
+        "killpg",
+        lambda pgid, signum: group_signals.append((pgid, signum)),
+    )
+
+    with pytest.raises(campaign.RunnerError, match="safe isolated process group"):
+        campaign.spawn_process(
+            "replica-0",
+            ("synthetic-app",),
+            tmp_path / "replica-0.log",
+            tmp_path,
+            replica_id=0,
+        )
+
+    assert process.killed == 1
+    assert process.waited == 1
+    assert group_signals == []
+
+
 def test_plotting_is_explicit_and_does_not_change_a_pass(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1128,6 +1208,69 @@ def test_manager_command_has_no_crash_ground_truth(tmp_path: Path) -> None:
     assert "--issuer-private-key" in command
     assert "--structured-event-output" in command
 
+    copied_tree = tmp_path / "config" / "epoch0.tree"
+    file_command = campaign.build_manager_command(
+        Path("/bin/adaptation-manager"),
+        replicas_tls=tls[:7],
+        manager_tls=tls[7],
+        issuer={"pub": "issuer-pub", "sec": "issuer-sec"},
+        manager_port=27000,
+        peer_port=25000,
+        activation_delay_blocks=5,
+        run_id="synthetic-non-evidence",
+        source_instance="synthetic-manager-instance",
+        structured_event_path=tmp_path / "manager.jsonl",
+        bundle_path=tmp_path / "successor.bundle",
+        initial_tree_file=copied_tree,
+    )
+    option = file_command.index("--epoch-zero-tree-file")
+    assert file_command[option + 1] == str(copied_tree)
+    assert "--epoch-zero-tree-file" not in command
+
+
+def test_n7_three_reporter_v2_manager_command_has_one_real_transition(
+    tmp_path: Path,
+) -> None:
+    profile = {
+        "profile_id": campaign.N7_THREE_REPORTER_OMISSION_PROFILE_ID,
+        "throughput_windows": [
+            {"phase": "baseline", "epoch_number": 0, "bucket_count": 1},
+            {"phase": "degraded", "epoch_number": 0, "bucket_count": 1},
+            {"phase": "containment", "epoch_number": 1, "bucket_count": 1},
+        ],
+    }
+    assert campaign._profile_throughput_windows(profile) == tuple(
+        profile["throughput_windows"]
+    )
+    request = {
+        "policy_intent": "fault_containment",
+        "evidence_window_rule": "fresh_exact_predecessor_after_common_commit",
+        "transition_artifact_id": "e0-to-e1-containment",
+        "bundle_path": "transitions/e0-to-e1-containment/successor.bundle",
+        "evidence_snapshot_path": "transitions/e0-to-e1-containment/evidence-snapshot.json",
+        "predecessor_epoch_number": 0,
+        "successor_epoch_number": 1,
+        "minimum_predecessor_residency_ms": 0,
+        "policy_parameters": {"containment_baseline_roots": [{"tree_id": 0, "replica_id": 0}]},
+    }
+    tls = [
+        {"crt": f"crt-{index}", "sec": f"sec-{index}", "cid": f"cid-{index}"}
+        for index in range(8)
+    ]
+    command = campaign.build_manager_command(
+        Path("/bin/adaptation-manager"),
+        replicas_tls=tls[:7], manager_tls=tls[7],
+        issuer={"pub": "issuer-pub", "sec": "issuer-sec"},
+        manager_port=27000, peer_port=25000, activation_delay_blocks=5,
+        run_id="n7-v2", source_instance="n7-v2-manager",
+        structured_event_path=tmp_path / "manager.jsonl",
+        transition_requests=(request,),
+        bundle_paths=(tmp_path / request["bundle_path"],),
+    )
+    assert command.count("--transition-request") == 1
+    assert command.count("--bundle-output") == 1
+    assert json.loads(command[command.index("--transition-request") + 1]) == request
+
 
 def test_process_check_accepts_only_guarded_clean_manager_exit(
     tmp_path: Path,
@@ -1816,3 +1959,30 @@ def test_manifest_uses_validator_schema_and_explicit_false_ground_truth(tmp_path
     assert manifest["profile"]["sha256"] == hashlib.sha256(profile).hexdigest()
     assert len(manifest["sources"]) == 8
     json.dumps(manifest)
+
+
+def test_initial_tree_file_is_strict_and_derives_matching_epoch_metadata(tmp_path: Path) -> None:
+    tree_file = tmp_path / "epoch0.tree"
+    tree_file.write_text(
+        "\n".join(
+            [
+                "fan:2 pipe:2 0 1 2 3 4 5 6",
+                "fan:2 pipe:2 1 2 3 4 5 6 0",
+                "fan:2 pipe:2 2 1 3 4 5 6 0",
+                "fan:2 pipe:2 3 4 5 6 0 1 2",
+                "fan:2 pipe:2 4 5 6 0 1 2 3",
+                "fan:2 pipe:2 5 6 0 1 2 3 4",
+                "fan:2 pipe:2 6 0 1 2 3 4 5",
+            ]
+        ) + "\n",
+        encoding="ascii",
+    )
+    _, trees = campaign._load_initial_tree_file(tree_file)
+    assert trees[2] == (2, 1, 3, 4, 5, 6, 0)
+    epoch_input = campaign._initial_epoch_input(trees)
+    assert epoch_input["epoch0_trees"][2]["members_breadth_first"] == [2, 1, 3, 4, 5, 6, 0]
+
+    broken = tmp_path / "broken.tree"
+    broken.write_text("fan:2 pipe:2 0 1 2\n", encoding="ascii")
+    with pytest.raises(campaign.RunnerError, match="seven newline-terminated"):
+        campaign._load_initial_tree_file(broken)

@@ -44,6 +44,23 @@ const std::vector<AdaptiveV2ManagerSessionTerminalRecord> *AdaptiveManagerSessio
 bool AdaptiveManagerSessionFacade::v3_arm_hard_deadline(std::uint64_t t) noexcept { return state_->v3 && state_->v3->arm_hard_deadline(t); }
 AdaptiveV2ManagerLifecycleResult AdaptiveManagerSessionFacade::v3_ingest_timed_lifecycle(const AuthenticatedReporter&s,const MsgProposalLifecycleNotice&m,std::uint64_t t) noexcept { return state_->v3 ? state_->v3->ingest_timed_lifecycle(s,m,t) : AdaptiveV2ManagerLifecycleResult{}; }
 bool AdaptiveManagerSessionFacade::v3_begin_readiness(std::uint64_t t) noexcept { return state_->v3 && state_->v3->begin_readiness(t); }
+bool AdaptiveManagerSessionFacade::v3_begin_operator_capacity_epoch1() noexcept
+{
+    return state_->v3 && state_->v3->begin_operator_capacity_epoch1();
+}
+bool AdaptiveManagerSessionFacade::v3_authorize_operator_capacity_epoch1(
+    const OperatorCapacityAuthorization &authorization) noexcept
+{
+    return state_->v3 &&
+        state_->v3->authorize_operator_capacity_epoch1(authorization);
+}
+const AdaptationSnapshot *
+AdaptiveManagerSessionFacade::v3_operator_capacity_baseline_snapshot() const noexcept
+{
+    return state_->v3
+        ? state_->v3->operator_capacity_baseline_snapshot()
+        : nullptr;
+}
 AdaptiveV3ManagerObservationResult AdaptiveManagerSessionFacade::v3_observe_readiness(ReplicaID p,std::uint64_t t,const bytearray_t &b) noexcept { return state_->v3 ? state_->v3->observe_readiness(p,t,b) : AdaptiveV3ManagerObservationResult{}; }
 std::optional<AdaptiveV3CertificateDelivery> AdaptiveManagerSessionFacade::v3_begin_delivery(ReplicaID p,std::uint64_t t) noexcept { return state_->v3 ? state_->v3->begin_delivery(p,t) : std::nullopt; }
 AdaptiveV3CertificateDeliveryDisposition AdaptiveManagerSessionFacade::v3_record_delivery_result(ReplicaID p,std::uint32_t a,bool e,std::uint64_t t) noexcept { return state_->v3 ? state_->v3->record_delivery_result(p,a,e,t) : AdaptiveV3CertificateDeliveryDisposition::rejected_ack; }

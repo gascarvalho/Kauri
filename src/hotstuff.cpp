@@ -3757,8 +3757,15 @@ namespace hotstuff
         {
             return false;
         }
-        if (!experiment_byzantine_adapter
-                 ->consume_outbound_aggregate_marker(context))
+        const auto static_gate =
+            experiment_byzantine_adapter->active_static_omission_gate();
+        const bool first_for_context = experiment_byzantine_adapter
+            ->consume_outbound_aggregate_marker(context);
+        if (static_gate.has_value())
+            emit_fault_aggregate_omitted(
+                key, tree.parent.value_or(get_id()), first_for_context,
+                *static_gate);
+        if (!first_for_context)
         {
             return true;
         }
@@ -6467,6 +6474,48 @@ namespace hotstuff
         {
             // Evidence failure invalidates the run, never protocol behavior.
         }
+    }
+
+    bool HotStuffBase::emit_fault_injection_armed(
+        const ExperimentOmissionActivation &activation,
+        const ExperimentOmissionActivationGate &gate) noexcept
+    {
+        if (audit_event_emitter == nullptr || activation.actor != get_id() ||
+            activation.actor != gate.local_replica)
+            return false;
+        try
+        {
+            audit_event_emitter->emit_audit(AuditStructuredEventPayload{
+                FaultInjectionArmedStructuredEvent{
+                    activation.actor, activation.gate_sha256,
+                    activation.manager_fault_window_arm_event_sha256,
+                    gate.profile_sha256, gate.tree_file_sha256,
+                    gate.launch_argv_sha256,
+                    activation.activation_monotonic_ns}});
+            auto *owner = dynamic_cast<StructuredEventDrainOwner *>(
+                audit_event_emitter);
+            if (owner == nullptr)
+                return false;
+            owner->drain();
+            return owner->health().healthy;
+        }
+        catch (...) { return false; }
+    }
+
+    void HotStuffBase::emit_fault_aggregate_omitted(
+        const ProposalKey &key, ReplicaID parent, bool first_for_context,
+        const ExperimentOmissionActivation &activation) noexcept
+    {
+        if (audit_event_emitter == nullptr || activation.actor != get_id())
+            return;
+        try
+        {
+            audit_event_emitter->emit_audit(AuditStructuredEventPayload{
+                FaultAggregateOmittedStructuredEvent{
+                    get_id(), parent, key.configuration, key.block_hash,
+                    activation.gate_sha256, first_for_context}});
+        }
+        catch (...) {}
     }
 
     void HotStuffBase::emit_committed_block_event(
@@ -12823,6 +12872,24 @@ namespace hotstuff
                     }
                 };
         }
+        if (options.activation_gate.has_value())
+        {
+            const auto gate = *options.activation_gate;
+            auto configured_activation_emitter =
+                std::move(options.omission_activation_emitter);
+            options.omission_activation_emitter =
+                [this, gate,
+                 configured_activation_emitter =
+                     std::move(configured_activation_emitter)](
+                    const ExperimentOmissionActivation &activation)
+                {
+                    if (!emit_fault_injection_armed(activation, gate))
+                        throw std::runtime_error(
+                            "fault injection activation audit was not durable");
+                    if (configured_activation_emitter)
+                        configured_activation_emitter(activation);
+                };
+        }
         auto diagnostic_window = options.diagnostic_window;
         auto response_evidence_duplicate_probe =
             options.response_evidence_duplicate_probe;
@@ -16517,58 +16584,83 @@ namespace hotstuff
          */
         else if (config.treegen_algo == "file")
         {
-            std::ifstream file(config.treegen_fpath);
-            std::string line;
-            size_t tid = 0;
-
-            if (!file.is_open())
+            if (epoch_protocol_mode == EpochProtocolMode::adaptive_v2 ||
+                epoch_protocol_mode == EpochProtocolMode::adaptive_v3)
             {
-                std::string str = "tree_config: Provided treegen file path is invalid! Failed to open file " + config.treegen_fpath;
-                throw std::runtime_error(str);
+                const auto definitions =
+                    parse_adaptive_v2_epoch_zero_tree_file(
+                        config.treegen_fpath, fixed_membership);
+                for (const auto &definition : definitions)
+                {
+                    std::vector<uint32_t> members(
+                        definition.members_breadth_first.begin(),
+                        definition.members_breadth_first.end());
+                    default_trees.emplace_back(
+                        Tree(
+                            definition.tree_id,
+                            static_cast<std::uint8_t>(definition.fanout),
+                            static_cast<std::uint8_t>(
+                                definition.pipeline_stretch),
+                            members),
+                        replicas,
+                        id);
+                }
             }
-
-            while (std::getline(file, line))
+            else
             {
-                std::istringstream iss(line);
-                std::string tmp;
-                std::string delimiter = ":";
-                std::string token;
-                std::vector<uint32_t> new_tree_array;
-                uint32_t replica_id;
-                uint8_t fanout;
-                uint8_t pipe_stretch;
+                std::ifstream file(config.treegen_fpath);
+                std::string line;
+                size_t tid = 0;
 
-                /* Fanout */
-                iss >> tmp;
-                token = tmp.substr(0, tmp.find(delimiter));
-                if (token == "fan")
+                if (!file.is_open())
                 {
-                    fanout = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
-                }
-                else
-                {
-                    throw std::runtime_error("tree_config: Provided treegen file has invalid tree fanout!");
+                    std::string str = "tree_config: Provided treegen file path is invalid! Failed to open file " + config.treegen_fpath;
+                    throw std::runtime_error(str);
                 }
 
-                /* Pipeline Stretch */
-                iss >> tmp;
-                token = tmp.substr(0, tmp.find(delimiter));
-                if (token == "pipe")
+                while (std::getline(file, line))
                 {
-                    pipe_stretch = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
-                }
-                else
-                {
-                    throw std::runtime_error("tree_config: Provided treegen file has invalid tree pipeline-stretch!");
-                }
+                    std::istringstream iss(line);
+                    std::string tmp;
+                    std::string delimiter = ":";
+                    std::string token;
+                    std::vector<uint32_t> new_tree_array;
+                    uint32_t replica_id;
+                    uint8_t fanout;
+                    uint8_t pipe_stretch;
 
-                while (iss >> replica_id)
-                {
-                    new_tree_array.push_back(replica_id);
-                }
+                    /* Fanout */
+                    iss >> tmp;
+                    token = tmp.substr(0, tmp.find(delimiter));
+                    if (token == "fan")
+                    {
+                        fanout = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+                    }
+                    else
+                    {
+                        throw std::runtime_error("tree_config: Provided treegen file has invalid tree fanout!");
+                    }
 
-                default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
-                tid++;
+                    /* Pipeline Stretch */
+                    iss >> tmp;
+                    token = tmp.substr(0, tmp.find(delimiter));
+                    if (token == "pipe")
+                    {
+                        pipe_stretch = std::stoi(tmp.substr(tmp.find(delimiter) + delimiter.length()));
+                    }
+                    else
+                    {
+                        throw std::runtime_error("tree_config: Provided treegen file has invalid tree pipeline-stretch!");
+                    }
+
+                    while (iss >> replica_id)
+                    {
+                        new_tree_array.push_back(replica_id);
+                    }
+
+                    default_trees.push_back(TreeNetwork(Tree(tid, fanout, pipe_stretch, new_tree_array), std::move(replicas), id));
+                    tid++;
+                }
             }
         }
 

@@ -115,6 +115,19 @@ std::vector<EpochTreeDefinition> production_n7_trees()
         {6, 2, 2, {6, 0, 1, 2, 3, 4, 5}, {}}};
 }
 
+// Prospective N=7 v2 E0 schedule for the bounded relay-omission test.
+// Relay 1 stays a leaf in initial T0 and is internal only in later T4-T6.
+std::vector<EpochTreeDefinition> n7_three_reporter_omission_trees()
+{
+    auto trees = production_n7_trees();
+    trees[0].members_breadth_first = {0, 2, 3, 1, 4, 5, 6};
+    trees[2].members_breadth_first = {2, 3, 4, 0, 1, 5, 6};
+    trees[4].members_breadth_first = {4, 1, 5, 0, 2, 3, 6};
+    trees[5].members_breadth_first = {5, 1, 6, 0, 2, 3, 4};
+    trees[6].members_breadth_first = {6, 1, 0, 2, 3, 4, 5};
+    return trees;
+}
+
 EpochDefinitionInput epoch_input(
     std::uint32_t epoch_number,
     const uint256_t &previous_epoch_digest,
@@ -222,6 +235,21 @@ struct Fixture
                 ? production_epoch_input(0, uint256_t{}, 15)
                 : epoch_input(0, uint256_t{}, 15),
             validation_context(10));
+        epoch = {definition.epoch_number(), definition.epoch_digest()};
+        ledger = std::make_unique<EvidenceLedger>(
+            epochs,
+            window,
+            EvidenceStoreLimits{accepted_capacity, 64});
+    }
+
+    Fixture(
+        std::size_t accepted_capacity,
+        std::vector<EpochTreeDefinition> trees)
+    {
+        auto input = epoch_input(0, uint256_t{}, 15);
+        input.trees = std::move(trees);
+        const auto &definition = epochs.stage(
+            input, validation_context(10));
         epoch = {definition.epoch_number(), definition.epoch_digest()};
         ledger = std::make_unique<EvidenceLedger>(
             epochs,
@@ -1466,6 +1494,139 @@ TEST_CASE(
               std::vector<ReplicaID>{4, 5, 6});
         CHECK(candidate.total_uncompensated_timeouts == 3);
     }
+}
+
+TEST_CASE(
+    "N7 non-cyclic E0 exposes exactly three aggregate-relay parents",
+    "[adaptive-v2][selection][n7][omission][topology]")
+{
+    constexpr ReplicaID kOmittingRelay = 1;
+    const auto trees = n7_three_reporter_omission_trees();
+    REQUIRE(trees.size() == kReplicaCount);
+    REQUIRE(trees[4].members_breadth_first ==
+            std::vector<ReplicaID>{4, 1, 5, 0, 2, 3, 6});
+    CHECK(trees[0].members_breadth_first !=
+          production_n7_trees()[0].members_breadth_first);
+
+    std::vector<std::pair<std::uint32_t, ReplicaID>> opportunities;
+    for (const auto &tree : trees)
+    {
+        auto members = tree.members_breadth_first;
+        std::sort(members.begin(), members.end());
+        CHECK(members == fixed_membership());
+        const auto position = static_cast<std::size_t>(
+            std::find(tree.members_breadth_first.begin(),
+                      tree.members_breadth_first.end(), kOmittingRelay) -
+            tree.members_breadth_first.begin());
+        REQUIRE(position < tree.members_breadth_first.size());
+        const auto first_leaf =
+            ((tree.members_breadth_first.size() - 2) / tree.fanout) + 1;
+        if (position != 0 && position < first_leaf)
+        {
+            opportunities.emplace_back(
+                tree.tree_id,
+                tree.members_breadth_first[(position - 1) / tree.fanout]);
+        }
+    }
+
+    // This proves only structural observation opportunities.  It neither
+    // creates signed evidence nor validates a selector decision.
+    CHECK(opportunities ==
+          std::vector<std::pair<std::uint32_t, ReplicaID>>{
+              {4, 4}, {5, 5}, {6, 6}});
+    CHECK(opportunities.size() == 3); // f + 1 for N=7, f=2.
+}
+
+TEST_CASE(
+    "N7 non-cyclic E0 selector needs six accepted relay-parent timeouts",
+    "[adaptive-v2][selection][n7][omission][three-reporter]")
+{
+    constexpr ReplicaID kOmittingRelay = 1;
+    constexpr std::uint64_t kEvidenceStartNs = 100'000;
+    Fixture fixture(256, n7_three_reporter_omission_trees());
+
+    // Establish an ordinary baseline.  The later aggregate-relay timeouts are
+    // the only candidate evidence and remain separate from fault ground truth.
+    for (const auto [target, tree] :
+         std::vector<std::pair<ReplicaID, std::uint32_t>>{
+             {0, 2}, {1, 3}, {2, 6}, {3, 6}, {4, 6}, {5, 6}, {6, 0}})
+    {
+        fixture.on_time_in_tree(target, tree);
+    }
+
+    auto config = selection_config(6, 2, 128);
+    config.required_nonresponsive = 1;
+    config.fault_window_arm_required = true;
+    AdaptiveV2ByzantineSelection selector(
+        *fixture.ledger, fixture.members, fixture.epoch, config);
+    REQUIRE(selector.freeze_baseline(fixture.ledger->high_watermark()) ==
+            AdaptiveV2SelectionStatus::baseline_frozen);
+
+    AdaptiveV2FaultWindowArm arm;
+    arm.predecessor_epoch_number = fixture.epoch.epoch_number;
+    arm.predecessor_epoch_digest = fixture.epoch.epoch_digest;
+    arm.evidence_start_monotonic_ns = kEvidenceStartNs;
+    // The frozen fault window admits only the three omitted relay contexts.
+    arm.prefault_tree_id = 4;
+    arm.required_tree_ids = {4, 5, 6};
+    arm.evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowEvidenceBasis::
+            exact_timeout_attempt_id_v1;
+    arm.snapshot_evidence_basis =
+        hotstuff::AdaptiveV2FaultWindowSnapshotEvidenceBasis::
+            legacy_all_accepted_v1;
+    REQUIRE(selector.arm_fault_window(arm));
+
+    const auto first = fixture.aggregate_timeout_in_tree(
+        4, kOmittingRelay, 4, kEvidenceStartNs + 2'100'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        4, kOmittingRelay, 4, kEvidenceStartNs + 2'250'000U, 100);
+    const auto one_parent = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(one_parent.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(one_parent.selected_replicas.empty());
+
+    const auto second = fixture.aggregate_timeout_in_tree(
+        5, kOmittingRelay, 5, kEvidenceStartNs + 2'400'000U, 100);
+    (void)fixture.aggregate_timeout_in_tree(
+        5, kOmittingRelay, 5, kEvidenceStartNs + 2'550'000U, 100);
+    const auto two_parents = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(two_parents.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(two_parents.selected_replicas.empty());
+
+    const auto third = fixture.aggregate_timeout_in_tree(
+        6, kOmittingRelay, 6, kEvidenceStartNs + 2'700'000U, 100);
+    const auto five_attempts = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(five_attempts.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(five_attempts.selected_replicas.empty());
+    (void)fixture.aggregate_timeout_in_tree(
+        6, kOmittingRelay, 6, kEvidenceStartNs + 2'850'000U, 100);
+    const auto three_parents = selector.select_through(
+        fixture.ledger->high_watermark());
+    REQUIRE(three_parents.status == AdaptiveV2SelectionStatus::selected);
+    CHECK(three_parents.selected_replicas ==
+          std::vector<ReplicaID>{kOmittingRelay});
+    REQUIRE(three_parents.eligible_candidates.size() == 1);
+    CHECK(three_parents.eligible_candidates.front().qualifying_reporters ==
+          std::vector<ReplicaID>{4, 5, 6});
+    CHECK(three_parents.eligible_candidates.front().total_uncompensated_timeouts ==
+          6);
+
+    // A legal late contribution compensates its exact timeout attempt and
+    // removes one parent from the guard; topology alone cannot sustain it.
+    (void)first;
+    (void)second;
+    fixture.late_v3(third, kEvidenceStartNs + 3'100'000U);
+    const auto compensated = selector.select_through(
+        fixture.ledger->high_watermark());
+    CHECK(compensated.status ==
+          AdaptiveV2SelectionStatus::insufficient_guarded_candidates);
+    CHECK(compensated.selected_replicas.empty());
 }
 
 TEST_CASE(

@@ -3,9 +3,10 @@
 #define KAURI_ADAPTATION_MANAGER_TESTING 1
 #include "../examples/adaptation_manager.cpp"
 
-#include <string>
+#include <filesystem>
 #include <iterator>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "catch.hpp"
@@ -23,6 +24,14 @@ constexpr char kDigestD[] =
     "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 constexpr char kDigestE[] =
     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+
+std::vector<ReplicaID> n7_membership()
+{
+    std::vector<ReplicaID> membership;
+    for (ReplicaID replica = 0; replica < 7; ++replica)
+        membership.push_back(replica);
+    return membership;
+}
 
 std::string replace_once(std::string value, const std::string &from,
                          const std::string &to);
@@ -287,6 +296,27 @@ std::string replace_once(std::string value, const std::string &from,
 }
 
 } // namespace
+
+TEST_CASE(
+    "manager and adaptive replica bootstrap share the archived N7 Epoch-0 identity",
+    "[adaptive-v2][manager][configuration][n7][epoch-zero]")
+{
+    const auto tree_file = std::filesystem::path{KAURI_PROJECT_SOURCE_DIR} /
+        "experiments/adaptive/n7-three-reporter-omission/epoch0.tree";
+    REQUIRE(std::filesystem::is_regular_file(tree_file));
+
+    ManagerOptions manager_options;
+    manager_options.membership = n7_membership();
+    manager_options.epoch_zero_tree_file = tree_file.string();
+    const auto manager_input = manager_epoch_zero(manager_options);
+
+    const auto replica_input = hotstuff::adaptive_v2_epoch_zero_input(
+        n7_membership(),
+        hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+            tree_file.string(), n7_membership()));
+    CHECK(hotstuff::compute_epoch_digest(manager_input) ==
+          hotstuff::compute_epoch_digest(replica_input));
+}
 
 TEST_CASE("fault-window parser accepts exact canonical publisher bytes",
           "[adaptive-v2][fault-window-arm][v4][parser]")

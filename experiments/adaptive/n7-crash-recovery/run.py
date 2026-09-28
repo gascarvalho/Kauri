@@ -79,6 +79,9 @@ PAIRED_CONTROL_PROFILE_ID = (
 PAIRED_CONTROL_PROFILE_SHA256 = (
     "70ae0386338f8d66ff9d5489baa5cde403e576a9e32455090810fe5bb5906b03"
 )
+N7_THREE_REPORTER_OMISSION_PROFILE_ID = (
+    "n7-three-reporter-relay-omission-v2"
+)
 PAIRED_PROFILE_ARMS = {
     PAIRED_ADAPTIVE_PROFILE_ID: "adaptive",
     PAIRED_CONTROL_PROFILE_ID: "control",
@@ -659,12 +662,19 @@ def _profile_transition_requests(
         "minimum_predecessor_residency_ms",
         "policy_parameters",
     }
+    live_root_source_field = "containment_baseline_root_source"
     requests: list[dict[str, Any]] = []
     artifact_ids: set[str] = set()
     artifact_paths: set[str] = set()
     previous_successor: int | None = None
     for index, item in enumerate(raw):
-        if not isinstance(item, dict) or set(item) != expected_fields:
+        if (
+            not isinstance(item, dict)
+            or set(item) not in (
+                expected_fields,
+                {*expected_fields, live_root_source_field},
+            )
+        ):
             raise RunnerError(
                 f"transition_requests[{index}] has an invalid field set"
             )
@@ -732,23 +742,35 @@ def _profile_transition_requests(
             raise RunnerError(
                 f"transition_requests[{index}].policy_parameters is invalid"
             )
-        if intent == "performance_optimization" and parameters:
+        live_root_source = item.get(live_root_source_field)
+        if intent == "performance_optimization" and (
+            parameters or live_root_source is not None
+        ):
             raise RunnerError("optimization policy parameters must be empty")
         if intent == "fault_containment":
-            roots = parameters.get("containment_baseline_roots")
-            if (
-                set(parameters) != {"containment_baseline_roots"}
-                or not isinstance(roots, list)
-                or not roots
-                or any(
-                    not isinstance(root, dict)
-                    or set(root) != {"tree_id", "replica_id"}
-                    or type(root["tree_id"]) is not int
-                    or type(root["replica_id"]) is not int
-                    for root in roots
-                )
-            ):
-                raise RunnerError("containment policy parameters are invalid")
+            if live_root_source is not None:
+                if (
+                    live_root_source != "live_predecessor_roots"
+                    or parameters
+                ):
+                    raise RunnerError(
+                        "live containment roots require empty policy parameters"
+                    )
+            else:
+                roots = parameters.get("containment_baseline_roots")
+                if (
+                    set(parameters) != {"containment_baseline_roots"}
+                    or not isinstance(roots, list)
+                    or not roots
+                    or any(
+                        not isinstance(root, dict)
+                        or set(root) != {"tree_id", "replica_id"}
+                        or type(root["tree_id"]) is not int
+                        or type(root["replica_id"]) is not int
+                        for root in roots
+                    )
+                ):
+                    raise RunnerError("containment policy parameters are invalid")
         requests.append(json.loads(json.dumps(item)))
     return tuple(requests)
 
@@ -763,19 +785,28 @@ def _profile_throughput_windows(
             ("baseline", 0),
             ("degraded", 0),
             ("containment", 1),
-            ("control_late", 1),
         )
-        if profile_id == PAIRED_CONTROL_PROFILE_ID
+        if profile_id == N7_THREE_REPORTER_OMISSION_PROFILE_ID
         else (
-            ("baseline", 0),
-            ("degraded", 0),
-            ("containment", 1),
-            ("optimized", 2),
+            (
+                ("baseline", 0),
+                ("degraded", 0),
+                ("containment", 1),
+                ("control_late", 1),
+            )
+            if profile_id == PAIRED_CONTROL_PROFILE_ID
+            else (
+                ("baseline", 0),
+                ("degraded", 0),
+                ("containment", 1),
+                ("optimized", 2),
+            )
         )
     )
     if (
         profile_id
         not in {
+            N7_THREE_REPORTER_OMISSION_PROFILE_ID,
             RECURRING_PROFILE_ID,
             PAIRED_ADAPTIVE_PROFILE_ID,
             PAIRED_CONTROL_PROFILE_ID,
@@ -783,7 +814,7 @@ def _profile_throughput_windows(
         or not isinstance(raw, list)
         or len(raw) != len(expected)
     ):
-        raise RunnerError("frozen profile requires four throughput windows")
+        raise RunnerError("frozen profile requires its exact throughput windows")
     windows: list[dict[str, Any]] = []
     for index, (item, (phase, epoch_number)) in enumerate(zip(raw, expected)):
         if (
@@ -1152,6 +1183,7 @@ def build_manager_command(
     transition_requests: Sequence[Mapping[str, Any]] = (),
     bundle_paths: Sequence[Path] = (),
     manager_extra_args: Sequence[str] = (),
+    initial_tree_file: Path | None = None,
 ) -> tuple[str, ...]:
     if len(replicas_tls) != 7:
         raise RunnerError("manager command requires exactly seven replica TLS identities")
@@ -1203,6 +1235,8 @@ def build_manager_command(
                 f"{replica_id},127.0.0.1:{peer_port + replica_id},{tls['crt']}",
             )
         )
+    if initial_tree_file is not None:
+        command.extend(("--epoch-zero-tree-file", str(initial_tree_file)))
     command.extend(manager_extra_args)
     result = tuple(command)
     _assert_safe_command(result)
@@ -1219,7 +1253,16 @@ def _main_config_payload(
     peer_port: int,
     client_port: int,
     manager_port: int,
+    initial_tree_file: Path | None = None,
 ) -> bytes:
+    tree_lines = (
+        ["tree-generation = default"]
+        if initial_tree_file is None
+        else [
+            "tree-generation = file",
+            f"tree-generation-fpath = {initial_tree_file}",
+        ]
+    )
     lines = [
         f"block-size = {runtime['block_size']}",
         "nworker = 2",
@@ -1235,7 +1278,7 @@ def _main_config_payload(
         f"leader-progress-timeout = {float(profile['leader_progress_timeout_s'])}",
         f"leader-activation-grace = {float(profile['leader_activation_grace_s'])}",
         "client-ip = 127.0.0.1",
-        "tree-generation = default",
+        *tree_lines,
         f"tree-switch-period = {runtime['tree_switch_period_blocks']}",
         "epoch-protocol-mode = adaptive_v2",
         f"epoch-change-issuer-id = {ISSUER_ID}",
@@ -1303,7 +1346,16 @@ def _replica_effective_runtime(
     }
 
 
-def _initial_epoch_input() -> dict[str, Any]:
+def _initial_epoch_input(
+    trees: Sequence[Sequence[int]] | None = None,
+) -> dict[str, Any]:
+    orders = (
+        tuple(tuple((root + offset) % 7 for offset in range(7)) for root in REPLICA_IDS)
+        if trees is None
+        else tuple(tuple(tree) for tree in trees)
+    )
+    if len(orders) != len(REPLICA_IDS):
+        raise RunnerError("initial tree input requires exactly seven trees")
     return {
         "schema_version": 1,
         "replica_count": 7,
@@ -1315,14 +1367,35 @@ def _initial_epoch_input() -> dict[str, Any]:
                 "tree_id": root,
                 "fanout": 2,
                 "pipeline_depth": 2,
-                "members_breadth_first": [
-                    (root + offset) % 7 for offset in range(7)
-                ],
+                "members_breadth_first": list(orders[root]),
                 "wait_exempt": [],
             }
             for root in REPLICA_IDS
         ],
     }
+
+
+def _load_initial_tree_file(path: Path) -> tuple[bytes, tuple[tuple[int, ...], ...]]:
+    try:
+        payload = path.read_bytes()
+        lines = payload.decode("ascii").splitlines()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RunnerError(f"cannot read initial tree file: {exc}") from exc
+    if len(lines) != len(REPLICA_IDS) or not payload.endswith(b"\n"):
+        raise RunnerError("initial tree file must contain seven newline-terminated trees")
+    trees: list[tuple[int, ...]] = []
+    for tree_id, line in enumerate(lines):
+        fields = line.split()
+        if fields[:2] != ["fan:2", "pipe:2"] or len(fields) != 9:
+            raise RunnerError("initial tree file must use fan:2 pipe:2 and seven members")
+        try:
+            members = tuple(int(field) for field in fields[2:])
+        except ValueError as exc:
+            raise RunnerError("initial tree file contains a non-integer replica") from exc
+        if set(members) != set(REPLICA_IDS) or len(set(members)) != len(REPLICA_IDS) or members[0] != tree_id:
+            raise RunnerError("initial tree file must contain each member once with tree-id root")
+        trees.append(members)
+    return payload, tuple(trees)
 
 
 def _runtime_artifact(
@@ -1458,6 +1531,7 @@ def write_runtime_inputs(
     manager_binary: Path,
     manager_extra_args: Sequence[str] = FULL_RUN_MANAGER_EXTRA_ARGS,
     fault_plan: FaultPlan | None = None,
+    initial_tree_file: Path | None = None,
 ) -> tuple[Path, list[Path], tuple[str, ...], list[tuple[str, ...]], list[dict[str, Any]]]:
     config_directory = run_directory / "config"
     runtime_directory = run_directory / "runtime"
@@ -1468,24 +1542,34 @@ def write_runtime_inputs(
         app_binary=app_binary,
         manager_binary=manager_binary,
     )
+    runtime_artifacts: list[dict[str, Any]] = []
+    copied_tree_file: Path | None = None
+    initial_trees: tuple[tuple[int, ...], ...] | None = None
+    if initial_tree_file is not None:
+        tree_payload, initial_trees = _load_initial_tree_file(initial_tree_file)
+        copied_tree_file = config_directory / "epoch0.tree"
+        _write_private(copied_tree_file, tree_payload)
+        runtime_artifacts.append(
+            _runtime_artifact(run_directory, copied_tree_file, kind="initial_tree_file", replica_id=None)
+        )
     main_config = config_directory / "hotstuff.gen.conf"
     _write_private(
         main_config,
-        _main_config_payload(
-            profile,
-            runtime,
-            bls,
+            _main_config_payload(
+                profile,
+                runtime,
+                bls,
             tls,
             issuer,
             peer_port=peer_port,
             client_port=client_port,
             manager_port=manager_port,
+            initial_tree_file=copied_tree_file,
         ),
     )
 
     replica_configs: list[Path] = []
     replica_commands: list[tuple[str, ...]] = []
-    runtime_artifacts: list[dict[str, Any]] = []
     for replica_id in REPLICA_IDS:
         replica_config = config_directory / f"replica-{replica_id}.conf"
         _write_private(
@@ -1578,10 +1662,11 @@ def write_runtime_inputs(
             *manager_extra_args,
             *(fault_plan.manager_cli_args() if fault_plan is not None else ()),
         ),
+        initial_tree_file=copied_tree_file,
         **manager_options,
     )
     epoch_input_path = runtime_directory / "epoch-input.json"
-    _write_json_exclusive(epoch_input_path, _initial_epoch_input())
+    _write_json_exclusive(epoch_input_path, _initial_epoch_input(initial_trees))
     runtime_artifacts.append(
         _runtime_artifact(
             run_directory,
@@ -1655,6 +1740,8 @@ def spawn_process(
 ) -> ProcessRecord:
     _assert_safe_command(command)
     log_handle = log_path.open("xb")
+    process: subprocess.Popen[bytes] | None = None
+    safe_pgid: int | None = None
     try:
         process = subprocess.Popen(
             list(command),
@@ -1666,6 +1753,7 @@ def spawn_process(
         pgid = os.getpgid(process.pid)
         if pgid != process.pid or pgid <= 1 or pgid == os.getpgrp():
             raise RunnerError(f"{name} does not own a safe isolated process group")
+        safe_pgid = pgid
         return ProcessRecord(
             name,
             process.pid,
@@ -1676,7 +1764,50 @@ def spawn_process(
             log_handle,
             replica_id,
         )
-    except Exception:
+    except BaseException:
+        if process is not None:
+            # Until the post-Popen identity check has completed, killing an
+            # observed group could signal an unrelated process.  Fall back to
+            # the exact returned child PID; use killpg only after proving that
+            # the child owns its isolated start_new_session group.
+            group_killed = False
+            if safe_pgid is not None:
+                try:
+                    os.killpg(safe_pgid, signal.SIGKILL)
+                    group_killed = True
+                except ProcessLookupError:
+                    group_killed = True
+                except BaseException:
+                    pass
+            if not group_killed:
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except BaseException:
+                    # Reaping below is still required even if signaling was
+                    # interrupted or the process disappeared concurrently.
+                    pass
+            try:
+                process.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                process.wait(timeout=5.0)
+            except ChildProcessError:
+                pass
+            except BaseException:
+                # A cleanup-time interrupt must not skip the final reap.
+                try:
+                    process.kill()
+                except (ProcessLookupError, OSError):
+                    pass
+                try:
+                    process.wait(timeout=5.0)
+                except (ChildProcessError, subprocess.TimeoutExpired):
+                    pass
         log_handle.close()
         raise
 
