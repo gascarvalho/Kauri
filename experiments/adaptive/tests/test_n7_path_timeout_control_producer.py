@@ -112,6 +112,20 @@ def test_control_contract_strips_the_only_successor_authorizing_pairs():
     assert result[-1] == "--fault-window-arm-control-only"
 
 
+def test_control_reader_accepts_native_prepared_base_plan_format(tmp_path: Path):
+    base = {"schema_version": 1, "state": "PREPARED_E0_IDENTITY_DERIVED_EXECUTION_DISABLED"}
+    path = tmp_path / "local-launch-plan.json"
+    path.write_text(json.dumps(base, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    assert producer._read_prepared_base_plan(path) == base
+
+
+def test_control_reader_rejects_non_object_base_plan(tmp_path: Path):
+    path = tmp_path / "local-launch-plan.json"
+    path.write_text("[]\n", encoding="utf-8")
+    with pytest.raises(producer.ProducerError, match="prepared base plan"):
+        producer._read_prepared_base_plan(path)
+
+
 @pytest.mark.parametrize("command", [
     ("manager", "--transition-request", "only-request"),
     ("manager", "--bundle-output", "only-bundle"),

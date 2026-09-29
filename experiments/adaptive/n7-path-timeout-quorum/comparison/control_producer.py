@@ -268,10 +268,23 @@ def _read_canonical_object(path: Path, label: str) -> tuple[dict[str, Any], byte
     return value, raw
 
 
+def _read_prepared_base_plan(path: Path) -> dict[str, Any]:
+    """Read the base runner's pretty JSON; its raw bytes are bound separately."""
+    if path.is_symlink() or not path.is_file():
+        raise ProducerError("prepared base plan is not a regular file")
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ProducerError("prepared base plan is not JSON") from exc
+    if not isinstance(value, dict):
+        raise ProducerError("prepared base plan is not a JSON object")
+    return value
+
+
 def _rederive_prepared_control(root: Path, plan: Mapping[str, Any]) -> None:
     """Recompute every launch-relevant field from the immutable base plan."""
     base_path = _safe_child(root, "local-launch-plan.json")
-    base_plan, _ = _read_canonical_object(base_path, "prepared base plan")
+    base_plan = _read_prepared_base_plan(base_path)
     if (plan.get("base_plan") != _descriptor(base_path, root=root) or
             plan.get("base_plan_sha256") != base_plan.get("plan_sha256") or
             base_plan.get("plan_sha256") != adaptive.adapter._plan_digest(base_plan)):
