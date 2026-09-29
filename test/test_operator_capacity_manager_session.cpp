@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "hotstuff/operator_capacity_authorization.h"
+#include "hotstuff/operator_capacity_epoch1_finalizer.h"
+#include "hotstuff/operator_capacity_label_envelope.h"
 #include "hotstuff/operator_capacity_policy.h"
 #include "support/adaptive_v3_manager_session_fixture.h"
 
@@ -57,8 +59,8 @@ OperatorCapacityIssuer test_capacity_issuer(
         snapshot.labels.push_back({replica, replica < 6
             ? OperatorCapacityClass::slow : OperatorCapacityClass::fast});
     snapshot.canonical_digest = operator_capacity_snapshot_digest(snapshot);
-    return {73, "manager-session-test", snapshot.canonical_digest,
-            PubKeySecp256k1(key)};
+    return {kauri::test_support::cert13::kIssuerId, "manager-session-stage-b", snapshot.canonical_digest,
+            PubKeySecp256k1(key), "manager-session-test"};
 }
 
 EpochDefinitionInput n31_epoch_zero(const std::vector<ReplicaID> &replicas)
@@ -86,7 +88,9 @@ OperatorCapacityAuthorization capacity_authorization(
 {
     auto key = issuer_key();
     auto policy = capacity_policy_for(fixture, snapshot, arm);
-    return authorize_operator_capacity(fixture.replicas, policy, 73, key);
+    return authorize_operator_capacity(fixture.replicas, policy,
+                                       kauri::test_support::cert13::kIssuerId,
+                                       key);
 }
 
 bool exact_trees(const std::vector<EpochTreeDefinition> &left,
@@ -143,6 +147,9 @@ TEST_CASE("operator-capacity manager session freezes an all-live N31 snapshot be
     {
         auto authorization = capacity_authorization(
             fixture, *snapshot, OperatorCapacityArm::fast_priority_treatment);
+        REQUIRE(verify_operator_capacity_authorization(
+            authorization, fixture.config.operator_capacity_issuer.value(),
+            fixture.replicas));
         REQUIRE(fixture.session.authorize_operator_capacity_epoch1(authorization));
         const auto *bundle = fixture.session.successor_bundle();
         REQUIRE(bundle != nullptr);
@@ -222,5 +229,212 @@ TEST_CASE("operator-capacity manager session freezes an all-live N31 snapshot be
             fixture, *snapshot, OperatorCapacityArm::fast_priority_treatment);
         REQUIRE_FALSE(fixture.session.authorize_operator_capacity_epoch1(authorization));
         CHECK(fixture.session.successor_bundle() == nullptr);
+    }
+}
+
+TEST_CASE("operator-capacity authorization cannot create a successor at or after its raw hard deadline",
+          "[operator-capacity][n31][adaptive-v3][manager-session][deadline]")
+{
+    const auto all_live = members(31);
+    const auto initial = n31_epoch_zero(all_live);
+    auto issuer = test_capacity_issuer(initial, all_live);
+    auto raw_clock_now = std::make_shared<std::uint64_t>(500);
+    Fixture fixture(31, all_live, 1, BlsMembershipConstruction::random, 1,
+                    false, issuer, initial,
+                    [raw_clock_now] { return *raw_clock_now; });
+
+    REQUIRE(fixture.session.begin_operator_capacity_epoch1());
+    REQUIRE(fixture.session.arm_hard_deadline(700));
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+    fixture.evidence.ready_all();
+    std::uint64_t attempt = 1;
+    for (const auto replica : all_live)
+        for (std::uint32_t count = 0; count < 2; ++count)
+            fixture.evidence.record_for_tree(
+                replica, fixture.tree_with_reporter_in(replica, all_live),
+                ResponseOutcome::on_time, "operator-capacity-baseline",
+                attempt++);
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    const auto *baseline = fixture.session.operator_capacity_baseline_snapshot();
+    REQUIRE(baseline != nullptr);
+    fixture.session.advance(500);
+    const auto authorization = capacity_authorization(
+        fixture, *baseline, OperatorCapacityArm::fast_priority_treatment);
+
+    SECTION("deadline equality expires without a successor")
+    {
+        *raw_clock_now = 700;
+        REQUIRE_FALSE(fixture.session.authorize_operator_capacity_epoch1(
+            authorization));
+        CHECK(fixture.session.successor_bundle() == nullptr);
+        CHECK(fixture.session.status() ==
+              AdaptiveV3ManagerSessionStatus::terminal);
+        REQUIRE(fixture.session.terminal_audit() != nullptr);
+        CHECK(fixture.session.terminal_audit()->reason ==
+              AdaptiveV3ManagerSessionTerminalReason::hard_deadline_exhausted);
+    }
+
+    SECTION("a later raw sample expires despite a stale session tick")
+    {
+        *raw_clock_now = 701;
+        REQUIRE_FALSE(fixture.session.authorize_operator_capacity_epoch1(
+            authorization));
+        CHECK(fixture.session.successor_bundle() == nullptr);
+        CHECK(fixture.session.status() ==
+              AdaptiveV3ManagerSessionStatus::terminal);
+        REQUIRE(fixture.session.terminal_audit() != nullptr);
+        CHECK(fixture.session.terminal_audit()->reason ==
+              AdaptiveV3ManagerSessionTerminalReason::hard_deadline_exhausted);
+    }
+
+    SECTION("a regressed raw sample does not authorize a successor")
+    {
+        *raw_clock_now = 499;
+        REQUIRE_FALSE(fixture.session.authorize_operator_capacity_epoch1(
+            authorization));
+        CHECK(fixture.session.successor_bundle() == nullptr);
+        CHECK(fixture.session.status() ==
+              AdaptiveV3ManagerSessionStatus::selecting);
+    }
+}
+
+TEST_CASE("operator-capacity Stage B derives its signed decision from verified Stage A and the live baseline",
+          "[operator-capacity][n31][adaptive-v3][finalizer]")
+{
+    const auto all_live = members(31);
+    const auto initial = n31_epoch_zero(all_live);
+    auto issuer = test_capacity_issuer(initial, all_live);
+    auto raw_clock_now = std::make_shared<std::uint64_t>(500);
+    Fixture fixture(31, all_live, 1, BlsMembershipConstruction::random, 1,
+                    false, issuer, initial,
+                    [raw_clock_now] { return *raw_clock_now; });
+
+    REQUIRE(fixture.session.begin_operator_capacity_epoch1());
+    REQUIRE(fixture.session.arm_hard_deadline(1'000'000));
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::awaiting_readiness);
+    fixture.evidence.ready_all();
+    std::uint64_t attempt = 1;
+    for (const auto replica : all_live)
+        for (std::uint32_t count = 0; count < 2; ++count)
+            fixture.evidence.record_for_tree(
+                replica, fixture.tree_with_reporter_in(replica, all_live),
+                ResponseOutcome::on_time, "operator-capacity-baseline",
+                attempt++);
+    REQUIRE(fixture.session.evaluate() ==
+            AdaptiveV2ManagerControllerStatus::baseline_frozen);
+    const auto *baseline = fixture.session.operator_capacity_baseline_snapshot();
+    REQUIRE(baseline != nullptr);
+    fixture.session.advance(500);
+
+    const auto epoch = baseline->epoch();
+    const auto topology = operator_capacity_baseline_topology_digest(
+        epoch, all_live, fixture.initial.trees);
+    const auto capacity = capacity_policy_for(
+        fixture, *baseline, OperatorCapacityArm::fast_priority_treatment)
+        .capacity_snapshot;
+    auto label_key = issuer_key();
+    label_key.from_hex(
+        "5aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    const OperatorCapacityLabelEnvelopeIssuer label_issuer{
+        74, capacity.issuer_reference, capacity.canonical_digest,
+        PubKeySecp256k1(label_key)};
+    const OperatorCapacityEpoch1FinalizerIssuer epoch_issuer{
+        kauri::test_support::cert13::kIssuerId, issuer_key()};
+
+    const auto signed_treatment = sign_operator_capacity_label_envelope(
+        all_live, epoch, topology,
+        OperatorCapacityArm::fast_priority_treatment, capacity, 74,
+        label_key);
+    const auto verified_treatment = verify_operator_capacity_label_envelope(
+        signed_treatment, label_issuer, all_live, epoch, topology, 500);
+    REQUIRE(verified_treatment);
+
+    SECTION("treatment finalizes and activates from the manager-frozen baseline")
+    {
+        const auto final = finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 500, epoch_issuer);
+        REQUIRE(final);
+        CHECK(final->envelope_digest ==
+              operator_capacity_label_envelope_digest(signed_treatment));
+        REQUIRE(fixture.session.authorize_operator_capacity_epoch1(
+            final->authorization));
+        REQUIRE(fixture.session.successor_bundle() != nullptr);
+        for (std::uint32_t tree = 0; tree < 21; ++tree)
+            CHECK(fixture.session.successor_bundle()->definition()
+                      .trees[tree].members_breadth_first.front() == tree + 6);
+        complete_readiness(fixture, all_live, 510, 1000,
+                           "finalized-capacity-treatment");
+        CHECK(fixture.session.status() ==
+              AdaptiveV3ManagerSessionStatus::terminal);
+    }
+
+    SECTION("exact-copy sham uses the same live baseline and signed epoch path")
+    {
+        const auto signed_sham = sign_operator_capacity_label_envelope(
+            all_live, epoch, topology, OperatorCapacityArm::exact_copy_sham,
+            capacity, 74, label_key);
+        const auto verified_sham = verify_operator_capacity_label_envelope(
+            signed_sham, label_issuer, all_live, epoch, topology, 500);
+        REQUIRE(verified_sham);
+        const auto final = finalize_operator_capacity_epoch1(
+            *verified_sham, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 500, epoch_issuer);
+        REQUIRE(final);
+        REQUIRE(fixture.session.authorize_operator_capacity_epoch1(
+            final->authorization));
+        REQUIRE(fixture.session.successor_bundle() != nullptr);
+        CHECK(exact_trees(fixture.session.successor_bundle()->definition().trees,
+                          fixture.initial.trees));
+        complete_readiness(fixture, all_live, 510, 1000,
+                           "finalized-capacity-sham");
+        CHECK(fixture.session.status() ==
+              AdaptiveV3ManagerSessionStatus::terminal);
+    }
+
+    SECTION("wrong membership, zero or expired RAW time, and missing issuer fail")
+    {
+        auto fewer = all_live;
+        fewer.pop_back();
+        CHECK_FALSE(finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            fewer, *baseline, 500, epoch_issuer));
+        CHECK_FALSE(finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 0, epoch_issuer));
+        CHECK_FALSE(finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 1001, epoch_issuer));
+        CHECK_FALSE(finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 500,
+            OperatorCapacityEpoch1FinalizerIssuer{0, issuer_key()}));
+        const auto wrong_epoch_signer = finalize_operator_capacity_epoch1(
+            *verified_treatment, fixture.session.ingress().current_epoch(),
+            all_live, *baseline, 500,
+            OperatorCapacityEpoch1FinalizerIssuer{74, label_key});
+        REQUIRE(wrong_epoch_signer);
+        CHECK_FALSE(fixture.session.authorize_operator_capacity_epoch1(
+            wrong_epoch_signer->authorization));
+        auto reordered_trees = fixture.initial.trees;
+        std::swap(reordered_trees[0], reordered_trees[1]);
+        const auto wrong_topology = operator_capacity_baseline_topology_digest(
+            epoch, all_live, reordered_trees);
+        const auto signed_wrong_topology = sign_operator_capacity_label_envelope(
+            all_live, epoch, wrong_topology,
+            OperatorCapacityArm::fast_priority_treatment, capacity, 74,
+            label_key);
+        const auto verified_wrong_topology =
+            verify_operator_capacity_label_envelope(
+                signed_wrong_topology, label_issuer, all_live, epoch,
+                wrong_topology, 500);
+        REQUIRE(verified_wrong_topology);
+        CHECK_FALSE(finalize_operator_capacity_epoch1(
+            *verified_wrong_topology,
+            fixture.session.ingress().current_epoch(), all_live, *baseline,
+            500, epoch_issuer));
     }
 }

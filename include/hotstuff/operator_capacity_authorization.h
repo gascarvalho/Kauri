@@ -31,10 +31,14 @@ enum class OperatorCapacityAuthorizationWireError : std::uint8_t
 
 struct OperatorCapacityIssuer
 {
+    /** Stage-B authorization signer, distinct from the Stage-A label issuer. */
     std::uint32_t issuer_id{0};
     std::string issuer_reference;
     uint256_t approved_capacity_digest;
     PubKeySecp256k1 public_key;
+    /** Independently pinned Stage-A label-issuer reference. Empty retains
+     * the historical same-issuer construction for existing callers only. */
+    std::string approved_label_issuer_reference;
 };
 
 struct OperatorCapacityAuthorization

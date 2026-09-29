@@ -106,6 +106,11 @@ EpochDefinitionInput adaptive_v2_epoch_zero_input(
 
 // Parse the legacy fan:<n> pipe:<n> bootstrap schedule into one or more exact
 // adaptive-v2 Epoch-0 tree definitions. Default cyclic callers do not read it.
+// The byte-buffer form lets provenance tools hash and parse one immutable read.
+std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_bytes(
+    const bytearray_t &bytes,
+    const std::vector<ReplicaID> &membership);
+
 std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
     const std::string &path,
     const std::vector<ReplicaID> &membership);

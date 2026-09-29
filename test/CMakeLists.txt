@@ -318,6 +318,78 @@ set_tests_properties(
     LABELS "unit;adaptive;operator-capacity;authorization"
     TIMEOUT 5)
 add_kauri_catch_test(
+    test_operator_capacity_label_envelope
+    test_operator_capacity_label_envelope.cpp)
+set_tests_properties(
+    test_operator_capacity_label_envelope PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;label-envelope"
+    TIMEOUT 5)
+add_kauri_catch_test(
+    test_operator_capacity_label_envelope_cli
+    test_operator_capacity_label_envelope_cli.cpp)
+target_compile_definitions(
+    test_operator_capacity_label_envelope_cli PRIVATE
+    KAURI_OPERATOR_CAPACITY_LABEL_ENVELOPE_VERIFY="$<TARGET_FILE:operator-capacity-label-envelope-verify>")
+add_dependencies(
+    test_operator_capacity_label_envelope_cli
+    operator-capacity-label-envelope-verify)
+set_tests_properties(
+    test_operator_capacity_label_envelope_cli PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;label-envelope;cli"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_operator_capacity_label_envelope_sign_cli
+    test_operator_capacity_label_envelope_sign_cli.cpp)
+target_compile_definitions(
+    test_operator_capacity_label_envelope_sign_cli PRIVATE
+    KAURI_OPERATOR_CAPACITY_LABEL_ENVELOPE_SIGN="$<TARGET_FILE:operator-capacity-label-envelope-sign>"
+    KAURI_OPERATOR_CAPACITY_LABEL_ENVELOPE_VERIFY="$<TARGET_FILE:operator-capacity-label-envelope-verify>")
+add_dependencies(
+    test_operator_capacity_label_envelope_sign_cli
+    operator-capacity-label-envelope-sign
+    operator-capacity-label-envelope-verify)
+set_tests_properties(
+    test_operator_capacity_label_envelope_sign_cli PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;label-envelope;sign;cli"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_operator_capacity_authorization_cli
+    test_operator_capacity_authorization_cli.cpp)
+target_compile_definitions(
+    test_operator_capacity_authorization_cli PRIVATE
+    KAURI_OPERATOR_CAPACITY_AUTHORIZATION_VERIFY="$<TARGET_FILE:operator-capacity-authorization-verify>")
+add_dependencies(
+    test_operator_capacity_authorization_cli
+    operator-capacity-authorization-verify)
+set_tests_properties(
+    test_operator_capacity_authorization_cli PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;authorization;cli"
+    TIMEOUT 10)
+add_kauri_catch_test(
+    test_operator_capacity_identity_parity_cli
+    test_operator_capacity_identity_parity_cli.cpp)
+target_compile_definitions(
+    test_operator_capacity_identity_parity_cli PRIVATE
+    KAURI_OPERATOR_CAPACITY_IDENTITY_PARITY_VERIFY="$<TARGET_FILE:operator-capacity-identity-parity-verify>"
+    KAURI_HOTSTUFF_KEYGEN_PATH="$<TARGET_FILE:hotstuff-keygen>"
+    KAURI_HOTSTUFF_TLS_KEYGEN_PATH="$<TARGET_FILE:hotstuff-tls-keygen>")
+add_dependencies(
+    test_operator_capacity_identity_parity_cli
+    operator-capacity-identity-parity-verify
+    hotstuff-keygen
+    hotstuff-tls-keygen)
+set_tests_properties(
+    test_operator_capacity_identity_parity_cli PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;identity-parity;cli"
+    TIMEOUT 40)
+add_kauri_catch_test(
+    test_operator_capacity_consumption_record
+    test_operator_capacity_consumption_record.cpp)
+set_tests_properties(
+    test_operator_capacity_consumption_record PROPERTIES
+    LABELS "unit;adaptive;operator-capacity;consumption"
+    TIMEOUT 5)
+add_kauri_catch_test(
     test_adaptive_v2_selection
     test_adaptive_v2_selection.cpp)
 set_tests_properties(

@@ -33,6 +33,79 @@ std::vector<ReplicaID> n7_membership()
     return membership;
 }
 
+hotstuff::VerifiedOperatorCapacityLabelEnvelope
+verified_capacity_stage_a_for(const AdaptiveV3ManagerOptions &options)
+{
+    const auto epoch_zero = manager_epoch_zero(options.manager);
+    const hotstuff::AdaptationEpochId epoch0{
+        epoch_zero.epoch_number, hotstuff::compute_epoch_digest(epoch_zero)};
+    const auto topology = hotstuff::operator_capacity_baseline_topology_digest(
+        epoch0, options.manager.membership, epoch_zero.trees);
+
+    hotstuff::OperatorCapacitySnapshot snapshot;
+    snapshot.issuer_reference = "test-capacity-label-issuer";
+    snapshot.predecessor = epoch0;
+    snapshot.valid_from_monotonic_ns = 100;
+    snapshot.valid_until_monotonic_ns = 200;
+    for (const auto replica : options.manager.membership)
+    {
+        snapshot.labels.push_back({replica, replica < 2
+            ? hotstuff::OperatorCapacityClass::slow
+            : hotstuff::OperatorCapacityClass::fast});
+    }
+    snapshot.canonical_digest =
+        hotstuff::operator_capacity_snapshot_digest(snapshot);
+
+    hotstuff::PrivKeySecp256k1 label_key;
+    label_key.from_hex(
+        "4aede145d13021fb43c938bced67511a7740c05786d3e0b94ffbdaa7f15afc57");
+    const hotstuff::OperatorCapacityLabelEnvelopeIssuer label_issuer{
+        29, snapshot.issuer_reference, snapshot.canonical_digest,
+        hotstuff::PubKeySecp256k1(label_key)};
+    const auto envelope = hotstuff::sign_operator_capacity_label_envelope(
+        options.manager.membership, epoch0, topology,
+        hotstuff::OperatorCapacityArm::fast_priority_treatment, snapshot,
+        label_issuer.issuer_id, label_key);
+    const auto verified = hotstuff::verify_operator_capacity_label_envelope(
+        envelope, label_issuer, options.manager.membership, epoch0, topology,
+        150);
+    REQUIRE(verified.has_value());
+    return *verified;
+}
+
+void configure_verified_capacity_mode(AdaptiveV3ManagerOptions &options)
+{
+    options.manager.operator_capacity_cli = OperatorCapacityCliInput{
+        "unused-stage-a-envelope", std::string(64, 'a'), "29",
+        "test-capacity-label-issuer", std::string(66, 'a'),
+        std::string(64, 'b'), std::string(64, 'c'), "1000",
+        "stage-b.json", "consumption.json", "test-stage-b-issuer"};
+    options.operator_capacity_stage_a = verified_capacity_stage_a_for(options);
+    options.operator_capacity_issuer = hotstuff::OperatorCapacityIssuer{
+        17, "test-stage-b-issuer",
+        options.operator_capacity_stage_a->capacity_snapshot().canonical_digest,
+        hotstuff::PubKeySecp256k1(options.manager.issuer_private_key),
+        "test-capacity-label-issuer"};
+    options.operator_capacity_raw_clock_now_ns = [] { return 150ULL; };
+    options.operator_capacity_stage_a_wire_sha256 = std::string(64, 'a');
+    options.operator_capacity_label_issuer_id = 29;
+    options.operator_capacity_label_issuer_reference =
+        "test-capacity-label-issuer";
+    options.operator_capacity_label_issuer_public_key_fingerprint =
+        std::string(64, 'b');
+    options.operator_capacity_stage_b_issuer_reference = "test-stage-b-issuer";
+    options.operator_capacity_stage_b_authorization_output = "stage-b.json";
+    options.operator_capacity_consumption_output = "consumption.json";
+    options.operator_capacity_hard_deadline_ns = 1000;
+}
+
+TransitionRequest optimization_first_request()
+{
+    TransitionRequest request;
+    request.policy.intent = TreePolicyKind::performance_optimization;
+    return request;
+}
+
 std::string replace_once(std::string value, const std::string &from,
                          const std::string &to);
 
@@ -323,6 +396,12 @@ TEST_CASE(
     ManagerOptions manager_options;
     manager_options.membership = n7_membership();
     manager_options.epoch_zero_tree_file = tree_file.string();
+    // Mirror the CLI's file-parse step: manager_epoch_zero consumes the
+    // parsed Epoch-0 input, not the path string alone.
+    manager_options.epoch_zero = hotstuff::adaptive_v2_epoch_zero_input(
+        manager_options.membership,
+        hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+            tree_file.string(), manager_options.membership));
     const auto manager_input = manager_epoch_zero(manager_options);
 
     const auto replica_input = hotstuff::adaptive_v2_epoch_zero_input(
@@ -719,4 +798,37 @@ TEST_CASE(
           std::optional<ReplicaID>{3});
     CHECK_FALSE(lookup_adaptive_v3_tls_source(
         peer_to_replica, options.local_peer_id).has_value());
+}
+
+TEST_CASE(
+    "adaptive-v3 permits optimization-first only after verified operator-capacity admission",
+    "[adaptive-v3][operator-capacity][policy]")
+{
+    AdaptiveV3CliFixture fixture;
+
+    SECTION("ordinary optimization-first remains rejected")
+    {
+        auto options = parse_adaptive_v3_test_options(fixture.arguments());
+        options.manager.transition_requests = {optimization_first_request()};
+        CHECK_THROWS_AS(adaptive_v3_session_config(options),
+                        std::invalid_argument);
+    }
+
+    SECTION("fully configured capacity mode admits its one optimization epoch")
+    {
+        auto options = parse_adaptive_v3_test_options(fixture.arguments());
+        options.manager.transition_requests = {optimization_first_request()};
+        configure_verified_capacity_mode(options);
+        const auto config = adaptive_v3_session_config(options);
+        CHECK(config.expected_cycle_count == 1);
+    }
+
+    SECTION("partial capacity state remains rejected")
+    {
+        auto options = parse_adaptive_v3_test_options(fixture.arguments());
+        options.manager.transition_requests = {optimization_first_request()};
+        options.manager.operator_capacity_cli = OperatorCapacityCliInput{};
+        CHECK_THROWS_AS(adaptive_v3_session_config(options),
+                        std::invalid_argument);
+    }
 }

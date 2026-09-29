@@ -264,6 +264,42 @@ TEST_CASE("N31 operator-capacity sham exact-copies predecessor at the native dec
     CHECK(sham.policy_snapshot_id != "");
 }
 
+TEST_CASE("N31 capacity placement preserves either uniform tree shape and rejects a mixed predecessor",
+          "[operator-capacity][n31][shape]")
+{
+    const auto snapshot = responsive_snapshot();
+    for (const std::uint32_t fanout : {2U, 5U})
+    {
+        auto config = treatment();
+        config.fanout = fanout;
+        for (auto &tree : config.baseline_trees)
+            tree.fanout = fanout;
+
+        const auto selected = hotstuff::build_operator_capacity_placement(
+            members(), snapshot, config);
+        REQUIRE(selected);
+        REQUIRE(selected.trees.size() == config.baseline_trees.size());
+        for (const auto &tree : selected.trees)
+        {
+            CHECK(tree.fanout == fanout);
+            CHECK(tree.pipeline_stretch == 2);
+            CHECK(tree.members_breadth_first.front() >= 6);
+        }
+
+        config.arm = OperatorCapacityArm::exact_copy_sham;
+        const auto sham = hotstuff::build_operator_capacity_placement(
+            members(), snapshot, config);
+        REQUIRE(sham);
+        CHECK(same_ordered_trees(sham.trees, config.baseline_trees));
+    }
+
+    auto mixed = treatment();
+    mixed.baseline_trees.front().fanout = 2;
+    CHECK(hotstuff::build_operator_capacity_placement(
+              members(), snapshot, mixed).status ==
+          OperatorCapacityPolicyStatus::invalid_exact_copy_baseline);
+}
+
 TEST_CASE("N31 operator-capacity policy fails closed on invalid binding or nonresponsive input",
           "[operator-capacity][n31][binding]")
 {

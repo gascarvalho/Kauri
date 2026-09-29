@@ -216,6 +216,9 @@ add_library(hotstuff
     OBJECT
     src/adaptation.cpp
     src/operator_capacity_authorization.cpp
+    src/operator_capacity_consumption_record.cpp
+    src/operator_capacity_epoch1_finalizer.cpp
+    src/operator_capacity_label_envelope.cpp
     src/operator_capacity_policy.cpp
     src/activation_readiness_wire.cpp
     src/adaptation_manager.cpp

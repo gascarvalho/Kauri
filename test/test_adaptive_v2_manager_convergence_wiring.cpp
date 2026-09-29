@@ -1,12 +1,19 @@
 #include <cctype>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <initializer_list>
 #include <sstream>
 #include <string>
 
+#include <sys/stat.h>
+
 #include "catch.hpp"
+#include "examples/adaptation_manager_epoch_zero_tree_file.h"
 #include "hotstuff/adaptive_v2_reporting_outbox.h"
+#include "hotstuff/configuration.h"
 
 #ifndef KAURI_PROJECT_SOURCE_DIR
 #error "KAURI_PROJECT_SOURCE_DIR must name the repository root"
@@ -23,6 +30,39 @@ std::string source(const char *relative_path)
     std::ostringstream contents;
     contents << input.rdbuf();
     return contents.str();
+}
+
+struct TemporaryDirectory final
+{
+    std::filesystem::path path;
+
+    TemporaryDirectory()
+    {
+        auto template_path =
+            (std::filesystem::temp_directory_path() /
+             "kauri-epoch-zero-tree-XXXXXX")
+                .string();
+        const auto *created = ::mkdtemp(template_path.data());
+        REQUIRE(created != nullptr);
+        path = created;
+    }
+
+    ~TemporaryDirectory()
+    {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+};
+
+void write_bytes(const std::filesystem::path &path,
+                 const hotstuff::bytearray_t &bytes)
+{
+    std::ofstream output(path, std::ios::binary);
+    REQUIRE(output.good());
+    output.write(
+        reinterpret_cast<const char *>(bytes.data()),
+        static_cast<std::streamsize>(bytes.size()));
+    REQUIRE(output.good());
 }
 
 std::string code_without_comments_or_literals(const std::string &contents)
@@ -517,6 +557,99 @@ TEST_CASE(
                   "convergence_tick_+options_.convergence_deadline_ticks") !=
               std::string::npos);
     }
+}
+
+TEST_CASE(
+    "manager binds a supplied epoch-zero tree from one secure immutable read",
+    "[adaptive-v2][manager][epoch-zero][tree-file][immutable-read][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto options = manager_options_parser(raw_manager);
+    // The v3 startup verifier has a forward declaration of this helper;
+    // inspect its implementation rather than treating the declaration as a
+    // function body.
+    const auto implementation = raw_manager.rfind(
+        "EpochDefinitionInput manager_epoch_zero(");
+    REQUIRE(implementation != std::string::npos);
+    const auto epoch_zero = function_body(
+        raw_manager.substr(implementation),
+        "EpochDefinitionInput manager_epoch_zero(");
+
+    REQUIRE_FALSE(epoch_zero.empty());
+    CHECK(contains_in_order(
+        options,
+        {"options.epoch_zero_tree_file",
+         "adaptation_manager_detail::read_epoch_zero_tree_file(",
+         "options.epoch_zero_tree_sha256 =",
+         "options.epoch_zero =",
+         "parse_adaptive_v2_epoch_zero_tree_bytes("}));
+    CHECK(epoch_zero.find("return *options.epoch_zero") !=
+          std::string::npos);
+    CHECK(epoch_zero.find("parse_adaptive_v2_epoch_zero_tree_file(") ==
+          std::string::npos);
+    CHECK(without_whitespace(raw_manager).find(
+              "std::optional<EpochDefinitionInput>epoch_zero;") !=
+          std::string::npos);
+    CHECK(without_whitespace(raw_manager).find(
+              "std::optional<std::string>epoch_zero_tree_sha256;") !=
+          std::string::npos);
+    CHECK(count_occurrences(
+              raw_manager, "manager_epoch_zero(options_.manager)") == 1);
+    CHECK(count_occurrences(raw_manager, "manager_epoch_zero(options_)") == 1);
+}
+
+TEST_CASE(
+    "epoch-zero tree loader captures bounded regular bytes and lowercase SHA-256",
+    "[adaptive-v2][manager][epoch-zero][tree-file][secure-read][behavior]")
+{
+    TemporaryDirectory directory;
+    const auto regular = directory.path / "epoch0.tree";
+    const hotstuff::bytearray_t expected{'a', 'b', 'c'};
+    write_bytes(regular, expected);
+
+    const auto loaded = adaptation_manager_detail::read_epoch_zero_tree_file(
+        regular.string());
+    CHECK(loaded.bytes == expected);
+    CHECK(loaded.sha256 ==
+          "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    const auto symlink = directory.path / "epoch0-link";
+    REQUIRE(::symlink(regular.c_str(), symlink.c_str()) == 0);
+    CHECK_THROWS_AS(
+        adaptation_manager_detail::read_epoch_zero_tree_file(symlink.string()),
+        std::system_error);
+
+    const auto fifo = directory.path / "epoch0-fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    const auto started = std::chrono::steady_clock::now();
+    CHECK_THROWS_AS(
+        adaptation_manager_detail::read_epoch_zero_tree_file(fifo.string()),
+        std::invalid_argument);
+    CHECK(std::chrono::steady_clock::now() - started <
+          std::chrono::seconds(1));
+
+    const auto oversized = directory.path / "oversized.tree";
+    hotstuff::bytearray_t too_large(
+        adaptation_manager_detail::kMaximumEpochZeroTreeBytes + 1, 0);
+    write_bytes(oversized, too_large);
+    CHECK_THROWS_AS(
+        adaptation_manager_detail::read_epoch_zero_tree_file(oversized.string()),
+        std::invalid_argument);
+
+    const auto fixture = std::filesystem::path{KAURI_PROJECT_SOURCE_DIR} /
+        "experiments/adaptive/n7-three-reporter-omission/epoch0.tree";
+    const auto fixture_loaded =
+        adaptation_manager_detail::read_epoch_zero_tree_file(fixture.string());
+    std::ifstream fixture_input(fixture, std::ios::binary);
+    REQUIRE(fixture_input.good());
+    const hotstuff::bytearray_t fixture_bytes{
+        std::istreambuf_iterator<char>(fixture_input),
+        std::istreambuf_iterator<char>()};
+    CHECK(fixture_loaded.bytes == fixture_bytes);
+    const auto membership = std::vector<hotstuff::ReplicaID>{0, 1, 2, 3, 4, 5, 6};
+    const auto parsed = hotstuff::parse_adaptive_v2_epoch_zero_tree_bytes(
+        fixture_loaded.bytes, membership);
+    CHECK_FALSE(parsed.empty());
 }
 
 TEST_CASE(
@@ -1089,14 +1222,17 @@ TEST_CASE(
     const auto run = function_body(manager, "int run()");
     REQUIRE_FALSE(run.empty());
 
-    const auto failed_start = run.find("if (!begin_current_cycle())");
+    const auto failed_start = run.find(
+        "if (options_.fault_window_arm_control_only");
     REQUIRE(failed_start != std::string::npos);
     const auto operational_guard = run.find("if (!failed_)", failed_start);
     REQUIRE(operational_guard != std::string::npos);
     CHECK(failed_start < operational_guard);
     CHECK(contains_in_order(
         run.substr(failed_start),
-        {"if (!begin_current_cycle())", "fail(", "if (!failed_)"}));
+        {"if (options_.fault_window_arm_control_only",
+         "? !begin_fixed_e0_control_cycle()",
+         ": !begin_current_cycle())", "fail(", "if (!failed_)"}));
 
     const auto fail = function_body(
         manager,
@@ -1929,4 +2065,41 @@ TEST_CASE(
         {"emit_path_timeout_quorum_selection_decided(*request, *bundle)",
          "write_exclusive_bundle(",
          "session_.start_convergence("}));
+}
+
+TEST_CASE(
+    "fixed-E0 control emits only arm-bound observation heartbeats",
+    "[adaptive-v2][manager][fixed-e0-control][observation][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+
+    const auto consume = function_body(manager, "bool try_arm_fault_window()");
+    REQUIRE_FALSE(consume.empty());
+    CHECK(contains_in_order(
+        consume,
+        {"fault_window_arm_sha256_ = document.sha256",
+         "if (options_.fault_window_arm_control_only)",
+         "emit_fixed_e0_control_observation()",
+         "fixed_e0_control_observation_timer.add("}));
+
+    const auto observe = function_body(
+        manager, "void handle_fixed_e0_control_observation_timer()");
+    REQUIRE_FALSE(observe.empty());
+    CHECK(contains_in_order(
+        observe,
+        {"consumed_fault_window_arm_is_unchanged()",
+         "emit_fixed_e0_control_observation()",
+         "fixed_e0_control_observation_timer.add("}));
+    CHECK(observe.find("session_.evaluate()") == std::string::npos);
+    CHECK(observe.find("session_.begin_cycle(") == std::string::npos);
+    CHECK(observe.find("session_.start_convergence(") == std::string::npos);
+
+    const auto emit = function_body(
+        manager, "void emit_fixed_e0_control_observation()");
+    REQUIRE_FALSE(emit.empty());
+    CHECK(emit.find("FixedE0ControlObservationStructuredEvent") !=
+          std::string::npos);
+    CHECK(emit.find("fault_window_arm_sha256_") != std::string::npos);
+    CHECK(emit.find("session_.") == std::string::npos);
 }

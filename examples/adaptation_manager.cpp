@@ -57,8 +57,13 @@
 #include "hotstuff/adaptive_v2_selection.h"
 #include "hotstuff/adaptive_v3_manager_session.h"
 #include "hotstuff/configuration.h"
+#include "hotstuff/operator_capacity_consumption_record.h"
+#include "hotstuff/operator_capacity_epoch1_finalizer.h"
+#include "hotstuff/operator_capacity_label_envelope.h"
 #include "hotstuff/structured_event.h"
 #include "hotstuff/util.h"
+
+#include "adaptation_manager_epoch_zero_tree_file.h"
 
 namespace
 {
@@ -130,6 +135,9 @@ constexpr std::uint64_t kAdaptiveV3E2ReserveNs =
 constexpr double kAdaptiveV3TickSeconds = 0.001;
 // Bound isolated-ingress latency while batching a burst at one fixed deadline.
 constexpr double kEvaluationCoalescingSeconds = 0.05;
+// Fixed-E0 controls remain source-observable after their verified arm.  This
+// is experiment-only liveness evidence; it never enters the controller.
+constexpr double kFixedE0ControlObservationSeconds = 1.0;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
 // one convergence timer interval for scheduling and transport dispatch.
 constexpr double kConvergenceAckDrainSeconds = 1.1;
@@ -215,6 +223,22 @@ struct FaultWindowArmDocument
     hotstuff::FaultWindowArmedStructuredEvent event;
 };
 
+/** Raw CLI material. It is verified only by the adaptive-v3 startup path. */
+struct OperatorCapacityCliInput
+{
+    std::string stage_a_envelope_path;
+    std::string stage_a_wire_sha256;
+    std::string label_issuer_id;
+    std::string label_issuer_reference;
+    std::string label_issuer_public_key_hex;
+    std::string label_issuer_public_key_fingerprint;
+    std::string approved_capacity_digest;
+    std::string hard_deadline_ns;
+    std::string stage_b_authorization_output;
+    std::string consumption_output;
+    std::string stage_b_issuer_reference;
+};
+
 enum class FaultWindowArmReadStatus : std::uint8_t
 {
     consumed,
@@ -245,6 +269,8 @@ struct ManagerOptions
     std::vector<ReplicaEndpoint> replicas;
     std::vector<ReplicaID> membership;
     std::optional<std::string> epoch_zero_tree_file;
+    std::optional<EpochDefinitionInput> epoch_zero;
+    std::optional<std::string> epoch_zero_tree_sha256;
     AdaptiveV2ManagerRuntimeShape runtime_shape;
     std::uint32_t required_nonresponsive{0};
     hotstuff::EpochChangeIssuerId issuer_id{0};
@@ -268,6 +294,9 @@ struct ManagerOptions
     std::uint64_t fault_containment_evidence_start_monotonic_ns{0};
     std::uint32_t fault_containment_required_tree_coverage{0};
     std::optional<FaultWindowArmBindings> fault_window_arm;
+    // Experimental fixed-E0 control: arm the exact same verified omission
+    // boundary as the adaptive arm, but never construct a successor epoch.
+    bool fault_window_arm_control_only{false};
     std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
     bool cycle_1_inherited_wait_exempt_eligibility_gate{false};
     bool cycle_1_responsive_cross_commit_retention_readiness_gate{false};
@@ -282,6 +311,7 @@ struct ManagerOptions
         experiment_drop_bundle_attempt;
     std::optional<std::uint32_t>
         experiment_drop_activation_ack;
+    std::optional<OperatorCapacityCliInput> operator_capacity_cli;
 };
 
 struct AdaptiveV3ManagerOptions
@@ -304,6 +334,20 @@ struct AdaptiveV3ManagerOptions
     std::uint32_t maximum_delivery_attempts{5};
     std::uint64_t retry_interval_ticks{1};
     hotstuff::ActivationReadinessWireLimits wire_limits;
+    // Populated only after a future capacity-specific startup admission has
+    // verified the signed Stage-A input and the separately pinned issuer.
+    std::optional<hotstuff::OperatorCapacityIssuer> operator_capacity_issuer;
+    std::function<std::uint64_t()> operator_capacity_raw_clock_now_ns;
+    std::optional<hotstuff::VerifiedOperatorCapacityLabelEnvelope>
+        operator_capacity_stage_a;
+    std::string operator_capacity_stage_a_wire_sha256;
+    std::uint32_t operator_capacity_label_issuer_id{0};
+    std::string operator_capacity_label_issuer_reference;
+    std::string operator_capacity_label_issuer_public_key_fingerprint;
+    std::string operator_capacity_stage_b_issuer_reference;
+    std::string operator_capacity_stage_b_authorization_output;
+    std::string operator_capacity_consumption_output;
+    std::uint64_t operator_capacity_hard_deadline_ns{0};
     std::string structured_event_run_id;
     std::string structured_event_source_instance;
     std::string structured_event_output;
@@ -1462,6 +1506,20 @@ bool adaptive_v3_requested(int argc, char **argv)
 // selection, topology, evidence, fault-window, residency, TLS, and event
 // arguments.  v3 only adds its public BLS/readiness policy.
 ManagerOptions parse_options(int argc, char **argv);
+EpochDefinitionInput manager_epoch_zero(const ManagerOptions &options);
+
+std::uint64_t checked_monotonic_raw_now_ns()
+{
+    timespec now{};
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &now) != 0 || now.tv_sec < 0 ||
+        now.tv_nsec < 0 ||
+        static_cast<std::uint64_t>(now.tv_sec) >
+            std::numeric_limits<std::uint64_t>::max() /
+                kNanosecondsPerSecond)
+        throw std::runtime_error("cannot sample CLOCK_MONOTONIC_RAW");
+    return static_cast<std::uint64_t>(now.tv_sec) * kNanosecondsPerSecond +
+        static_cast<std::uint64_t>(now.tv_nsec);
+}
 
 AdaptiveV3ManagerOptions parse_adaptive_v3_options(int argc, char **argv)
 {
@@ -1538,6 +1596,97 @@ AdaptiveV3ManagerOptions parse_adaptive_v3_options(int argc, char **argv)
     unified.structured_event_run_id = unified.manager.structured_event_run_id;
     unified.structured_event_source_instance = unified.manager.structured_event_source_instance;
     unified.structured_event_output = unified.manager.structured_event_output;
+    if (unified.manager.operator_capacity_cli.has_value())
+    {
+        const auto &input = *unified.manager.operator_capacity_cli;
+        const auto exact_lower_hex = [](const std::string &value,
+                                        std::size_t size) {
+            return value.size() == size && std::all_of(
+                value.begin(), value.end(), [](unsigned char character) {
+                    return (character >= '0' && character <= '9') ||
+                        (character >= 'a' && character <= 'f');
+                });
+        };
+        if (!exact_lower_hex(input.stage_a_wire_sha256, 64) ||
+            !exact_lower_hex(input.label_issuer_public_key_hex, 66) ||
+            !exact_lower_hex(input.label_issuer_public_key_fingerprint, 64) ||
+            !exact_lower_hex(input.approved_capacity_digest, 64) ||
+            input.label_issuer_reference.size() >
+                hotstuff::kMaximumOperatorCapacityIssuerReferenceBytes ||
+            input.stage_b_issuer_reference.empty() ||
+            input.stage_b_issuer_reference.size() >
+                hotstuff::kMaximumOperatorCapacityIssuerReferenceBytes ||
+            input.stage_b_authorization_output == input.consumption_output ||
+            input.stage_a_envelope_path == input.stage_b_authorization_output ||
+            input.stage_a_envelope_path == input.consumption_output)
+            throw std::invalid_argument("operator-capacity startup bindings are invalid");
+        const auto label_issuer_id = parse_adaptive_v3_positive_unsigned<std::uint32_t>(
+            input.label_issuer_id, "operator-capacity label issuer id");
+        const auto hard_deadline = parse_adaptive_v3_positive_unsigned<std::uint64_t>(
+            input.hard_deadline_ns, "operator-capacity hard deadline ns");
+        const auto envelope_file =
+            adaptation_manager_detail::read_epoch_zero_tree_file(
+                input.stage_a_envelope_path);
+        if (envelope_file.sha256 != input.stage_a_wire_sha256)
+            throw std::invalid_argument("operator-capacity Stage-A wire SHA-256 differs");
+        constexpr hotstuff::OperatorCapacityLabelEnvelopeWireLimits limits{};
+        const auto decoded = hotstuff::decode_operator_capacity_label_envelope(
+            envelope_file.bytes, limits);
+        if (!decoded)
+            throw std::invalid_argument("operator-capacity Stage-A envelope is malformed");
+        const hotstuff::PubKeySecp256k1 label_public_key(
+            parse_hex(input.label_issuer_public_key_hex,
+                      "operator-capacity label issuer public key", 66));
+        hotstuff::DataStream label_key_stream;
+        label_public_key.serialize(label_key_stream);
+        const auto label_key_bytes =
+            static_cast<hotstuff::bytearray_t>(std::move(label_key_stream));
+        if (adaptation_manager_detail::sha256_lower_hex(label_key_bytes) !=
+            input.label_issuer_public_key_fingerprint)
+            throw std::invalid_argument(
+                "operator-capacity label issuer fingerprint differs");
+        const auto e0_input = manager_epoch_zero(unified.manager);
+        const hotstuff::AdaptationEpochId epoch0{
+            e0_input.epoch_number, hotstuff::compute_epoch_digest(e0_input)};
+        const auto topology_digest =
+            hotstuff::operator_capacity_baseline_topology_digest(
+                epoch0, unified.manager.membership, e0_input.trees);
+        const hotstuff::OperatorCapacityLabelEnvelopeIssuer label_issuer{
+            label_issuer_id, input.label_issuer_reference,
+            hotstuff::uint256_t(parse_hex(input.approved_capacity_digest,
+                                           "operator-capacity digest", 64)),
+            label_public_key};
+        const auto verified = hotstuff::verify_operator_capacity_label_envelope(
+            *decoded.value, label_issuer, unified.manager.membership, epoch0,
+            topology_digest, checked_monotonic_raw_now_ns());
+        if (!verified)
+            throw std::invalid_argument("operator-capacity Stage-A verification failed");
+        hotstuff::PubKeySecp256k1 stage_b_public_key(
+            unified.manager.issuer_private_key);
+        unified.operator_capacity_issuer = hotstuff::OperatorCapacityIssuer{
+            unified.manager.issuer_id, input.stage_b_issuer_reference,
+            label_issuer.approved_capacity_digest, stage_b_public_key,
+            input.label_issuer_reference};
+        unified.operator_capacity_raw_clock_now_ns =
+            [] { return checked_monotonic_raw_now_ns(); };
+        unified.operator_capacity_stage_a = std::move(*verified);
+        unified.operator_capacity_stage_a_wire_sha256 = input.stage_a_wire_sha256;
+        unified.operator_capacity_label_issuer_id = label_issuer_id;
+        unified.operator_capacity_label_issuer_reference =
+            input.label_issuer_reference;
+        unified.operator_capacity_label_issuer_public_key_fingerprint =
+            input.label_issuer_public_key_fingerprint;
+        unified.operator_capacity_stage_b_issuer_reference =
+            input.stage_b_issuer_reference;
+        unified.operator_capacity_stage_b_authorization_output =
+            input.stage_b_authorization_output;
+        unified.operator_capacity_consumption_output = input.consumption_output;
+        unified.operator_capacity_hard_deadline_ns = hard_deadline;
+        if (unified.manager.fault_window_arm.has_value() ||
+            unified.manager.transition_requests.size() != 1)
+            throw std::invalid_argument(
+                "operator-capacity mode requires one no-fault transition request");
+    }
     return unified;
 
     // Kept below temporarily as a compile-visible record of the old parser;
@@ -1705,13 +1854,8 @@ AdaptiveV3ManagerOptions parse_adaptive_v3_options(int argc, char **argv)
 
 EpochDefinitionInput manager_epoch_zero(const ManagerOptions &options)
 {
-    if (options.epoch_zero_tree_file.has_value())
-    {
-        return hotstuff::adaptive_v2_epoch_zero_input(
-            options.membership,
-            hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
-                *options.epoch_zero_tree_file, options.membership));
-    }
+    if (options.epoch_zero.has_value())
+        return *options.epoch_zero;
     auto epoch = hotstuff::derive_adaptive_v2_cyclic_epoch_zero(
         options.membership,
         options.runtime_shape.tree_shape.fanout,
@@ -2176,6 +2320,8 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_fault_window_arm_clock_domain = Config::OptValStr::create();
     auto opt_fault_window_arm_snapshot_evidence_basis = Config::OptValStr::create();
     auto opt_fault_window_arm_selection_cardinality_policy = Config::OptValStr::create();
+    auto opt_fault_window_arm_control_only =
+        Config::OptValFlag::create(false);
     auto opt_cycle_1_selection_not_before_monotonic_ns =
         Config::OptValStr::create("0");
     auto opt_cycle_1_inherited_wait_exempt_eligibility_gate =
@@ -2206,6 +2352,19 @@ ManagerOptions parse_options(int argc, char **argv)
         Config::OptValStr::create();
     auto opt_activation_readiness_retry_interval_ticks =
         Config::OptValStr::create();
+    // Parsed by the common parser so adaptive-v3 can validate this complete
+    // capability as one startup admission before any transport starts.
+    auto opt_operator_capacity_stage_a_envelope = Config::OptValStr::create();
+    auto opt_operator_capacity_stage_a_wire_sha256 = Config::OptValStr::create();
+    auto opt_operator_capacity_label_issuer_id = Config::OptValStr::create();
+    auto opt_operator_capacity_label_issuer_reference = Config::OptValStr::create();
+    auto opt_operator_capacity_label_issuer_public_key = Config::OptValStr::create();
+    auto opt_operator_capacity_label_issuer_public_key_fingerprint = Config::OptValStr::create();
+    auto opt_operator_capacity_approved_capacity_digest = Config::OptValStr::create();
+    auto opt_operator_capacity_hard_deadline_ns = Config::OptValStr::create();
+    auto opt_operator_capacity_stage_b_authorization_output = Config::OptValStr::create();
+    auto opt_operator_capacity_consumption_output = Config::OptValStr::create();
+    auto opt_operator_capacity_stage_b_issuer_reference = Config::OptValStr::create();
 
     config.add_opt("help", opt_help, Config::SWITCH_ON, 'h');
     config.add_opt("protocol-mode", opt_protocol_mode, Config::SET_VAL);
@@ -2219,6 +2378,28 @@ ManagerOptions parse_options(int argc, char **argv)
     config.add_opt("activation-readiness-retry-interval-ticks",
                    opt_activation_readiness_retry_interval_ticks,
                    Config::SET_VAL);
+    config.add_opt("operator-capacity-stage-a-envelope",
+                   opt_operator_capacity_stage_a_envelope, Config::SET_VAL);
+    config.add_opt("operator-capacity-stage-a-wire-sha256",
+                   opt_operator_capacity_stage_a_wire_sha256, Config::SET_VAL);
+    config.add_opt("operator-capacity-label-issuer-id",
+                   opt_operator_capacity_label_issuer_id, Config::SET_VAL);
+    config.add_opt("operator-capacity-label-issuer-reference",
+                   opt_operator_capacity_label_issuer_reference, Config::SET_VAL);
+    config.add_opt("operator-capacity-label-issuer-public-key-hex",
+                   opt_operator_capacity_label_issuer_public_key, Config::SET_VAL);
+    config.add_opt("operator-capacity-label-issuer-public-key-fingerprint",
+                   opt_operator_capacity_label_issuer_public_key_fingerprint, Config::SET_VAL);
+    config.add_opt("operator-capacity-approved-capacity-digest",
+                   opt_operator_capacity_approved_capacity_digest, Config::SET_VAL);
+    config.add_opt("operator-capacity-hard-deadline-ns",
+                   opt_operator_capacity_hard_deadline_ns, Config::SET_VAL);
+    config.add_opt("operator-capacity-stage-b-authorization-output",
+                   opt_operator_capacity_stage_b_authorization_output, Config::SET_VAL);
+    config.add_opt("operator-capacity-consumption-output",
+                   opt_operator_capacity_consumption_output, Config::SET_VAL);
+    config.add_opt("operator-capacity-stage-b-issuer-reference",
+                   opt_operator_capacity_stage_b_issuer_reference, Config::SET_VAL);
     config.add_opt("listen", opt_listen, Config::SET_VAL);
     config.add_opt("replica", opt_replicas, Config::APPEND);
     config.add_opt("tls-privkey", opt_tls_private_key, Config::SET_VAL);
@@ -2336,6 +2517,8 @@ ManagerOptions parse_options(int argc, char **argv)
     config.add_opt("fault-window-arm-selection-cardinality-policy",
                    opt_fault_window_arm_selection_cardinality_policy,
                    Config::SET_VAL);
+    config.add_opt("fault-window-arm-control-only",
+                   opt_fault_window_arm_control_only, Config::SWITCH_ON);
     config.add_opt(
         "cycle-1-selection-not-before-monotonic-ns",
         opt_cycle_1_selection_not_before_monotonic_ns,
@@ -2534,7 +2717,16 @@ ManagerOptions parse_options(int argc, char **argv)
     }
     options.runtime_shape = *runtime_shape;
     if (!opt_epoch_zero_tree_file->get().empty())
+    {
         options.epoch_zero_tree_file = opt_epoch_zero_tree_file->get();
+        auto tree_file = adaptation_manager_detail::read_epoch_zero_tree_file(
+            *options.epoch_zero_tree_file);
+        options.epoch_zero_tree_sha256 = std::move(tree_file.sha256);
+        options.epoch_zero = hotstuff::adaptive_v2_epoch_zero_input(
+            options.membership,
+            hotstuff::parse_adaptive_v2_epoch_zero_tree_bytes(
+                tree_file.bytes, options.membership));
+    }
     options.required_nonresponsive =
         opt_required_nonresponsive->get().empty()
             ? options.runtime_shape.required_nonresponsive
@@ -2725,12 +2917,27 @@ ManagerOptions parse_options(int argc, char **argv)
     if (options.fault_window_arm.has_value() && fault_coverage_enabled)
         throw std::invalid_argument(
             "fault-window arm conflicts with legacy static coverage");
+    options.fault_window_arm_control_only =
+        opt_fault_window_arm_control_only->get();
+    if (options.fault_window_arm_control_only &&
+        !options.fault_window_arm.has_value())
+    {
+        throw std::invalid_argument(
+            "fixed-E0 control mode requires a fault-window arm");
+    }
 
     const auto &raw_transition_requests =
         opt_transition_requests->get();
     const auto &bundle_outputs = opt_bundle_outputs->get();
-    if (raw_transition_requests.empty() ||
-        raw_transition_requests.size() != bundle_outputs.size())
+    if (options.fault_window_arm_control_only &&
+        (!raw_transition_requests.empty() || !bundle_outputs.empty()))
+    {
+        throw std::invalid_argument(
+            "fixed-E0 control mode rejects transition requests and bundle outputs");
+    }
+    if (!options.fault_window_arm_control_only &&
+        (raw_transition_requests.empty() ||
+         raw_transition_requests.size() != bundle_outputs.size()))
     {
         throw std::invalid_argument(
             "transition requests and bundle outputs must be nonempty and paired");
@@ -3005,6 +3212,39 @@ ManagerOptions parse_options(int argc, char **argv)
         options.experiment_drop_activation_ack = ordinal;
     }
 
+    OperatorCapacityCliInput capacity_cli{
+        opt_operator_capacity_stage_a_envelope->get(),
+        opt_operator_capacity_stage_a_wire_sha256->get(),
+        opt_operator_capacity_label_issuer_id->get(),
+        opt_operator_capacity_label_issuer_reference->get(),
+        opt_operator_capacity_label_issuer_public_key->get(),
+        opt_operator_capacity_label_issuer_public_key_fingerprint->get(),
+        opt_operator_capacity_approved_capacity_digest->get(),
+        opt_operator_capacity_hard_deadline_ns->get(),
+        opt_operator_capacity_stage_b_authorization_output->get(),
+        opt_operator_capacity_consumption_output->get(),
+        opt_operator_capacity_stage_b_issuer_reference->get()};
+    const std::array<const std::string *, 11> capacity_values{
+        &capacity_cli.stage_a_envelope_path,
+        &capacity_cli.stage_a_wire_sha256,
+        &capacity_cli.label_issuer_id,
+        &capacity_cli.label_issuer_reference,
+        &capacity_cli.label_issuer_public_key_hex,
+        &capacity_cli.label_issuer_public_key_fingerprint,
+        &capacity_cli.approved_capacity_digest,
+        &capacity_cli.hard_deadline_ns,
+        &capacity_cli.stage_b_authorization_output,
+        &capacity_cli.consumption_output,
+        &capacity_cli.stage_b_issuer_reference};
+    if (std::any_of(capacity_values.begin(), capacity_values.end(),
+                    [](const auto *value) { return !value->empty(); }))
+    {
+        if (!std::all_of(capacity_values.begin(), capacity_values.end(),
+                         [](const auto *value) { return !value->empty(); }))
+            throw std::invalid_argument("operator-capacity options are incomplete");
+        options.operator_capacity_cli = std::move(capacity_cli);
+    }
+
     return options;
 }
 
@@ -3037,6 +3277,9 @@ hotstuff::AdaptiveV3ManagerSessionConfig adaptive_v3_session_config(
     config.controller.successor_protocol_mode =
         hotstuff::EpochProtocolMode::adaptive_v3;
     config.readiness_membership = options.readiness_membership;
+    config.operator_capacity_issuer = options.operator_capacity_issuer;
+    config.operator_capacity_raw_clock_now_ns =
+        options.operator_capacity_raw_clock_now_ns;
     config.required_release_count = options.required_release_count;
     config.maximum_delivery_attempts = options.maximum_delivery_attempts;
     if (options.retry_interval_ticks >
@@ -3061,13 +3304,43 @@ hotstuff::AdaptiveV3ManagerSessionConfig adaptive_v3_session_config(
         kAdaptiveV3CommonCommitStabilizationNs;
     config.e2_reserve_ticks = kAdaptiveV3E2ReserveNs;
     const auto policies = transition_policies(options.manager);
-    if (policies.empty() || policies.size() > 2 ||
-        policies.front().intent != TreePolicyKind::fault_containment ||
-        (policies.size() == 2 &&
-         policies[1].intent != TreePolicyKind::performance_optimization))
+    const auto verified_operator_capacity_mode = [&options] {
+        // These values are populated together only after parse_adaptive_v3_options
+        // verifies the externally pinned Stage-A envelope.  Do not treat raw CLI
+        // presence alone as admission to the optimization-first lifecycle.
+        return options.manager.operator_capacity_cli.has_value() &&
+            options.operator_capacity_issuer.has_value() &&
+            static_cast<bool>(options.operator_capacity_raw_clock_now_ns) &&
+            options.operator_capacity_stage_a.has_value() &&
+            options.operator_capacity_stage_a_wire_sha256.size() == 64 &&
+            options.operator_capacity_label_issuer_id != 0 &&
+            !options.operator_capacity_label_issuer_reference.empty() &&
+            !options.operator_capacity_label_issuer_public_key_fingerprint.empty() &&
+            !options.operator_capacity_stage_b_issuer_reference.empty() &&
+            !options.operator_capacity_stage_b_authorization_output.empty() &&
+            !options.operator_capacity_consumption_output.empty() &&
+            options.operator_capacity_hard_deadline_ns != 0 &&
+            options.operator_capacity_stage_a->capacity_snapshot().issuer_reference ==
+                options.operator_capacity_label_issuer_reference &&
+            options.operator_capacity_stage_a->capacity_snapshot().canonical_digest ==
+                options.operator_capacity_issuer->approved_capacity_digest &&
+            options.operator_capacity_issuer->issuer_reference ==
+                options.operator_capacity_stage_b_issuer_reference &&
+            options.operator_capacity_issuer->approved_label_issuer_reference ==
+                options.operator_capacity_label_issuer_reference;
+    };
+    const auto conventional_sequence = !policies.empty() &&
+        policies.size() <= 2 &&
+        policies.front().intent == TreePolicyKind::fault_containment &&
+        (policies.size() == 1 ||
+         policies[1].intent == TreePolicyKind::performance_optimization);
+    const auto capacity_optimization_first = policies.size() == 1 &&
+        policies.front().intent == TreePolicyKind::performance_optimization &&
+        verified_operator_capacity_mode();
+    if (!conventional_sequence && !capacity_optimization_first)
     {
         throw std::invalid_argument(
-            "adaptive-v3 requires one containment cycle or containment followed by optimization");
+            "adaptive-v3 requires containment, or verified operator-capacity optimization");
     }
     config.expected_cycle_count = policies.size();
     config.wire_limits = options.wire_limits;
@@ -4069,16 +4342,39 @@ private:
         if (failed_ || !phase.has_value() ||
             next_policy_ >= transition_policies_.size())
             return;
+        const auto begin_tick = manager_tick_ns();
+        if (*phase != hotstuff::AdaptiveV3ManagerSessionStatus::idle &&
+            *phase != hotstuff::AdaptiveV3ManagerSessionStatus::residency)
+            return;
+        if (options_.operator_capacity_stage_a.has_value())
+        {
+            if (*phase != hotstuff::AdaptiveV3ManagerSessionStatus::idle ||
+                next_policy_ != 0 || begin_tick ==
+                    std::numeric_limits<std::uint64_t>::max() ||
+                options_.operator_capacity_hard_deadline_ns == 0 ||
+                begin_tick > std::numeric_limits<std::uint64_t>::max() -
+                    options_.operator_capacity_hard_deadline_ns ||
+                begin_tick < options_.operator_capacity_stage_a->capacity_snapshot().valid_from_monotonic_ns ||
+                begin_tick > options_.operator_capacity_stage_a->capacity_snapshot().valid_until_monotonic_ns ||
+                !facade_.v3_begin_operator_capacity_epoch1() ||
+                !facade_.v3_arm_hard_deadline(
+                    begin_tick + options_.operator_capacity_hard_deadline_ns))
+            {
+                fail("operator_capacity_epoch1_begin_rejected");
+                return;
+            }
+            operator_capacity_deadline_ns_ =
+                begin_tick + options_.operator_capacity_hard_deadline_ns;
+            ++next_policy_;
+            evaluate_transition_cycle();
+            return;
+        }
         const auto policy = resolved_v3_transition_policy(next_policy_);
         if (!policy.has_value())
         {
             fail("transition_policy_resolution_failed");
             return;
         }
-        const auto begin_tick = manager_tick_ns();
-        if (*phase != hotstuff::AdaptiveV3ManagerSessionStatus::idle &&
-            *phase != hotstuff::AdaptiveV3ManagerSessionStatus::residency)
-            return;
         const auto containment_cycle = next_policy_ == 0;
         if (!containment_cycle)
         {
@@ -4451,6 +4747,94 @@ private:
             request.evidence_snapshot_output, canonical_payload);
     }
 
+    bool finalize_operator_capacity_epoch1() noexcept
+    {
+        try
+        {
+            if (!options_.operator_capacity_stage_a.has_value() ||
+                !options_.operator_capacity_issuer.has_value())
+                return false;
+            const auto *baseline =
+                facade_.v3_operator_capacity_baseline_snapshot();
+            if (baseline == nullptr)
+                return false;
+            const auto decision_tick = manager_tick_ns();
+            if (decision_tick == std::numeric_limits<std::uint64_t>::max() ||
+                operator_capacity_deadline_ns_ == 0 ||
+                decision_tick >= operator_capacity_deadline_ns_)
+                return false;
+            const hotstuff::OperatorCapacityEpoch1FinalizerIssuer finalizer{
+                options_.manager.issuer_id, options_.manager.issuer_private_key};
+            const auto finalized = hotstuff::finalize_operator_capacity_epoch1(
+                *options_.operator_capacity_stage_a,
+                facade_.ingress().current_epoch(), options_.manager.membership,
+                *baseline, decision_tick, finalizer);
+            if (!finalized ||
+                !facade_.v3_authorize_operator_capacity_epoch1(
+                    finalized->authorization))
+                return false;
+            const auto *bundle = facade_.v3_successor_bundle();
+            if (bundle == nullptr)
+                return false;
+            const auto authorization_wire =
+                hotstuff::encode_operator_capacity_authorization(
+                    finalized->authorization, {});
+            const auto stage_b_sha256 =
+                adaptation_manager_detail::sha256_lower_hex(authorization_wire);
+            const auto bundle_bytes = bundle->canonical_bytes();
+            const auto &epoch0 = facade_.ingress().current_epoch();
+            hotstuff::OperatorCapacityConsumptionRecord record;
+            record.run_id = options_.structured_event_run_id;
+            record.source_instance = options_.structured_event_source_instance;
+            record.stage_a_wire_sha256 =
+                options_.operator_capacity_stage_a_wire_sha256;
+            record.stage_a_semantic_digest =
+                finalized->envelope_digest.to_hex();
+            record.stage_b_authorization_wire_sha256 = stage_b_sha256;
+            record.label_issuer_id = options_.operator_capacity_label_issuer_id;
+            record.label_issuer_reference =
+                options_.operator_capacity_label_issuer_reference;
+            record.label_issuer_public_key_fingerprint =
+                options_.operator_capacity_label_issuer_public_key_fingerprint;
+            record.epoch_change_issuer_id = options_.manager.issuer_id;
+            record.arm = options_.operator_capacity_stage_a->arm();
+            record.capacity_digest =
+                options_.operator_capacity_issuer->approved_capacity_digest.to_hex();
+            record.epoch0_digest = epoch0.epoch_digest().to_hex();
+            record.epoch0_topology_digest =
+                hotstuff::operator_capacity_baseline_topology_digest(
+                    {epoch0.epoch_number(), epoch0.epoch_digest()},
+                    options_.manager.membership, epoch0.trees()).to_hex();
+            record.baseline_snapshot_id = baseline->snapshot_id();
+            record.baseline_evidence_cutoff = baseline->evidence_cutoff();
+            record.decision_monotonic_raw_ns =
+                finalized->authorization.policy.decision_monotonic_ns;
+            if (manager_tick_ns() >= operator_capacity_deadline_ns_)
+                return false;
+            record.hard_deadline_monotonic_raw_ns = operator_capacity_deadline_ns_;
+            record.successor_policy_snapshot_id =
+                bundle->definition().evidence_snapshot_id;
+            record.successor_bundle_sha256 =
+                adaptation_manager_detail::sha256_lower_hex(bundle_bytes);
+            // Both exclusive writes complete before readiness starts or any
+            // successor byte is sent. A later failure leaves an auditable
+            // partial Stage-B artifact and prevents publication.
+            write_exclusive_bundle(
+                options_.operator_capacity_stage_b_authorization_output,
+                authorization_wire);
+            write_exclusive_json(options_.operator_capacity_consumption_output,
+                hotstuff::serialize_operator_capacity_consumption_record(record));
+            event_sink_.drain();
+            if (!event_sink_.health().healthy)
+                return false;
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     void evaluate_transition_cycle() noexcept
     {
         if (failed_ || facade_.v3_status() !=
@@ -4478,7 +4862,18 @@ private:
             fail("controller_unhealthy");
             return;
         }
-        if (status != AdaptiveV2ManagerControllerStatus::successor_ready &&
+        if (options_.operator_capacity_stage_a.has_value() &&
+            status == AdaptiveV2ManagerControllerStatus::baseline_frozen)
+        {
+            if (!finalize_operator_capacity_epoch1())
+            {
+                fail("operator_capacity_epoch1_authorization_failed");
+                return;
+            }
+        }
+        if (facade_.v3_status() !=
+                hotstuff::AdaptiveV3ManagerSessionStatus::successor_available &&
+            status != AdaptiveV2ManagerControllerStatus::successor_ready &&
             status != AdaptiveV2ManagerControllerStatus::already_ready)
             return;
         const auto *bundle = facade_.v3_successor_bundle();
@@ -4497,14 +4892,41 @@ private:
         {
             const auto output_path = transition_bundle_output_path(
                 *request, *bundle, facade_);
-            write_exclusive_bundle(output_path, bundle->canonical_bytes());
-            emit_v3_shape_decision(*request, *bundle);
-            emit_v3_evidence_snapshot(*request, *bundle);
-            if (!facade_.v3_begin_readiness(manager_tick_ns()))
+            const auto capacity_mode =
+                options_.operator_capacity_stage_a.has_value();
+            if (capacity_mode &&
+                !facade_.v3_begin_readiness(manager_tick_ns()))
             {
                 emit_new_session_terminals();
                 throw std::runtime_error(
                     "v3 manager session rejected readiness start");
+            }
+            // Capacity mode has durable Stage-B and consumption artifacts;
+            // its deadline is checked before this bundle file is observable.
+            write_exclusive_bundle(output_path, bundle->canonical_bytes());
+            if (!capacity_mode)
+            {
+                emit_v3_shape_decision(*request, *bundle);
+                emit_v3_evidence_snapshot(*request, *bundle);
+                if (!facade_.v3_begin_readiness(manager_tick_ns()))
+                {
+                    emit_new_session_terminals();
+                    throw std::runtime_error(
+                        "v3 manager session rejected readiness start");
+                }
+            }
+            else
+            {
+                const auto publication_tick = manager_tick_ns();
+                facade_.v3_advance(publication_tick);
+                if (publication_tick >= operator_capacity_deadline_ns_ ||
+                    facade_.v3_status() !=
+                        hotstuff::AdaptiveV3ManagerSessionStatus::collecting)
+                {
+                    emit_new_session_terminals();
+                    throw std::runtime_error(
+                        "operator capacity deadline expired before bundle send");
+                }
             }
             if (transport_.send_bundle(*bundle) <
                 options_.required_release_count)
@@ -4569,6 +4991,7 @@ private:
         last_controller_status_;
     bool fault_window_arm_timer_pending_{false};
     bool fault_window_armed_{false};
+    std::uint64_t operator_capacity_deadline_ns_{0};
     bool failed_{false};
 };
 
@@ -4633,6 +5056,10 @@ public:
         fault_window_arm_timer = salticidae::TimerEvent(
             event_context_, [this](salticidae::TimerEvent &) {
                 handle_fault_window_arm_timer();
+            });
+        fixed_e0_control_observation_timer = salticidae::TimerEvent(
+            event_context_, [this](salticidae::TimerEvent &) {
+                handle_fixed_e0_control_observation_timer();
             });
         if (options_.fault_window_arm.has_value())
         {
@@ -4701,7 +5128,9 @@ public:
             for (const auto &replica : options_.replicas)
                 network_.conn_peer(replica.peer_id);
 
-            if (!begin_current_cycle())
+            if (options_.fault_window_arm_control_only
+                    ? !begin_fixed_e0_control_cycle()
+                    : !begin_current_cycle())
                 fail("manager_cycle_start_failed");
             else
                 evaluate();
@@ -4736,7 +5165,8 @@ public:
             structured_event_sink_.drain();
             if (!structured_event_sink_.health().healthy)
                 failed_ = true;
-            return failed_ || !request_sequence_.shutdown_eligible()
+            return failed_ || (!options_.fault_window_arm_control_only &&
+                               !request_sequence_.shutdown_eligible())
                 ? 1
                 : 0;
         }
@@ -5008,6 +5438,50 @@ private:
         convergence_failure_emitted_ = false;
         refresh_cycle_audit();
         return true;
+    }
+
+    bool begin_fixed_e0_control_cycle() noexcept
+    {
+        if (!options_.fault_window_arm_control_only ||
+            !options_.fault_window_arm.has_value() ||
+            !options_.transition_requests.empty())
+            return false;
+        try
+        {
+            AdaptiveV2TransitionPolicy policy;
+            policy.intent = TreePolicyKind::fault_containment;
+            policy.apply_shape_selection = false;
+            const auto &trees = session_.ingress().current_epoch().trees();
+            if (trees.size() != options_.runtime_shape.tree_shape.tree_count)
+                return false;
+            for (const auto &tree : trees)
+            {
+                if (tree.members_breadth_first.empty())
+                    return false;
+                policy.containment_baseline_roots.push_back(
+                    hotstuff::BaselineRoot{tree.tree_id,
+                                             tree.members_breadth_first.front()});
+            }
+            std::sort(policy.containment_baseline_roots.begin(),
+                      policy.containment_baseline_roots.end(),
+                      [](const auto &left, const auto &right) {
+                          return left.tree_id < right.tree_id;
+                      });
+            const auto generation =
+                session_.ingress().activation_generation();
+            if (generation == 0)
+                return false;
+            cycle_audits_.push_back(CycleAuditContext{
+                "fixed-e0-control/" + options_.structured_event_run_id,
+                generation, 0, 0});
+            if (!session_.begin_cycle(policy))
+            {
+                cycle_audits_.pop_back();
+                return false;
+            }
+            return true;
+        }
+        catch (...) { return false; }
     }
 
     bool schedule_post_baseline_observation(
@@ -5853,6 +6327,7 @@ private:
         cancel_cycle_1_selection_gate();
         fault_window_arm_timer.del();
         fault_window_arm_timer_pending_ = false;
+        fixed_e0_control_observation_timer.del();
         const auto convergence = session_.convergence_status();
         if (convergence.has_value() && !convergence_failure_emitted_)
         {
@@ -5884,6 +6359,7 @@ private:
         predecessor_residency_pending_ = false;
         cancel_post_baseline_observation();
         cancel_cycle_1_selection_gate();
+        fixed_e0_control_observation_timer.del();
         if (network_stop_required_ && !network_stopped_)
         {
             network_stopped_ = true;
@@ -5901,6 +6377,19 @@ private:
         if (!session_stopped_)
         {
             session_stopped_ = true;
+            if (options_.fault_window_arm_control_only && !failed_)
+            {
+                refresh_cycle_audit();
+                if (!fault_window_armed_ ||
+                    !session_.finalize_noop_cycle(
+                        AdaptiveV2ManagerCycleTerminalReason::explicit_no_op))
+                {
+                    failed_ = true;
+                    HOTSTUFF_LOG_WARN(
+                        "KAURI_ADAPTIVE_MANAGER fatal "
+                        "reason=fixed_e0_control_noop_finalization_failed");
+                }
+            }
             session_.shutdown();
             emit_new_session_terminals();
         }
@@ -6030,8 +6519,17 @@ private:
             fault_window_arm_inode_ = read.metadata.st_ino;
             fault_window_arm_size_ = read.metadata.st_size;
             fault_window_arm_mtime_ = read.metadata.st_mtime;
+            fault_window_arm_sha256_ = document.sha256;
             fault_window_arm_timer.del();
             fault_window_arm_timer_pending_ = false;
+            if (options_.fault_window_arm_control_only)
+            {
+                emit_fixed_e0_control_observation();
+                if (failed_)
+                    return false;
+                fixed_e0_control_observation_timer.add(
+                    kFixedE0ControlObservationSeconds);
+            }
             return true;
         }
         catch (...)
@@ -6060,6 +6558,44 @@ private:
             return false;
         }
         return true;
+    }
+
+    void emit_fixed_e0_control_observation() noexcept
+    {
+        if (!options_.fault_window_arm_control_only ||
+            !fault_window_armed_ || fault_window_arm_sha256_.empty())
+        {
+            fail("fixed_e0_control_observation_context_invalid");
+            return;
+        }
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{
+                hotstuff::FixedE0ControlObservationStructuredEvent{
+                    fault_window_arm_sha256_}});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+            fail("fixed_e0_control_observation_emit_failed");
+    }
+
+    void handle_fixed_e0_control_observation_timer() noexcept
+    {
+        if (failed_ || !options_.fault_window_arm_control_only ||
+            !fault_window_armed_)
+            return;
+        if (!consumed_fault_window_arm_is_unchanged())
+            return;
+        emit_fixed_e0_control_observation();
+        if (failed_)
+            return;
+        try
+        {
+            fixed_e0_control_observation_timer.add(
+                kFixedE0ControlObservationSeconds);
+        }
+        catch (...)
+        {
+            fail("fixed_e0_control_observation_timer_failed");
+        }
     }
 
     void schedule_fault_window_arm() noexcept
@@ -6349,6 +6885,41 @@ private:
         last_evaluated_ready_members_ = readiness.ready_members;
         last_evaluated_evidence_cutoff_ = evidence_cutoff;
         refresh_cycle_audit();
+        if (options_.fault_window_arm_control_only)
+        {
+            if (!options_.fault_window_arm.has_value() ||
+                !options_.transition_requests.empty())
+            {
+                fail("fixed_e0_control_configuration_drift");
+                return;
+            }
+            if (fault_window_armed_ && !consumed_fault_window_arm_is_unchanged())
+                return;
+            if (fault_window_armed_)
+            {
+                // The control has reached its terminal observation state.
+                // Calling evaluate here could construct a successor inside
+                // the controller even though publication is suppressed.
+                return;
+            }
+            const auto status = session_.evaluate();
+            if (status == AdaptiveV2ManagerControllerStatus::unhealthy)
+            {
+                fail("fixed_e0_control_controller_unhealthy");
+                return;
+            }
+            if (status == AdaptiveV2ManagerControllerStatus::baseline_frozen)
+            {
+                schedule_fault_window_arm();
+                return;
+            }
+            if (status == AdaptiveV2ManagerControllerStatus::successor_ready ||
+                status == AdaptiveV2ManagerControllerStatus::already_ready)
+            {
+                fail("fixed_e0_control_unexpected_successor");
+            }
+            return;
+        }
         const auto *request = current_transition_request();
         const auto controller = session_.controller_audit();
         if (request == nullptr)
@@ -7216,6 +7787,7 @@ private:
     salticidae::TimerEvent cycle_1_selection_gate_timer;
     salticidae::TimerEvent evaluation_timer;
     salticidae::TimerEvent fault_window_arm_timer;
+    salticidae::TimerEvent fixed_e0_control_observation_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
     std::chrono::steady_clock::time_point
@@ -7241,6 +7813,7 @@ private:
     bool evaluation_timer_pending_{false};
     bool fault_window_arm_timer_pending_{false};
     bool fault_window_armed_{false};
+    std::string fault_window_arm_sha256_;
     dev_t fault_window_arm_device_{0};
     ino_t fault_window_arm_inode_{0};
     off_t fault_window_arm_size_{0};

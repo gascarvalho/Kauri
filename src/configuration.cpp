@@ -247,21 +247,20 @@ EpochDefinitionInput adaptive_v2_epoch_zero_input(
     return input;
 }
 
-std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
-    const std::string &path,
+std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_bytes(
+    const bytearray_t &bytes,
     const std::vector<ReplicaID> &membership)
 {
-    if (path.empty() || membership.empty())
-        throw std::invalid_argument("adaptive-v2 epoch-zero tree file and membership are required");
-    std::ifstream file(path);
-    if (!file.is_open())
-        throw std::invalid_argument("cannot open adaptive-v2 epoch-zero tree file");
+    if (membership.empty())
+        throw std::invalid_argument("adaptive-v2 epoch-zero membership is required");
     auto expected_members = membership;
     std::sort(expected_members.begin(), expected_members.end());
     if (std::adjacent_find(expected_members.begin(), expected_members.end()) != expected_members.end())
         throw std::invalid_argument("adaptive-v2 epoch-zero membership must be unique");
     std::vector<EpochTreeDefinition> trees;
     std::string line;
+    const std::string text(bytes.begin(), bytes.end());
+    std::istringstream file(text);
     while (std::getline(file, line))
     {
         const auto line_number = trees.size() + 1;
@@ -291,6 +290,22 @@ std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
     if (!file.eof() || trees.empty())
         throw std::invalid_argument("adaptive-v2 epoch-zero tree file must contain at least one valid tree");
     return trees;
+}
+
+std::vector<EpochTreeDefinition> parse_adaptive_v2_epoch_zero_tree_file(
+    const std::string &path,
+    const std::vector<ReplicaID> &membership)
+{
+    if (path.empty() || membership.empty())
+        throw std::invalid_argument("adaptive-v2 epoch-zero tree file and membership are required");
+    std::ifstream file(path);
+    if (!file.is_open())
+        throw std::invalid_argument("cannot open adaptive-v2 epoch-zero tree file");
+    const bytearray_t bytes{std::istreambuf_iterator<char>(file),
+                            std::istreambuf_iterator<char>()};
+    if (file.bad())
+        throw std::invalid_argument("adaptive-v2 epoch-zero tree file read failed");
+    return parse_adaptive_v2_epoch_zero_tree_bytes(bytes, membership);
 }
 
 bytearray_t canonical_serialize_epoch(const EpochDefinitionInput &input)

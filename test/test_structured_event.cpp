@@ -573,6 +573,7 @@ using hotstuff::ExperimentReplicaRole;
 using hotstuff::ExclusiveFileStructuredEventOutput;
 using hotstuff::ExpectedMessageType;
 using hotstuff::FaultWindowArmedStructuredEvent;
+using hotstuff::FixedE0ControlObservationStructuredEvent;
 using hotstuff::FaultAggregateOmittedStructuredEvent;
 using hotstuff::FaultContributionOpportunityStructuredEvent;
 using hotstuff::MonotonicRawStructuredEventClock;
@@ -2162,8 +2163,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 17,
-        "the audit capability appends the path-timeout selection decision");
+        std::variant_size<AuditStructuredEventPayload>::value == 18,
+        "the audit capability appends fixed-E0 control observation evidence");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -2219,6 +2220,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<13, AuditStructuredEventPayload>,
             hotstuff::AdaptiveV3CommandTerminalStructuredEvent>::value,
         "the fourteenth audit payload is pre-readiness command terminal");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<17, AuditStructuredEventPayload>,
+            FixedE0ControlObservationStructuredEvent>::value,
+        "the final audit payload is fixed-E0 control liveness evidence");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -3333,6 +3339,46 @@ TEST_CASE("fault-window armed events partition schema-only fields",
     invalid.selection_cardinality_policy =
         "all_guarded_up_to_fault_bound_v1";
     CHECK(rejects(std::move(invalid)));
+}
+
+TEST_CASE("fixed-E0 control observation is a manager-only arm-bound event",
+          "[adaptive-v2][structured-event][fixed-e0-control][behavior]")
+{
+    const auto arm_sha = digest("fixed-e0-control-arm").to_hex();
+    const auto event = FixedE0ControlObservationStructuredEvent{arm_sha};
+
+    FakeClock clock({8'200});
+    MemoryOutput output;
+    StructuredEventSink sink(manager_event_config(), clock, output);
+    sink.emit_audit(AuditStructuredEventPayload{event});
+    sink.shutdown();
+    CHECK(sink.health().healthy);
+    const auto text = rendered(output);
+    CHECK(text.find("\"event_type\":\"fixed_e0_control.observation\"") !=
+          std::string::npos);
+    CHECK(text.find("\"fault_window_arm_sha256\":\"" + arm_sha + "\"") !=
+          std::string::npos);
+
+    auto replica_config = manager_event_config();
+    replica_config.source.kind = hotstuff::StructuredEventSourceKind::replica;
+    FakeClock replica_clock({8'201});
+    MemoryOutput replica_output;
+    StructuredEventSink replica_sink(replica_config, replica_clock, replica_output);
+    replica_sink.emit_audit(AuditStructuredEventPayload{event});
+    const auto replica_health = replica_sink.health();
+    CHECK_FALSE(replica_health.healthy);
+    CHECK(replica_health.first_failure == StructuredEventFailure::invalid_payload);
+
+    auto invalid = event;
+    invalid.fault_window_arm_sha256 = "not-a-digest";
+    FakeClock invalid_clock({8'202});
+    MemoryOutput invalid_output;
+    StructuredEventSink invalid_sink(manager_event_config(), invalid_clock,
+                                     invalid_output);
+    invalid_sink.emit_audit(AuditStructuredEventPayload{invalid});
+    const auto invalid_health = invalid_sink.health();
+    CHECK_FALSE(invalid_health.healthy);
+    CHECK(invalid_health.first_failure == StructuredEventFailure::invalid_payload);
 }
 
 TEST_CASE("N7 static aggregate omission has a source-sequenced audit marker",

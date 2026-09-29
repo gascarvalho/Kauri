@@ -380,6 +380,19 @@ struct FaultWindowArmedStructuredEvent
     std::string fault_window_arm_sha256;
 };
 
+/**
+ * Manager-owned liveness observation for the experimental fixed-E0 control.
+ *
+ * The event is emitted only after the manager has consumed the exact arm.
+ * It is observational: it neither votes nor evaluates/constructs a successor
+ * configuration.  The raw source timestamp lets experiment validation prove
+ * that the manager remained live through a replica-observed omission window.
+ */
+struct FixedE0ControlObservationStructuredEvent
+{
+    std::string fault_window_arm_sha256;
+};
+
 /** Replica-local acknowledgement that the N7 omission gate became valid. */
 struct FaultInjectionArmedStructuredEvent
 {
@@ -549,7 +562,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV3CommandTerminalStructuredEvent,
     FaultInjectionArmedStructuredEvent,
     FaultAggregateOmittedStructuredEvent,
-    AdaptiveV2SelectionDecidedStructuredEvent>;
+    AdaptiveV2SelectionDecidedStructuredEvent,
+    FixedE0ControlObservationStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -674,6 +688,7 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v3_wire_rejected,
     adaptive_v3_command_terminal,
     adaptive_v3_observation_retry_exhausted,
+    fixed_e0_control_observation,
 };
 
 StructuredEventType structured_event_type(

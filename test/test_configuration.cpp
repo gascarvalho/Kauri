@@ -771,6 +771,33 @@ TEST_CASE("manager tree-file bootstrap has the replica Epoch-0 identity",
               hotstuff::adaptive_v2_epoch_zero_input(membership7(), replica_trees)));
 }
 
+TEST_CASE("adaptive epoch-zero byte parser equals the path parser",
+          "[adaptive-v2][configuration][epoch-zero][bytes]")
+{
+    const auto path = std::filesystem::path{KAURI_PROJECT_SOURCE_DIR} /
+        "experiments/adaptive/n7-three-reporter-omission/epoch0.tree";
+    std::ifstream input(path, std::ios::binary);
+    REQUIRE(input.is_open());
+    const hotstuff::bytearray_t bytes{
+        std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    REQUIRE_FALSE(input.bad());
+
+    const auto from_path = hotstuff::parse_adaptive_v2_epoch_zero_tree_file(
+        path.string(), membership7());
+    const auto from_bytes = hotstuff::parse_adaptive_v2_epoch_zero_tree_bytes(
+        bytes, membership7());
+    REQUIRE(from_bytes.size() == from_path.size());
+    for (std::size_t index = 0; index < from_path.size(); ++index) {
+        CHECK(from_bytes[index].tree_id == from_path[index].tree_id);
+        CHECK(from_bytes[index].fanout == from_path[index].fanout);
+        CHECK(from_bytes[index].pipeline_stretch == from_path[index].pipeline_stretch);
+        CHECK(from_bytes[index].members_breadth_first ==
+              from_path[index].members_breadth_first);
+        CHECK(from_bytes[index].wait_exempt_leaves ==
+              from_path[index].wait_exempt_leaves);
+    }
+}
+
 TEST_CASE("adaptive replica tree-file bootstrap rejects malformed input",
           "[adaptive-v2][configuration][n7][epoch-zero]")
 {

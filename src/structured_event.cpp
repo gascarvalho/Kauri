@@ -525,6 +525,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 16:
             type = StructuredEventType::adaptive_v2_selection_decided;
             return true;
+        case 17:
+            type = StructuredEventType::fixed_e0_control_observation;
+            return true;
         case 4:
             type = StructuredEventType::adaptive_v2_session_terminal;
             return true;
@@ -1585,6 +1588,21 @@ bool valid_fault_window_armed_payload(
         valid_digest(event.fault_window_arm_sha256);
 }
 
+bool valid_fixed_e0_control_observation_payload(
+    const FixedE0ControlObservationStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto valid_digest = [](const std::string &value) {
+        return value.size() == 64 && std::all_of(
+            value.begin(), value.end(), [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f');
+            });
+    };
+    return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
+        valid_digest(event.fault_window_arm_sha256);
+}
+
 bool valid_fault_injection_armed_payload(
     const FaultInjectionArmedStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
@@ -2118,6 +2136,10 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
             return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
                 valid_selection_decided_payload(
                     std::get<AdaptiveV2SelectionDecidedStructuredEvent>(payload));
+        case 17:
+            return valid_fixed_e0_control_observation_payload(
+                std::get<FixedE0ControlObservationStructuredEvent>(payload),
+                config);
         default:
             return false;
     }
@@ -2842,6 +2864,15 @@ void append_fault_window_armed_payload(
     builder.append('}');
 }
 
+void append_fixed_e0_control_observation_payload(
+    JsonLineBuilder &builder,
+    const FixedE0ControlObservationStructuredEvent &event)
+{
+    builder.append("{\"fault_window_arm_sha256\":");
+    builder.append_escaped(event.fault_window_arm_sha256);
+    builder.append('}');
+}
+
 void append_fault_injection_armed_payload(
     JsonLineBuilder &builder, const FaultInjectionArmedStructuredEvent &event)
 {
@@ -3555,6 +3586,11 @@ std::string serialize_audit_event(
                 builder,
                 std::get<AdaptiveV2SelectionDecidedStructuredEvent>(event));
             break;
+        case 17:
+            append_fixed_e0_control_observation_payload(
+                builder,
+                std::get<FixedE0ControlObservationStructuredEvent>(event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -4071,6 +4107,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "adaptive_v2.cross_commit_retention_ready";
         case StructuredEventType::fault_window_armed:
             return "fault_window_armed";
+        case StructuredEventType::fixed_e0_control_observation:
+            return "fixed_e0_control.observation";
         case StructuredEventType::fault_injection_armed:
             return "fault.injection_armed";
         case StructuredEventType::fault_aggregate_omitted:

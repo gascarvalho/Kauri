@@ -350,6 +350,26 @@ bool AdaptiveV3ManagerSession::begin_cycle(
 bool AdaptiveV3ManagerSession::begin_operator_capacity_epoch1() noexcept
 {
     auto &s = *state_;
+    bool stage_b_signer_matches_controller = false;
+    try
+    {
+        if (s.config.operator_capacity_issuer)
+        {
+            const PubKeySecp256k1 controller_key(
+                s.config.controller.issuer_private_key);
+            DataStream expected;
+            DataStream actual;
+            controller_key.serialize(expected);
+            s.config.operator_capacity_issuer->public_key.serialize(actual);
+            stage_b_signer_matches_controller =
+                static_cast<bytearray_t>(std::move(expected)) ==
+                static_cast<bytearray_t>(std::move(actual));
+        }
+    }
+    catch (...)
+    {
+        return false;
+    }
     if (s.phase != AdaptiveV3ManagerSessionStatus::idle ||
         s.cycle_ordinal != 0 || s.config.expected_cycle_count != 1 ||
         s.ingress.current_epoch().epoch_number() != 0 ||
@@ -357,6 +377,10 @@ bool AdaptiveV3ManagerSession::begin_operator_capacity_epoch1() noexcept
         !s.config.operator_capacity_raw_clock_now_ns ||
         s.config.operator_capacity_issuer->issuer_id == 0 ||
         s.config.operator_capacity_issuer->issuer_reference.empty() ||
+        s.config.operator_capacity_issuer->approved_label_issuer_reference.empty() ||
+        s.config.operator_capacity_issuer->issuer_id !=
+            s.config.controller.issuer_id ||
+        !stage_b_signer_matches_controller ||
         s.ingress.current_epoch().trees().empty() ||
         std::any_of(s.ingress.current_epoch().trees().begin(),
                     s.ingress.current_epoch().trees().end(),
@@ -395,8 +419,7 @@ bool AdaptiveV3ManagerSession::authorize_operator_capacity_epoch1(
     const OperatorCapacityAuthorization &authorization) noexcept
 {
     auto &s = *state_;
-    if (s.expire_hard_deadline(s.last_tick) ||
-        s.phase != AdaptiveV3ManagerSessionStatus::selecting ||
+    if (s.phase != AdaptiveV3ManagerSessionStatus::selecting ||
         !s.operator_capacity_epoch1 || !s.controller || s.projection ||
         s.operator_capacity_successor)
     {
@@ -415,11 +438,16 @@ bool AdaptiveV3ManagerSession::authorize_operator_capacity_epoch1(
     {
         return false;
     }
+    if (raw_clock_now == 0 || raw_clock_now < s.last_tick)
+        return false;
+    s.last_tick = raw_clock_now;
+    if (s.expire_hard_deadline(raw_clock_now))
+        return false;
     if (snapshot == nullptr || !verified ||
         verified->issuer_id() != issuer.issuer_id ||
         verified->capacity_digest() != issuer.approved_capacity_digest ||
         verified->policy().capacity_snapshot.issuer_reference !=
-            issuer.issuer_reference ||
+            issuer.approved_label_issuer_reference ||
         verified->policy().capacity_snapshot.predecessor != snapshot->epoch() ||
         verified->policy().expected_responsiveness_snapshot_id !=
             snapshot->snapshot_id() ||
@@ -428,7 +456,6 @@ bool AdaptiveV3ManagerSession::authorize_operator_capacity_epoch1(
         verified->policy().decision_clock_domain !=
             OperatorCapacityClockDomain::monotonic_raw_ns ||
         verified->policy().decision_monotonic_ns == 0 ||
-        raw_clock_now == 0 ||
         raw_clock_now < verified->policy().decision_monotonic_ns ||
         raw_clock_now >
             verified->policy().capacity_snapshot.valid_until_monotonic_ns)
