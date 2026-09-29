@@ -82,6 +82,9 @@ PAIRED_CONTROL_PROFILE_SHA256 = (
 N7_THREE_REPORTER_OMISSION_PROFILE_ID = (
     "n7-three-reporter-relay-omission-v2"
 )
+N7_PATH_TIMEOUT_QUORUM_PROFILE_ID = (
+    "n7-path-local-timeout-quorum-v3"
+)
 PAIRED_PROFILE_ARMS = {
     PAIRED_ADAPTIVE_PROFILE_ID: "adaptive",
     PAIRED_CONTROL_PROFILE_ID: "control",
@@ -786,7 +789,10 @@ def _profile_throughput_windows(
             ("degraded", 0),
             ("containment", 1),
         )
-        if profile_id == N7_THREE_REPORTER_OMISSION_PROFILE_ID
+        if profile_id in {
+            N7_THREE_REPORTER_OMISSION_PROFILE_ID,
+            N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
+        }
         else (
             (
                 ("baseline", 0),
@@ -807,6 +813,7 @@ def _profile_throughput_windows(
         profile_id
         not in {
             N7_THREE_REPORTER_OMISSION_PROFILE_ID,
+            N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
             RECURRING_PROFILE_ID,
             PAIRED_ADAPTIVE_PROFILE_ID,
             PAIRED_CONTROL_PROFILE_ID,

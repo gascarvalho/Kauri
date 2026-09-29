@@ -98,6 +98,14 @@ def test_v3_profile_uses_manager_supported_live_predecessor_roots():
     assert '"containment_baseline_root_source":"live_predecessor_roots"' in encoded
 
 
+def test_v3_profile_passes_real_base_runtime_window_contract():
+    frozen = adapter._load_frozen_v3_profile()
+    runtime = adapter.base.runtime_parameters(frozen)
+
+    assert runtime["throughput_windows"] == frozen["throughput_windows"]
+    assert runtime["transition_requests"] == frozen["transition_requests"]
+
+
 @pytest.mark.parametrize(
     ("source", "parameters"),
     (
