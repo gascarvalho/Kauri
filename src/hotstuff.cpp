@@ -6434,8 +6434,10 @@ namespace hotstuff
             marker.authenticated_proposal_source_replica !=
                 marker.physical_parent ||
             !marker.expected_message_type.has_value() ||
-            marker.fault_mode !=
-                "tiered_persistent_responsive_omission_v2")
+            (marker.fault_mode !=
+                 "tiered_persistent_responsive_omission_v2" &&
+             marker.fault_mode !=
+                 "role_scoped_persistent_selected_omission_v1"))
             return;
         try
         {
@@ -12878,7 +12880,9 @@ namespace hotstuff
                     const ExperimentOmissionMarker &marker)
                 {
                     if (marker.fault_mode !=
-                        "tiered_persistent_responsive_omission_v2")
+                            "tiered_persistent_responsive_omission_v2" &&
+                        marker.fault_mode !=
+                            "role_scoped_persistent_selected_omission_v1")
                     {
                         if (configured_marker_emitter)
                             configured_marker_emitter(marker);

@@ -368,6 +368,19 @@ ExperimentByzantineOptions persistent_omission_options(
     return options;
 }
 
+ExperimentByzantineOptions role_scoped_single_hard_options(
+    ReplicaID local_replica,
+    std::vector<ExperimentOmissionMarker> *markers = nullptr)
+{
+    auto options = persistent_omission_options(local_replica, markers);
+    options.rotating_omission->mode =
+        "role_scoped_persistent_selected_omission_v1";
+    options.rotating_omission->actor_ids = {1};
+    options.rotating_omission->expected_actor_count = 1;
+    options.rotating_omission->max_omissions_per_proposal = 1;
+    return options;
+}
+
 ExperimentByzantineOptions tiered_omission_options(
     ReplicaID local_replica,
     std::size_t responsive_period = 32,
@@ -1817,6 +1830,60 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "role-scoped single hard actor retains its bounded fault across roles",
+    "[adaptive-v2][experiment][byzantine][persistent][role-scoped]")
+{
+    std::vector<ExperimentOmissionMarker> markers;
+    auto two_actor = role_scoped_single_hard_options(1);
+    two_actor.rotating_omission->actor_ids = {1, 3};
+    two_actor.rotating_omission->expected_actor_count = 2;
+    two_actor.rotating_omission->max_omissions_per_proposal = 2;
+    REQUIRE_THROWS_AS(
+        ExperimentByzantineAdapter(std::move(two_actor)),
+        std::invalid_argument);
+    ExperimentByzantineAdapter adapter(
+        role_scoped_single_hard_options(1, &markers));
+
+    const ConfigurationId epoch_zero{
+        0, 4, digest("role-scoped-e0")};
+    const ConfigurationId epoch_one{
+        1, 2, digest("role-scoped-e1")};
+    CHECK(adapter.consume_outbound_aggregate(
+        context("role-scoped-e0-internal", epoch_zero, "factorial-window-1"),
+        ExperimentReplicaRole::internal, 100));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        context("role-scoped-e1-root", epoch_one, "factorial-window-1"),
+        ExperimentReplicaRole::root, 101));
+    CHECK(
+        adapter.consume_outbound_direct_vote(
+            context("role-scoped-e1-leaf", epoch_one, "factorial-window-1"),
+            ExperimentReplicaRole::leaf, 102) ==
+        ExperimentDirectVoteDisposition::omit_first);
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        context("role-scoped-after-window", epoch_one, "factorial-window-1"),
+        ExperimentReplicaRole::internal, 200));
+
+    REQUIRE(markers.size() == 2);
+    for (const auto &marker : markers)
+    {
+        CHECK(marker.fault_mode ==
+              "role_scoped_persistent_selected_omission_v1");
+        CHECK(marker.actor == 1);
+        CHECK(marker.cohort == ExperimentOmissionCohort::hard);
+        CHECK(marker.hard_actor_count == 1);
+        CHECK(marker.responsive_degraded_actor_count == 0);
+        CHECK(marker.fault_threshold == 2);
+        CHECK(marker.responsive_omission_period == 0);
+        CHECK(marker.contribution_ordinal == 0);
+        CHECK(marker.role_contribution_ordinal == 0);
+    }
+    CHECK(markers[0].physical_role == ExperimentReplicaRole::internal);
+    CHECK(markers[0].action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(markers[1].physical_role == ExperimentReplicaRole::leaf);
+    CHECK(markers[1].action == ExperimentOmissionAction::omit_direct_vote);
+}
+
+TEST_CASE(
     "tiered responsive-degraded cohort query is diagnostic-only",
     "[adaptive-v2][experiment][byzantine][tiered][cohort-query]")
 {
@@ -2785,6 +2852,9 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         parser.find("persistent_selected_omission_v1") !=
+        std::string::npos);
+    CHECK(
+        parser.find("role_scoped_persistent_selected_omission_v1") !=
         std::string::npos);
     CHECK(
         parser.find("tiered_persistent_responsive_omission_v1") !=

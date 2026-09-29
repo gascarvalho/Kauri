@@ -370,6 +370,7 @@ parse_experiment_byzantine_options(
     {
         if (fault_mode != "rotating_intermittent_omission_v1" &&
             fault_mode != "persistent_selected_omission_v1" &&
+            fault_mode != "role_scoped_persistent_selected_omission_v1" &&
             fault_mode != "tiered_persistent_responsive_omission_v1" &&
             fault_mode != "tiered_persistent_responsive_omission_v2")
             throw HotStuffError(

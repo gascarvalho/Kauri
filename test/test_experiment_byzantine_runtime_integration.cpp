@@ -1499,6 +1499,18 @@ ExperimentByzantineOptions persistent_options(
     return options;
 }
 
+ExperimentByzantineOptions role_scoped_single_hard_options(
+    ReplicaID local_replica)
+{
+    auto options = persistent_options(local_replica);
+    options.rotating_omission->mode =
+        "role_scoped_persistent_selected_omission_v1";
+    options.rotating_omission->actor_ids = {1};
+    options.rotating_omission->expected_actor_count = 1;
+    options.rotating_omission->max_omissions_per_proposal = 1;
+    return options;
+}
+
 ExperimentByzantineOptions tiered_options(
     ReplicaID local_replica,
     std::size_t responsive_period = 32,
@@ -5826,6 +5838,67 @@ TEST_CASE(
         CHECK(emitter.events[1].contribution_ordinal == 0);
         CHECK(emitter.events[1].role_contribution_ordinal == 0);
     }
+}
+
+TEST_CASE(
+    "single hard role-scoped omission emits E0 and E1 role evidence",
+    "[adaptive-v2][experiment][fault-opportunity][single-hard][n7]")
+{
+    EventContext event_context;
+    TestHotStuff runtime(
+        1, 1, bytearray_t{}, NetAddr("127.0.0.1:0"),
+        new PaceMakerDummy(1), event_context, 0,
+        HotStuffBase::Net::Config(), NetAddr(),
+        EpochProtocolMode::adaptive_v2);
+    RecordingOpportunityAuditEmitter emitter;
+    runtime.bind_structured_event_emitters(nullptr, nullptr, &emitter);
+    runtime.configure_experiment_byzantine_faults(
+        role_scoped_single_hard_options(1));
+
+    const ProposalKey epoch_zero_internal{
+        ConfigurationId{0, 4, digest("single-hard-e0")},
+        digest("single-hard-e0-internal")};
+    const ProposalKey epoch_one_leaf{
+        ConfigurationId{1, 2, digest("single-hard-e1")},
+        digest("single-hard-e1-leaf")};
+    using Access = ExperimentByzantineRuntimeIntegrationTestAccess;
+    Access::seed_view_generation(runtime, epoch_zero_internal, 31);
+    Access::seed_view_generation(runtime, epoch_one_leaf, 32);
+
+    CHECK(Access::consume_aggregate(
+        runtime, epoch_zero_internal,
+        tree(ExperimentReplicaRole::internal, 1)));
+    CHECK(Access::consume_direct_vote(
+        runtime, epoch_one_leaf,
+        tree(ExperimentReplicaRole::leaf, 1)));
+
+    REQUIRE(emitter.events.size() == 2);
+    const auto &e0 = emitter.events[0];
+    CHECK(e0.actor == 1);
+    CHECK(e0.proposal == epoch_zero_internal);
+    CHECK(e0.physical_role == ExperimentReplicaRole::internal);
+    CHECK(e0.expected_message_type == ExpectedMessageType::aggregate_relay);
+    CHECK(e0.scheduled_action == ExperimentOmissionAction::omit_aggregate);
+    CHECK(e0.cohort == ExperimentOmissionCohort::hard);
+    CHECK(e0.fault_mode ==
+          "role_scoped_persistent_selected_omission_v1");
+    CHECK(e0.hard_actor_count == 1);
+    CHECK(e0.responsive_degraded_actor_count == 0);
+    CHECK(e0.fault_threshold == 2);
+    CHECK(e0.responsive_omission_period == 0);
+    CHECK(e0.contribution_ordinal == 0);
+    CHECK(e0.role_contribution_ordinal == 0);
+
+    const auto &e1 = emitter.events[1];
+    CHECK(e1.proposal == epoch_one_leaf);
+    CHECK(e1.physical_role == ExperimentReplicaRole::leaf);
+    CHECK(e1.expected_message_type == ExpectedMessageType::direct_vote);
+    CHECK(e1.scheduled_action == ExperimentOmissionAction::omit_direct_vote);
+    CHECK(e1.cohort == ExperimentOmissionCohort::hard);
+    CHECK(e1.fault_mode == e0.fault_mode);
+    CHECK(e1.hard_actor_count == e0.hard_actor_count);
+    CHECK(e1.responsive_degraded_actor_count == 0);
+    CHECK(e1.fault_threshold == e0.fault_threshold);
 }
 
 TEST_CASE(

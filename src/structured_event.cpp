@@ -795,9 +795,13 @@ bool valid_fault_contribution_opportunity(
     const FaultContributionOpportunityStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
 {
+    const bool tiered_v2 =
+        event.fault_mode == "tiered_persistent_responsive_omission_v2";
+    const bool single_hard_role_scoped =
+        event.fault_mode ==
+        "role_scoped_persistent_selected_omission_v1";
     if (!replica_source_matches(config, event.actor) ||
-        event.fault_mode !=
-            "tiered_persistent_responsive_omission_v2" ||
+        (!tiered_v2 && !single_hard_role_scoped) ||
         event.proposal.configuration.epoch_digest == uint256_t{} ||
         event.proposal.block_hash == uint256_t{} ||
         event.view_generation == 0 ||
@@ -817,9 +821,13 @@ bool valid_fault_contribution_opportunity(
             event.window_start_monotonic_ns ||
         event.decision_monotonic_ns >=
             event.window_end_monotonic_ns ||
-        event.responsive_omission_period < 2 ||
+        (tiered_v2 && event.responsive_omission_period < 2) ||
+        (single_hard_role_scoped && event.responsive_omission_period != 0) ||
         event.fault_threshold == 0 || event.hard_actor_count == 0 ||
-        event.responsive_degraded_actor_count == 0 ||
+        (tiered_v2 && event.responsive_degraded_actor_count == 0) ||
+        (single_hard_role_scoped &&
+         (event.hard_actor_count != 1 ||
+          event.responsive_degraded_actor_count != 0)) ||
         event.hard_actor_count >
             std::numeric_limits<std::size_t>::max() -
                 event.responsive_degraded_actor_count ||
@@ -851,6 +859,9 @@ bool valid_fault_contribution_opportunity(
         return event.contribution_ordinal == 0 &&
                event.role_contribution_ordinal == 0 &&
                event.scheduled_action == omission_action;
+
+    if (single_hard_role_scoped)
+        return false;
 
     if (event.cohort !=
             ExperimentOmissionCohort::responsive_degraded ||

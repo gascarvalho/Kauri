@@ -66,6 +66,12 @@ constexpr const char *kRotatingOmissionMode =
     "rotating_intermittent_omission_v1";
 constexpr const char *kPersistentOmissionMode =
     "persistent_selected_omission_v1";
+// This is intentionally distinct from the two-cohort tiered modes. It is a
+// single hard-actor schedule whose marker binds the physical role on every
+// exact proposal, allowing an experiment to retain the fault across a move
+// from an internal relay to a leaf without introducing another fault cohort.
+constexpr const char *kRoleScopedPersistentOmissionMode =
+    "role_scoped_persistent_selected_omission_v1";
 constexpr const char *kTieredOmissionModeV1 =
     "tiered_persistent_responsive_omission_v1";
 constexpr const char *kTieredOmissionModeV2 =
@@ -148,7 +154,8 @@ bool is_rotating_omission_mode(const std::string &mode) noexcept
 
 bool is_persistent_omission_mode(const std::string &mode) noexcept
 {
-    return mode == kPersistentOmissionMode;
+    return mode == kPersistentOmissionMode ||
+           mode == kRoleScopedPersistentOmissionMode;
 }
 
 bool is_tiered_omission_mode(const std::string &mode) noexcept
@@ -159,6 +166,12 @@ bool is_tiered_omission_mode(const std::string &mode) noexcept
 bool is_role_scoped_tiered_omission_mode(const std::string &mode) noexcept
 {
     return mode == kTieredOmissionModeV2;
+}
+
+bool is_role_scoped_omission_mode(const std::string &mode) noexcept
+{
+    return is_role_scoped_tiered_omission_mode(mode) ||
+           mode == kRoleScopedPersistentOmissionMode;
 }
 
 bool is_scheduled_omission_mode(const std::string &mode) noexcept
@@ -266,7 +279,8 @@ std::string format_experiment_omission_marker(
             << " actor=" << marker.actor
             << " action=" << omission_action_name(marker.action)
             << " monotonic_ns=" << marker.monotonic_ns;
-    if (is_tiered_omission_mode(marker.fault_mode))
+    if (is_tiered_omission_mode(marker.fault_mode) ||
+        marker.fault_mode == kRoleScopedPersistentOmissionMode)
     {
         encoded << " cohort=" << omission_cohort_name(marker.cohort)
                 << " hard_actor_count=" << marker.hard_actor_count
@@ -279,7 +293,7 @@ std::string format_experiment_omission_marker(
                 << marker.responsive_omission_period
                 << " contribution_ordinal="
                 << marker.contribution_ordinal;
-        if (is_role_scoped_tiered_omission_mode(marker.fault_mode))
+        if (is_role_scoped_omission_mode(marker.fault_mode))
             encoded << " contribution_role="
                     << replica_role_name(marker.contribution_role)
                     << " role_contribution_ordinal="
@@ -484,6 +498,11 @@ struct ExperimentByzantineAdapter::State
                     { return actor >= scheduled.replica_count; }))
                 throw std::invalid_argument(
                     "scheduled omission actor is outside membership");
+            if (scheduled.mode == kRoleScopedPersistentOmissionMode &&
+                (scheduled.actor_ids.size() != 1 ||
+                 scheduled.expected_actor_count != 1))
+                throw std::invalid_argument(
+                    "role-scoped persistent omission requires exactly one hard actor");
             std::sort(
                 scheduled.responsive_degraded_actor_ids.begin(),
                 scheduled.responsive_degraded_actor_ids.end());
@@ -620,7 +639,8 @@ struct ExperimentByzantineAdapter::State
         const bool inside_window =
             monotonic_ns >= scheduled.window_start_monotonic_ns &&
             monotonic_ns < scheduled.window_end_monotonic_ns;
-        if (is_tiered_omission_mode(scheduled.mode))
+        if (is_tiered_omission_mode(scheduled.mode) ||
+            scheduled.mode == kRoleScopedPersistentOmissionMode)
         {
             decision.cohort = local_actor_cohort();
             decision.auditable =
@@ -628,7 +648,7 @@ struct ExperimentByzantineAdapter::State
                 decision.cohort != ExperimentOmissionCohort::none;
             if (decision.auditable)
             {
-                if (is_role_scoped_tiered_omission_mode(scheduled.mode))
+                if (is_role_scoped_omission_mode(scheduled.mode))
                     decision.contribution_role = role;
                 bool omit =
                     decision.cohort == ExperimentOmissionCohort::hard;
@@ -707,7 +727,8 @@ struct ExperimentByzantineAdapter::State
         std::uint64_t role_contribution_ordinal) const
     {
         const auto &scheduled = *options.rotating_omission;
-        if (!is_tiered_omission_mode(scheduled.mode))
+        if (!is_tiered_omission_mode(scheduled.mode) &&
+            scheduled.mode != kRoleScopedPersistentOmissionMode)
             return;
         marker.cohort = cohort;
         marker.hard_actor_count = scheduled.actor_ids.size();
@@ -719,7 +740,7 @@ struct ExperimentByzantineAdapter::State
         marker.responsive_omission_period =
             scheduled.responsive_omission_period;
         marker.contribution_ordinal = contribution_ordinal;
-        if (is_role_scoped_tiered_omission_mode(scheduled.mode))
+        if (is_role_scoped_omission_mode(scheduled.mode))
         {
             marker.contribution_role = contribution_role;
             marker.role_contribution_ordinal = role_contribution_ordinal;
@@ -732,7 +753,7 @@ struct ExperimentByzantineAdapter::State
         ExperimentReplicaRole role) const
     {
         const auto &scheduled = *options.rotating_omission;
-        if (!is_role_scoped_tiered_omission_mode(scheduled.mode))
+        if (!is_role_scoped_omission_mode(scheduled.mode))
             return;
         marker.view_generation = context.view_generation;
         marker.physical_parent = context.physical_parent;
@@ -748,7 +769,7 @@ struct ExperimentByzantineAdapter::State
         std::uint64_t monotonic_ns)
     {
         const auto &scheduled = *options.rotating_omission;
-        if (is_role_scoped_tiered_omission_mode(scheduled.mode) &&
+        if (is_role_scoped_omission_mode(scheduled.mode) &&
             role == ExperimentReplicaRole::root)
             return;
         if (scheduled_capacity_marker_emitted)

@@ -5826,6 +5826,58 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "single hard role-scoped opportunity requires one actor and no second cohort",
+    "[adaptive-v2][experiment][fault-opportunity][single-hard][structured-event]")
+{
+    auto event = contribution_opportunity_event();
+    event.actor = 1;
+    event.cohort = ExperimentOmissionCohort::hard;
+    event.contribution_ordinal = 0;
+    event.role_contribution_ordinal = 0;
+    event.responsive_omission_period = 0;
+    event.hard_actor_count = 1;
+    event.responsive_degraded_actor_count = 0;
+    event.fault_threshold = 2;
+    event.fault_mode = "role_scoped_persistent_selected_omission_v1";
+
+    auto config = event_config();
+    config.source.logical_id = "replica-1";
+    config.designated_commit_observer.reset();
+    FakeClock clock({503});
+    MemoryOutput output;
+    StructuredEventSink sink(config, clock, output);
+    sink.emit_audit(AuditStructuredEventPayload{event});
+    sink.drain();
+    CHECK(sink.health().healthy);
+    CHECK(rendered(output).find(
+              "\"fault_mode\":\"role_scoped_persistent_selected_omission_v1\"") !=
+          std::string::npos);
+
+    const auto rejects = [&config](
+                             FaultContributionOpportunityStructuredEvent
+                                 invalid) {
+        FakeClock invalid_clock({504});
+        MemoryOutput invalid_output;
+        StructuredEventSink invalid_sink(
+            config, invalid_clock, invalid_output);
+        invalid_sink.emit_audit(AuditStructuredEventPayload{std::move(invalid)});
+        return !invalid_sink.health().healthy && invalid_sink.health().stopped &&
+               invalid_sink.health().first_failure ==
+                   StructuredEventFailure::invalid_payload;
+    };
+
+    auto second_actor = event;
+    second_actor.hard_actor_count = 2;
+    CHECK(rejects(std::move(second_actor)));
+    auto second_cohort = event;
+    second_cohort.responsive_degraded_actor_count = 1;
+    CHECK(rejects(std::move(second_cohort)));
+    auto nonzero_period = event;
+    nonzero_period.responsive_omission_period = 2;
+    CHECK(rejects(std::move(nonzero_period)));
+}
+
+TEST_CASE(
     "blocked root QC serializes exact source-bound queue evidence",
     "[adaptive-v2][pipeline][root-qc-queue-blocked][structured-event]"
     "[intentional-red]")
