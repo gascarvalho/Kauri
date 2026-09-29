@@ -1342,15 +1342,18 @@ def execute(
             if (manager_terminal is None or
                     manager_terminal.get("source_monotonic_ns", 0) > horizon_end_ns):
                 raise ProducerError("manager lacks a successful terminal record before fixed horizon")
-            if not _streams_cover_fixed_horizon(
-                    coverage_streams, horizon_end_ns):
-                raise ProducerError("raw streams do not cover the prospective fixed horizon")
         cleanup_receipt = _cleanup_receipt(
             run_directory, run_id, records, declared_ports
         )
         cleanup_written = True
         if cleanup_receipt["complete"] is not True:
             raise ProducerError("cleanup left a live process group or declared listener")
+        if prospective_fixed_horizon:
+            # The orderly shutdown writes source-bound process.stopped events.
+            # Checking before cleanup falsely censors an otherwise complete window.
+            if not _streams_cover_fixed_horizon(
+                    base._event_streams(run_directory), horizon_end_ns):
+                raise ProducerError("raw streams do not cover the prospective fixed horizon")
 
         manager_bundle = Path(_one_option(expected_manager, "--bundle-output"))
         artifacts = {

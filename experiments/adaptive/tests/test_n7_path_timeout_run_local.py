@@ -695,6 +695,14 @@ def test_prospective_horizon_anchors_only_a_gate_bound_physical_omission_and_rej
     assert producer._streams_cover_fixed_horizon(streams, 200) is False
 
 
+def test_prospective_horizon_checks_raw_coverage_after_orderly_shutdown():
+    import inspect
+    body = inspect.getsource(producer.execute)
+    assert body.index("cleanup_receipt = _cleanup_receipt(") < body.index(
+        "if not _streams_cover_fixed_horizon("
+    )
+
+
 def test_prospective_no_omission_aborts_once_and_cleans_all_eight_processes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
