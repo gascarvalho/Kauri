@@ -6649,7 +6649,9 @@ private:
 
     void schedule_evaluation() noexcept
     {
-        if (failed_ || request_sequence_.shutdown_eligible() ||
+        if (failed_ ||
+            (!options_.fault_window_arm_control_only &&
+             request_sequence_.shutdown_eligible()) ||
             predecessor_residency_pending_ ||
             post_baseline_observation_pending_ ||
             cycle_1_selection_gate_pending_ ||
@@ -6876,7 +6878,9 @@ private:
 
     void evaluate()
     {
-        if (failed_ || request_sequence_.shutdown_eligible() ||
+        if (failed_ ||
+            (!options_.fault_window_arm_control_only &&
+             request_sequence_.shutdown_eligible()) ||
             predecessor_residency_pending_ ||
             post_baseline_observation_pending_)
             return;
@@ -7418,7 +7422,8 @@ private:
         const ManagerNetwork::conn_t &connection,
         Ingest &&operation)
     {
-        if (request_sequence_.shutdown_eligible())
+        if (!options_.fault_window_arm_control_only &&
+            request_sequence_.shutdown_eligible())
             return;
         const auto source = authenticated_source(connection);
         if (!source.has_value())

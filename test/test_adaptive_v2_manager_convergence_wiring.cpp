@@ -2085,6 +2085,17 @@ TEST_CASE(
          "placement_tree_count",
          "session_.begin_cycle(policy)"}));
 
+    for (const auto *signature : {"void schedule_evaluation()",
+                                  "void evaluate()", "void ingest("})
+    {
+        const auto body = function_body(manager, signature);
+        REQUIRE_FALSE(body.empty());
+        CHECK(body.find("!options_.fault_window_arm_control_only") !=
+              std::string::npos);
+        CHECK(body.find("request_sequence_.shutdown_eligible()") !=
+              std::string::npos);
+    }
+
     const auto consume = function_body(manager, "bool try_arm_fault_window()");
     REQUIRE_FALSE(consume.empty());
     CHECK(contains_in_order(
