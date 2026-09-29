@@ -210,6 +210,75 @@ def test_prepare_rejects_a_rehashed_base_plan_with_a_different_causal_contract(
     assert not (tmp_path / producer.AUTHORIZATION_REQUEST).exists()
 
 
+def test_prospective_prepare_hash_binds_the_exact_omission_window_without_changing_legacy_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    _fixture(monkeypatch, tmp_path)
+    producer.prepare(tmp_path, prospective_fixed_horizon=True)
+    plan = json.loads((tmp_path / producer.EXECUTION_PLAN).read_bytes())
+    request = json.loads((tmp_path / producer.AUTHORIZATION_REQUEST).read_bytes())
+    assert plan["prospective_fixed_horizon"] == producer.PROSPECTIVE_FIXED_HORIZON
+    assert request["prospective_fixed_horizon"] == producer.PROSPECTIVE_FIXED_HORIZON
+    assert request["execution_plan_sha256"] == plan["plan_sha256"]
+    authorization_path, _authorization = _external_authorization(tmp_path)
+    finalized = producer.finalize(tmp_path, authorization_path)
+    assert finalized["authorization_request_sha256"] == producer.base.sha256_file(
+        tmp_path / producer.AUTHORIZATION_REQUEST
+    )
+
+
+def test_prospective_execute_rejects_legacy_or_mutated_horizon_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    authorization_path = _finalized_execution_fixture(monkeypatch, tmp_path)
+    launched = []
+    with pytest.raises(producer.ProducerError, match="not bound"):
+        producer.execute(tmp_path, authorization_path, execution_enabled=True,
+                         prospective_fixed_horizon=True,
+                         spawn=lambda name, *_args, **_kwargs: launched.append(name))
+    assert launched == []
+
+
+def test_prospective_prepare_rejects_a_timeout_without_startup_cleanup_reserve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    launched = []
+    _fixture(monkeypatch, tmp_path)
+    with pytest.raises(producer.ProducerError, match="startup/cleanup reserve"):
+        producer.prepare(tmp_path, hard_timeout_seconds=90, prospective_fixed_horizon=True)
+    assert not (tmp_path / producer.EXECUTION_PLAN).exists()
+
+    other_root = tmp_path / "prospective"
+    other_root.mkdir()
+    _fixture(monkeypatch, other_root)
+    producer.prepare(other_root, prospective_fixed_horizon=True)
+    plan_path = other_root / producer.EXECUTION_PLAN
+    plan = json.loads(plan_path.read_bytes())
+    plan["prospective_fixed_horizon"]["duration_ns"] = 59_000_000_000
+    plan["plan_sha256"] = producer._execution_plan_digest(plan)
+    plan_path.write_bytes(producer._canonical(plan))
+    with pytest.raises(producer.ProducerError, match="not bound"):
+        producer.execute(other_root, other_root / "missing.json", execution_enabled=True,
+                         prospective_fixed_horizon=True,
+                         spawn=lambda name, *_args, **_kwargs: launched.append(name))
+    assert launched == []
+
+
+def test_execute_rejects_a_mutated_runtime_authorization_request_before_spawn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    authorization_path = _finalized_execution_fixture(monkeypatch, tmp_path)
+    request_path = tmp_path / producer.AUTHORIZATION_REQUEST
+    request = json.loads(request_path.read_bytes())
+    request["hard_timeout_seconds"] = 301
+    request_path.write_bytes(producer._canonical(request))
+    launched = []
+    with pytest.raises(producer.ProducerError, match="authorization request drifted"):
+        producer.execute(tmp_path, authorization_path, execution_enabled=True,
+                         spawn=lambda name, *_args, **_kwargs: launched.append(name))
+    assert launched == []
+
+
 def test_prepare_inputs_is_one_reproducible_no_launch_entrypoint(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -422,9 +491,11 @@ def test_execute_cli_requires_explicit_reviewed_enablement(
     assert seen == [((tmp_path, tmp_path / "approval.json"), {"execution_enabled": True})]
 
 
-def _finalized_execution_fixture(monkeypatch: pytest.MonkeyPatch, root: Path):
+def _finalized_execution_fixture(
+    monkeypatch: pytest.MonkeyPatch, root: Path, *, prospective_fixed_horizon: bool = False,
+):
     _fixture(monkeypatch, root)
-    producer.prepare(root)
+    producer.prepare(root, prospective_fixed_horizon=prospective_fixed_horizon)
     authorization_path, _ = _external_authorization(root)
     producer.finalize(root, authorization_path)
     (root / "logs").mkdir(exist_ok=True)
@@ -597,6 +668,68 @@ def test_enabled_lifecycle_orders_arm_gate_cleanup_and_raw_validation(
         )
     assert receipt["fault_window_arm"]["source_sequence"] == 9
     assert receipt["fault_injection_arm"]["source_sequence"] == 10
+
+
+def test_prospective_horizon_anchors_only_a_gate_bound_physical_omission_and_rejects_censoring():
+    streams = {
+        "adaptive-manager": [{"source_monotonic_ns": 200}],
+        **{f"replica-{replica}": [{"source_monotonic_ns": 200}] for replica in range(7)},
+    }
+    streams["replica-1"] = [
+        {"event_type": "fault.aggregate_omitted", "source_monotonic_ns": 150,
+         "payload": {"actor": 1, "parent_replica": 4, "epoch_number": 0,
+                     "tree_id": 4, "epoch_digest": "a" * 64,
+                     "block_hash": "b" * 64, "gate_sha256": "wrong",
+                     "first_for_context": True}},
+        {"event_type": "fault.aggregate_omitted", "source_monotonic_ns": 160,
+         "payload": {"actor": 1, "parent_replica": 4, "epoch_number": 0,
+                     "tree_id": 4, "epoch_digest": "a" * 64,
+                     "block_hash": "c" * 64, "gate_sha256": "right",
+                     "first_for_context": True}},
+        {"event_type": "stream.coverage", "source_monotonic_ns": 200, "payload": {}},
+    ]
+    assert producer._first_source_bound_physical_omission(streams, "right")["source_monotonic_ns"] == 160
+    assert producer._first_source_bound_physical_omission(streams, "absent") is None
+    assert producer._streams_cover_fixed_horizon(streams, 200) is True
+    streams["replica-6"] = [{"source_monotonic_ns": 199}]
+    assert producer._streams_cover_fixed_horizon(streams, 200) is False
+
+
+def test_prospective_no_omission_aborts_once_and_cleans_all_eight_processes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    authorization_path = _finalized_execution_fixture(
+        monkeypatch, tmp_path, prospective_fixed_horizon=True,
+    )
+    monkeypatch.setattr(producer.base, "ports_in_use", lambda _ports: [])
+    monkeypatch.setattr(producer.os, "killpg", lambda *_args: (_ for _ in ()).throw(ProcessLookupError()))
+    monkeypatch.setattr(producer.validator, "_common_e0_commit_before_arm", lambda *_args, **_kwargs: (7, "e" * 64))
+    monkeypatch.setattr(producer.validator, "validate_known_raw_events", lambda *_args, **_kwargs: {"verdict": "PARTIAL_ONLY"})
+    streams = {"adaptive-manager": [{"event_type": "process.ready"}], **{f"replica-{replica}": [{"event_type": "process.ready"}] for replica in range(7)}}
+    monkeypatch.setattr(producer.base, "_event_streams", lambda _root: streams)
+    arm = {"source_sequence": 9, "source_monotonic_ns": 100, "event_type": "fault_window_armed", "payload": {}}
+    injection = {"source_sequence": 10, "source_monotonic_ns": 102, "event_type": "fault.injection_armed", "payload": {}}
+    monkeypatch.setattr(producer, "_one_event_line", lambda _path, event_type, **_kwargs: (arm, "1" * 64) if event_type == "fault_window_armed" else (injection, "2" * 64))
+    monkeypatch.setattr(producer, "_raw_clock_ns", lambda: 101)
+
+    class Process:
+        def poll(self): return None
+    class Record:
+        def __init__(self, name, ordinal):
+            self.name, self.pid, self.pgid, self.process = name, 3000 + ordinal, 3000 + ordinal, Process()
+    launched, cleaned = [], []
+    monkeypatch.setattr(producer.adapter.comparison, "_shutdown_records", lambda records: (cleaned.extend(record.name for record in records) or [{"source_id": record.name, "pid": record.pid, "pgid": record.pgid, "returncode": -15} for record in records]))
+    def wait(_records, _deadline, probe, label, **_kwargs):
+        if label == "source-bound physical aggregate omission":
+            raise producer.ProducerError("no gate-bound physical omission")
+        return probe()
+    monkeypatch.setattr(producer, "_wait_for", wait)
+    with pytest.raises(producer.ProducerError, match="no-retry execution aborted"):
+        producer.execute(tmp_path, authorization_path, prospective_fixed_horizon=True,
+                         execution_enabled=True,
+                         spawn=lambda name, *_args, **_kwargs: (launched.append(name) or Record(name, len(launched))))
+    assert launched == cleaned == ["adaptive-manager", *(f"replica-{replica}" for replica in range(7))]
+    assert json.loads((tmp_path / "local-run-abort.json").read_bytes())["status"] == "ABORTED"
 
 
 @pytest.mark.parametrize(

@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "study_id": "n7-path-local-omission-matched-progress-v1",
+  "state": "PLANNING_ONLY_NO_LAUNCH",
+  "claim_boundary": "This planning scaffold authorizes no process, no cluster run, no frozen campaign, no throughput estimator, and no positive thesis claim.",
+  "primary_outcome": {
+    "status": "UNBOUND_PROSPECTIVE_DESIGN",
+    "prerequisite": "One designated authoritative block.committed event after the frozen fault-window arm, with matching block.commit_observed witnesses from every other replica.",
+    "candidate_advantage_outcome": "paired authoritative common-commit count and maximum inter-commit gap over a fixed source-bound post-physical-omission horizon",
+    "required_control_boundary": "source-bound shadow boundary corresponding to the adaptive arm E1 activation",
+    "throughput": "not_bound_in_planning_scaffold"
+  },
+  "shared_inputs": {
+    "replica_ids": [0, 1, 2, 3, 4, 5, 6],
+    "fault_threshold": 2,
+    "quorum": 5,
+    "epoch0_tree_sha256": "38a2baa37b7fcec43f5c58423be068d807cc253fedbdc379520a3e42428dffcc",
+    "fault_actor": 1,
+    "fault_mode": "selective_aggregate_relay_omission",
+    "fault_window_basis": "exact_matched_post_arm_physical_omission_v1",
+    "measurement_window": "[first_admitted_source_bound_physical_omission,+60000000000ns]",
+    "measurement_anchor_source": "replica-1:fault.aggregate_omitted:first_for_context",
+    "workload": "must_be_identical_within_pair",
+    "hard_timeout_seconds": 600
+  },
+  "arms": {
+    "control": {
+      "arm_id": "C",
+      "policy": "inherited_fixed_epoch0_no_successor",
+      "required_terminal_validator_verdict": "CONTROL_RAW_BUNDLE_VALIDATED_PROSPECTIVE",
+      "requires_no_adaptive_successor": true
+    },
+    "adaptive": {
+      "arm_id": "A",
+      "policy": "native_path_timeout_containment",
+      "required_terminal_validator_verdict": "RAW_BUNDLE_VALIDATED",
+      "requires_selection": [1],
+      "requires_successor_activation": true
+    }
+  },
+  "pairs": [
+    {"pair_id": "P1", "seed": 41719, "arm_order": ["A", "C"]},
+    {"pair_id": "P2", "seed": 41720, "arm_order": ["C", "A"]},
+    {"pair_id": "P3", "seed": 41721, "arm_order": ["A", "C"]}
+  ],
+  "failure_accounting": {
+    "no_retry": true,
+    "retain_terminal_statuses": ["PASS", "ABORTED", "INCOMPLETE"],
+    "replacement_runs": false,
+    "exclude_shakedown_from_pairs": true
+  },
+  "campaign_gate": "A separately implemented control producer and source-blind control validator are required before any execution approval.",
+  "manifest_sha256": "11792524a174435538cc1887f47e64a8f0e5c4776706a1eb4506de19434a6dc7"
+}

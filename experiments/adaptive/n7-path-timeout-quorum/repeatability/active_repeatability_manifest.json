@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "study_id": "n7-path-local-timeout-quorum-v4-active-repeatability-v1",
+  "state": "NON_EVIDENTIARY_PLANNING_NO_LAUNCH",
+  "claim_boundary": "A three-slot same-profile active-arm planning contract only. The existing v4 runner does not emit the required source terminal or archive receipts, so this file neither authorizes execution nor can collect evidence until a separately reviewed producer contract exists; it never supports fault-breadth, control-comparison, throughput, or general Byzantine-resilience claims.",
+  "frozen_profile": {
+    "profile_id": "n7-path-local-timeout-quorum-v4",
+    "profile_sha256": "3e2b2af834279168199db31bd5ee47e0abdef480d1d5327a17cbcc1b57efc244",
+    "snapshot_seed": 41719,
+    "epoch0_tree_sha256": "38a2baa37b7fcec43f5c58423be068d807cc253fedbdc379520a3e42428dffcc",
+    "replica_ids": [0, 1, 2, 3, 4, 5, 6],
+    "fault_threshold": 2,
+    "quorum": 5,
+    "omitting_replica": 1,
+    "tree_ids": [4, 5, 6],
+    "parent_reporters": [4, 5, 6],
+    "physical_omission_causality_basis": "exact_matched_post_arm_physical_omission_v1"
+  },
+  "execution_policy": {
+    "hard_timeout_seconds": 600,
+    "external_timeout_seconds": 720,
+    "no_retry": true,
+    "replacement_runs": false,
+    "requires_distinct_execution_authorization_per_slot": true
+  },
+  "slots": [
+    {"slot_id": "R1", "root_id": "n7-path-quorum-v4-repeatability-r1", "archive_root_id": "n7-path-quorum-v4-repeatability-r1-archive"},
+    {"slot_id": "R2", "root_id": "n7-path-quorum-v4-repeatability-r2", "archive_root_id": "n7-path-quorum-v4-repeatability-r2-archive"},
+    {"slot_id": "R3", "root_id": "n7-path-quorum-v4-repeatability-r3", "archive_root_id": "n7-path-quorum-v4-repeatability-r3-archive"}
+  ],
+  "denominator": {
+    "scheduled_slots": 3,
+    "retain_terminal_statuses": ["RAW_BUNDLE_VALIDATED", "ABORTED", "INCOMPLETE"],
+    "missing_slot_is_rejected": true,
+    "failed_slot_is_retained_not_replaced": true
+  },
+  "replay_and_archive_gate": {
+    "required_raw_receipt": "raw-bundle-receipt.json",
+    "required_raw_verdict": "raw-bundle-verdict.json",
+    "required_validator_verdict": "RAW_BUNDLE_VALIDATED",
+    "required_terminal_receipt": "repeatability-terminal-receipt.json",
+    "required_archive_receipt": "repeatability-archive-receipt.json",
+    "required_archive_file_manifest": "archive-file-manifest.json",
+    "archive_contract": "terminal and archive receipts bind the actual authorization, source artifact, source root, and archive file manifest"
+  },
+  "manifest_sha256": "06eb5f94784b7307df04a1e3057a147884e77351b84d32a2dbc366979d13a145"
+}

@@ -708,6 +708,98 @@ def _common_e0_commit_before_arm(
     raise ValidationError("all-seven pre-arm common E0 commit is missing")
 
 
+def _prospective_fixed_horizon_commits(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]], *, anchor_ns: int,
+    end_ns: int, predecessor_digest: str, successor_digest: str,
+) -> tuple[int, int | None]:
+    """Derive unique all-peer E1 commits from retained structured events.
+
+    This intentionally accepts no caller summary.  The designated observer's
+    complete ``block.committed`` event supplies the successor proof and each
+    other replica's complete ``block.commit_observed`` event supplies one
+    independent witness for the same height/hash.
+    """
+    designated: dict[tuple[int, str], tuple[int, Mapping[str, Any], tuple[object, ...]]] = {}
+    observations: dict[tuple[int, str], dict[int, tuple[Mapping[str, Any], tuple[object, ...]]]] = {}
+    hashes_by_height: dict[int, str] = {}
+    for replica in runner.REPLICA_IDS:
+        previous_timestamp: int | None = None
+        previous_designated_height: int | None = None
+        for event in streams[f"replica-{replica}"]:
+            timestamp = event.get("source_monotonic_ns")
+            if not isinstance(timestamp, int):
+                raise ValidationError("prospective horizon source timestamp is invalid")
+            if previous_timestamp is not None and timestamp <= previous_timestamp:
+                raise ValidationError("prospective horizon source time is not strictly increasing")
+            previous_timestamp = timestamp
+            if not anchor_ns <= event.get("source_monotonic_ns", 0) <= end_ns:
+                continue
+            event_type = event.get("event_type")
+            if event_type not in {"block.committed", "block.commit_observed"}:
+                continue
+            payload = event.get("payload")
+            expected_fields = _COMMIT_FIELDS if event_type == "block.committed" else _COMMIT_OBSERVED_FIELDS
+            if not isinstance(payload, Mapping) or set(payload) != expected_fields:
+                raise ValidationError("prospective horizon commit payload has schema drift")
+            height = _positive_int(payload["block_height"], "prospective committed block height")
+            block_hash = _hex64(payload["block_hash"], "prospective committed block hash", nonzero=True)
+            parent_hash = payload["parent_hash"]
+            if parent_hash is not None:
+                _hex64(parent_hash, "prospective committed parent hash", nonzero=True)
+            if (type(payload["transaction_count"]) is not int or payload["transaction_count"] < 0 or
+                    type(payload["commit_batch_index"]) is not int or payload["commit_batch_index"] < 0):
+                raise ValidationError("prospective horizon commit counters are invalid")
+            metadata = (parent_hash, payload["transaction_count"], payload["commit_batch_index"])
+            prior_hash = hashes_by_height.setdefault(height, block_hash)
+            if prior_hash != block_hash:
+                raise ValidationError("prospective horizon commits conflict at one height")
+            key = (height, block_hash)
+            if event_type == "block.committed":
+                if type(payload["designated_observer"]) is not bool:
+                    raise ValidationError("prospective horizon designated observer flag is invalid")
+                if payload["designated_observer"] is not True:
+                    continue
+                proof = payload["decision_proof"]
+                if not isinstance(proof, Mapping) or set(proof) != _DECISION_PROOF_FIELDS:
+                    raise ValidationError("prospective horizon designated commit proof has schema drift")
+                is_successor = (
+                    proof["epoch_number"] == 1 and type(proof["tree_id"]) is int and
+                    proof["tree_id"] in _E1_TREE_IDS and proof["epoch_digest"] == successor_digest and
+                    proof["block_hash"] == block_hash
+                )
+                is_predecessor = (
+                    proof["epoch_number"] == 0 and type(proof["tree_id"]) is int and
+                    proof["tree_id"] in runner.REPLICA_IDS and proof["epoch_digest"] == predecessor_digest and
+                    proof["block_hash"] == block_hash
+                )
+                if not is_successor and not is_predecessor:
+                    raise ValidationError("prospective horizon designated commit has wrong epoch proof")
+                if previous_designated_height is not None and height <= previous_designated_height:
+                    raise ValidationError("prospective horizon designated heights are not strictly increasing")
+                previous_designated_height = height
+                if is_predecessor:
+                    continue
+                if key in designated:
+                    raise ValidationError("prospective horizon has duplicate designated commit")
+                designated[key] = (replica, event, metadata)
+            else:
+                bucket = observations.setdefault(key, {})
+                if replica in bucket:
+                    raise ValidationError("prospective horizon has duplicate peer witness")
+                bucket[replica] = (event, metadata)
+    accepted: list[int] = []
+    for key, (authoritative_replica, event, metadata) in designated.items():
+        witnesses = observations.get(key, {})
+        if set(witnesses) != set(runner.REPLICA_IDS):
+            raise ValidationError("prospective horizon designated commit lacks all peers")
+        if any(witness_metadata != metadata for _witness, witness_metadata in witnesses.values()):
+            raise ValidationError("prospective horizon peer metadata conflicts with designated commit")
+        accepted.append(event["source_monotonic_ns"])
+    accepted.sort()
+    gaps = [later - earlier for earlier, later in zip(accepted, accepted[1:])]
+    return len(accepted), max(gaps) if gaps else None
+
+
 def _fault_window_start(
     value: object, *, run_id: str, epoch_digest: str
 ) -> tuple[int, int]:
@@ -954,7 +1046,10 @@ def _validate_native_injection(
     return _hex64(payload["gate_sha256"], "fault injection gate_sha256")
 
 
-def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str, Any]:
+def validate_raw_bundle(
+    run_root: Path, receipt: Mapping[str, Any], *,
+    require_fixed_horizon: bool = False,
+) -> dict[str, Any]:
     """Validate a sealed N7 v4 local bundle; reject any incomplete producer contract."""
     expected_receipt = {
         "schema_version", "scenario", "run_id", "artifacts", "fault_window_arm", "fault_injection_arm",
@@ -1028,6 +1123,14 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
         "issuer_public_key_sha256", "replica_1_launch_argv_sha256",
         "physical_omission_causality_basis", "hard_timeout_seconds", "no_retry",
     }
+    prospective_contract = {
+        "anchor_source": "replica-1:fault.aggregate_omitted:first_for_context",
+        "duration_ns": 60_000_000_000,
+        "manager_coverage": "source_bound_successful_terminal_before_horizon",
+        "replica_coverage": "all_seven_through_horizon",
+    }
+    if require_fixed_horizon:
+        request_fields.add("prospective_fixed_horizon")
     if (not isinstance(request, Mapping) or set(request) != request_fields or
             request.get("schema_version") != 1 or
             request.get("kind") != "kauri-n7-local-execution-authorization-request-v1" or
@@ -1040,6 +1143,12 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
             request.get("replica_1_launch_argv_sha256") != bindings.get("replica_1_launch_argv_sha256") or
             request.get("physical_omission_causality_basis") != causal_basis or
             request.get("hard_timeout_seconds") != execution_plan.get("hard_timeout_seconds") or
+            (require_fixed_horizon and (
+                request.get("prospective_fixed_horizon") != prospective_contract or
+                execution_plan.get("prospective_fixed_horizon") != prospective_contract or
+                request.get("hard_timeout_seconds", 0) <= 90
+            )) or
+            (not require_fixed_horizon and "prospective_fixed_horizon" in request) or
             request.get("no_retry") is not True or
             hashlib.sha256(request_bytes).hexdigest() != preflight["approved_plan_request_sha256"]):
         raise ValidationError("authorization request does not bind the approved execution plan")
@@ -1252,6 +1361,59 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
         ):
             raise ValidationError("accepted timeout lacks the v4 causal chronology")
 
+    # The matched-control comparison is measured from an observed physical
+    # omission, never from gate publication.  Require every retained source
+    # to extend through one fixed RAW-time horizon before any metric is
+    # reported; this prevents a post-gate truncation from looking like a zero
+    # progress interval.
+    fixed_horizon = None
+    if require_fixed_horizon:
+        omission_anchor_ns = min(
+            event["source_monotonic_ns"] for event in first_drops.values())
+        fixed_horizon_end_ns = omission_anchor_ns + 60_000_000_000
+        terminal_fields = {
+            "cycle_ordinal", "policy_intent", "outcome", "reason",
+            "transition_artifact_id", "predecessor_epoch_number",
+            "predecessor_epoch_digest", "successor_epoch_number",
+            "successor_epoch_digest", "command_payload_digest",
+            "winning_activation", "controller_failure",
+            "evidence_window_activation_generation", "baseline_evidence_cutoff",
+            "current_evidence_cutoff",
+        }
+        successful_terminals = [
+            event for event in manager_events
+            if event.get("event_type") == "adaptive_v2_session_terminal" and
+            event.get("source_monotonic_ns", 0) <= fixed_horizon_end_ns and
+            isinstance(event.get("payload"), Mapping) and
+            set(event["payload"]) == terminal_fields and
+            event["payload"].get("outcome") == "advanced" and
+            event["payload"].get("reason") == "successor_converged" and
+            event["payload"].get("controller_failure") is None and
+            event["payload"].get("predecessor_epoch_number") == 0 and
+            event["payload"].get("predecessor_epoch_digest") == partial["epoch0_digest"] and
+            event["payload"].get("successor_epoch_number") == 1 and
+            event["payload"].get("successor_epoch_digest") == partial["e1_successor_epoch_digest"]
+        ]
+        if len(successful_terminals) != 1:
+            raise ValidationError("manager lacks a successful terminal record before fixed horizon")
+        if set(replica_streams) != set(expected_sources) or any(
+                not stream or stream[-1].get("source_monotonic_ns", 0) <
+                fixed_horizon_end_ns for stream in replica_streams.values()):
+            raise ValidationError("replica streams do not cover the fixed omission horizon")
+        common_commit_count, maximum_inter_commit_gap_ns = _prospective_fixed_horizon_commits(
+            replica_streams,
+            anchor_ns=omission_anchor_ns,
+            end_ns=fixed_horizon_end_ns,
+            predecessor_digest=partial["epoch0_digest"],
+            successor_digest=partial["e1_successor_epoch_digest"],
+        )
+        fixed_horizon = {
+            "anchor_monotonic_ns": omission_anchor_ns,
+            "horizon_end_monotonic_ns": fixed_horizon_end_ns,
+            "authoritative_common_commit_count": common_commit_count,
+            "maximum_inter_commit_gap_ns": maximum_inter_commit_gap_ns,
+        }
+
     issuer = _read_artifact(run_root, artifacts["issuer_public_key"], "issuer public key", _MAX_SMALL_BYTES)
     try:
         issuer_key = issuer.decode("ascii").strip()
@@ -1305,6 +1467,8 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
         "claim_boundary": "source-bound N7 v4 local-run evidence; external campaign replication remains required",
         "physical_omission_causality_basis": causal_basis,
         "e1_bundle_sha256": hashlib.sha256(wire).hexdigest(),
+        **({"fixed_horizon": fixed_horizon}
+           if fixed_horizon is not None else {}),
     }
 
 

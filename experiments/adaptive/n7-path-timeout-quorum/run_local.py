@@ -59,6 +59,12 @@ GATE_KIND = "kauri-n7-static-aggregate-omission-gate-v1"
 ARM_KIND = "kauri-focused-fault-window-arm-v4"
 PROFILE_ID = runner.SCENARIO
 PROFILE_SHA256 = adapter.PROFILE_V4_SHA256
+PROSPECTIVE_FIXED_HORIZON = {
+    "anchor_source": "replica-1:fault.aggregate_omitted:first_for_context",
+    "duration_ns": 60_000_000_000,
+    "manager_coverage": "source_bound_successful_terminal_before_horizon",
+    "replica_coverage": "all_seven_through_horizon",
+}
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z")
 
@@ -330,8 +336,11 @@ def prepare(
     *,
     hard_timeout_seconds: int = 300,
     e0_helper_invoke=None,
+    prospective_fixed_horizon: bool = False,
 ) -> dict[str, Any]:
     """Freeze exact launch inputs and emit an unsigned approval request only."""
+    if prospective_fixed_horizon and hard_timeout_seconds <= 90:
+        raise ProducerError("prospective horizon requires more than 60s plus startup/cleanup reserve")
     run_directory = run_directory.resolve()
     plan_path = _safe_child(run_directory, "local-launch-plan.json")
     try:
@@ -457,6 +466,8 @@ def prepare(
         "manager_command": list(final_manager),
         "replica_commands": [list(command) for command in final_replicas],
     }
+    if prospective_fixed_horizon:
+        execution_plan["prospective_fixed_horizon"] = PROSPECTIVE_FIXED_HORIZON
     execution_plan["plan_sha256"] = _execution_plan_digest(execution_plan)
     execution_plan_bytes = _canonical(execution_plan)
     execution_plan_sha256 = execution_plan["plan_sha256"]
@@ -478,6 +489,8 @@ def prepare(
         "hard_timeout_seconds": hard_timeout_seconds,
         "no_retry": True,
     }
+    if prospective_fixed_horizon:
+        request["prospective_fixed_horizon"] = PROSPECTIVE_FIXED_HORIZON
     request_bytes = _canonical(request)
     _write_exclusive(_safe_child(run_directory, AUTHORIZATION_REQUEST), request_bytes)
     return {
@@ -501,6 +514,7 @@ def prepare_inputs(
     client_port: int,
     manager_port: int,
     hard_timeout_seconds: int = 300,
+    prospective_fixed_horizon: bool = False,
     verify_repository=base.verify_repository_state,
     generate_identities=base.generate_identities,
     prepare_adapter=adapter.prepare_local_inputs,
@@ -573,9 +587,10 @@ def prepare_inputs(
             manager_binary=binaries["adaptation-manager"],
             e0_helper_binary=binaries["n7-epoch0-treefile-digest"],
         )
-        result = prepare_execution(
-            run_directory, hard_timeout_seconds=hard_timeout_seconds
-        )
+        execution_kwargs = {"hard_timeout_seconds": hard_timeout_seconds}
+        if prospective_fixed_horizon:
+            execution_kwargs["prospective_fixed_horizon"] = True
+        result = prepare_execution(run_directory, **execution_kwargs)
     except (OSError, base.RunnerError, adapter.AdapterError) as exc:
         raise ProducerError(f"prepare-inputs failed after preserving {run_directory}: {exc}") from exc
     return {
@@ -641,6 +656,11 @@ def finalize(run_directory: Path, authorization_path: Path) -> dict[str, Any]:
         "hard_timeout_seconds": plan.get("hard_timeout_seconds"),
         "no_retry": True,
     }
+    prospective_mode = plan.get("prospective_fixed_horizon")
+    if prospective_mode is not None:
+        if prospective_mode != PROSPECTIVE_FIXED_HORIZON:
+            raise ProducerError("prepared prospective horizon contract drifted")
+        expected_request["prospective_fixed_horizon"] = PROSPECTIVE_FIXED_HORIZON
     if (
         plan.get("state") != "PREPARED_EXTERNAL_APPROVAL_REQUIRED"
         or plan.get("plan_sha256") != _execution_plan_digest(plan)
@@ -944,12 +964,48 @@ def _cleanup_receipt(
     return receipt
 
 
+def _first_source_bound_physical_omission(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]], gate_sha256: str,
+) -> Mapping[str, Any] | None:
+    """Return the first retained replica-1 omission bound to this one-shot gate."""
+    candidates: list[Mapping[str, Any]] = []
+    expected_payload = {
+        "actor", "parent_replica", "epoch_number", "tree_id", "epoch_digest",
+        "block_hash", "gate_sha256", "first_for_context",
+    }
+    for event in streams.get("replica-1", ()):
+        if event.get("event_type") != "fault.aggregate_omitted":
+            continue
+        payload = event.get("payload")
+        if (not isinstance(payload, Mapping) or set(payload) != expected_payload or
+                payload.get("actor") != 1 or
+                payload.get("gate_sha256") != gate_sha256 or
+                payload.get("first_for_context") is not True or
+                type(event.get("source_monotonic_ns")) is not int):
+            continue
+        candidates.append(event)
+    return min(candidates, key=lambda item: item["source_monotonic_ns"]) if candidates else None
+
+
+def _streams_cover_fixed_horizon(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]], horizon_end_ns: int,
+) -> bool:
+    expected = {f"replica-{replica}" for replica in range(7)}
+    replicas = {source: events for source, events in streams.items() if source.startswith("replica-")}
+    return set(replicas) == expected and all(
+        events and isinstance(events[-1].get("source_monotonic_ns"), int) and
+        events[-1]["source_monotonic_ns"] >= horizon_end_ns
+        for events in replicas.values()
+    )
+
+
 def execute(
     run_directory: Path,
     authorization_path: Path,
     *,
     spawn=base.spawn_process,
     execution_enabled: bool = False,
+    prospective_fixed_horizon: bool = False,
 ) -> dict[str, Any]:
     """Run exactly one finalized local attempt and seal accepted or aborted evidence."""
     if execution_enabled is not True:
@@ -962,16 +1018,27 @@ def execute(
     )
     if plan.get("plan_sha256") != _execution_plan_digest(plan):
         raise ProducerError("execution plan semantic digest changed")
+    if prospective_fixed_horizon and plan.get("prospective_fixed_horizon") != PROSPECTIVE_FIXED_HORIZON:
+        raise ProducerError("prospective execution is not bound by the finalized plan")
+    if not prospective_fixed_horizon and "prospective_fixed_horizon" in plan:
+        raise ProducerError("prospective finalized plan requires explicit prospective execution mode")
     if plan.get("run_id") != plan.get("bindings", {}).get("run_id"):
         raise ProducerError("execution plan run ID differs from its command binding")
     archived_authorization, archived_authorization_bytes = _read_canonical_object(
         _safe_child(run_directory, APPROVED_AUTHORIZATION), "archived authorization"
+    )
+    execution_request, execution_request_bytes = _read_canonical_object(
+        _safe_child(run_directory, AUTHORIZATION_REQUEST), "execution authorization request"
     )
     supplied_authorization, supplied_authorization_bytes = _read_canonical_object(
         authorization_path.resolve(), "supplied authorization"
     )
     if supplied_authorization != archived_authorization or supplied_authorization_bytes != archived_authorization_bytes:
         raise ProducerError("supplied authorization differs from finalized archived approval")
+    if (archived_authorization.get("request_sha256") != _sha256(execution_request_bytes) or
+            execution_request.get("execution_plan_sha256") != plan.get("plan_sha256") or
+            execution_request.get("no_retry") is not True):
+        raise ProducerError("execution authorization request drifted before spawn")
     if archived_authorization.get("execution_plan_sha256") != plan["plan_sha256"]:
         raise ProducerError("authorization does not bind the final execution plan")
     finalization, _ = _read_canonical_object(
@@ -1246,6 +1313,38 @@ def execute(
             "six qualifying timeouts, signed E1 activation, and post-E1 common commit",
             allow_clean_manager_exit=allow_clean_manager_exit,
         )
+        if prospective_fixed_horizon:
+            gate_sha256 = base.sha256_file(gate_path)
+
+            def omission_probe():
+                return _first_source_bound_physical_omission(
+                    base._event_streams(run_directory), gate_sha256,
+                )
+
+            omission = _wait_for(
+                records, deadline, omission_probe,
+                "source-bound physical aggregate omission",
+                allow_clean_manager_exit=allow_clean_manager_exit,
+            )
+            horizon_end_ns = omission["source_monotonic_ns"] + 60_000_000_000
+            while _raw_clock_ns() < horizon_end_ns:
+                if time.monotonic() >= deadline:
+                    raise ProducerError("prospective fixed horizon exceeded hard timeout")
+                time.sleep(0.05)
+            coverage_streams = base._event_streams(run_directory)
+            try:
+                manager_terminal = base.manager_convergence_ready_event(
+                    coverage_streams.get("adaptive-manager", ()), transition_requests,
+                    required_completed=1,
+                )
+            except base.RunnerError as exc:
+                raise ProducerError("manager terminal record is not successful") from exc
+            if (manager_terminal is None or
+                    manager_terminal.get("source_monotonic_ns", 0) > horizon_end_ns):
+                raise ProducerError("manager lacks a successful terminal record before fixed horizon")
+            if not _streams_cover_fixed_horizon(
+                    coverage_streams, horizon_end_ns):
+                raise ProducerError("raw streams do not cover the prospective fixed horizon")
         cleanup_receipt = _cleanup_receipt(
             run_directory, run_id, records, declared_ports
         )
@@ -1300,7 +1399,12 @@ def execute(
         }
         raw_receipt_path = _safe_child(run_directory, "raw-bundle-receipt.json")
         _write_exclusive(raw_receipt_path, _canonical(raw_receipt))
-        verdict = validator.validate_raw_bundle(run_directory, raw_receipt)
+        verdict = (
+            validator.validate_raw_bundle(
+                run_directory, raw_receipt, require_fixed_horizon=True,
+            ) if prospective_fixed_horizon else
+            validator.validate_raw_bundle(run_directory, raw_receipt)
+        )
         _write_exclusive(
             _safe_child(run_directory, "raw-bundle-verdict.json"), _canonical(verdict)
         )
@@ -1373,9 +1477,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     inputs_parser.add_argument("--client-port", type=int, default=26100)
     inputs_parser.add_argument("--manager-port", type=int, default=27100)
     inputs_parser.add_argument("--hard-timeout-seconds", type=int, default=300)
+    inputs_parser.add_argument("--prospective-fixed-horizon", action="store_true")
     prepare_parser = subparsers.add_parser("prepare")
     prepare_parser.add_argument("--run-root", type=Path, required=True)
     prepare_parser.add_argument("--hard-timeout-seconds", type=int, default=300)
+    prepare_parser.add_argument("--prospective-fixed-horizon", action="store_true")
     finalize_parser = subparsers.add_parser("finalize")
     finalize_parser.add_argument("--run-root", type=Path, required=True)
     finalize_parser.add_argument("--authorization", type=Path, required=True)
@@ -1383,33 +1489,39 @@ def main(argv: Sequence[str] | None = None) -> int:
     execute_parser.add_argument("--run-root", type=Path, required=True)
     execute_parser.add_argument("--authorization", type=Path, required=True)
     execute_parser.add_argument("--enable-reviewed-execution", action="store_true")
+    execute_parser.add_argument("--prospective-fixed-horizon", action="store_true")
     args = parser.parse_args(argv)
     try:
         if args.phase == "prepare-inputs":
+            prepare_inputs_kwargs = {
+                "app_binary": args.app_binary,
+                "manager_binary": args.manager_binary,
+                "keygen_binary": args.keygen_binary,
+                "tls_keygen_binary": args.tls_keygen_binary,
+                "e0_helper_binary": args.e0_helper_binary,
+                "peer_port": args.peer_port,
+                "client_port": args.client_port,
+                "manager_port": args.manager_port,
+                "hard_timeout_seconds": args.hard_timeout_seconds,
+            }
+            if args.prospective_fixed_horizon:
+                prepare_inputs_kwargs["prospective_fixed_horizon"] = True
             result = prepare_inputs(
                 args.run_root,
-                app_binary=args.app_binary,
-                manager_binary=args.manager_binary,
-                keygen_binary=args.keygen_binary,
-                tls_keygen_binary=args.tls_keygen_binary,
-                e0_helper_binary=args.e0_helper_binary,
-                peer_port=args.peer_port,
-                client_port=args.client_port,
-                manager_port=args.manager_port,
-                hard_timeout_seconds=args.hard_timeout_seconds,
+                **prepare_inputs_kwargs,
             )
         elif args.phase == "prepare":
-            result = prepare(
-                args.run_root, hard_timeout_seconds=args.hard_timeout_seconds
-            )
+            prepare_kwargs = {"hard_timeout_seconds": args.hard_timeout_seconds}
+            if args.prospective_fixed_horizon:
+                prepare_kwargs["prospective_fixed_horizon"] = True
+            result = prepare(args.run_root, **prepare_kwargs)
         elif args.phase == "finalize":
             result = finalize(args.run_root, args.authorization)
         else:
-            result = execute(
-                args.run_root,
-                args.authorization,
-                execution_enabled=args.enable_reviewed_execution,
-            )
+            execute_kwargs = {"execution_enabled": args.enable_reviewed_execution}
+            if args.prospective_fixed_horizon:
+                execute_kwargs["prospective_fixed_horizon"] = True
+            result = execute(args.run_root, args.authorization, **execute_kwargs)
     except (OSError, KeyError, IndexError, TypeError, ProducerError, adapter.AdapterError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

@@ -1133,3 +1133,293 @@ def test_raw_bundle_validator_accepts_native_signed_n7_bundle_and_rejects_bound_
 
 def _replica_event(sequence: int, time_ns: int, event_type: str, payload: object) -> dict:
     return {"event_schema_version": 1, "run_id": "run-1", "source_kind": "replica", "source_id": "replica-1", "source_instance": "replica-instance-1", "source_sequence": sequence, "source_monotonic_ns": time_ns, "event_type": event_type, "payload": payload}
+
+
+_W19_HORIZON = {
+    "anchor_source": "replica-1:fault.aggregate_omitted:first_for_context",
+    "duration_ns": 60_000_000_000,
+    "manager_coverage": "source_bound_successful_terminal_before_horizon",
+    "replica_coverage": "all_seven_through_horizon",
+}
+
+
+def _canonical_json(value: object) -> bytes:
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+
+
+def _w19_terminal(decoded: object) -> dict:
+    return {
+        "cycle_ordinal": 0,
+        "policy_intent": "fault_containment",
+        "outcome": "advanced",
+        "reason": "successor_converged",
+        "transition_artifact_id": "n7-e1",
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": "a" * 64,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": decoded.epoch_digest,
+        "command_payload_digest": decoded.command.payload_digest,
+        "winning_activation": {
+            "predecessor_epoch_number": 0,
+            "predecessor_epoch_digest": "a" * 64,
+            "successor_epoch_number": 1,
+            "successor_epoch_digest": decoded.epoch_digest,
+            "command_payload_digest": decoded.command.payload_digest,
+            "command_block_height": 10,
+            "command_block_hash": "d" * 64,
+            "activation_delay_blocks": 2,
+            "activation_height": 12,
+        },
+        "controller_failure": None,
+        "evidence_window_activation_generation": 1,
+        "baseline_evidence_cutoff": 1,
+        "current_evidence_cutoff": 6,
+    }
+
+
+def _write_w19_prospective_raw_bundle(tmp_path: Path) -> dict:
+    """Create a native-shaped no-launch W19 receipt with an omission+60s tail."""
+    wire, decoded, issuer = _signed_n7_bundle("a" * 64)
+    preflight = runner.preflight("a" * 64)
+    issuer_bytes = (issuer + "\n").encode()
+    preflight["approved_issuer_public_key_sha256"] = hashlib.sha256(issuer_bytes).hexdigest()
+    tree_bytes = Path(preflight["tree_file"]["path"]).read_bytes()
+    tree_sha = hashlib.sha256(tree_bytes).hexdigest()
+    plan = {
+        "scenario": runner.SCENARIO, "run_id": "run-1",
+        "state": "PREPARED_EXTERNAL_APPROVAL_REQUIRED",
+        "profile_sha256": validator.PROFILE_V4_SHA256,
+        "base_plan_sha256": "b" * 64, "repository_revision": "c" * 40,
+        "final_launch_arguments_sha256": "d" * 64,
+        "issuer_public_key_sha256": "e" * 64, "hard_timeout_seconds": 300,
+        "physical_omission_causality_basis": runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        "prospective_fixed_horizon": deepcopy(_W19_HORIZON), "no_retry": True,
+        "bindings": {
+            "run_id": "run-1", "manager_source_instance": "manager-1",
+            "epoch_digest": "a" * 64, "tree_file_sha256": tree_sha,
+            "topology_proof_sha256": tree_sha, "transition_request_sha256": "e" * 64,
+            "replica_1_launch_argv_sha256": "f" * 64,
+            "replica_1_launch_argv_sha256_domain": "kauri-n7-replica-argv-without-self-hash-v1",
+        },
+    }
+    plan["plan_sha256"] = hashlib.sha256(
+        json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    request = {
+        "schema_version": 1, "kind": "kauri-n7-local-execution-authorization-request-v1",
+        "scenario": runner.SCENARIO, "execution_plan_sha256": plan["plan_sha256"],
+        "base_plan_sha256": plan["base_plan_sha256"],
+        "repository_revision": plan["repository_revision"],
+        "final_launch_arguments_sha256": plan["final_launch_arguments_sha256"],
+        "issuer_public_key_sha256": plan["issuer_public_key_sha256"],
+        "replica_1_launch_argv_sha256": plan["bindings"]["replica_1_launch_argv_sha256"],
+        "physical_omission_causality_basis": runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        "hard_timeout_seconds": 300, "prospective_fixed_horizon": deepcopy(_W19_HORIZON),
+        "no_retry": True,
+    }
+    plan_bytes, request_bytes = _canonical_json(plan), _canonical_json(request)
+    request_sha = hashlib.sha256(request_bytes).hexdigest()
+    authorization = {
+        "schema_version": 1, "kind": "kauri-n7-local-execution-authorization-v1",
+        "request_sha256": request_sha, "execution_plan_sha256": plan["plan_sha256"],
+        "approval_reference": "synthetic-w19-no-launch", "approved_utc": "2026-09-29T00:00:00Z",
+        "no_retry": True,
+    }
+    authorization_bytes = _canonical_json(authorization)
+    preflight["approved_plan_request_sha256"] = request_sha
+    preflight["approved_plan_authorization_sha256"] = hashlib.sha256(authorization_bytes).hexdigest()
+    preflight["tree_file"] = {**preflight["tree_file"], "path": "/missing/relocated-epoch0.tree"}
+    arm_file = dict(_arm()["payload"])
+    arm_file.pop("fault_window_arm_sha256")
+    arm_file.update({"profile_sha256": plan["profile_sha256"], "topology_proof_sha256": tree_sha,
+                     "request_sha256": plan["bindings"]["transition_request_sha256"],
+                     "fault_receipt_sha256": hashlib.sha256(authorization_bytes).hexdigest()})
+    arm_file_bytes = _canonical_json(arm_file)
+    arm_event = _arm()
+    arm_event["payload"] = {**arm_file, "fault_window_arm_sha256": hashlib.sha256(arm_file_bytes).hexdigest()}
+    manager = _manager_events(arm_event)
+    manager.append({
+        "event_schema_version": 1, "run_id": "run-1", "source_kind": "adaptation_manager",
+        "source_id": "adaptive-manager", "source_instance": "manager-1", "source_sequence": 10,
+        "source_monotonic_ns": 2_000_010, "event_type": "adaptive_v2_session_terminal",
+        "payload": _w19_terminal(decoded),
+    })
+    manager_bytes = b"".join(_canonical_json(event) for event in manager)
+    arm_sha = hashlib.sha256(manager_bytes.splitlines()[0]).hexdigest()
+    gate_file = {
+        "schema_version": 1, "kind": "kauri-n7-static-aggregate-omission-gate-v1",
+        "profile_sha256": plan["profile_sha256"], "tree_file_sha256": tree_sha,
+        "epoch_digest": "a" * 64, "replica_id": 1,
+        "launch_argv_sha256": plan["bindings"]["replica_1_launch_argv_sha256"],
+        "manager_run_id": "run-1", "manager_source_instance": "manager-1",
+        "manager_source_sequence": 1, "fault_window_arm_event_sha256": arm_sha,
+        "activation_monotonic_ns": 120,
+    }
+    gate_file_bytes = json.dumps(gate_file, separators=(",", ":")).encode() + b"\n"
+    gate_sha = hashlib.sha256(gate_file_bytes).hexdigest()
+    streams = _replica_streams()
+    command = streams["replica-0"][1]["payload"]
+    for event_list in streams.values():
+        event_list[1]["payload"] = {**command, "payload_digest": decoded.command.payload_digest,
+                                      "successor_epoch_digest": decoded.epoch_digest}
+        event_list[2]["payload"]["epoch_digest"] = decoded.epoch_digest
+    streams["replica-0"][3]["payload"]["decision_proof"]["epoch_digest"] = decoded.epoch_digest
+    injection_payload = {"actor": 1, "gate_sha256": gate_sha,
+                         "manager_fault_window_arm_event_sha256": arm_sha,
+                         "profile_sha256": plan["profile_sha256"], "tree_file_sha256": tree_sha,
+                         "launch_argv_sha256": plan["bindings"]["replica_1_launch_argv_sha256"],
+                         "activation_monotonic_ns": 120}
+    replica_one_tail = streams["replica-1"][1:]
+    for sequence, event in enumerate(replica_one_tail, 9):
+        event["source_sequence"], event["source_monotonic_ns"] = sequence, 600 + sequence
+    streams["replica-1"] = [streams["replica-1"][0], _replica_event(2, 250, "fault.injection_armed", injection_payload)]
+    for sequence, event in enumerate(_six_events(), 3):
+        observation = event["payload"]["observation"]
+        streams["replica-1"].append(_replica_event(sequence, 350 + sequence, "fault.aggregate_omitted", {
+            "actor": 1, "parent_replica": observation["configuration"]["tree_id"], "epoch_number": 0,
+            "tree_id": observation["configuration"]["tree_id"], "epoch_digest": "a" * 64,
+            "block_hash": observation["block_hash"], "gate_sha256": gate_sha, "first_for_context": True}))
+    streams["replica-1"].extend(replica_one_tail)
+    horizon_end = 60_000_000_353
+    successor_hash = "2" * 64
+    for replica, events in enumerate(streams.values()):
+        last = events[-1]
+        if replica == 0:
+            designated_witness = deepcopy(last)
+            designated_witness.update({"source_sequence": last["source_sequence"] + 1,
+                                       "source_monotonic_ns": last["source_monotonic_ns"] + 1,
+                                       "event_type": "block.commit_observed"})
+            designated_witness["payload"] = {
+                "block_height": 13, "block_hash": "1" * 64, "parent_hash": None,
+                "transaction_count": 1, "commit_batch_index": 0,
+            }
+            events.append(designated_witness)
+            last = designated_witness
+            committed = deepcopy(events[-2])
+            committed.update({"source_sequence": last["source_sequence"] + 1,
+                              "source_monotonic_ns": horizon_end - 1, "event_type": "block.committed"})
+            committed["payload"].update({"block_height": 14, "block_hash": successor_hash,
+                                         "parent_hash": "1" * 64})
+            committed["payload"]["decision_proof"].update({"epoch_digest": decoded.epoch_digest,
+                                                               "block_hash": successor_hash})
+            events.append(committed)
+            last = committed
+        observed = deepcopy(events[-1] if replica else events[-2])
+        observed.update({"source_sequence": last["source_sequence"] + 1,
+                         "source_monotonic_ns": horizon_end, "event_type": "block.commit_observed"})
+        observed["payload"] = {"block_height": 14, "block_hash": successor_hash, "parent_hash": "1" * 64,
+                               "transaction_count": 1, "commit_batch_index": 0}
+        events.append(observed)
+    payloads = {
+        "preflight.json": json.dumps(preflight, sort_keys=True).encode(), "inputs/epoch0.tree": tree_bytes,
+        "runtime/n7-local-execution-plan.json": plan_bytes, "authorization.json": authorization_bytes,
+        "runtime/execution-authorization-request.json": request_bytes,
+        "runtime/fault-window-arm.json": arm_file_bytes, "runtime/static-omission-gate.json": gate_file_bytes,
+        "manager.jsonl": manager_bytes, "bundle.bin": wire, "issuer.txt": issuer_bytes,
+        "cleanup.json": json.dumps({"schema_version": 1, "run_id": "run-1", "complete": True, "processes": [
+            {"source_id": source, "pid": index + 1, "pgid": index + 1, "returncode": 0, "termination": "clean-exit"}
+            for index, source in enumerate(["adaptive-manager", *[f"replica-{i}" for i in range(7)]])]}).encode(),
+    }
+    for source, events in streams.items():
+        payloads[f"{source}.jsonl"] = b"".join(_canonical_json(event) for event in events)
+    for name, value in payloads.items():
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(value)
+    receipt = {"schema_version": 1, "scenario": runner.SCENARIO, "run_id": "run-1", "artifacts": {
+        "preflight": _artifact("preflight.json", payloads["preflight.json"]),
+        "epoch0_tree": _artifact("inputs/epoch0.tree", tree_bytes),
+        "execution_plan": _artifact("runtime/n7-local-execution-plan.json", plan_bytes),
+        "authorization_request": _artifact("runtime/execution-authorization-request.json", request_bytes),
+        "plan_authorization": _artifact("authorization.json", authorization_bytes),
+        "fault_window_arm": _artifact("runtime/fault-window-arm.json", arm_file_bytes),
+        "omission_gate": _artifact("runtime/static-omission-gate.json", gate_file_bytes),
+        "manager_events": _artifact("manager.jsonl", manager_bytes),
+        "replica_streams": {f"replica-{i}": _artifact(f"replica-{i}.jsonl", payloads[f"replica-{i}.jsonl"]) for i in range(7)},
+        "e1_bundle": _artifact("bundle.bin", wire), "issuer_public_key": _artifact("issuer.txt", issuer_bytes),
+        "cleanup": _artifact("cleanup.json", payloads["cleanup.json"]),
+    }, "fault_window_arm": {"source_sequence": 1, "line_sha256": arm_sha, "clock_domain": "host-raw"},
+        "fault_injection_arm": {"source_sequence": 2,
+                                  "line_sha256": hashlib.sha256(payloads["replica-1.jsonl"].splitlines()[1]).hexdigest(),
+                                  "clock_domain": "host-raw"}}
+    return {"receipt": receipt, "plan": plan, "request": request, "authorization": authorization,
+            "preflight": preflight, "decoded": decoded}
+
+
+def _w19_reseal_contract(bundle: dict, tmp_path: Path) -> None:
+    """Rehash the full prospective approval chain after an intentional mutation."""
+    plan, request, authorization, preflight = (bundle[key] for key in ("plan", "request", "authorization", "preflight"))
+    plan["plan_sha256"] = hashlib.sha256(json.dumps(
+        {key: value for key, value in plan.items() if key != "plan_sha256"}, sort_keys=True, separators=(",", ":")
+    ).encode()).hexdigest()
+    request["execution_plan_sha256"] = plan["plan_sha256"]
+    plan_bytes, request_bytes = _canonical_json(plan), _canonical_json(request)
+    authorization["request_sha256"] = hashlib.sha256(request_bytes).hexdigest()
+    authorization["execution_plan_sha256"] = plan["plan_sha256"]
+    authorization_bytes = _canonical_json(authorization)
+    preflight["approved_plan_request_sha256"] = authorization["request_sha256"]
+    preflight["approved_plan_authorization_sha256"] = hashlib.sha256(authorization_bytes).hexdigest()
+    preflight_bytes = json.dumps(preflight, sort_keys=True).encode()
+    updates = {
+        "runtime/n7-local-execution-plan.json": plan_bytes,
+        "runtime/execution-authorization-request.json": request_bytes,
+        "authorization.json": authorization_bytes,
+        "preflight.json": preflight_bytes,
+    }
+    artifact_names = {"runtime/n7-local-execution-plan.json": "execution_plan",
+                      "runtime/execution-authorization-request.json": "authorization_request",
+                      "authorization.json": "plan_authorization", "preflight.json": "preflight"}
+    for path, value in updates.items():
+        (tmp_path / path).write_bytes(value)
+        bundle["receipt"]["artifacts"][artifact_names[path]] = _artifact(path, value)
+
+
+def test_w19_prospective_raw_bundle_requires_exact_horizon_contract_and_terminal(tmp_path: Path):
+    bundle = _write_w19_prospective_raw_bundle(tmp_path)
+    verdict = validator.validate_raw_bundle(tmp_path, bundle["receipt"], require_fixed_horizon=True)
+    assert verdict["verdict"] == "RAW_BUNDLE_VALIDATED"
+    assert verdict["fixed_horizon"] == {
+        "anchor_monotonic_ns": 353, "horizon_end_monotonic_ns": 60_000_000_353,
+        "authoritative_common_commit_count": 2, "maximum_inter_commit_gap_ns": 59_999_999_748,
+    }
+    assert bundle["preflight"]["approved_plan_request_sha256"] == hashlib.sha256(
+        (tmp_path / "runtime/execution-authorization-request.json").read_bytes()).hexdigest()
+    assert bundle["preflight"]["approved_plan_authorization_sha256"] == hashlib.sha256(
+        (tmp_path / "authorization.json").read_bytes()).hexdigest()
+
+    for mutation, error in (("changed", "authorization request"), ("missing", "authorization request"),
+                            ("extra", "authorization request")):
+        case = _write_w19_prospective_raw_bundle(tmp_path / mutation)
+        contract = case["request"]
+        if mutation == "changed":
+            contract["prospective_fixed_horizon"]["duration_ns"] = 59_000_000_000
+            case["plan"]["prospective_fixed_horizon"]["duration_ns"] = 59_000_000_000
+        elif mutation == "missing":
+            del contract["prospective_fixed_horizon"]
+        else:
+            contract["unexpected"] = True
+        _w19_reseal_contract(case, tmp_path / mutation)
+        with pytest.raises(validator.ValidationError, match=error):
+            validator.validate_raw_bundle(tmp_path / mutation, case["receipt"], require_fixed_horizon=True)
+
+    for mutation in ("failed", "late", "duplicate"):
+        case_root = tmp_path / mutation
+        case = _write_w19_prospective_raw_bundle(case_root)
+        lines = [json.loads(line) for line in (case_root / "manager.jsonl").read_bytes().splitlines()]
+        terminal = lines[-1]
+        if mutation == "failed":
+            terminal["payload"]["outcome"] = "failed"
+            terminal["payload"]["reason"] = "controller_unhealthy"
+            terminal["payload"]["controller_failure"] = {"stage": "selection", "selection_status": None, "epoch_factory_status": None}
+        elif mutation == "late":
+            terminal["source_monotonic_ns"] = 60_000_000_354
+        else:
+            duplicate = deepcopy(terminal)
+            duplicate["source_sequence"] += 1
+            duplicate["source_monotonic_ns"] += 1
+            lines.append(duplicate)
+        manager_bytes = b"".join(_canonical_json(event) for event in lines)
+        (case_root / "manager.jsonl").write_bytes(manager_bytes)
+        case["receipt"]["artifacts"]["manager_events"] = _artifact("manager.jsonl", manager_bytes)
+        with pytest.raises(validator.ValidationError, match="successful terminal record before fixed horizon"):
+            validator.validate_raw_bundle(case_root, case["receipt"], require_fixed_horizon=True)
