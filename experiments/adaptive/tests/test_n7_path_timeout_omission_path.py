@@ -539,7 +539,7 @@ def test_partial_raw_validator_rejects_same_or_higher_inflight_predecessor(heigh
         )
 
 
-def test_partial_raw_validator_rejects_later_same_height_inflight_predecessor():
+def test_partial_raw_validator_rejects_repeated_local_designated_height():
     streams = _with_inflight_predecessor_commit(_replica_streams())
     later = deepcopy(streams["replica-0"][-2])
     later["source_sequence"] = 6
@@ -547,7 +547,38 @@ def test_partial_raw_validator_rejects_later_same_height_inflight_predecessor():
     later["payload"]["block_height"] = 13
     streams["replica-0"].append(later)
 
-    with pytest.raises(validator.ValidationError, match="does not precede"):
+    with pytest.raises(validator.ValidationError, match="not strictly increasing per source"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+def test_partial_raw_validator_rejects_conflicting_lower_e0_commits_at_h11():
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+    first = deepcopy(streams["replica-0"][-2])
+    first["source_sequence"] = 4
+    first["source_monotonic_ns"] = 604
+    first["payload"]["block_height"] = 11
+    first["payload"]["block_hash"] = "c" * 64
+    first["payload"]["decision_proof"]["block_hash"] = "c" * 64
+    streams["replica-0"].insert(-2, first)
+    streams["replica-0"][-2]["source_sequence"] = 5
+    streams["replica-0"][-2]["source_monotonic_ns"] = 605
+    streams["replica-0"][-1]["source_sequence"] = 6
+    streams["replica-0"][-1]["source_monotonic_ns"] = 606
+
+    conflicting = deepcopy(first)
+    conflicting["source_sequence"] = 4
+    conflicting["source_monotonic_ns"] = 604
+    conflicting["source_id"] = "replica-1"
+    conflicting["source_instance"] = "replica-instance-1"
+    conflicting["payload"]["block_hash"] = "d" * 64
+    conflicting["payload"]["decision_proof"]["block_hash"] = "d" * 64
+    streams["replica-1"][-1]["source_sequence"] = 5
+    streams["replica-1"][-1]["source_monotonic_ns"] = 605
+    streams["replica-1"].insert(-1, conflicting)
+
+    with pytest.raises(validator.ValidationError, match="conflict at one post-activation height"):
         validator.validate_known_raw_events(
             runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
         )

@@ -480,8 +480,16 @@ def _common_commit_after_activation(
     def validate_all_designated_commits(
         successor_height: int, successor_hash: str, successor_parent_hash: object,
     ) -> None:
-        """Bound every post-activation designated E0 commit below the E1 result."""
+        """Audit the complete post-activation designated commit chain.
+
+        An in-flight E0 commit is permitted after activation, but it must still
+        be one coherent chain.  In particular, accepting the later common E1
+        commit must not hide an earlier same-height conflict or a broken local
+        E0 parent link.
+        """
+        commits_by_height: dict[int, tuple[object, ...]] = {}
         for replica_id in runner.REPLICA_IDS:
+            previous_local_height: int | None = None
             for event in streams[f"replica-{replica_id}"]:
                 if (event["event_type"] != "block.committed" or
                         not is_after_activation(event, replica_id)):
@@ -496,6 +504,11 @@ def _common_commit_after_activation(
                 parent_hash = payload["parent_hash"]
                 if parent_hash is not None:
                     _hex64(parent_hash, "committed parent hash", nonzero=True)
+                if (type(payload["transaction_count"]) is not int or
+                        payload["transaction_count"] < 0 or
+                        type(payload["commit_batch_index"]) is not int or
+                        payload["commit_batch_index"] < 0):
+                    raise ValidationError("designated commit counters are invalid")
                 proof = payload["decision_proof"]
                 if not isinstance(proof, Mapping) or set(proof) != _DECISION_PROOF_FIELDS:
                     raise ValidationError("committed decision proof has schema drift")
@@ -511,6 +524,21 @@ def _common_commit_after_activation(
                 )
                 if not is_successor and not is_predecessor:
                     raise ValidationError("authoritative E1 commit has the wrong decision proof")
+                metadata = (
+                    block_hash,
+                    parent_hash,
+                    payload["transaction_count"],
+                    payload["commit_batch_index"],
+                    proof["epoch_number"],
+                    proof["tree_id"],
+                    proof["epoch_digest"],
+                )
+                if previous_local_height is not None and height <= previous_local_height:
+                    raise ValidationError("designated commit heights are not strictly increasing per source")
+                previous_local_height = height
+                prior = commits_by_height.setdefault(height, metadata)
+                if prior != metadata:
+                    raise ValidationError("designated commits conflict at one post-activation height")
                 if is_predecessor:
                     if height >= successor_height:
                         raise ValidationError("in-flight E0 commit does not precede the common E1 commit")
@@ -518,6 +546,17 @@ def _common_commit_after_activation(
                         raise ValidationError("contiguous in-flight E0 commit does not bind the common E1 parent")
                 elif height == successor_height and block_hash != successor_hash:
                     raise ValidationError("designated E1 commit conflicts with the common E1 result")
+        previous_height: int | None = None
+        previous_metadata: tuple[object, ...] | None = None
+        for height in sorted(commits_by_height):
+            metadata = commits_by_height[height]
+            if previous_height is not None and height == previous_height + 1:
+                # metadata[1] is the child parent hash and previous_metadata[0]
+                # is the immediately preceding designated block hash.
+                assert previous_metadata is not None
+                if metadata[1] != previous_metadata[0]:
+                    raise ValidationError("adjacent designated commits have a broken parent link")
+            previous_height, previous_metadata = height, metadata
 
     def validate_all_peer_observations(
         successor_height: int,
