@@ -5452,16 +5452,23 @@ private:
             policy.intent = TreePolicyKind::fault_containment;
             policy.apply_shape_selection = false;
             const auto &trees = session_.ingress().current_epoch().trees();
-            if (trees.size() != options_.runtime_shape.tree_shape.tree_count)
+            const auto placement_tree_count =
+                options_.runtime_shape.tree_shape.tree_count;
+            if (trees.size() < placement_tree_count)
                 return false;
             for (const auto &tree : trees)
             {
+                if (tree.tree_id >= placement_tree_count)
+                    continue;
                 if (tree.members_breadth_first.empty())
                     return false;
                 policy.containment_baseline_roots.push_back(
                     hotstuff::BaselineRoot{tree.tree_id,
                                              tree.members_breadth_first.front()});
             }
+            if (policy.containment_baseline_roots.size() !=
+                placement_tree_count)
+                return false;
             std::sort(policy.containment_baseline_roots.begin(),
                       policy.containment_baseline_roots.end(),
                       [](const auto &left, const auto &right) {

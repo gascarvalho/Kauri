@@ -2074,6 +2074,17 @@ TEST_CASE(
     const auto raw_manager = source("examples/adaptation_manager.cpp");
     const auto manager = code_without_comments_or_literals(raw_manager);
 
+    const auto start = function_body(
+        manager, "bool begin_fixed_e0_control_cycle()");
+    REQUIRE_FALSE(start.empty());
+    CHECK(contains_in_order(
+        start,
+        {"trees.size() < placement_tree_count",
+         "tree.tree_id >= placement_tree_count",
+         "policy.containment_baseline_roots.size() !=",
+         "placement_tree_count",
+         "session_.begin_cycle(policy)"}));
+
     const auto consume = function_body(manager, "bool try_arm_fault_window()");
     REQUIRE_FALSE(consume.empty());
     CHECK(contains_in_order(
