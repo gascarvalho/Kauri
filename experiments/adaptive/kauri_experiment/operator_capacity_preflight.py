@@ -3,12 +3,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 from typing import Mapping
 
 
 KIND = "kauri-n31-operator-capacity-preflight-request-v1"
+TOOL_IDENTITY_DOCUMENT_KIND = "kauri-n31-operator-capacity-tool-identity-document-v1"
+TOOL_IDENTITY_DOCUMENT_VERDICT = "UNVERIFIED_TOOL_IDENTITY_DOCUMENT"
+_NATIVE_ARM_BY_PRELAUNCH_ARM = {
+    "treatment": "fast_priority_treatment",
+    "sham": "exact_copy_sham",
+}
 SLOW_REPLICA_IDS = tuple(range(6))
 FAST_REPLICA_IDS = tuple(range(6, 31))
 QUOTA_CONTRACT_ID = "n31-static-resource-cpu-sham-quota-v1"
@@ -55,14 +63,36 @@ def _reject_duplicate_fields(pairs: list[tuple[str, object]]) -> dict[str, objec
     return result
 
 
-def _validate_quota_profile(path: Path) -> str:
+def _strict_json_file(path: Path, maximum_bytes: int, *, label: str) -> tuple[dict[str, object], str]:
+    """Read a bounded, non-symlink JSON object and retain its exact-byte hash."""
+    return _strict_json_bytes(_read_regular(path, maximum_bytes), label=label)
+
+
+def _strict_json_bytes(payload: bytes, *, label: str) -> tuple[dict[str, object], str]:
+    """Parse an already descriptor-bound JSON byte string exactly once."""
     try:
-        if path.is_symlink() or not path.is_file():
-            raise PreflightError(f"not a regular file: {path}")
-        with path.open("rb") as source:
-            payload = source.read(64 * 1024 + 1)
-        if len(payload) > 64 * 1024:
-            raise PreflightError(f"input exceeds byte limit: {path}")
+        parsed = json.loads(
+            payload.decode("ascii"), object_pairs_hook=_reject_duplicate_fields,
+        )
+    except PreflightError:
+        raise
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise PreflightError(f"{label} is not strict ASCII JSON") from error
+    if not isinstance(parsed, dict):
+        raise PreflightError(f"{label} must be a JSON object")
+    return parsed, hashlib.sha256(payload).hexdigest()
+
+
+def _hex_digest(value: object, *, label: str) -> str:
+    if not isinstance(value, str) or len(value) != 64 or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise PreflightError(f"{label} is malformed")
+    return value
+
+
+def _validate_quota_profile_bytes(payload: bytes) -> str:
+    try:
         parsed = json.loads(payload.decode("ascii"), object_pairs_hook=_reject_duplicate_fields)
     except PreflightError:
         raise
@@ -75,30 +105,61 @@ def _validate_quota_profile(path: Path) -> str:
     ).hexdigest()
 
 
+def _unverified_binary_identity_document(
+    path: Path, *, binary_names: set[str],
+) -> tuple[dict[str, str], str, str]:
+    """Read caller-supplied tool provenance; it is never an authorization."""
+    document, document_sha256 = _strict_json_file(
+        path, 64 * 1024, label="tool identity document",
+    )
+    if (document.get("schema_version") != 1 or
+            document.get("kind") != TOOL_IDENTITY_DOCUMENT_KIND or
+            document.get("verdict") != TOOL_IDENTITY_DOCUMENT_VERDICT):
+        raise PreflightError("tool identity document is malformed")
+    approval_ref = document.get("approval_ref")
+    if not isinstance(approval_ref, str) or not approval_ref or len(approval_ref) > 256:
+        raise PreflightError("tool identity document reference is malformed")
+    identities = document.get("binary_sha256")
+    if not isinstance(identities, dict) or set(identities) != binary_names:
+        raise PreflightError("tool identity document set is incomplete")
+    return {
+        name: _hex_digest(value, label=f"tool identity document digest {name}")
+        for name, value in identities.items()
+    }, document_sha256, approval_ref
+
+
 def _sha256(path: Path, maximum_bytes: int) -> str:
-    if maximum_bytes <= 0 or path.is_symlink() or not path.is_file():
-        raise PreflightError(f"not a regular file: {path}")
-    if path.stat().st_size > maximum_bytes:
-        raise PreflightError(f"input exceeds byte limit: {path}")
-    with path.open("rb") as source:
-        payload = source.read(maximum_bytes + 1)
-    if len(payload) > maximum_bytes:
-        raise PreflightError(f"input exceeds byte limit: {path}")
-    return hashlib.sha256(payload).hexdigest()
+    return hashlib.sha256(_read_regular(path, maximum_bytes)).hexdigest()
 
 
-def _native_digest(binary: Path, *arguments: str) -> str:
-    if binary.is_symlink() or not binary.is_file():
-        raise PreflightError(f"native helper unavailable: {binary}")
+def _read_regular(path: Path, maximum_bytes: int) -> bytes:
+    """Read one bounded regular file through a single no-follow descriptor."""
+    if maximum_bytes <= 0:
+        raise PreflightError(f"input exceeds byte limit: {path}")
     try:
-        completed = subprocess.run((str(binary), *arguments), text=True,
-                                   capture_output=True, timeout=10, check=False)
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise PreflightError(f"native helper unavailable: {binary}") from error
-    value = completed.stdout.strip()
-    if completed.returncode != 0 or len(value) != 64 or any(c not in "0123456789abcdef" for c in value):
-        raise PreflightError(f"native helper rejected input: {binary.name}")
-    return value
+        descriptor = os.open(
+            path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        raise PreflightError(f"not a regular file: {path}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise PreflightError(f"not a regular file: {path}")
+        if metadata.st_size < 0 or metadata.st_size > maximum_bytes:
+            raise PreflightError(f"input exceeds byte limit: {path}")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                raise PreflightError(f"input changed during read: {path}")
+            chunks.append(chunk); remaining -= len(chunk)
+        if os.read(descriptor, 1):
+            raise PreflightError(f"input changed during read: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
 
 
 def _repository_state(repository: Path) -> tuple[str, str]:
@@ -127,71 +188,87 @@ def _repository_state(repository: Path) -> tuple[str, str]:
 
 
 def canonical_request(
-    *, repository: Path, snapshot_wire: Path, capacity_digest_binary: Path,
+    *, repository: Path, capacity_snapshot_wire: Path,
+    stage_a_envelope_wire: Path, capacity_digest_binary: Path,
     epoch0_digest_binary: Path, epoch0_arm: str, epoch0_tree_file: Path,
     arm: str, quota_profile: Path, output_root: Path,
-    issuer_public_key_fingerprint: str, binaries: Mapping[str, Path],
+    issuer_id: int, issuer_reference: str,
+    issuer_public_key_fingerprint: str, approved_capacity_digest: str,
+    issuer_public_key_hex: str, epoch0_topology_digest: str,
+    native_envelope_verifier_binary: Path, native_envelope_receipt_output: Path,
+    tool_identity_document: Path | None,
+    binaries: Mapping[str, Path],
 ) -> dict[str, object]:
     """Derive a request only; it never creates an approval or execution root."""
     if arm not in {"treatment", "sham"}:
         raise PreflightError("arm is not predeclared")
+    native_arm = _NATIVE_ARM_BY_PRELAUNCH_ARM[arm]
     if epoch0_arm != "slow-roots":
         raise PreflightError("operator-capacity study requires the frozen slow-roots baseline")
-    if len(issuer_public_key_fingerprint) != 64 or any(c not in "0123456789abcdef" for c in issuer_public_key_fingerprint):
-        raise PreflightError("issuer fingerprint is malformed")
+    if issuer_id <= 0:
+        raise PreflightError("issuer id is malformed")
+    if not issuer_reference or len(issuer_reference.encode("ascii", "ignore")) != len(issuer_reference) or len(issuer_reference) > 128:
+        raise PreflightError("issuer reference is malformed")
+    _hex_digest(issuer_public_key_fingerprint, label="issuer fingerprint")
+    if len(issuer_public_key_hex) != 66 or any(c not in "0123456789abcdef" for c in issuer_public_key_hex):
+        raise PreflightError("issuer public key is malformed")
+    _hex_digest(approved_capacity_digest, label="approved capacity digest")
+    _hex_digest(epoch0_topology_digest, label="epoch0 topology digest")
     if output_root.exists() or output_root.is_symlink():
         raise PreflightError("output root must be fresh")
-    if set(binaries) != {"app", "keygen", "tls_keygen", "capacity_digest", "epoch0_digest"}:
+    binary_names = {"adaptation_manager", "keygen", "tls_keygen", "capacity_digest", "epoch0_digest", "stage_a_envelope_verifier"}
+    if set(binaries) != binary_names:
         raise PreflightError("binary identity set is incomplete")
     if binaries["capacity_digest"].resolve() != capacity_digest_binary.resolve() or \
        binaries["epoch0_digest"].resolve() != epoch0_digest_binary.resolve():
         raise PreflightError("invoked helper identity is not bound")
+    if binaries["stage_a_envelope_verifier"].resolve() != native_envelope_verifier_binary.resolve():
+        raise PreflightError("invoked verifier identity is not bound")
+    if native_envelope_receipt_output.exists() or native_envelope_receipt_output.is_symlink():
+        raise PreflightError("native envelope receipt output must be fresh")
     revision, repository_status = _repository_state(repository)
     if repository_status:
         raise PreflightError("repository is not clean")
-    snapshot_sha256 = _sha256(snapshot_wire, 16 * 1024)
-    quota_sha256 = _sha256(quota_profile, 64 * 1024)
-    quota_assignment_semantic_sha256 = _validate_quota_profile(quota_profile)
-    epoch0_tree_file_sha256 = _sha256(epoch0_tree_file, 8 * 1024)
-    for helper in (capacity_digest_binary, epoch0_digest_binary):
-        if helper.is_symlink() or not helper.is_file():
-            raise PreflightError(f"native helper unavailable: {helper}")
-    binary_sha256 = {
-        name: _sha256(path, 512 * 1024 * 1024)
-        for name, path in sorted(binaries.items())
-    }
-    epoch0_digest = _native_digest(epoch0_digest_binary, epoch0_arm, str(epoch0_tree_file))
-    semantic_digest = _native_digest(
-        capacity_digest_binary, "--validate-n31", epoch0_digest, str(snapshot_wire)
+    if tool_identity_document is None:
+        return {"schema_version": 1, "kind": KIND,
+                "verdict": "PENDING_TOOL_IDENTITY_APPROVAL",
+                "claim_eligible": False, "figure_eligible": False,
+                "revision": revision, "protocol": {"N": 31, "Q": 21},
+                "arm": arm, "stage_a_native_arm": native_arm,
+                "required_binary_names": sorted(binary_names),
+                "tool_identity_authorization_required": True,
+                "output_root": str(output_root.resolve())}
+    documented_binary_sha256, tool_identity_document_sha256, tool_identity_document_ref = (
+        _unverified_binary_identity_document(
+            tool_identity_document, binary_names=binary_names,
+        )
     )
-    if (_sha256(snapshot_wire, 16 * 1024) != snapshot_sha256 or
-            _sha256(epoch0_tree_file, 8 * 1024) != epoch0_tree_file_sha256 or
-            _sha256(quota_profile, 64 * 1024) != quota_sha256):
-        raise PreflightError("input bytes changed during native derivation")
-    binary_sha256_after = {
+    observed_binary_sha256 = {
         name: _sha256(path, 512 * 1024 * 1024)
         for name, path in sorted(binaries.items())
     }
-    if binary_sha256_after != binary_sha256:
-        raise PreflightError("binary bytes changed during native derivation")
-    revision_after, repository_status_after = _repository_state(repository)
-    if revision_after != revision or repository_status_after:
-        raise PreflightError("repository state changed during native derivation")
-    return {"schema_version": 1, "kind": KIND, "verdict": "PREFLIGHT_OK_NO_EXECUTION",
-            "claim_eligible": False, "figure_eligible": False, "revision": revision,
-            "protocol": {"N": 31, "Q": 21}, "arm": arm,
-            "snapshot_wire_sha256": snapshot_sha256,
-            "snapshot_semantic_digest": semantic_digest,
-            "epoch0_tree_digest": epoch0_digest, "epoch0_tree_file_sha256": epoch0_tree_file_sha256, "epoch0_arm": epoch0_arm,
-            "quota_profile_sha256": quota_sha256,
-            "quota_contract_id": QUOTA_CONTRACT_ID,
-            "quota_assignment_semantic_sha256": quota_assignment_semantic_sha256,
-            "slow_replica_ids": list(SLOW_REPLICA_IDS),
-            "fast_replica_ids": list(FAST_REPLICA_IDS),
-            "slow_cpu_quota_percent": 25, "fast_cpu_quota_percent": 100,
-            "epoch0_exposed_slow_root_ids": list(SLOW_REPLICA_IDS),
-            "issuer_public_key_fingerprint": issuer_public_key_fingerprint,
-            "binary_sha256": binary_sha256, "output_root": str(output_root.resolve())}
+    input_sha256 = {
+        "capacity_snapshot_wire": _sha256(capacity_snapshot_wire, 16 * 1024),
+        "stage_a_envelope_wire": _sha256(stage_a_envelope_wire, 32 * 1024),
+        "epoch0_tree_file": _sha256(epoch0_tree_file, 8 * 1024),
+        "quota_profile": _sha256(quota_profile, 64 * 1024),
+    }
+    _validate_quota_profile_bytes(_read_regular(quota_profile, 64 * 1024))
+    if _sha256(tool_identity_document, 64 * 1024) != tool_identity_document_sha256:
+        raise PreflightError("tool identity document changed during inspection")
+    return {"schema_version": 1, "kind": KIND,
+            "verdict": TOOL_IDENTITY_DOCUMENT_VERDICT,
+            "claim_eligible": False, "figure_eligible": False,
+            "revision": revision, "protocol": {"N": 31, "Q": 21},
+            "arm": arm, "stage_a_native_arm": native_arm,
+            "tool_identity_authorization_required": True,
+            "tool_identity_document_sha256": tool_identity_document_sha256,
+            "tool_identity_document_ref": tool_identity_document_ref,
+            "binary_sha256": observed_binary_sha256,
+            "input_sha256": input_sha256,
+            "tool_identity_document_matches_observed_binaries": (
+                observed_binary_sha256 == documented_binary_sha256),
+            "output_root": str(output_root.resolve())}
 
 
 def canonical_json(value: object) -> bytes:
