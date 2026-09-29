@@ -16,7 +16,7 @@ spec.loader.exec_module(subject)
 
 def test_profile_emits_only_the_role_scoped_scheduled_native_mode() -> None:
     start = 100
-    end = start + subject.COMMON_HORIZON_NS
+    end = start + subject.COMMON_HORIZON_NS + subject.MINIMUM_POST_START_ANCHOR_SLACK_NS
     overlay = subject.argv_overlay(
         window_start_monotonic_ns=start,
         window_end_monotonic_ns=end,
@@ -39,7 +39,7 @@ def test_profile_emits_only_the_role_scoped_scheduled_native_mode() -> None:
 
 @pytest.mark.parametrize(
     ("start", "end"),
-    ((0, 60_000_000_000), (1, 1), (1, 60_000_000_000)),
+    ((0, 70_000_000_000), (1, 1), (1, 60_000_000_001)),
 )
 def test_profile_rejects_windows_that_do_not_cover_the_common_horizon(
     start: int, end: int,
@@ -54,7 +54,10 @@ def test_profile_rejects_windows_that_do_not_cover_the_common_horizon(
 def test_preflight_is_explicitly_non_executing_and_binds_one_hard_actor() -> None:
     preflight = subject.preflight(
         window_start_monotonic_ns=10,
-        window_end_monotonic_ns=10 + subject.COMMON_HORIZON_NS + 1,
+        window_end_monotonic_ns=(
+            10 + subject.COMMON_HORIZON_NS
+            + subject.MINIMUM_POST_START_ANCHOR_SLACK_NS
+        ),
     )
 
     assert preflight["status"] == "PREFLIGHT_ONLY_NO_EXECUTION"

@@ -18,6 +18,7 @@ FAULT_THRESHOLD = 2
 QUORUM = 5
 REPLICA_IDS = tuple(range(7))
 COMMON_HORIZON_NS = 60_000_000_000
+MINIMUM_POST_START_ANCHOR_SLACK_NS = 10_000_000_000
 CONTEXT_LIMIT = 100_000
 MAX_OMISSIONS_PER_PROPOSAL = 1
 
@@ -43,9 +44,10 @@ def argv_overlay(*, window_start_monotonic_ns: int,
     """
     start = _positive_uint64(window_start_monotonic_ns, "fault window start")
     end = _positive_uint64(window_end_monotonic_ns, "fault window end")
-    if end <= start or end - start < COMMON_HORIZON_NS:
+    minimum_duration = COMMON_HORIZON_NS + MINIMUM_POST_START_ANCHOR_SLACK_NS
+    if end <= start or end - start < minimum_duration:
         raise SustainedRoleProfileError(
-            "fault window must cover the complete 60-second common horizon"
+            "fault window must cover a positive post-start anchor allowance plus the 60-second common horizon"
         )
     return (
         "--experiment-byzantine-mode", NATIVE_MODE,
@@ -91,6 +93,7 @@ def preflight(*, window_start_monotonic_ns: int,
             "window_start_monotonic_ns": window_start_monotonic_ns,
             "window_end_monotonic_ns": window_end_monotonic_ns,
             "common_horizon_ns": COMMON_HORIZON_NS,
+            "minimum_post_start_anchor_slack_ns": MINIMUM_POST_START_ANCHOR_SLACK_NS,
             "argv_overlay": list(overlay),
         },
     }
