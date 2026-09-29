@@ -1049,7 +1049,48 @@ TEST_CASE(
             context("v3-after-arm", options.configuration),
             ExperimentReplicaRole::internal));
 
+        // v4 retains the 3-by-3 timeout-quorum quota, but is a distinct
+        // profile whose physical-omission causality is checked downstream.
+        // The native gate must therefore accept only its exact profile/basis
+        // pair before releasing an aggregate omission.
+        const auto v4_line = manager_line_for(
+            "n7-path-local-timeout-quorum-v4",
+            "exact_post_fault_path_timeout_quorum_v1");
+        write_file(manager_path, v4_line + "\n");
+        write_file(gate_path, gate_bytes_for(v4_line));
+        ExperimentByzantineAdapter v4_adapter(v3_options);
+        CHECK(v4_adapter.consume_outbound_aggregate(
+            context("v4-after-arm", options.configuration),
+            ExperimentReplicaRole::internal));
+
+        ExperimentByzantineAdapter v4_with_v2_quota(options);
+        CHECK_FALSE(v4_with_v2_quota.consume_outbound_aggregate(
+            context("v4-with-v2-quota", options.configuration),
+            ExperimentReplicaRole::internal));
+
+        const auto v4_wrong_basis_line = manager_line_for(
+            "n7-path-local-timeout-quorum-v4",
+            "exact_post_fault_attempt_start_v1");
+        write_file(manager_path, v4_wrong_basis_line + "\n");
+        write_file(gate_path, gate_bytes_for(v4_wrong_basis_line));
+        ExperimentByzantineAdapter v4_wrong_basis(v3_options);
+        CHECK_FALSE(v4_wrong_basis.consume_outbound_aggregate(
+            context("v4-with-legacy-basis", options.configuration),
+            ExperimentReplicaRole::internal));
+
+        const auto unknown_profile_line = manager_line_for(
+            "n7-path-local-timeout-quorum-v5",
+            "exact_post_fault_path_timeout_quorum_v1");
+        write_file(manager_path, unknown_profile_line + "\n");
+        write_file(gate_path, gate_bytes_for(unknown_profile_line));
+        ExperimentByzantineAdapter unknown_profile(v3_options);
+        CHECK_FALSE(unknown_profile.consume_outbound_aggregate(
+            context("unknown-profile", options.configuration),
+            ExperimentReplicaRole::internal));
+
         // Neither profile may borrow the other profile's quota.
+        write_file(manager_path, v3_line + "\n");
+        write_file(gate_path, gate_bytes_for(v3_line));
         ExperimentByzantineAdapter v3_with_v2_quota(options);
         CHECK_FALSE(v3_with_v2_quota.consume_outbound_aggregate(
             context("v3-with-v2-quota", options.configuration),

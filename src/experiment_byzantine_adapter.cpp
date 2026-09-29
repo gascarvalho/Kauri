@@ -76,6 +76,8 @@ constexpr const char *kN7ThreeReporterProfileV2 =
     "n7-three-reporter-relay-omission-v2";
 constexpr const char *kN7PathTimeoutQuorumProfileV3 =
     "n7-path-local-timeout-quorum-v3";
+constexpr const char *kN7PathTimeoutQuorumProfileV4 =
+    "n7-path-local-timeout-quorum-v4";
 constexpr const char *kExactPostFaultAttemptStartBasis =
     "exact_post_fault_attempt_start_v1";
 constexpr const char *kExactPostFaultPathTimeoutQuorumBasis =
@@ -910,6 +912,15 @@ struct ExperimentByzantineAdapter::State
                 if (payload.rfind(v3, 0) == 0)
                     return std::make_pair(
                         std::move(v3), kExactPostFaultPathTimeoutQuorumBasis);
+                // v4 preserves v3's bounded 3-by-3 timeout evidence quota,
+                // while its stronger physical-omission causality requirement
+                // is validated from the sealed receipt downstream.  Keep the
+                // profile identity explicit so it cannot silently inherit a
+                // legacy v2/v3 authorization.
+                const auto v4 = prefix_for(kN7PathTimeoutQuorumProfileV4);
+                if (payload.rfind(v4, 0) == 0)
+                    return std::make_pair(
+                        std::move(v4), kExactPostFaultPathTimeoutQuorumBasis);
                 return std::nullopt;
             }();
             const auto after_topology = std::string{
