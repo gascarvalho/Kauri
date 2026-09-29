@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""No-launch command contract for the N=7 fixed-E0 matched control.
+"""Prepare, authorize, execute, and validate the N=7 fixed-E0 control.
 
-This is intentionally not an execution entrypoint.  It derives a control
-command from the same prepared N=7 inputs as the adaptive arm, removes every
-successor request/output, and requires the native manager's explicit future
-``--fault-window-arm-control-only`` mode.  Until that native mode exists, the
-only valid outcome is a prepared contract; this module cannot start a process.
+The control derives its commands from the adaptive arm's prepared inputs but
+removes all successor requests and outputs. Its native manager runs only the
+``--fault-window-arm-control-only`` observation mode.
 """
 from __future__ import annotations
 
@@ -46,6 +44,7 @@ REQUEST_KIND = "kauri-n7-fixed-e0-control-authorization-request-v2"
 AUTHORIZATION_KIND = "kauri-n7-fixed-e0-control-authorization-v2"
 FINALIZATION_KIND = "kauri-n7-fixed-e0-control-finalization-receipt-v2"
 ALLOWED_OMISSION_CONTEXTS = frozenset({(4, 4), (5, 5), (6, 6)})
+DESIGNATED_OBSERVER = 2
 
 
 class ProducerError(ValueError):
@@ -173,6 +172,7 @@ def prepare_no_successor_control(run_directory: Path, *, hard_timeout_seconds: i
     try:
         base_plan = json.loads(base_path.read_text(encoding="utf-8"))
         manager, replicas = adaptive.adapter._verify_executable_local_plan(root, base_plan)
+        _require_frozen_observer(root)
         final_manager, final_replicas, bindings = adaptive._final_commands(
             root, base_plan, manager, replicas, hard_timeout_seconds=hard_timeout_seconds
         )
@@ -281,6 +281,21 @@ def _read_prepared_base_plan(path: Path) -> dict[str, Any]:
     return value
 
 
+def _require_frozen_observer(root: Path) -> None:
+    """Bind the control's authoritative source to every prepared replica config."""
+    expected = f"replica-{DESIGNATED_OBSERVER}"
+    for replica_id in range(7):
+        path = _safe_child(root, f"runtime/replica-{replica_id}.effective.json")
+        if path.is_symlink() or not path.is_file():
+            raise ProducerError("prepared control observer config is missing")
+        try:
+            effective = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ProducerError("prepared control observer config is invalid") from exc
+        if not isinstance(effective, dict) or effective.get("authoritative_observer") != expected:
+            raise ProducerError("prepared control observer differs from frozen launch config")
+
+
 def _rederive_prepared_control(root: Path, plan: Mapping[str, Any]) -> None:
     """Recompute every launch-relevant field from the immutable base plan."""
     base_path = _safe_child(root, "local-launch-plan.json")
@@ -291,6 +306,7 @@ def _rederive_prepared_control(root: Path, plan: Mapping[str, Any]) -> None:
         raise ProducerError("base plan differs from approved control plan")
     try:
         base_manager, base_replicas = adaptive.adapter._verify_executable_local_plan(root, base_plan)
+        _require_frozen_observer(root)
         manager, replicas, bindings = adaptive._final_commands(
             root, base_plan, base_manager, base_replicas,
             hard_timeout_seconds=plan["hard_timeout_seconds"],
@@ -490,16 +506,16 @@ def execute_no_successor_control(
         while raw_clock() < horizon_deadline:
             if monotonic() >= deadline: raise ProducerError("control fixed horizon exceeded hard timeout")
             sleep(0.05)
-        coverage = event_streams(root)
-        if not streams_cover_horizon(coverage, horizon_deadline):
-            raise ProducerError("control raw streams do not cover the fixed omission horizon")
         cleanup_receipt = cleanup(root, plan["run_id"], records, ports)
         _require_clean_control_cleanup(cleanup_receipt)
         cleanup_written = True
+        coverage = event_streams(root)
+        if not streams_cover_horizon(coverage, horizon_deadline):
+            raise ProducerError("control raw streams do not cover the fixed omission horizon")
         manifest = comparison_validator.load_manifest(); comparison_validator.validate_manifest(manifest)
         manifest_path = _safe_child(root, CONTROL_MANIFEST)
         _write_exclusive(manifest_path, comparison_validator.MANIFEST_PATH.read_bytes())
-        contract = {"schema_version": 2, "state": "FROZEN_EXECUTION_NO_SUCCESSOR", "run_id": plan["run_id"], "manifest_sha256": manifest["manifest_sha256"], "epoch0": plan["epoch0"], "fault_window_arm": {"source_sequence": arm_event["source_sequence"], "event_sha256": arm_line}, "omission_gate_sha256": gate_sha, "omission_context": {"tree_id": omission_payload["tree_id"], "parent_replica": omission_payload["parent_replica"], "expected_message_type": "aggregate_relay"}, "designated_observer": 0, "horizon_ns": 60_000_000_000}
+        contract = {"schema_version": 2, "state": "FROZEN_EXECUTION_NO_SUCCESSOR", "run_id": plan["run_id"], "manifest_sha256": manifest["manifest_sha256"], "epoch0": plan["epoch0"], "fault_window_arm": {"source_sequence": arm_event["source_sequence"], "event_sha256": arm_line}, "omission_gate_sha256": gate_sha, "omission_context": {"tree_id": omission_payload["tree_id"], "parent_replica": omission_payload["parent_replica"], "expected_message_type": "aggregate_relay"}, "designated_observer": DESIGNATED_OBSERVER, "horizon_ns": 60_000_000_000}
         artifacts = {"manager_events": adaptive._descriptor(root, manager_path), "replica_streams": {f"replica-{i}": adaptive._descriptor(root, _safe_child(root, f"raw/replica-{i}.jsonl")) for i in range(7)}, "fault_window_arm": adaptive._descriptor(root, arm_path), "omission_gate": adaptive._descriptor(root, gate_path), "cleanup": adaptive._descriptor(root, _safe_child(root, "runtime/cleanup-receipt.json")), "manifest": _descriptor(manifest_path, root=root), "prepared_plan": _descriptor(_safe_child(root, CONTROL_PLAN), root=root), "authorization_request": _descriptor(_safe_child(root, CONTROL_AUTHORIZATION_REQUEST), root=root), "approved_authorization": _descriptor(_safe_child(root, CONTROL_APPROVED_AUTHORIZATION), root=root), "finalization_receipt": _descriptor(_safe_child(root, CONTROL_FINALIZATION_RECEIPT), root=root), "base_plan": _descriptor(_safe_child(root, "local-launch-plan.json"), root=root), "executables": plan["executables"]}
         receipt = {"schema_version": 2, "kind": "kauri-n7-fixed-e0-control-raw-bundle-v2", "contract": contract, "artifacts": artifacts}
         adaptive._write_exclusive(_safe_child(root, "fixed-e0-control-raw-bundle-receipt.json"), _canonical(receipt))

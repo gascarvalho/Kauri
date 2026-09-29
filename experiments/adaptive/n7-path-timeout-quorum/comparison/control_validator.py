@@ -180,8 +180,11 @@ def validate_control(contract: Mapping[str, Any], manager_events: Sequence[objec
                     raise ValidationError(
                         "later omission lacks an identical prior true context"
                     )
-            elif event["event_type"] == "block.committed" and isinstance(payload, Mapping) and payload.get("designated_observer") is True:
-                if replica != contract["designated_observer"]:
+            elif event["event_type"] == "block.committed":
+                if not isinstance(payload, Mapping):
+                    raise ValidationError("control native commit has schema drift")
+                is_designated = replica == contract["designated_observer"]
+                if type(payload.get("designated_observer")) is not bool or payload["designated_observer"] != is_designated:
                     raise ValidationError("control designated observer differs from contract")
                 proof = payload.get("decision_proof")
                 if (set(payload) != {"block_height", "block_hash", "parent_hash", "transaction_count", "designated_observer", "decision_proof", "view_generation", "commit_batch_index"} or
@@ -204,9 +207,10 @@ def validate_control(contract: Mapping[str, Any], manager_events: Sequence[objec
                     raise ValidationError("control designated commit identity is invalid")
                 if all_heights.setdefault(height, block_hash) != block_hash:
                     raise ValidationError("control commits conflict at one height")
-                if height in designated:
-                    raise ValidationError("control repeats a designated commit height")
-                designated[height] = (block_hash, event)
+                if is_designated:
+                    if height in designated:
+                        raise ValidationError("control repeats a designated commit height")
+                    designated[height] = (block_hash, event)
             elif event["event_type"] == "block.commit_observed":
                 if not isinstance(payload, Mapping):
                     raise ValidationError("control witness native metadata has schema drift")
@@ -246,8 +250,10 @@ def validate_control(contract: Mapping[str, Any], manager_events: Sequence[objec
         expected_metadata = (
             committed["parent_hash"], committed["transaction_count"], committed["commit_batch_index"],
         )
+        # Native peers may log the same decision before the designated observer;
+        # identity, metadata, and the fixed horizon establish the common commit.
         if (set(witnesses) != _REPLICAS or
-                any(not max(start, event["source_monotonic_ns"]) <= witness["source_monotonic_ns"] <= end
+                any(not start <= witness["source_monotonic_ns"] <= end
                     for witness in witnesses.values()) or
                 any((witness["payload"]["parent_hash"], witness["payload"]["transaction_count"],
                      witness["payload"]["commit_batch_index"]) != expected_metadata
@@ -614,6 +620,20 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
     prepared = _verify_v2_authority_chain(run_root, artifacts)
     if prepared.get("run_id") != run_id or prepared.get("epoch0") != contract.get("epoch0"):
         raise ValidationError("raw contract differs from the independently replayed authority chain")
+    observer = contract.get("designated_observer")
+    if type(observer) is not int or observer not in _REPLICAS:
+        raise ValidationError("control designated observer is invalid")
+    for replica_id in _REPLICAS:
+        effective_path = run_root / f"runtime/replica-{replica_id}.effective.json"
+        if effective_path.is_symlink() or not effective_path.is_file():
+            raise ValidationError("prepared replica observer config is missing")
+        try:
+            effective = json.loads(effective_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise ValidationError("prepared replica observer config is invalid") from exc
+        if (not isinstance(effective, Mapping) or
+                effective.get("authoritative_observer") != f"replica-{observer}"):
+            raise ValidationError("control observer differs from frozen replica config")
     if prepared.get("hard_timeout_seconds") != 600:
         raise ValidationError("control hard timeout differs from the frozen 600-second manifest")
     # Hash the two one-shot causal artifacts and cleanup. Their exact semantic

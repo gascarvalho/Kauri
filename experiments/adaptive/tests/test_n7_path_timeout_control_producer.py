@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import hashlib
+import inspect
 import json
 from pathlib import Path
 
@@ -124,6 +125,26 @@ def test_control_reader_rejects_non_object_base_plan(tmp_path: Path):
     path.write_text("[]\n", encoding="utf-8")
     with pytest.raises(producer.ProducerError, match="prepared base plan"):
         producer._read_prepared_base_plan(path)
+
+
+def test_control_observer_is_bound_to_every_prepared_replica(tmp_path: Path):
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    for replica in range(7):
+        (runtime / f"replica-{replica}.effective.json").write_text(
+            json.dumps({"authoritative_observer": "replica-2"}), encoding="utf-8"
+        )
+    producer._require_frozen_observer(tmp_path)
+    (runtime / "replica-6.effective.json").write_text(
+        json.dumps({"authoritative_observer": "replica-0"}), encoding="utf-8"
+    )
+    with pytest.raises(producer.ProducerError, match="differs from frozen"):
+        producer._require_frozen_observer(tmp_path)
+
+
+def test_control_checks_horizon_coverage_after_clean_shutdown():
+    body = inspect.getsource(producer.execute_no_successor_control)
+    assert body.index("cleanup_receipt = cleanup(") < body.index("coverage = event_streams(root)")
 
 
 @pytest.mark.parametrize("command", [

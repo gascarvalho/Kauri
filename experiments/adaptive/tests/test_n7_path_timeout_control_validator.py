@@ -51,6 +51,30 @@ def test_control_validator_accepts_zero_or_more_e0_common_commits_after_first_dr
     assert result["maximum_inter_commit_gap_ns"] is None
 
 
+def test_control_accepts_peer_witness_logged_before_designated_event_within_horizon():
+    contract, manager, streams = _fixture()
+    streams["replica-2"][0]["source_monotonic_ns"] = 250
+    result = control.validate_control(contract, manager, streams)
+    assert result["common_commit_count"] == 1
+
+
+@pytest.mark.parametrize("mutation", ["conflicting_hash", "malformed_proof"])
+def test_control_rejects_non_designated_native_commit_drift(mutation):
+    contract, manager, streams = _fixture()
+    payload = copy.deepcopy(streams["replica-0"][0]["payload"])
+    payload["designated_observer"] = False
+    if mutation == "conflicting_hash":
+        payload["block_hash"] = "9" * 64
+        payload["decision_proof"]["block_hash"] = "9" * 64
+    else:
+        payload["decision_proof"]["epoch_number"] = 1
+    streams["replica-3"].append(
+        _event("replica", "replica-3", 2, 302, "block.committed", payload)
+    )
+    with pytest.raises(control.ValidationError):
+        control.validate_control(contract, manager, streams)
+
+
 @pytest.mark.parametrize("field", (
     "omission_hash", "designated_hash", "proof_hash", "witness_hash",
     "designated_parent", "witness_parent", "proof_tree", "view_generation",
@@ -154,6 +178,10 @@ def _v2_authority_fixture(monkeypatch: pytest.MonkeyPatch, root: Path, *, hard_t
     """Build no-launch, native-shaped base bytes plus a complete v2 authority chain."""
     for directory in ("runtime", "raw", "config"):
         (root / directory).mkdir()
+    for replica in range(7):
+        (root / f"runtime/replica-{replica}.effective.json").write_text(
+            json.dumps({"authoritative_observer": "replica-2"}), encoding="utf-8"
+        )
     (root / "config/hotstuff.gen.conf").write_text(
         "".join(f"replica = 127.0.0.1:{11000 + item};{12000 + item}, key, cert\n" for item in range(7)),
         encoding="utf-8",
@@ -197,6 +225,13 @@ def _v2_authority_fixture(monkeypatch: pytest.MonkeyPatch, root: Path, *, hard_t
 def _v2_receipt(monkeypatch: pytest.MonkeyPatch, root: Path, *, tree_id: int = 4, hard_timeout_seconds: int = 600):
     prepared = _v2_authority_fixture(monkeypatch, root, hard_timeout_seconds=hard_timeout_seconds)
     contract, manager, streams = _fixture()
+    contract["designated_observer"] = 2
+    designated = streams["replica-0"].pop(0)
+    designated["source_id"] = "replica-2"
+    designated["source_instance"] = "replica-2-i"
+    streams["replica-2"].insert(0, designated)
+    streams["replica-0"][0]["source_sequence"] = 1
+    streams["replica-2"][1]["source_sequence"] = 2
     manifest_bytes = (Path(control.__file__).resolve().parent / "matched_manifest.json").read_bytes()
     contract["manifest_sha256"] = json.loads(manifest_bytes)["manifest_sha256"]
     contract.update({"state": "FROZEN_EXECUTION_NO_SUCCESSOR", "run_id": prepared["run_id"], "epoch0": prepared["epoch0"], "omission_context": {"tree_id": tree_id, "parent_replica": tree_id, "expected_message_type": "aggregate_relay"}})
@@ -281,6 +316,15 @@ def test_raw_bundle_v2_replays_the_full_prepared_authority_chain(monkeypatch: py
     assert result["verdict"] == "CONTROL_RAW_BUNDLE_VALIDATED_PROSPECTIVE"
     replica_one = (tmp_path / receipt["artifacts"]["replica_streams"]["replica-1"]["path"]).read_text(encoding="utf-8")
     assert replica_one.count('"event_type":"fault.aggregate_omitted"') == 3
+
+
+def test_raw_bundle_v2_rejects_observer_config_drift(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    receipt = _v2_receipt(monkeypatch, tmp_path)
+    (tmp_path / "runtime/replica-3.effective.json").write_text(
+        json.dumps({"authoritative_observer": "replica-0"}), encoding="utf-8"
+    )
+    with pytest.raises(control.ValidationError, match="observer differs"):
+        control.validate_raw_bundle(tmp_path, receipt)
 
 
 def test_raw_bundle_v2_requires_the_manifest_frozen_600_second_timeout(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
