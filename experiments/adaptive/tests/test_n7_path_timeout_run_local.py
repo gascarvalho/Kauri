@@ -70,7 +70,7 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, root: Path):
         "--structured-event-source-instance", "manager-instance",
         "--transition-request",
         json.dumps(
-            producer.adapter._load_frozen_v3_profile()["transition_requests"][0],
+            producer.adapter._load_frozen_v4_profile()["transition_requests"][0],
             sort_keys=True,
             separators=(",", ":"),
         ),
@@ -94,6 +94,13 @@ def _fixture(monkeypatch: pytest.MonkeyPatch, root: Path):
         "schema_version": 1,
         "scenario": producer.PROFILE_ID,
         "relay_omission": {"replica_id": 1},
+        "fault_window_arm": {
+            "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+            "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+            "physical_omission_causality_basis": (
+                "exact_matched_post_arm_physical_omission_v1"
+            ),
+        },
     }
     plan = {
         "schema_version": 1,
@@ -148,6 +155,9 @@ def test_prepare_binds_exact_arm_gate_commands_without_launch(
     plan = json.loads((tmp_path / producer.EXECUTION_PLAN).read_bytes())
     assert plan["plan_sha256"] == producer._execution_plan_digest(plan)
     assert plan["run_id"] == plan["bindings"]["run_id"] == "run-n7"
+    assert plan["physical_omission_causality_basis"] == (
+        "exact_matched_post_arm_physical_omission_v1"
+    )
     assert plan["base_plan_sha256"] == base_plan["plan_sha256"]
     final_manager = plan["manager_command"]
     assert final_manager[: len(manager)] == list(manager)
@@ -174,10 +184,30 @@ def test_prepare_binds_exact_arm_gate_commands_without_launch(
     )
     request = json.loads((tmp_path / producer.AUTHORIZATION_REQUEST).read_bytes())
     assert request["execution_plan_sha256"] == plan["plan_sha256"]
+    assert request["physical_omission_causality_basis"] == (
+        "exact_matched_post_arm_physical_omission_v1"
+    )
     assert request["no_retry"] is True
     assert result["authorization_request_sha256"] == producer.base.sha256_file(
         tmp_path / producer.AUTHORIZATION_REQUEST
     )
+
+
+def test_prepare_rejects_a_rehashed_base_plan_with_a_different_causal_contract(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    plan, _manager, _replicas = _fixture(monkeypatch, tmp_path)
+    altered = json.loads(json.dumps(plan))
+    altered["preflight"]["fault_window_arm"][
+        "physical_omission_causality_basis"
+    ] = "unbound"
+    altered["plan_sha256"] = producer.adapter._plan_digest(altered)
+    producer.base._replace_json(tmp_path / "local-launch-plan.json", altered)
+
+    with pytest.raises(producer.ProducerError, match="causal contract drifted"):
+        producer.prepare(tmp_path)
+    assert not (tmp_path / producer.EXECUTION_PLAN).exists()
+    assert not (tmp_path / producer.AUTHORIZATION_REQUEST).exists()
 
 
 def test_prepare_inputs_is_one_reproducible_no_launch_entrypoint(
@@ -227,7 +257,7 @@ def test_prepare_inputs_is_one_reproducible_no_launch_entrypoint(
     assert result["repository_revision"] == "d" * 40
     assert captured["adapter_kwargs"]["repository_revision"] == "d" * 40
     assert captured["hard_timeout_seconds"] == 240
-    assert (run_root / "profile.json").read_bytes() == producer.adapter.PROFILE_V3_FILE.read_bytes()
+    assert (run_root / "profile.json").read_bytes() == producer.adapter.PROFILE_V4_FILE.read_bytes()
     assert all((run_root / child).is_dir() for child in ("raw", "logs", "config"))
     assert not (run_root / producer.APPROVED_AUTHORIZATION).exists()
 
@@ -315,6 +345,35 @@ def test_finalize_rejects_a_self_consistent_replacement_base_plan_before_archivi
     assert not (tmp_path / producer.APPROVED_PREFLIGHT).exists()
 
 
+@pytest.mark.parametrize(
+    "field, replacement",
+    [
+        ("base_plan_sha256", "0" * 64),
+        ("repository_revision", "0" * 40),
+        ("final_launch_arguments_sha256", "0" * 64),
+        ("issuer_public_key_sha256", "0" * 64),
+        ("replica_1_launch_argv_sha256", "0" * 64),
+        ("hard_timeout_seconds", 601),
+        ("unexpected", "extra"),
+    ],
+)
+def test_finalize_rejects_rehashed_misleading_authorization_request(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, replacement: object
+):
+    _fixture(monkeypatch, tmp_path)
+    producer.prepare(tmp_path)
+    request_path = tmp_path / producer.AUTHORIZATION_REQUEST
+    request = json.loads(request_path.read_bytes())
+    request[field] = replacement
+    request_path.write_bytes(producer._canonical(request))
+    authorization_path, _ = _external_authorization(tmp_path)
+
+    with pytest.raises(producer.ProducerError, match="request and execution plan"):
+        producer.finalize(tmp_path, authorization_path)
+    assert not (tmp_path / producer.APPROVED_AUTHORIZATION).exists()
+    assert not (tmp_path / producer.APPROVED_PREFLIGHT).exists()
+
+
 def test_gate_and_arm_documents_bind_the_final_plan(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
@@ -325,8 +384,10 @@ def test_gate_and_arm_documents_bind_the_final_plan(
         plan, authorization_sha256="c" * 64, evidence_start_monotonic_ns=101
     )
     assert arm["required_tree_ids"] == [4, 5, 6]
-    assert arm["profile_id"] == "n7-path-local-timeout-quorum-v3"
+    assert arm["profile_id"] == "n7-path-local-timeout-quorum-v4"
     assert arm["snapshot_evidence_basis"] == "exact_post_fault_path_timeout_quorum_v1"
+    assert arm["schema_version"] == 4
+    assert arm["kind"] == "kauri-focused-fault-window-arm-v4"
     assert arm["request_sha256"] == plan["bindings"]["transition_request_sha256"]
     assert arm["fault_receipt_sha256"] == "c" * 64
     gate = producer.build_omission_gate(

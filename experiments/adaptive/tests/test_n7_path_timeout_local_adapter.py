@@ -32,7 +32,7 @@ def test_local_adapter_prepares_eight_commands_with_only_relay_one_impaired(monk
     monkeypatch.setattr(adapter.base, "write_runtime_inputs", lambda *a, **k: (calls.append(k) or (main, configs, ("manager", "--required-nonresponsive", "1"), [("app", "--conf", str(main), "--conf", str(config)) for config in configs], stale)))
     helper = tmp_path / "n7-epoch0-treefile-digest"; helper.write_text("synthetic helper")
     plan = adapter.prepare_local_inputs(
-        tmp_path, adapter._load_frozen_v3_profile(), [], [], {"pub": "issuer-public"}, peer_port=1, client_port=2, manager_port=3,
+        tmp_path, adapter._load_frozen_v4_profile(), [], [], {"pub": "issuer-public"}, peer_port=1, client_port=2, manager_port=3,
         run_id="run", repository_revision="d" * 40, source_instances={}, app_binary=tmp_path / "app",
         manager_binary=tmp_path / "manager", e0_helper_binary=helper,
         e0_helper_invoke=lambda *args, **kwargs: SimpleNamespace(
@@ -75,20 +75,20 @@ def test_v3_timeout_config_requires_all_seven_clean_replica_files(tmp_path: Path
         adapter._enable_exact_timeout_attempt_evidence_v3(configs)
 
 
-def test_v3_profile_rejects_v1_or_tampered_profile(tmp_path: Path):
+def test_v4_profile_rejects_v1_or_tampered_profile(tmp_path: Path):
     v1 = tmp_path / "profile-v1.json"
     v1.write_text('{"profile_id":"n7-f2-q5-crash-recovery-v2"}')
     with pytest.raises(adapter.AdapterError, match="SHA-256"):
-        adapter._load_frozen_v3_profile(v1)
-    frozen = adapter._load_frozen_v3_profile()
+        adapter._load_frozen_v4_profile(v1)
+    frozen = adapter._load_frozen_v4_profile()
     altered = dict(frozen)
     altered["crash_targets"] = [0, 1]
     with pytest.raises(adapter.AdapterError, match="caller profile"):
-        adapter._require_v3_profile(altered, adapter.PROFILE_V3_FILE)
+        adapter._require_v4_profile(altered, adapter.PROFILE_V4_FILE)
 
 
-def test_v3_profile_uses_manager_supported_live_predecessor_roots():
-    frozen = adapter._load_frozen_v3_profile()
+def test_v4_profile_uses_manager_supported_live_predecessor_roots_and_freezes_causal_contract():
+    frozen = adapter._load_frozen_v4_profile()
     request = frozen["transition_requests"][0]
 
     assert request["containment_baseline_root_source"] == "live_predecessor_roots"
@@ -96,10 +96,16 @@ def test_v3_profile_uses_manager_supported_live_predecessor_roots():
     assert adapter.base._profile_transition_requests(frozen) == (request,)
     encoded = json.dumps(request, sort_keys=True, separators=(",", ":"))
     assert '"containment_baseline_root_source":"live_predecessor_roots"' in encoded
+    assert frozen["fault_window_arm"]["snapshot_evidence_basis"] == (
+        "exact_post_fault_path_timeout_quorum_v1"
+    )
+    assert frozen["fault_window_arm"]["physical_omission_causality_basis"] == (
+        "exact_matched_post_arm_physical_omission_v1"
+    )
 
 
-def test_v3_profile_passes_real_base_runtime_window_contract():
-    frozen = adapter._load_frozen_v3_profile()
+def test_v4_profile_passes_real_base_runtime_window_contract():
+    frozen = adapter._load_frozen_v4_profile()
     runtime = adapter.base.runtime_parameters(frozen)
 
     assert runtime["throughput_windows"] == frozen["throughput_windows"]
@@ -116,7 +122,7 @@ def test_v3_profile_passes_real_base_runtime_window_contract():
 def test_v3_profile_rejects_invalid_live_root_source_contract(
     source: str, parameters: dict[str, object]
 ):
-    frozen = adapter._load_frozen_v3_profile()
+    frozen = adapter._load_frozen_v4_profile()
     mutated = json.loads(json.dumps(frozen))
     request = mutated["transition_requests"][0]
     request["containment_baseline_root_source"] = source

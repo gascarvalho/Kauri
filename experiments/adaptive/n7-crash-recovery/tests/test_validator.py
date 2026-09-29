@@ -196,11 +196,13 @@ def test_complete_recurring_run_requires_exact_two_cycle_causality(
         "successor_epoch_digest",
         "command_payload_digest",
         "winning_activation",
+        "controller_failure",
         "evidence_window_activation_generation",
         "baseline_evidence_cutoff",
         "current_evidence_cutoff",
     }
     assert all(set(event["payload"]) == expected_terminal_fields for event in terminals)
+    assert all(event["payload"]["controller_failure"] is None for event in terminals)
     assert [event["payload"]["cycle_ordinal"] for event in terminals] == [0, 1]
     assert [
         (
@@ -241,6 +243,7 @@ def test_complete_recurring_run_requires_exact_two_cycle_causality(
         }
     ) == 2
 
+
     artifact_paths = [
         artifact["path"]
         for artifact in synthetic_run.load(manifest)["runtime_artifacts"]
@@ -272,6 +275,32 @@ def test_complete_recurring_run_requires_exact_two_cycle_causality(
         "containment",
         "optimized",
     }
+
+
+@pytest.mark.parametrize("mutation", ("missing", "non_null"))
+def test_recurring_validator_rejects_terminal_controller_failure_drift(
+    tmp_path: Path, mutation: str
+) -> None:
+    manifest, epochs = synthetic_run.create_recurring_run(tmp_path / "run")
+    manager_path = tmp_path / "run/raw/adaptive-manager.jsonl"
+
+    def alter(values: list[dict[str, object]]) -> None:
+        terminal = next(
+            event for event in values
+            if event["event_type"] == "adaptive_v2_session_terminal"
+        )
+        payload = terminal["payload"]
+        assert isinstance(payload, dict)
+        if mutation == "missing":
+            del payload["controller_failure"]
+        else:
+            payload["controller_failure"] = "controller_failed"
+
+    _rewrite_jsonl(manager_path, alter)
+
+    verdict = validator.validate_run(manifest, epochs, tmp_path / "validated")
+    assert verdict["verdict"] == "FAIL"
+    assert "adaptive_v2_session_terminal" in verdict["reason"]
 
 
 def test_complete_paired_adaptive_run_uses_exact_fixed_windows(

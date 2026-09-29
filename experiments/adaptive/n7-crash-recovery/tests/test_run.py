@@ -1351,6 +1351,10 @@ def test_manager_clean_exit_requires_both_ready_and_terminal_cycles() -> None:
         ]
         for sequence, event in enumerate(events, start=1):
             event["source_sequence"] = sequence
+            if event["event_type"] == "adaptive_v2_session_terminal":
+                # Native manager terminals carry this explicit controller-health
+                # field.  A clean advanced cycle must attest that it is null.
+                event["payload"]["controller_failure"] = None
         return events
 
     first_cycle = cycle_events(1)
@@ -1408,6 +1412,24 @@ def test_manager_clean_exit_requires_both_ready_and_terminal_cycles() -> None:
     with pytest.raises(campaign.RunnerError, match="fixed quorum"):
         campaign.manager_convergence_ready_event(invalid_events, requests)
 
+    for mutation in ("absent", "non_null", "extra"):
+        malformed_events = json.loads(json.dumps(both_cycles))
+        malformed_terminal = next(
+            event
+            for event in malformed_events
+            if event["event_type"] == "adaptive_v2_session_terminal"
+            and event["payload"]["cycle_ordinal"] == 1
+        )
+        if mutation == "absent":
+            del malformed_terminal["payload"]["controller_failure"]
+        elif mutation == "non_null":
+            malformed_terminal["payload"]["controller_failure"] = "shutdown_failed"
+        else:
+            malformed_terminal["payload"]["unexpected"] = None
+
+        with pytest.raises(campaign.RunnerError, match="terminal"):
+            campaign.manager_convergence_ready_event(malformed_events, requests)
+
 
 def test_manager_polling_surfaces_failed_terminal_before_ready() -> None:
     requests = synthetic_run.recurring_transition_requests()
@@ -1428,6 +1450,7 @@ def test_manager_polling_surfaces_failed_terminal_before_ready() -> None:
             "outcome": "failed",
             "reason": "caller_failed",
             "winning_activation": None,
+            "controller_failure": None,
         }
     )
 
@@ -1573,6 +1596,8 @@ def _three_cycle_manager_contract(
     events.sort(key=lambda event: int(event["source_monotonic_ns"]))
     for sequence, event in enumerate(events, start=1):
         event["source_sequence"] = sequence
+        if event["event_type"] == "adaptive_v2_session_terminal":
+            event["payload"]["controller_failure"] = None
     return requests, events
 
 

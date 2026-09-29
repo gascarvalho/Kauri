@@ -41,6 +41,9 @@ class ValidationError(ValueError):
 _MAX_RAW_BYTES = 16 * 1024 * 1024
 _MAX_SMALL_BYTES = 256 * 1024
 _E1_TREE_IDS = tuple(range(5))  # N=7 factory emits Q=5 dissemination trees.
+# The profile is a study input, not a caller-selected label.  Keep this pinned
+# independently of the mutable execution-plan artifact.
+PROFILE_V4_SHA256 = "3e2b2af834279168199db31bd5ee47e0abdef480d1d5327a17cbcc1b57efc244"
 
 
 def _strict_json(raw: bytes, label: str) -> Any:
@@ -430,14 +433,130 @@ def _parse_activation(payload: object, *, command: Mapping[str, Any]) -> None:
 
 def _common_commit_after_activation(
     streams: Mapping[str, Sequence[Mapping[str, Any]]],
-    activation_ns: Mapping[int, int],
+    activation_bounds: Mapping[int, tuple[int, int]],
     *,
+    predecessor_digest: str,
     successor_digest: str,
 ) -> tuple[int, str]:
-    """Find one raw-schema common E1 commit across all seven replicas."""
+    """Find a common E1 commit, allowing only a valid in-flight E0 predecessor."""
+
+    def is_after_activation(event: Mapping[str, Any], replica_id: int) -> bool:
+        activation_sequence, activation_ns = activation_bounds[replica_id]
+        return (
+            event["source_sequence"] > activation_sequence
+            and event["source_monotonic_ns"] > activation_ns
+        )
+
+    def audit_successor_commit_chronology() -> None:
+        """Make an E1 proof invalid if its local activation has not occurred."""
+        for replica_id in runner.REPLICA_IDS:
+            for event in streams[f"replica-{replica_id}"]:
+                if event["event_type"] != "block.committed":
+                    continue
+                payload = event["payload"]
+                if not isinstance(payload, Mapping) or set(payload) != _COMMIT_FIELDS:
+                    raise ValidationError("block.committed payload has schema drift")
+                proof = payload["decision_proof"]
+                if not isinstance(proof, Mapping) or set(proof) != _DECISION_PROOF_FIELDS:
+                    raise ValidationError("committed decision proof has schema drift")
+                if type(proof["epoch_number"]) is int and proof["epoch_number"] == 0:
+                    # E0 can legitimately complete after local E1 activation.
+                    continue
+                block_hash = _hex64(payload["block_hash"], "committed block hash", nonzero=True)
+                if (
+                    type(proof["epoch_number"]) is not int
+                    or proof["epoch_number"] != 1
+                    or type(proof["tree_id"]) is not int
+                    or proof["tree_id"] not in _E1_TREE_IDS
+                    or proof["epoch_digest"] != successor_digest
+                    or proof["block_hash"] != block_hash
+                ):
+                    raise ValidationError("successor E1 commit has the wrong decision proof")
+                if not is_after_activation(event, replica_id):
+                    raise ValidationError("successor E1 commit precedes exact activation")
+
+    audit_successor_commit_chronology()
+
+    def validate_all_designated_commits(
+        successor_height: int, successor_hash: str, successor_parent_hash: object,
+    ) -> None:
+        """Bound every post-activation designated E0 commit below the E1 result."""
+        for replica_id in runner.REPLICA_IDS:
+            for event in streams[f"replica-{replica_id}"]:
+                if (event["event_type"] != "block.committed" or
+                        not is_after_activation(event, replica_id)):
+                    continue
+                payload = event["payload"]
+                if not isinstance(payload, Mapping) or set(payload) != _COMMIT_FIELDS:
+                    raise ValidationError("block.committed payload has schema drift")
+                if payload["designated_observer"] is not True:
+                    continue
+                height = _positive_int(payload["block_height"], "committed block height")
+                block_hash = _hex64(payload["block_hash"], "committed block hash", nonzero=True)
+                parent_hash = payload["parent_hash"]
+                if parent_hash is not None:
+                    _hex64(parent_hash, "committed parent hash", nonzero=True)
+                proof = payload["decision_proof"]
+                if not isinstance(proof, Mapping) or set(proof) != _DECISION_PROOF_FIELDS:
+                    raise ValidationError("committed decision proof has schema drift")
+                is_successor = (
+                    type(proof["epoch_number"]) is int and proof["epoch_number"] == 1 and
+                    type(proof["tree_id"]) is int and proof["tree_id"] in _E1_TREE_IDS and
+                    proof["epoch_digest"] == successor_digest and proof["block_hash"] == block_hash
+                )
+                is_predecessor = (
+                    type(proof["epoch_number"]) is int and proof["epoch_number"] == 0 and
+                    type(proof["tree_id"]) is int and proof["tree_id"] in runner.REPLICA_IDS and
+                    proof["epoch_digest"] == predecessor_digest and proof["block_hash"] == block_hash
+                )
+                if not is_successor and not is_predecessor:
+                    raise ValidationError("authoritative E1 commit has the wrong decision proof")
+                if is_predecessor:
+                    if height >= successor_height:
+                        raise ValidationError("in-flight E0 commit does not precede the common E1 commit")
+                    if height == successor_height - 1 and successor_parent_hash != block_hash:
+                        raise ValidationError("contiguous in-flight E0 commit does not bind the common E1 parent")
+                elif height == successor_height and block_hash != successor_hash:
+                    raise ValidationError("designated E1 commit conflicts with the common E1 result")
+
+    def validate_all_peer_observations(
+        successor_height: int,
+        successor_hash: str,
+        successor_parent_hash: object,
+        successor_transaction_count: int,
+        successor_batch_index: int,
+    ) -> None:
+        """Reject a same-height peer observation that disagrees with the result."""
+        for replica_id in runner.REPLICA_IDS:
+            for event in streams[f"replica-{replica_id}"]:
+                if (event["event_type"] != "block.commit_observed" or
+                        not is_after_activation(event, replica_id)):
+                    continue
+                payload = event["payload"]
+                if not isinstance(payload, Mapping) or set(payload) != _COMMIT_OBSERVED_FIELDS:
+                    raise ValidationError("block.commit_observed payload has schema drift")
+                height = _positive_int(payload["block_height"], "observed block height")
+                if height != successor_height:
+                    continue
+                block_hash = _hex64(payload["block_hash"], "observed block hash", nonzero=True)
+                parent_hash = payload["parent_hash"]
+                if parent_hash is not None:
+                    _hex64(parent_hash, "observed parent hash", nonzero=True)
+                if (type(payload["transaction_count"]) is not int or
+                        payload["transaction_count"] < 0 or
+                        type(payload["commit_batch_index"]) is not int or
+                        payload["commit_batch_index"] < 0):
+                    raise ValidationError("block.commit_observed counters are invalid")
+                if (block_hash != successor_hash or
+                        parent_hash != successor_parent_hash or
+                        payload["transaction_count"] != successor_transaction_count or
+                        payload["commit_batch_index"] != successor_batch_index):
+                    raise ValidationError("post-activation common commit observation conflicts with the result")
+
     for authoritative_replica in runner.REPLICA_IDS:
         for event in streams[f"replica-{authoritative_replica}"]:
-            if event["event_type"] != "block.committed" or event["source_monotonic_ns"] <= activation_ns[authoritative_replica]:
+            if (event["event_type"] != "block.committed" or
+                    not is_after_activation(event, authoritative_replica)):
                 continue
             payload = event["payload"]
             if not isinstance(payload, Mapping) or set(payload) != _COMMIT_FIELDS:
@@ -455,13 +574,25 @@ def _common_commit_after_activation(
             proof = payload["decision_proof"]
             if not isinstance(proof, Mapping) or set(proof) != _DECISION_PROOF_FIELDS:
                 raise ValidationError("committed decision proof has schema drift")
-            if (
-                proof["epoch_number"] != 1
-                or type(proof["tree_id"]) is not int
-                or proof["tree_id"] not in runner.REPLICA_IDS
-                or proof["epoch_digest"] != successor_digest
-                or proof["block_hash"] != block_hash
-            ):
+            is_successor_proof = (
+                type(proof["epoch_number"]) is int
+                and proof["epoch_number"] == 1
+                and type(proof["tree_id"]) is int
+                and proof["tree_id"] in _E1_TREE_IDS
+                and proof["epoch_digest"] == successor_digest
+                and proof["block_hash"] == block_hash
+            )
+            is_predecessor_proof = (
+                type(proof["epoch_number"]) is int
+                and proof["epoch_number"] == 0
+                and type(proof["tree_id"]) is int
+                and proof["tree_id"] in runner.REPLICA_IDS
+                and proof["epoch_digest"] == predecessor_digest
+                and proof["block_hash"] == block_hash
+            )
+            if is_predecessor_proof:
+                continue
+            if not is_successor_proof:
                 raise ValidationError("authoritative E1 commit has the wrong decision proof")
             witnesses_match = True
             for replica_id in runner.REPLICA_IDS:
@@ -471,7 +602,7 @@ def _common_commit_after_activation(
                     (
                         candidate for candidate in streams[f"replica-{replica_id}"]
                         if candidate["event_type"] == "block.commit_observed"
-                        and candidate["source_monotonic_ns"] > activation_ns[replica_id]
+                        and is_after_activation(candidate, replica_id)
                         and isinstance(candidate["payload"], Mapping)
                         and candidate["payload"].get("block_height") == height
                         and candidate["payload"].get("block_hash") == block_hash
@@ -485,6 +616,14 @@ def _common_commit_after_activation(
                 if set(witness_payload) != _COMMIT_OBSERVED_FIELDS:
                     raise ValidationError("block.commit_observed payload has schema drift")
             if witnesses_match:
+                validate_all_designated_commits(height, block_hash, payload["parent_hash"])
+                validate_all_peer_observations(
+                    height,
+                    block_hash,
+                    payload["parent_hash"],
+                    payload["transaction_count"],
+                    payload["commit_batch_index"],
+                )
                 return height, block_hash
     raise ValidationError("all-seven post-E1 common commit is missing")
 
@@ -686,7 +825,7 @@ def validate_known_raw_events(
 
     streams: dict[str, list[Mapping[str, Any]]] = {}
     command: dict[str, Any] | None = None
-    activation_ns: dict[int, int] = {}
+    activation_bounds: dict[int, tuple[int, int]] = {}
     for replica_id in runner.REPLICA_IDS:
         source_id = f"replica-{replica_id}"
         raw_events = replica_streams[source_id]
@@ -720,13 +859,19 @@ def validate_known_raw_events(
         _parse_activation(activations[0]["payload"], command=parsed_command)
         if activations[0]["source_sequence"] <= commands[0]["source_sequence"]:
             raise ValidationError("E1 activation precedes its local command")
-        activation_ns[replica_id] = activations[0]["source_monotonic_ns"]
+        activation_bounds[replica_id] = (
+            activations[0]["source_sequence"],
+            activations[0]["source_monotonic_ns"],
+        )
 
     assert command is not None
     e0_height, e0_block_hash = _common_e0_commit_before_arm(
         streams, epoch_digest=expected_digest, arm_start_ns=arm_start_ns)
     height, block_hash = _common_commit_after_activation(
-        streams, activation_ns, successor_digest=command["successor_epoch_digest"]
+        streams,
+        activation_bounds,
+        predecessor_digest=expected_digest,
+        successor_digest=command["successor_epoch_digest"],
     )
     return {
         "schema_version": 1,
@@ -771,7 +916,7 @@ def _validate_native_injection(
 
 
 def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str, Any]:
-    """Validate a sealed N7 v3 local bundle; reject any incomplete producer contract."""
+    """Validate a sealed N7 v4 local bundle; reject any incomplete producer contract."""
     expected_receipt = {
         "schema_version", "scenario", "run_id", "artifacts", "fault_window_arm", "fault_injection_arm",
     }
@@ -790,6 +935,14 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
     preflight = _strict_json(preflight_bytes, "preflight")
     if not isinstance(preflight, Mapping):
         raise ValidationError("preflight is not an object")
+    causal_basis = runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+    expected_causal_contract = {
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+        "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+        "physical_omission_causality_basis": causal_basis,
+    }
+    if preflight.get("fault_window_arm") != expected_causal_contract:
+        raise ValidationError("preflight lacks the exact v4 physical-omission causal contract")
     epoch0_tree_bytes = _read_artifact(run_root, artifacts["epoch0_tree"], "epoch0 tree", _MAX_SMALL_BYTES)
     epoch0_tree_path = run_root / artifacts["epoch0_tree"]["path"]
     tree_record = preflight.get("tree_file")
@@ -823,13 +976,31 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
             bindings.get("replica_1_launch_argv_sha256_domain") != "kauri-n7-replica-argv-without-self-hash-v1" or
             execution_plan.get("no_retry") is not True):
         raise ValidationError("execution plan bindings do not match approved N7 inputs")
+    if execution_plan.get("physical_omission_causality_basis") != causal_basis:
+        raise ValidationError("execution plan lacks the exact v4 physical-omission causal contract")
+    if execution_plan.get("profile_sha256") != PROFILE_V4_SHA256:
+        raise ValidationError("execution plan does not bind the canonical v4 profile")
     for field in ("profile_sha256", "epoch_digest", "tree_file_sha256", "topology_proof_sha256", "transition_request_sha256", "replica_1_launch_argv_sha256"):
         _hex64(execution_plan.get(field) if field == "profile_sha256" else bindings.get(field), f"execution plan {field}")
     request = _strict_json(request_bytes, "authorization request")
-    if (not isinstance(request, Mapping) or request.get("schema_version") != 1 or
+    request_fields = {
+        "schema_version", "kind", "scenario", "execution_plan_sha256",
+        "base_plan_sha256", "repository_revision", "final_launch_arguments_sha256",
+        "issuer_public_key_sha256", "replica_1_launch_argv_sha256",
+        "physical_omission_causality_basis", "hard_timeout_seconds", "no_retry",
+    }
+    if (not isinstance(request, Mapping) or set(request) != request_fields or
+            request.get("schema_version") != 1 or
             request.get("kind") != "kauri-n7-local-execution-authorization-request-v1" or
             request.get("scenario") != runner.SCENARIO or
             request.get("execution_plan_sha256") != plan_digest or
+            request.get("base_plan_sha256") != execution_plan.get("base_plan_sha256") or
+            request.get("repository_revision") != execution_plan.get("repository_revision") or
+            request.get("final_launch_arguments_sha256") != execution_plan.get("final_launch_arguments_sha256") or
+            request.get("issuer_public_key_sha256") != execution_plan.get("issuer_public_key_sha256") or
+            request.get("replica_1_launch_argv_sha256") != bindings.get("replica_1_launch_argv_sha256") or
+            request.get("physical_omission_causality_basis") != causal_basis or
+            request.get("hard_timeout_seconds") != execution_plan.get("hard_timeout_seconds") or
             request.get("no_retry") is not True or
             hashlib.sha256(request_bytes).hexdigest() != preflight["approved_plan_request_sha256"]):
         raise ValidationError("authorization request does not bind the approved execution plan")
@@ -942,23 +1113,43 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
             injection_payload.get("launch_argv_sha256") != gate_file["launch_argv_sha256"] or
             injection_payload.get("activation_monotonic_ns") != gate_file["activation_monotonic_ns"]):
         raise ValidationError("native injection differs from approved omission gate or plan")
-    wanted_events = {
-        (event["payload"]["observation"]["configuration"]["tree_id"],
-         event["payload"]["observation"]["block_hash"]): event
-        for event in manager_events
-        if isinstance(event, Mapping) and event.get("event_type") == "evidence.observation_accepted"
-        and isinstance(event.get("payload"), Mapping)
-        and isinstance(event["payload"].get("observation"), Mapping)
-        and event["payload"]["observation"].get("observation_id") in partial["accepted_parent_omission_ids"]
-    }
+    def accepted_context(event: Mapping[str, Any]) -> tuple[object, ...]:
+        observation = event["payload"]["observation"]
+        configuration = observation["configuration"]
+        return (
+            configuration["epoch_number"], configuration["epoch_digest"],
+            configuration["tree_id"], observation["reporter_id"],
+            observation["observed_replica_id"], observation["block_hash"],
+            observation["expected_message_type"],
+        )
+
+    wanted_events: dict[tuple[object, ...], Mapping[str, Any]] = {}
+    for event in manager_events:
+        if (not isinstance(event, Mapping) or
+                event.get("event_type") != "evidence.observation_accepted" or
+                not isinstance(event.get("payload"), Mapping) or
+                not isinstance(event["payload"].get("observation"), Mapping) or
+                event["payload"]["observation"].get("observation_id") not in
+                partial["accepted_parent_omission_ids"]):
+            continue
+        context = accepted_context(event)
+        if context in wanted_events:
+            raise ValidationError("accepted timeout contexts must be unique")
+        wanted_events[context] = event
     wanted = set(wanted_events)
-    if not 6 <= len(wanted_events) <= 9 or any(
-        event["payload"]["observation"]["attempt_start_monotonic_ns"] <= injection_event["source_monotonic_ns"]
-        or event["source_monotonic_ns"] <= event["payload"]["observation"]["attempt_start_monotonic_ns"]
-        for event in wanted_events.values()
-    ):
-        raise ValidationError("accepted timeout attempts must begin after native injection and precede manager acceptance")
-    observed: set[tuple[int, str]] = set()
+    if not 6 <= len(wanted_events) <= 9:
+        raise ValidationError("accepted timeout context count is outside the declared range")
+    selection_event = next(
+        event for event in manager_events
+        if isinstance(event, Mapping) and
+        event.get("event_type") == "adaptive_v2.selection_decided"
+    )
+    selection_ns = selection_event["source_monotonic_ns"]
+    arm_ns = arm_event["source_monotonic_ns"]
+    gate_activation_ns = gate_file["activation_monotonic_ns"]
+    injection_ns = injection_event["source_monotonic_ns"]
+    observed: set[tuple[object, ...]] = set()
+    first_drops: dict[tuple[object, ...], Mapping[str, Any]] = {}
     physical_opportunities_by_tree: dict[int, int] = {
         tree_id: 0 for tree_id in runner.TREE_IDS
     }
@@ -974,7 +1165,12 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
                 drop["source_sequence"] <= injection_event["source_sequence"] or
                 drop["source_monotonic_ns"] <= injection_event["source_monotonic_ns"]):
             raise ValidationError("native replica-1 aggregate omission has schema or chronology drift")
-        context = (payload["tree_id"], _hex64(payload["block_hash"], "native omission block_hash"))
+        context = (
+            payload["epoch_number"], payload["epoch_digest"], payload["tree_id"],
+            payload["parent_replica"], payload["actor"],
+            _hex64(payload["block_hash"], "native omission block_hash"),
+            "aggregate_relay",
+        )
         if payload["first_for_context"]:
             if payload["tree_id"] not in physical_opportunities_by_tree:
                 raise ValidationError("native first omission is outside the declared path set")
@@ -983,21 +1179,39 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
             physical_opportunities_by_tree[payload["tree_id"]] += 1
             if physical_opportunities_by_tree[payload["tree_id"]] > 3:
                 raise ValidationError("native first omissions exceed the declared three-per-tree cap")
-            accepted_event = wanted_events.get(context)
-            if (accepted_event is not None and
-                    drop["source_monotonic_ns"] >= accepted_event["source_monotonic_ns"]):
-                raise ValidationError("native omission must precede its matching manager acceptance")
             observed.add(context)
+            first_drops[context] = drop
         else:
             # Native emits the audit record before returning early for a
             # repeated physical send. It is evidence of no new context.
             if context not in wanted:
                 raise ValidationError("native repeated omission is outside accepted context")
+            if context not in observed:
+                raise ValidationError("native repeated omission appears before its first-for-context record")
             repeat_count += 1
     if repeat_count > 64:
         raise ValidationError("native omission repeat bound exceeded")
     if not wanted.issubset(observed):
         raise ValidationError("native omission does not explain each accepted timeout")
+    for context, accepted_event in wanted_events.items():
+        drop = first_drops[context]
+        observation = accepted_event["payload"]["observation"]
+        attempt_start_ns = observation["attempt_start_monotonic_ns"]
+        deadline_ns = observation["deadline_duration_us"] * 1_000
+        timeout_ns = observation["reporter_monotonic_ns"]
+        manager_acceptance_ns = accepted_event["source_monotonic_ns"]
+        drop_ns = drop["source_monotonic_ns"]
+        # The reporter can start waiting before replica 1 arms the fault.
+        # What matters is that its exact attempted relay is physically omitted
+        # after the native gate has activated, before its deadline, and that
+        # this same timeout is accepted before the selection decision.
+        if not (
+            arm_ns < gate_activation_ns <= attempt_start_ns and
+            gate_activation_ns <= injection_ns < drop_ns and
+            attempt_start_ns < drop_ns < attempt_start_ns + deadline_ns <= timeout_ns <
+            manager_acceptance_ns < selection_ns
+        ):
+            raise ValidationError("accepted timeout lacks the v4 causal chronology")
 
     issuer = _read_artifact(run_root, artifacts["issuer_public_key"], "issuer public key", _MAX_SMALL_BYTES)
     try:
@@ -1046,7 +1260,13 @@ def validate_raw_bundle(run_root: Path, receipt: Mapping[str, Any]) -> dict[str,
                 type(process["pgid"]) is not int or process["pgid"] <= 0 or type(process["returncode"]) is not int or
                 process["termination"] not in {"clean-exit", "terminated"}):
             raise ValidationError("cleanup process record has schema drift")
-    return {**partial, "verdict": "RAW_BUNDLE_VALIDATED", "claim_boundary": "source-bound N7 v3 local-run evidence; external campaign replication remains required", "e1_bundle_sha256": hashlib.sha256(wire).hexdigest()}
+    return {
+        **partial,
+        "verdict": "RAW_BUNDLE_VALIDATED",
+        "claim_boundary": "source-bound N7 v4 local-run evidence; external campaign replication remains required",
+        "physical_omission_causality_basis": causal_basis,
+        "e1_bundle_sha256": hashlib.sha256(wire).hexdigest(),
+    }
 
 
 def main(argv: Sequence[str] | None = None) -> int:

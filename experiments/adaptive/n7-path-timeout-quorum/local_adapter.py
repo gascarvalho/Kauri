@@ -17,9 +17,9 @@ from typing import Any, Mapping, Sequence
 
 HERE = Path(__file__).resolve().parent
 KAURI = HERE.parents[2]
-PROFILE_V3_FILE = HERE / "profile-v3.json"
-PROFILE_V3_SHA256 = "1e8a2c530378ba2238cc6b8f5dc9296217e7630782cfe45e47b047fa03ba89c7"
-V3_MANAGER_ARGS = ("--required-nonresponsive", "1")
+PROFILE_V4_FILE = HERE / "profile-v4.json"
+PROFILE_V4_SHA256 = "3e2b2af834279168199db31bd5ee47e0abdef480d1d5327a17cbcc1b57efc244"
+V4_MANAGER_ARGS = ("--required-nonresponsive", "1")
 EXACT_TIMEOUT_EVIDENCE_OPTION = b"experiment-exact-timeout-attempt-evidence-v3 = true\n"
 
 
@@ -59,14 +59,14 @@ def _enable_exact_timeout_attempt_evidence_v3(configs: Sequence[Path]) -> None:
         path.write_bytes(payload + EXACT_TIMEOUT_EVIDENCE_OPTION)
 
 
-def _load_frozen_v3_profile(path: Path = PROFILE_V3_FILE) -> dict[str, Any]:
+def _load_frozen_v4_profile(path: Path = PROFILE_V4_FILE) -> dict[str, Any]:
     try:
         payload = path.read_bytes()
         profile = json.loads(payload.decode("utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise AdapterError(f"cannot load frozen v3 profile: {exc}") from exc
-    if hashlib.sha256(payload).hexdigest() != PROFILE_V3_SHA256:
-        raise AdapterError("frozen v3 profile SHA-256 differs from the canonical profile")
+        raise AdapterError(f"cannot load frozen v4 profile: {exc}") from exc
+    if hashlib.sha256(payload).hexdigest() != PROFILE_V4_SHA256:
+        raise AdapterError("frozen v4 profile SHA-256 differs from the canonical profile")
     expected = {
         "schema_version": 1,
         "profile_id": runner.SCENARIO,
@@ -89,6 +89,13 @@ def _load_frozen_v3_profile(path: Path = PROFILE_V3_FILE) -> dict[str, Any]:
                 "policy_parameters": {},
             }
         ],
+        "fault_window_arm": {
+            "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+            "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+            "physical_omission_causality_basis": (
+                runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+            ),
+        },
         "fanout": 2,
         "pipeline_depth": 2,
         "block_size": 1,
@@ -107,17 +114,30 @@ def _load_frozen_v3_profile(path: Path = PROFILE_V3_FILE) -> dict[str, Any]:
         ],
     }
     if profile != expected:
-        raise AdapterError("frozen v3 profile fields differ from the nine-context no-crash contract")
+        raise AdapterError("frozen v4 profile fields differ from the nine-context no-crash contract")
     return profile
 
 
-def _require_v3_profile(
+def _require_v4_profile(
     profile: Mapping[str, Any], path: Path,
 ) -> dict[str, Any]:
-    frozen = _load_frozen_v3_profile(path)
+    frozen = _load_frozen_v4_profile(path)
     if dict(profile) != frozen:
-        raise AdapterError("caller profile differs from the frozen v3 no-crash profile")
+        raise AdapterError("caller profile differs from the frozen v4 no-crash profile")
     return frozen
+
+
+def _require_v4_causal_contract(preflight: Mapping[str, Any]) -> None:
+    arm = preflight.get("fault_window_arm")
+    expected = {
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+        "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+        "physical_omission_causality_basis": (
+            runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+        ),
+    }
+    if arm != expected:
+        raise AdapterError("v4 preflight causal contract drifted")
 
 
 def _plan_digest(plan: Mapping[str, Any]) -> str:
@@ -231,6 +251,7 @@ def _verify_executable_local_plan(
     expected_preflight = runner.preflight(receipt["epoch_digest"], copied_tree)
     if expected_preflight != plan.get("preflight"):
         raise AdapterError("local plan preflight drifted")
+    _require_v4_causal_contract(expected_preflight)
 
     argv_path = run_directory / "runtime" / "launch-arguments.json"
     archived = json.loads(argv_path.read_text(encoding="utf-8"))
@@ -274,7 +295,7 @@ def _verify_executable_local_plan(
     if tree_arg + 1 >= len(manager_command) or Path(manager_command[tree_arg + 1]).resolve() != copied_tree:
         raise AdapterError("manager command E0 tree input drifted")
     if manager_command.count("--required-nonresponsive") != 1 or manager_command[manager_command.index("--required-nonresponsive") + 1] != "1":
-        raise AdapterError("manager command lacks the frozen v3 required-nonresponsive setting")
+        raise AdapterError("manager command lacks the frozen v4 required-nonresponsive setting")
     overlay = tuple(expected_preflight["relay_omission"]["argv_overlay"])
     if not replica_commands[runner.OMITTING_REPLICA][-len(overlay):] == overlay:
         raise AdapterError("omitting replica command lacks exact E0 overlay")
@@ -359,26 +380,26 @@ def prepare_local_inputs(
     manager_binary: Path,
     e0_helper_binary: Path | None = None,
     e0_helper_invoke=subprocess.run,
-    profile_path: Path = PROFILE_V3_FILE,
+    profile_path: Path = PROFILE_V4_FILE,
 ) -> dict[str, Any]:
     """Build and archive local-only commands without spawning any process."""
     if len(repository_revision) != 40 or any(
         character not in "0123456789abcdef" for character in repository_revision
     ):
         raise AdapterError("repository revision must be one full lower-case Git SHA")
-    frozen_profile = _require_v3_profile(profile, profile_path)
+    frozen_profile = _require_v4_profile(profile, profile_path)
     main_config, replica_configs, manager_command, commands, artifacts = base.write_runtime_inputs(
         run_directory, frozen_profile, bls, tls, issuer,
         peer_port=peer_port, client_port=client_port, manager_port=manager_port,
         run_id=run_id, source_instances=source_instances, app_binary=app_binary,
         manager_binary=manager_binary, initial_tree_file=runner.TREE_FILE,
-        manager_extra_args=(*base.FULL_RUN_MANAGER_EXTRA_ARGS, *V3_MANAGER_ARGS),
+        manager_extra_args=(*base.FULL_RUN_MANAGER_EXTRA_ARGS, *V4_MANAGER_ARGS),
     )
     _enable_exact_timeout_attempt_evidence_v3(replica_configs)
     if "tree-switch-period = 2" not in main_config.read_text(encoding="utf-8"):
-        raise AdapterError("base writer did not apply frozen v3 tree switch period")
+        raise AdapterError("base writer did not apply frozen v4 tree switch period")
     if manager_command.count("--required-nonresponsive") != 1 or manager_command[manager_command.index("--required-nonresponsive") + 1] != "1":
-        raise AdapterError("base writer did not apply frozen v3 manager setting")
+        raise AdapterError("base writer did not apply frozen v4 manager setting")
     copied_tree = run_directory / "config" / "epoch0.tree"
     helper_binary = (
         manager_binary.with_name("n7-epoch0-treefile-digest")
@@ -397,7 +418,8 @@ def prepare_local_inputs(
     base._write_private(issuer_public_key_path, (issuer_public_key + "\n").encode("ascii"))
     preflight = runner.preflight(identity["epoch_digest"], copied_tree)
     if preflight["relay_omission"].get("total_omission_contexts") != 9:
-        raise AdapterError("v3 preflight does not bind nine omission contexts")
+        raise AdapterError("v4 preflight does not bind nine omission contexts")
+    _require_v4_causal_contract(preflight)
     overlay = tuple(preflight["relay_omission"]["argv_overlay"])
     replica_commands = tuple(
         tuple(command) + (overlay if replica_id == runner.OMITTING_REPLICA else ())

@@ -1002,6 +1002,7 @@ def _manager_terminal_event(transition_index: int) -> dict[str, Any]:
             "successor_epoch_digest": identity["successor_epoch_digest"],
             "command_payload_digest": identity["command_payload_digest"],
             "winning_activation": identity,
+            "controller_failure": None,
             "evidence_window_activation_generation": (
                 checked_activation_generation(transition_index)
             ),

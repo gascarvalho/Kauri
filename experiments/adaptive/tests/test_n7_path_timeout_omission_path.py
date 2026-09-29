@@ -29,12 +29,12 @@ def _event(tree_id: int, reporter_id: int, sequence: int, *, outcome: str = "tim
     return {
         "event_schema_version": 1, "run_id": "run-1", "source_kind": "adaptation_manager",
         "source_id": "adaptive-manager", "source_instance": "manager-1", "source_sequence": sequence,
-        "source_monotonic_ns": 400 + sequence, "event_type": "evidence.observation_accepted",
+        "source_monotonic_ns": 1_000_000 + sequence, "event_type": "evidence.observation_accepted",
         "payload": {"ingestion_sequence": sequence - 1, "observation": {
             "schema_version": 3, "observation_id": f"{sequence:064x}", "reporter_id": reporter_id,
             "observed_replica_id": 1, "configuration": {"epoch_number": 0, "tree_id": tree_id, "epoch_digest": "a" * 64},
             "block_hash": f"{sequence + 10:064x}", "expected_message_type": "aggregate_relay", "outcome": outcome,
-            "response_duration_us": 0, "deadline_duration_us": 500, "reporter_monotonic_ns": 50 + sequence,
+            "response_duration_us": 0, "deadline_duration_us": 500, "reporter_monotonic_ns": 900_000 + sequence,
             "reporter_sequence": sequence, "signer_set": [], "attempt_start_monotonic_ns": 300 + sequence,
             "reporter_local_commit_monotonic_ns": 320 + sequence,
         }},
@@ -135,7 +135,7 @@ def _snapshot(sequence: int, *, cutoff: int = 6):
     return {
         "event_schema_version": 1, "run_id": "run-1", "source_kind": "adaptation_manager",
         "source_id": "adaptive-manager", "source_instance": "manager-1", "source_sequence": sequence,
-        "source_monotonic_ns": 500 + sequence, "event_type": "adaptive_v2_evidence_snapshot",
+        "source_monotonic_ns": 2_000_000 + sequence, "event_type": "adaptive_v2_evidence_snapshot",
         "payload": {
             "schema_version": 2, "cycle_ordinal": 0, "policy_intent": "fault_containment",
             "transition_artifact_id": "n7-e1", "predecessor_epoch_number": 0,
@@ -151,7 +151,7 @@ def _selection(sequence: int = 8, *, cutoff: int = 6):
     return {
         "event_schema_version": 1, "run_id": "run-1", "source_kind": "adaptation_manager",
         "source_id": "adaptive-manager", "source_instance": "manager-1", "source_sequence": sequence,
-        "source_monotonic_ns": 500 + sequence, "event_type": "adaptive_v2.selection_decided",
+        "source_monotonic_ns": 2_000_000 + sequence, "event_type": "adaptive_v2.selection_decided",
         "payload": {
             "schema_version": 1, "cycle_ordinal": 0,
             "predecessor_epoch_number": 0, "predecessor_epoch_digest": "a" * 64,
@@ -220,6 +220,94 @@ def test_partial_raw_validator_requires_arm_six_attempts_and_all_seven_commit_wi
     )
     assert verdict["verdict"] == "PARTIAL_ONLY"
     assert verdict["selected_replica_proof"] == "SOURCE_BOUND_PATH_TIMEOUT_SELECTION_DECISION"
+
+
+def test_partial_raw_validator_rejects_e1_decision_proof_tree_outside_signed_bundle():
+    manager = _manager_events()
+    candidate_tree_outside_bundle = _replica_streams()
+    candidate_tree_outside_bundle["replica-0"][3]["payload"]["decision_proof"]["tree_id"] = 5
+    with pytest.raises(validator.ValidationError, match="successor E1 commit has the wrong decision proof"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), candidate_tree_outside_bundle, _arm(),
+            run_id="run-1",
+        )
+
+    scanned_tree_outside_bundle = _replica_streams()
+    late_designated = deepcopy(scanned_tree_outside_bundle["replica-0"][3])
+    late_designated["source_sequence"] = 5
+    late_designated["source_monotonic_ns"] = 605
+    late_designated["payload"]["decision_proof"]["tree_id"] = 5
+    scanned_tree_outside_bundle["replica-0"].append(late_designated)
+    with pytest.raises(validator.ValidationError, match="successor E1 commit has the wrong decision proof"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), manager, scanned_tree_outside_bundle, _arm(), run_id="run-1",
+        )
+
+
+def test_partial_raw_validator_requires_post_activation_sequence_and_timestamp():
+    commit_before_activation_sequence = _replica_streams()
+    replica_zero = commit_before_activation_sequence["replica-0"]
+    replica_zero[2], replica_zero[3] = replica_zero[3], replica_zero[2]
+    replica_zero[3]["source_sequence"] = 5
+    with pytest.raises(validator.ValidationError, match="successor E1 commit precedes exact activation"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), commit_before_activation_sequence,
+            _arm(), run_id="run-1",
+        )
+
+    witness_before_activation_sequence = _replica_streams()
+    replica_one = witness_before_activation_sequence["replica-1"]
+    replica_one[2], replica_one[3] = replica_one[3], replica_one[2]
+    replica_one[3]["source_sequence"] = 5
+    with pytest.raises(validator.ValidationError, match="all-seven post-E1 common commit"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), witness_before_activation_sequence,
+            _arm(), run_id="run-1",
+        )
+
+
+def test_partial_raw_validator_audits_all_successor_commits_against_e1_activation():
+    early_successor = _replica_streams()
+    replica_zero = early_successor["replica-0"]
+    replica_zero[2], replica_zero[3] = replica_zero[3], replica_zero[2]
+    replica_zero[3]["source_sequence"] = 5
+    with pytest.raises(validator.ValidationError, match="successor E1 commit precedes exact activation"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), early_successor, _arm(), run_id="run-1",
+        )
+
+    malformed_early_successor = _replica_streams()
+    replica_zero = malformed_early_successor["replica-0"]
+    replica_zero[2], replica_zero[3] = replica_zero[3], replica_zero[2]
+    replica_zero[3]["source_sequence"] = 5
+    replica_zero[2]["payload"]["decision_proof"]["tree_id"] = 5
+    with pytest.raises(validator.ValidationError, match="successor E1 commit has the wrong decision proof"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), malformed_early_successor,
+            _arm(), run_id="run-1",
+        )
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("block_hash", "2" * 64),
+        ("parent_hash", "3" * 64),
+        ("transaction_count", 2),
+        ("commit_batch_index", 1),
+    ],
+)
+def test_partial_raw_validator_rejects_conflicting_post_activation_peer_observation(field, value):
+    streams = _replica_streams()
+    conflicting_observation = deepcopy(streams["replica-1"][3])
+    conflicting_observation["source_sequence"] = 5
+    conflicting_observation["source_monotonic_ns"] = 605
+    conflicting_observation["payload"][field] = value
+    streams["replica-1"].append(conflicting_observation)
+    with pytest.raises(validator.ValidationError, match="common commit observation conflicts"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1",
+        )
 
 
 def test_partial_raw_validator_rejects_missing_or_duplicate_selection_decision():
@@ -368,6 +456,98 @@ def test_partial_raw_validator_rejects_missing_common_witness():
     streams = _replica_streams()
     streams["replica-6"] = streams["replica-6"][:-1]
     with pytest.raises(validator.ValidationError, match="common commit"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+def _post_activation_predecessor_commit(*, digest: str = "a" * 64):
+    return {
+        "block_height": 12, "block_hash": "b" * 64, "parent_hash": "0" * 63 + "1",
+        "transaction_count": 1, "designated_observer": True,
+        "decision_proof": {
+            "epoch_number": 0, "tree_id": 0, "epoch_digest": digest,
+            "block_hash": "b" * 64,
+        },
+        "view_generation": None, "commit_batch_index": 0,
+    }
+
+
+def _with_inflight_predecessor_commit(streams, *, digest: str = "a" * 64):
+    authoritative = streams["replica-0"]
+    successor = authoritative[-1]
+    successor["source_sequence"] = 5
+    successor["source_monotonic_ns"] = 605
+    successor["payload"]["parent_hash"] = "b" * 64
+    predecessor = deepcopy(successor)
+    predecessor["source_sequence"] = 4
+    predecessor["source_monotonic_ns"] = 604
+    predecessor["payload"] = _post_activation_predecessor_commit(digest=digest)
+    authoritative.insert(-1, predecessor)
+    for replica_id in range(1, 7):
+        streams[f"replica-{replica_id}"][-1]["payload"]["parent_hash"] = "b" * 64
+    return streams
+
+
+def test_partial_raw_validator_skips_valid_inflight_predecessor_before_e1_commit():
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+
+    verdict = validator.validate_known_raw_events(
+        runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+    )
+
+    assert verdict["verdict"] == "PARTIAL_ONLY"
+
+
+def test_partial_raw_validator_rejects_conflicting_post_activation_predecessor_proof():
+    streams = _with_inflight_predecessor_commit(_replica_streams(), digest="b" * 64)
+
+    with pytest.raises(validator.ValidationError, match="wrong decision proof"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+def test_partial_raw_validator_rejects_malformed_post_activation_predecessor_proof():
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+    del streams["replica-0"][-2]["payload"]["decision_proof"]["epoch_digest"]
+
+    with pytest.raises(validator.ValidationError, match="decision proof has schema drift"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+def test_partial_raw_validator_requires_e1_after_valid_inflight_predecessor():
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+    streams["replica-0"] = streams["replica-0"][:-1]
+
+    with pytest.raises(validator.ValidationError, match="post-E1 common commit is missing"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+@pytest.mark.parametrize("height", [13, 14])
+def test_partial_raw_validator_rejects_same_or_higher_inflight_predecessor(height):
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+    streams["replica-0"][-2]["payload"]["block_height"] = height
+
+    with pytest.raises(validator.ValidationError, match="does not precede"):
+        validator.validate_known_raw_events(
+            runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
+        )
+
+
+def test_partial_raw_validator_rejects_later_same_height_inflight_predecessor():
+    streams = _with_inflight_predecessor_commit(_replica_streams())
+    later = deepcopy(streams["replica-0"][-2])
+    later["source_sequence"] = 6
+    later["source_monotonic_ns"] = 606
+    later["payload"]["block_height"] = 13
+    streams["replica-0"].append(later)
+
+    with pytest.raises(validator.ValidationError, match="does not precede"):
         validator.validate_known_raw_events(
             runner.preflight("a" * 64), _manager_events(), streams, _arm(), run_id="run-1"
         )
@@ -527,7 +707,14 @@ def test_raw_bundle_validator_accepts_native_signed_n7_bundle_and_rejects_bound_
     tree_sha = hashlib.sha256(tree_bytes).hexdigest()
     plan = {
         "scenario": runner.SCENARIO, "run_id": "run-1", "state": "PREPARED_EXTERNAL_APPROVAL_REQUIRED",
-        "profile_sha256": "d" * 64, "no_retry": True,
+        "profile_sha256": validator.PROFILE_V4_SHA256,
+        "base_plan_sha256": "b" * 64,
+        "repository_revision": "c" * 40,
+        "final_launch_arguments_sha256": "d" * 64,
+        "issuer_public_key_sha256": "e" * 64,
+        "hard_timeout_seconds": 300,
+        "physical_omission_causality_basis": runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        "no_retry": True,
         "bindings": {
             "run_id": "run-1", "manager_source_instance": "manager-1", "epoch_digest": "a" * 64,
             "tree_file_sha256": tree_sha, "topology_proof_sha256": tree_sha,
@@ -537,7 +724,20 @@ def test_raw_bundle_validator_accepts_native_signed_n7_bundle_and_rejects_bound_
     }
     plan["plan_sha256"] = hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     plan_bytes = json.dumps(plan, sort_keys=True, separators=(",", ":")).encode() + b"\n"
-    request = {"schema_version": 1, "kind": "kauri-n7-local-execution-authorization-request-v1", "scenario": runner.SCENARIO, "execution_plan_sha256": plan["plan_sha256"], "no_retry": True}
+    request = {
+        "schema_version": 1,
+        "kind": "kauri-n7-local-execution-authorization-request-v1",
+        "scenario": runner.SCENARIO,
+        "execution_plan_sha256": plan["plan_sha256"],
+        "base_plan_sha256": plan["base_plan_sha256"],
+        "repository_revision": plan["repository_revision"],
+        "final_launch_arguments_sha256": plan["final_launch_arguments_sha256"],
+        "issuer_public_key_sha256": plan["issuer_public_key_sha256"],
+        "replica_1_launch_argv_sha256": plan["bindings"]["replica_1_launch_argv_sha256"],
+        "physical_omission_causality_basis": runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        "hard_timeout_seconds": plan["hard_timeout_seconds"],
+        "no_retry": True,
+    }
     request_bytes = json.dumps(request, sort_keys=True, separators=(",", ":")).encode() + b"\n"
     request_sha = hashlib.sha256(request_bytes).hexdigest()
     preflight["approved_plan_request_sha256"] = request_sha
@@ -677,16 +877,124 @@ def test_raw_bundle_validator_accepts_native_signed_n7_bundle_and_rejects_bound_
     with pytest.raises(validator.ValidationError, match="native injection differs"):
         validator.validate_raw_bundle(tmp_path, bad_gate_file)
     (tmp_path / "runtime/static-omission-gate.json").write_bytes(gate_file_bytes)
-    bad_timing = deepcopy(receipt)
+    # A reporter may begin the relay before replica 1 arms its omission.  The
+    # matching physical drop, rather than the start, must follow injection.
+    started_before_injection = deepcopy(receipt)
     timing_lines = payloads["replica-1.jsonl"].splitlines()
-    late_injection = json.loads(timing_lines[1]); late_injection["source_monotonic_ns"] = 320
-    timing_lines[1] = json.dumps(late_injection, sort_keys=True, separators=(",", ":")).encode()
+    later_injection = json.loads(timing_lines[1]); later_injection["source_monotonic_ns"] = 320
+    timing_lines[1] = json.dumps(later_injection, sort_keys=True, separators=(",", ":")).encode()
     changed_timing = b"\n".join(timing_lines) + b"\n"
     (tmp_path / "replica-1.jsonl").write_bytes(changed_timing)
-    bad_timing["artifacts"]["replica_streams"]["replica-1"] = _artifact("replica-1.jsonl", changed_timing)
-    bad_timing["fault_injection_arm"]["line_sha256"] = hashlib.sha256(timing_lines[1]).hexdigest()
-    with pytest.raises(validator.ValidationError, match="timeout attempts must begin after native injection"):
-        validator.validate_raw_bundle(tmp_path, bad_timing)
+    started_before_injection["artifacts"]["replica_streams"]["replica-1"] = _artifact("replica-1.jsonl", changed_timing)
+    started_before_injection["fault_injection_arm"]["line_sha256"] = hashlib.sha256(timing_lines[1]).hexdigest()
+    assert validator.validate_raw_bundle(tmp_path, started_before_injection)["verdict"] == "RAW_BUNDLE_VALIDATED"
+    (tmp_path / "replica-1.jsonl").write_bytes(payloads["replica-1.jsonl"])
+
+    def changed_replica_one(index: int, mutate):
+        lines = payloads["replica-1.jsonl"].splitlines()
+        event = json.loads(lines[index])
+        mutate(event)
+        lines[index] = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+        raw = b"\n".join(lines) + b"\n"
+        (tmp_path / "replica-1.jsonl").write_bytes(raw)
+        changed_receipt = deepcopy(receipt)
+        changed_receipt["artifacts"]["replica_streams"]["replica-1"] = _artifact("replica-1.jsonl", raw)
+        return changed_receipt
+
+    # D must be strictly after injection and the reporter's attempt start.
+    drop_at_injection = changed_replica_one(2, lambda event: event.update(source_monotonic_ns=250))
+    with pytest.raises(validator.ValidationError, match="native replica-1 aggregate omission"):
+        validator.validate_raw_bundle(tmp_path, drop_at_injection)
+    drop_at_start = changed_replica_one(2, lambda event: event.update(source_monotonic_ns=302))
+    with pytest.raises(validator.ValidationError, match="v4 causal chronology"):
+        validator.validate_raw_bundle(tmp_path, drop_at_start)
+    drop_at_deadline = changed_replica_one(2, lambda event: event.update(source_monotonic_ns=500_302))
+    with pytest.raises(validator.ValidationError, match="v4 causal chronology"):
+        validator.validate_raw_bundle(tmp_path, drop_at_deadline)
+    (tmp_path / "replica-1.jsonl").write_bytes(payloads["replica-1.jsonl"])
+
+    def changed_manager_first_observation(mutate):
+        lines = payloads["manager.jsonl"].splitlines()
+        event = json.loads(lines[1])
+        mutate(event)
+        lines[1] = json.dumps(event, sort_keys=True, separators=(",", ":")).encode()
+        raw = b"\n".join(lines) + b"\n"
+        (tmp_path / "manager.jsonl").write_bytes(raw)
+        changed_receipt = deepcopy(receipt)
+        changed_receipt["artifacts"]["manager_events"] = _artifact("manager.jsonl", raw)
+        return changed_receipt
+
+    reporter_before_deadline = changed_manager_first_observation(
+        lambda event: event["payload"]["observation"].update(reporter_monotonic_ns=500_301)
+    )
+    with pytest.raises(validator.ValidationError, match="v4 causal chronology"):
+        validator.validate_raw_bundle(tmp_path, reporter_before_deadline)
+    timeout_not_after_drop = changed_manager_first_observation(
+        lambda event: event["payload"]["observation"].update(reporter_monotonic_ns=352)
+    )
+    with pytest.raises(validator.ValidationError, match="v4 causal chronology"):
+        validator.validate_raw_bundle(tmp_path, timeout_not_after_drop)
+    manager_before_timeout = changed_manager_first_observation(
+        lambda event: event.update(source_monotonic_ns=900_002)
+    )
+    with pytest.raises(validator.ValidationError, match="v4 causal chronology"):
+        validator.validate_raw_bundle(tmp_path, manager_before_timeout)
+    (tmp_path / "manager.jsonl").write_bytes(manager_bytes)
+
+    duplicate_first_drop = changed_replica_one(
+        3,
+        lambda event: event["payload"].update(
+            tree_id=4, parent_replica=4,
+            block_hash=f"{12:064x}", first_for_context=True,
+        ),
+    )
+    with pytest.raises(validator.ValidationError, match="repeats a first-for-context"):
+        validator.validate_raw_bundle(tmp_path, duplicate_first_drop)
+    (tmp_path / "replica-1.jsonl").write_bytes(payloads["replica-1.jsonl"])
+
+    # A repeat record is audit-only and can follow its first omission, never
+    # establish a context before that first physical omission exists.
+    repeat_before_first_lines = [json.loads(line) for line in payloads["replica-1.jsonl"].splitlines()]
+    premature_repeat = deepcopy(repeat_before_first_lines[2])
+    premature_repeat["payload"]["first_for_context"] = False
+    premature_repeat["source_sequence"] = 3
+    premature_repeat["source_monotonic_ns"] = 352
+    repeat_before_first_lines[2]["source_sequence"] = 4
+    repeat_before_first_lines[2]["source_monotonic_ns"] = 353
+    for event in repeat_before_first_lines[3:]:
+        event["source_sequence"] += 1
+        event["source_monotonic_ns"] += 1
+    repeat_before_first = b"".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        for event in [*repeat_before_first_lines[:2], premature_repeat, *repeat_before_first_lines[2:]]
+    )
+    (tmp_path / "replica-1.jsonl").write_bytes(repeat_before_first)
+    premature_repeat_receipt = deepcopy(receipt)
+    premature_repeat_receipt["artifacts"]["replica_streams"]["replica-1"] = _artifact(
+        "replica-1.jsonl", repeat_before_first
+    )
+    with pytest.raises(validator.ValidationError, match="repeat.*before its first"):
+        validator.validate_raw_bundle(tmp_path, premature_repeat_receipt)
+    (tmp_path / "replica-1.jsonl").write_bytes(payloads["replica-1.jsonl"])
+
+    repeat_after_first_lines = [json.loads(line) for line in payloads["replica-1.jsonl"].splitlines()]
+    valid_repeat = deepcopy(repeat_after_first_lines[2])
+    valid_repeat["payload"]["first_for_context"] = False
+    valid_repeat["source_sequence"] = 4
+    valid_repeat["source_monotonic_ns"] = 354
+    for event in repeat_after_first_lines[3:]:
+        event["source_sequence"] += 1
+        event["source_monotonic_ns"] += 1
+    repeat_after_first = b"".join(
+        json.dumps(event, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+        for event in [*repeat_after_first_lines[:3], valid_repeat, *repeat_after_first_lines[3:]]
+    )
+    (tmp_path / "replica-1.jsonl").write_bytes(repeat_after_first)
+    valid_repeat_receipt = deepcopy(receipt)
+    valid_repeat_receipt["artifacts"]["replica_streams"]["replica-1"] = _artifact(
+        "replica-1.jsonl", repeat_after_first
+    )
+    assert validator.validate_raw_bundle(tmp_path, valid_repeat_receipt)["verdict"] == "RAW_BUNDLE_VALIDATED"
     (tmp_path / "replica-1.jsonl").write_bytes(payloads["replica-1.jsonl"])
     bad_drop = deepcopy(receipt)
     drop_lines = payloads["replica-1.jsonl"].splitlines()
@@ -704,6 +1012,89 @@ def test_raw_bundle_validator_accepts_native_signed_n7_bundle_and_rejects_bound_
     with pytest.raises(validator.ValidationError, match="execution plan"):
         validator.validate_raw_bundle(tmp_path, receipt)
     (tmp_path / "runtime/n7-local-execution-plan.json").write_bytes(plan_bytes)
+
+    def receipt_with_causal_contract(
+        *, plan_basis, request_basis, profile_sha256=validator.PROFILE_V4_SHA256,
+        request_overrides=None,
+    ):
+        altered_plan = deepcopy(plan)
+        altered_plan["profile_sha256"] = profile_sha256
+        if plan_basis is None:
+            altered_plan.pop("physical_omission_causality_basis")
+        else:
+            altered_plan["physical_omission_causality_basis"] = plan_basis
+        altered_plan.pop("plan_sha256")
+        altered_plan["plan_sha256"] = hashlib.sha256(
+            json.dumps(altered_plan, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        altered_plan_bytes = json.dumps(
+            altered_plan, sort_keys=True, separators=(",", ":")
+        ).encode() + b"\n"
+        altered_request = deepcopy(request)
+        altered_request["execution_plan_sha256"] = altered_plan["plan_sha256"]
+        if request_basis is None:
+            altered_request.pop("physical_omission_causality_basis")
+        else:
+            altered_request["physical_omission_causality_basis"] = request_basis
+        if request_overrides:
+            altered_request.update(request_overrides)
+        altered_request_bytes = json.dumps(
+            altered_request, sort_keys=True, separators=(",", ":")
+        ).encode() + b"\n"
+        altered_authorization = deepcopy(authorization)
+        altered_authorization["request_sha256"] = hashlib.sha256(altered_request_bytes).hexdigest()
+        altered_authorization["execution_plan_sha256"] = altered_plan["plan_sha256"]
+        altered_authorization_bytes = json.dumps(
+            altered_authorization, sort_keys=True, separators=(",", ":")
+        ).encode() + b"\n"
+        altered_preflight = deepcopy(preflight)
+        altered_preflight["approved_plan_request_sha256"] = hashlib.sha256(altered_request_bytes).hexdigest()
+        altered_preflight["approved_plan_authorization_sha256"] = hashlib.sha256(altered_authorization_bytes).hexdigest()
+        altered_preflight_bytes = json.dumps(altered_preflight, sort_keys=True).encode()
+        (tmp_path / "preflight.json").write_bytes(altered_preflight_bytes)
+        (tmp_path / "runtime/n7-local-execution-plan.json").write_bytes(altered_plan_bytes)
+        (tmp_path / "runtime/execution-authorization-request.json").write_bytes(altered_request_bytes)
+        (tmp_path / "authorization.json").write_bytes(altered_authorization_bytes)
+        altered_receipt = deepcopy(receipt)
+        altered_receipt["artifacts"]["preflight"] = _artifact("preflight.json", altered_preflight_bytes)
+        altered_receipt["artifacts"]["execution_plan"] = _artifact(
+            "runtime/n7-local-execution-plan.json", altered_plan_bytes
+        )
+        altered_receipt["artifacts"]["authorization_request"] = _artifact(
+            "runtime/execution-authorization-request.json", altered_request_bytes
+        )
+        altered_receipt["artifacts"]["plan_authorization"] = _artifact(
+            "authorization.json", altered_authorization_bytes
+        )
+        return altered_receipt
+
+    missing_plan_causal_id = receipt_with_causal_contract(
+        plan_basis=None,
+        request_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+    )
+    with pytest.raises(validator.ValidationError, match="execution plan lacks the exact v4"):
+        validator.validate_raw_bundle(tmp_path, missing_plan_causal_id)
+    mismatched_request_causal_id = receipt_with_causal_contract(
+        plan_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        request_basis="other-causal-contract",
+    )
+    with pytest.raises(validator.ValidationError, match="authorization request does not bind"):
+        validator.validate_raw_bundle(tmp_path, mismatched_request_causal_id)
+    wrong_profile = receipt_with_causal_contract(
+        plan_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        request_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        profile_sha256="d" * 64,
+    )
+    with pytest.raises(validator.ValidationError, match="canonical v4 profile"):
+        validator.validate_raw_bundle(tmp_path, wrong_profile)
+    rehashed_wrong_timeout = receipt_with_causal_contract(
+        plan_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        request_basis=runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        request_overrides={"hard_timeout_seconds": 301},
+    )
+    with pytest.raises(validator.ValidationError, match="authorization request does not bind"):
+        validator.validate_raw_bundle(tmp_path, rehashed_wrong_timeout)
+
     (tmp_path / "cleanup.json").write_bytes(b"{}")
     with pytest.raises(validator.ValidationError, match="SHA-256"):
         validator.validate_raw_bundle(tmp_path, receipt)

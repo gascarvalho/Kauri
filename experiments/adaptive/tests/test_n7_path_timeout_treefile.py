@@ -63,5 +63,12 @@ def test_preflight_binds_nine_opportunities_but_only_six_required_timeouts() -> 
     assert relay["total_omission_contexts"] == 9
     assert relay["required_qualifying_reporters"] == 3
     assert relay["required_timeouts_per_reporter"] == 2
+    assert preflight["fault_window_arm"] == {
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+        "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+        "physical_omission_causality_basis": (
+            "exact_matched_post_arm_physical_omission_v1"
+        ),
+    }
     with pytest.raises(runner.PreflightError):
         runner.omission_overlay("a" * 64, context_limit=6)

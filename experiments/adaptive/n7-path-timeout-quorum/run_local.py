@@ -58,7 +58,7 @@ ARGV_HASH_DOMAIN = "kauri-n7-replica-argv-without-self-hash-v1"
 GATE_KIND = "kauri-n7-static-aggregate-omission-gate-v1"
 ARM_KIND = "kauri-focused-fault-window-arm-v4"
 PROFILE_ID = runner.SCENARIO
-PROFILE_SHA256 = adapter.PROFILE_V3_SHA256
+PROFILE_SHA256 = adapter.PROFILE_V4_SHA256
 _HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 _UTC = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\Z")
 
@@ -375,6 +375,19 @@ def prepare(
         replicas,
         hard_timeout_seconds=hard_timeout_seconds,
     )
+    preflight = base_plan.get("preflight")
+    if not isinstance(preflight, Mapping):
+        raise ProducerError("base local plan lacks v4 preflight")
+    causal_contract = preflight.get("fault_window_arm")
+    expected_causal_contract = {
+        "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+        "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+        "physical_omission_causality_basis": (
+            runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+        ),
+    }
+    if causal_contract != expected_causal_contract:
+        raise ProducerError("base local plan causal contract drifted")
     declared_ports = _declared_ports(run_directory, base_plan, final_manager)
     app_binary = Path(final_replicas[0][0]).resolve()
     manager_binary = Path(final_manager[0]).resolve()
@@ -423,6 +436,9 @@ def prepare(
         "base_plan_sha256": base_plan["plan_sha256"],
         "repository_revision": repository_revision,
         "profile_sha256": PROFILE_SHA256,
+        "physical_omission_causality_basis": (
+            runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+        ),
         "issuer_public_key": issuer_relative,
         "issuer_public_key_sha256": issuer_sha256,
         "approved_preflight": str(APPROVED_PREFLIGHT),
@@ -456,6 +472,9 @@ def prepare(
         "final_launch_arguments_sha256": execution_plan["final_launch_arguments_sha256"],
         "issuer_public_key_sha256": issuer_sha256,
         "replica_1_launch_argv_sha256": binding["replica_1_launch_argv_sha256"],
+        "physical_omission_causality_basis": (
+            runner.PHYSICAL_OMISSION_CAUSALITY_BASIS
+        ),
         "hard_timeout_seconds": hard_timeout_seconds,
         "no_retry": True,
     }
@@ -522,7 +541,7 @@ def prepare_inputs(
     run_directory.mkdir(parents=True, mode=0o700)
     for child in ("raw", "logs", "config"):
         (run_directory / child).mkdir(mode=0o700)
-    profile_bytes = adapter.PROFILE_V3_FILE.read_bytes()
+    profile_bytes = adapter.PROFILE_V4_FILE.read_bytes()
     if _sha256(profile_bytes) != PROFILE_SHA256:
         raise ProducerError("frozen profile changed before input preparation")
     base._write_private(run_directory / "profile.json", profile_bytes)
@@ -537,7 +556,7 @@ def prepare_inputs(
             binaries["hotstuff-tls-keygen"],
             run_directory / "config",
         )
-        profile = adapter._load_frozen_v3_profile()
+        profile = adapter._load_frozen_v4_profile()
         prepare_adapter(
             run_directory,
             profile,
@@ -605,12 +624,27 @@ def finalize(run_directory: Path, authorization_path: Path) -> dict[str, Any]:
         or not _valid_approved_utc(authorization.get("approved_utc"))
     ):
         raise ProducerError("external authorization is not bound to this exact no-retry plan")
+    bindings = plan.get("bindings")
+    if not isinstance(bindings, Mapping):
+        raise ProducerError("prepared execution plan lacks identity bindings")
+    expected_request = {
+        "schema_version": 1,
+        "kind": REQUEST_KIND,
+        "scenario": PROFILE_ID,
+        "execution_plan_sha256": plan.get("plan_sha256"),
+        "base_plan_sha256": plan.get("base_plan_sha256"),
+        "repository_revision": plan.get("repository_revision"),
+        "final_launch_arguments_sha256": plan.get("final_launch_arguments_sha256"),
+        "issuer_public_key_sha256": plan.get("issuer_public_key_sha256"),
+        "replica_1_launch_argv_sha256": bindings.get("replica_1_launch_argv_sha256"),
+        "physical_omission_causality_basis": runner.PHYSICAL_OMISSION_CAUSALITY_BASIS,
+        "hard_timeout_seconds": plan.get("hard_timeout_seconds"),
+        "no_retry": True,
+    }
     if (
         plan.get("state") != "PREPARED_EXTERNAL_APPROVAL_REQUIRED"
         or plan.get("plan_sha256") != _execution_plan_digest(plan)
-        or request.get("kind") != REQUEST_KIND
-        or request.get("execution_plan_sha256") != plan.get("plan_sha256")
-        or request.get("no_retry") is not True
+        or request_bytes != _canonical(expected_request)
     ):
         raise ProducerError("prepared request and execution plan are inconsistent")
     try:

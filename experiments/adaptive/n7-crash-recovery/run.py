@@ -85,6 +85,9 @@ N7_THREE_REPORTER_OMISSION_PROFILE_ID = (
 N7_PATH_TIMEOUT_QUORUM_PROFILE_ID = (
     "n7-path-local-timeout-quorum-v3"
 )
+N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID = (
+    "n7-path-local-timeout-quorum-v4"
+)
 PAIRED_PROFILE_ARMS = {
     PAIRED_ADAPTIVE_PROFILE_ID: "adaptive",
     PAIRED_CONTROL_PROFILE_ID: "control",
@@ -265,6 +268,7 @@ MANAGER_SESSION_TERMINAL_FIELDS = frozenset(
         "successor_epoch_digest",
         "command_payload_digest",
         "winning_activation",
+        "controller_failure",
         "evidence_window_activation_generation",
         "baseline_evidence_cutoff",
         "current_evidence_cutoff",
@@ -792,6 +796,7 @@ def _profile_throughput_windows(
         if profile_id in {
             N7_THREE_REPORTER_OMISSION_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
+            N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID,
         }
         else (
             (
@@ -814,6 +819,7 @@ def _profile_throughput_windows(
         not in {
             N7_THREE_REPORTER_OMISSION_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
+            N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID,
             RECURRING_PROFILE_ID,
             PAIRED_ADAPTIVE_PROFILE_ID,
             PAIRED_CONTROL_PROFILE_ID,
@@ -2092,6 +2098,7 @@ def manager_convergence_ready_event(
             or terminal_payload["command_payload_digest"]
             != identity["command_payload_digest"]
             or terminal_payload["winning_activation"] != identity
+            or terminal_payload["controller_failure"] is not None
         ):
             raise RunnerError(
                 "adaptive_v2_session_terminal does not bind its requested transition"

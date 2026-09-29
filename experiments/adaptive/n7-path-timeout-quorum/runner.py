@@ -21,7 +21,10 @@ OMITTING_REPLICA = 1
 EXPECTED_REPORTERS = (4, 5, 6)
 TREE_IDS = (4, 5, 6)
 TREE_FILE = Path(__file__).with_name("epoch0.tree")
-SCENARIO = "n7-path-local-timeout-quorum-v3"
+SCENARIO = "n7-path-local-timeout-quorum-v4"
+PHYSICAL_OMISSION_CAUSALITY_BASIS = (
+    "exact_matched_post_arm_physical_omission_v1"
+)
 
 
 class PreflightError(ValueError):
@@ -118,6 +121,13 @@ def preflight(epoch_digest: str, tree_file: Path = TREE_FILE) -> dict[str, Any]:
             "required_timeouts_per_reporter": 2,
             "total_omission_contexts": 9,
             "argv_overlay": list(omission_overlay(epoch_digest)),
+        },
+        "fault_window_arm": {
+            "timeout_evidence_basis": "exact_timeout_attempt_id_v1",
+            "snapshot_evidence_basis": "exact_post_fault_path_timeout_quorum_v1",
+            "physical_omission_causality_basis": (
+                PHYSICAL_OMISSION_CAUSALITY_BASIS
+            ),
         },
     }
 

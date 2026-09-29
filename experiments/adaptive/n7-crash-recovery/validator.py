@@ -522,6 +522,7 @@ _MANAGER_SESSION_TERMINAL_FIELDS = frozenset(
         "successor_epoch_digest",
         "command_payload_digest",
         "winning_activation",
+        "controller_failure",
         "evidence_window_activation_generation",
         "baseline_evidence_cutoff",
         "current_evidence_cutoff",
@@ -3300,6 +3301,7 @@ def _validate_recurring_manager_sessions(
             != command["successor_epoch_digest"]
             or terminal_payload["command_payload_digest"]
             != command["payload_digest"]
+            or terminal_payload["controller_failure"] is not None
             or not _json_values_equal(
                 terminal_payload["winning_activation"], expected_identity
             )
