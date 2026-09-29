@@ -147,6 +147,22 @@ def test_control_checks_horizon_coverage_after_clean_shutdown():
     assert body.index("cleanup_receipt = cleanup(") < body.index("coverage = event_streams(root)")
 
 
+def test_control_waits_for_a_pinned_manager_tick_after_horizon_before_cleanup():
+    body = inspect.getsource(producer.execute_no_successor_control)
+    assert body.index("post_horizon_pinned_observation(") < body.index("cleanup_receipt = cleanup(")
+    arm = "a" * 64
+    event = {
+        "event_type": "fixed_e0_control.observation",
+        "source_monotonic_ns": 99,
+        "payload": {"fault_window_arm_sha256": arm},
+    }
+    streams = {"adaptive-manager": [event]}
+    assert producer.post_horizon_pinned_observation(streams, arm, 100) is None
+    streams["adaptive-manager"].append({**event, "source_monotonic_ns": 100})
+    assert producer.post_horizon_pinned_observation(streams, arm, 100) is not None
+    assert producer.post_horizon_pinned_observation(streams, "b" * 64, 100) is None
+
+
 @pytest.mark.parametrize("command", [
     ("manager", "--transition-request", "only-request"),
     ("manager", "--bundle-output", "only-bundle"),

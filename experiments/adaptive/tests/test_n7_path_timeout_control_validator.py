@@ -209,7 +209,9 @@ def _v2_authority_fixture(monkeypatch: pytest.MonkeyPatch, root: Path, *, hard_t
         "main_config": "config/hotstuff.gen.conf", "runtime_artifacts": [{"kind": "transition_requests", "path": "runtime/transition-requests.json", "sha256": hashlib.sha256(transition.read_bytes()).hexdigest(), "replica_id": None}],
     }
     plan["plan_sha256"] = producer.adaptive.adapter._plan_digest(plan)
-    (root / "local-launch-plan.json").write_bytes(producer._canonical(plan))
+    (root / "local-launch-plan.json").write_bytes(
+        (json.dumps(plan, sort_keys=True, indent=2) + "\n").encode("utf-8")
+    )
     monkeypatch.setattr(producer.adaptive.adapter, "_verify_executable_local_plan", lambda *_args, **_kwargs: (manager, replicas))
     prepared = producer.prepare_no_successor_control(root, hard_timeout_seconds=hard_timeout_seconds)
     request_path = root / producer.CONTROL_AUTHORIZATION_REQUEST

@@ -506,6 +506,12 @@ def execute_no_successor_control(
         while raw_clock() < horizon_deadline:
             if monotonic() >= deadline: raise ProducerError("control fixed horizon exceeded hard timeout")
             sleep(0.05)
+        wait_for(
+            records, deadline,
+            lambda: post_horizon_pinned_observation(event_streams(root), arm_sha, horizon_deadline),
+            "post-horizon pinned-arm manager observation",
+            allow_clean_manager_exit=lambda _: False,
+        )
         cleanup_receipt = cleanup(root, plan["run_id"], records, ports)
         _require_clean_control_cleanup(cleanup_receipt)
         cleanup_written = True
@@ -536,6 +542,19 @@ def _control_event(path: Path, event_type: str, payload_key: str, payload_value:
         return adaptive._one_event_line(path, event_type, payload_sha_field=payload_key, payload_sha256=payload_value)
     except adaptive.ProducerError:
         return None
+
+
+def post_horizon_pinned_observation(
+    streams: Mapping[str, Sequence[Mapping[str, Any]]], arm_sha256: str,
+    horizon_end_ns: int,
+) -> Mapping[str, Any] | None:
+    """Require a native manager tick after the fixed omission horizon."""
+    return next((
+        event for event in streams.get("adaptive-manager", ())
+        if event.get("event_type") == "fixed_e0_control.observation"
+        and event.get("source_monotonic_ns", 0) >= horizon_end_ns
+        and event.get("payload") == {"fault_window_arm_sha256": arm_sha256}
+    ), None)
 
 
 def first_source_bound_physical_omission(streams: Mapping[str, Sequence[Mapping[str, Any]]], gate_sha256: str) -> Mapping[str, Any] | None:

@@ -336,7 +336,9 @@ def _sha256(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def _read_document(root: Path, descriptor: object, label: str) -> tuple[dict[str, Any], bytes]:
+def _read_document(
+    root: Path, descriptor: object, label: str, *, canonical: bool = True
+) -> tuple[dict[str, Any], bytes]:
     if not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "sha256"}:
         raise ValidationError(f"{label} descriptor drift")
     path = _safe_child(root, descriptor.get("path"))
@@ -347,7 +349,7 @@ def _read_document(root: Path, descriptor: object, label: str) -> tuple[dict[str
         document = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValidationError(f"{label} is not JSON") from exc
-    if not isinstance(document, dict) or raw != _canonical(document):
+    if not isinstance(document, dict) or (canonical and raw != _canonical(document)):
         raise ValidationError(f"{label} is not canonical JSON")
     return document, raw
 
@@ -495,7 +497,9 @@ def _verify_v2_authority_chain(root: Path, artifacts: Mapping[str, Any]) -> Mapp
     request, request_bytes = _read_document(root, artifacts["authorization_request"], "control request")
     approval, approval_bytes = _read_document(root, artifacts["approved_authorization"], "control approval")
     finalization, _ = _read_document(root, artifacts["finalization_receipt"], "control finalization")
-    base_plan, base_plan_bytes = _read_document(root, artifacts["base_plan"], "base plan")
+    # The base runner emits pretty JSON. Its exact bytes remain descriptor-
+    # hashed; the native plan digest and executable replay check its meaning.
+    base_plan, _ = _read_document(root, artifacts["base_plan"], "base plan", canonical=False)
     plan_fields = {
         "schema_version", "kind", "state", "claim_boundary", "base_plan", "base_plan_sha256",
         "run_id", "epoch0", "hard_timeout_seconds", "declared_ports", "bindings",
