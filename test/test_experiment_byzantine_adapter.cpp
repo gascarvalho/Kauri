@@ -2728,7 +2728,10 @@ TEST_CASE(
     CHECK(parser.find("omission_contexts_per_configuration") !=
           std::string::npos);
     CHECK(parser.find(
-              "per-configuration omission requires exactly three configurations, two contexts each, and a global limit of six") !=
+              "static_cast<std::size_t>(omission_contexts_per_configuration)") !=
+          std::string::npos);
+    CHECK(parser.find(
+              "per-configuration omission requires exactly three configurations with a supported static quota") !=
           std::string::npos);
     CHECK(parser.find("singular and plural additional omission configuration options are mutually exclusive") !=
           std::string::npos);

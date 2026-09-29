@@ -3435,14 +3435,12 @@ TEST_CASE("adaptive v2 executable validates exact pre-vote configuration",
 }
 
 TEST_CASE(
-    "adaptive v2 executable enforces the exact three-by-two omission quota",
+    "adaptive v2 executable preserves the three-by-two omission quota",
     "[adaptive-v2][experiment][byzantine][cli][subprocess]")
 {
     constexpr const char *digest =
         "1111111111111111111111111111111111111111111111111111111111111111";
-    constexpr const char *quota_error =
-        "per-configuration omission requires exactly three configurations, "
-        "two contexts each, and a global limit of six";
+    constexpr const char *quota_error = "with a supported static quota";
     const auto make_arguments = [digest](
         const std::string &additional_configurations,
         const std::string &global_limit,
@@ -3488,6 +3486,78 @@ TEST_CASE(
                   "adaptive-v2 epoch manager address is required") ==
               std::string::npos);
     }
+}
+
+TEST_CASE(
+    "adaptive v2 executable admits gated N7 three-by-three omission quota",
+    "[adaptive-v2][experiment][byzantine][cli][subprocess][n7-v3]")
+{
+    constexpr const char *digest =
+        "1111111111111111111111111111111111111111111111111111111111111111";
+    const auto make_arguments = [digest](
+        const std::string &global_limit,
+        const std::string &per_configuration_limit,
+        bool include_gate)
+    {
+        auto arguments = valid_adaptive_v2_arguments();
+        arguments.values.insert(arguments.values.end(), {"--idx", "1"});
+        for (int replica = 0; replica < 7; ++replica)
+            arguments.values.insert(
+                arguments.values.end(),
+                {"--replica", "127.0.0.1:10000,00,00"});
+        arguments.values.insert(
+            arguments.values.end(),
+            {"--experiment-byzantine-configuration",
+             std::string("0:4:") + digest,
+             "--experiment-omission-additional-configurations",
+             std::string("0:5:") + digest + ",0:6:" + digest,
+             "--experiment-byzantine-window", "n7-path-local-timeout-quorum-v3",
+             "--experiment-omit-outbound-aggregate",
+             "--experiment-byzantine-context-limit", global_limit,
+             "--experiment-omission-contexts-per-configuration",
+             per_configuration_limit});
+        if (include_gate)
+            arguments.values.insert(
+                arguments.values.end(),
+                {"--experiment-omission-activation-gate-path", "/tmp/n7-gate.json",
+                 "--experiment-omission-activation-gate-manager-events", "/tmp/n7-manager.jsonl",
+                 "--experiment-omission-activation-gate-run-id", "n7-v3-cli-test",
+                 "--experiment-omission-activation-gate-manager-source-instance", "manager-n7-v3-cli-test",
+                 "--experiment-omission-activation-gate-profile-sha256", digest,
+                 "--experiment-omission-activation-gate-tree-sha256", digest,
+                 "--experiment-omission-activation-gate-launch-argv-sha256", digest});
+        return arguments;
+    };
+
+    const auto accepted = run_hotstuff_app(
+        make_arguments("9", "3", true).values);
+    CAPTURE(accepted.output);
+    CHECK(accepted.status != 0);
+    CHECK(accepted.output.find("per-configuration omission requires") ==
+          std::string::npos);
+    CHECK(accepted.output.find("activation gate is limited") ==
+          std::string::npos);
+    CHECK(accepted.output.find(
+              "adaptive-v2 epoch manager address is required") !=
+          std::string::npos);
+
+    for (const auto &rejected_arguments : {
+             make_arguments("6", "3", true),
+             make_arguments("9", "2", true)})
+    {
+        const auto rejected = run_hotstuff_app(rejected_arguments.values);
+        CAPTURE(rejected.output);
+        CHECK(rejected.status != 0);
+        CHECK(rejected.output.find("per-configuration omission requires") !=
+              std::string::npos);
+    }
+
+    const auto ungated = run_hotstuff_app(
+        make_arguments("9", "3", false).values);
+    CAPTURE(ungated.output);
+    CHECK(ungated.status != 0);
+    CHECK(ungated.output.find("requires an activation gate") !=
+          std::string::npos);
 }
 
 TEST_CASE(

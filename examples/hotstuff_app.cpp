@@ -648,15 +648,17 @@ parse_experiment_byzantine_options(
         static_cast<std::size_t>(
             options.additional_omission_configuration.has_value()) +
         options.additional_omission_configurations.size();
+    const bool supported_static_quota =
+        omission_configuration_count == 3 &&
+        ((omission_contexts_per_configuration == 2 && context_limit == 6) ||
+         (omission_contexts_per_configuration == 3 && context_limit == 9));
     if (omission_contexts_per_configuration != 0)
     {
-        if (!omit_outbound_aggregate ||
-            omission_contexts_per_configuration != 2 ||
-            context_limit != 6 ||
-            omission_configuration_count != 3)
+        if (!omit_outbound_aggregate || !supported_static_quota)
             throw HotStuffError(
-                "per-configuration omission requires exactly three configurations, two contexts each, and a global limit of six");
-        options.maximum_omission_contexts_per_configuration = 2;
+                "per-configuration omission requires exactly three configurations with a supported static quota");
+        options.maximum_omission_contexts_per_configuration =
+            static_cast<std::size_t>(omission_contexts_per_configuration);
     }
     const bool activation_gate_requested = !raw_activation_gate_path.empty() ||
         !raw_activation_gate_manager_events.empty() ||
@@ -665,11 +667,9 @@ parse_experiment_byzantine_options(
         !raw_activation_gate_profile_sha256.empty() ||
         !raw_activation_gate_tree_sha256.empty() ||
         !raw_activation_gate_launch_argv_sha256.empty();
-    const auto is_n7_three_by_two_static = [&options, omission_contexts_per_configuration,
-                                              context_limit, omission_configuration_count] {
+    const auto is_n7_supported_static = [&options, supported_static_quota] {
         if (!options.omit_outbound_aggregate || options.configuration.epoch_number != 0 ||
-            options.configuration.tree_id != 4 || omission_contexts_per_configuration != 2 ||
-            context_limit != 6 || omission_configuration_count != 3 ||
+            options.configuration.tree_id != 4 || !supported_static_quota ||
             options.additional_omission_configurations.size() != 2)
             return false;
         const auto &first = options.additional_omission_configurations[0];
@@ -680,9 +680,9 @@ parse_experiment_byzantine_options(
                first.epoch_digest == options.configuration.epoch_digest &&
                second.epoch_digest == options.configuration.epoch_digest;
     }();
-    if (is_n7_three_by_two_static && !activation_gate_requested)
+    if (is_n7_supported_static && !activation_gate_requested)
         throw HotStuffError(
-            "N7 three-by-two static aggregate omission requires an activation gate");
+            "N7 static aggregate omission requires an activation gate");
     if (activation_gate_requested)
     {
         const auto valid_sha256 = [](const std::string &value) {
@@ -693,8 +693,7 @@ parse_experiment_byzantine_options(
                 });
         };
         if (!omit_outbound_aggregate || local_replica != 1 || replica_count != 7 ||
-            omission_configuration_count != 3 || context_limit != 6 ||
-            omission_contexts_per_configuration != 2 || raw_activation_gate_path.empty() ||
+            !supported_static_quota || raw_activation_gate_path.empty() ||
             raw_activation_gate_manager_events.empty() ||
             raw_activation_gate_run_id.empty() ||
             raw_activation_gate_manager_source_instance.empty() ||
@@ -702,7 +701,7 @@ parse_experiment_byzantine_options(
             !valid_sha256(raw_activation_gate_tree_sha256) ||
             !valid_sha256(raw_activation_gate_launch_argv_sha256))
             throw HotStuffError(
-                "activation gate is limited to replica 1 of the N7 three-by-two aggregate omission profile");
+                "activation gate is limited to replica 1 of a supported N7 aggregate omission profile");
         options.activation_gate = hotstuff::ExperimentOmissionActivationGate{
             raw_activation_gate_path, raw_activation_gate_manager_events,
             raw_activation_gate_run_id, raw_activation_gate_manager_source_instance,
