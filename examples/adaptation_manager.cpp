@@ -5242,8 +5242,10 @@ public:
                     replica.peer_id, replica.address);
             }
             network_.listen(options_.listen_address);
-            for (const auto &replica : options_.replicas)
-                network_.conn_peer(replica.peer_id);
+            // Each adaptive-v2 replica establishes and pins its single TLS
+            // connection to this manager. Reuse that bidirectional connection
+            // for manager-to-replica bundle delivery; a manager-originated
+            // dial would create a second, non-pinned replica connection.
 
             if (options_.fault_window_arm_control_only
                     ? !begin_fixed_e0_control_cycle()

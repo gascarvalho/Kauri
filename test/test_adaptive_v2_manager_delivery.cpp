@@ -107,6 +107,28 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager reuses replica initiated pinned connections for bundle delivery",
+    "[adaptive-v2][manager-delivery][connection-wiring]")
+{
+    const auto source = read_source("examples/adaptation_manager.cpp");
+    const auto mode_begin = source.find("class AdaptiveV2ManagerModeState final");
+    const auto mode_end = source.find("class AdaptationManager final", mode_begin);
+
+    REQUIRE(mode_begin != std::string::npos);
+    REQUIRE(mode_end != std::string::npos);
+    const auto mode = source.substr(mode_begin, mode_end - mode_begin);
+
+    CHECK(mode.find("network_.add_peer(replica.peer_id)") != std::string::npos);
+    CHECK(mode.find("network_.set_peer_addr(") != std::string::npos);
+    CHECK(mode.find("network_.listen(options_.listen_address)") !=
+          std::string::npos);
+    CHECK(mode.find("network_.conn_peer(replica.peer_id)") ==
+          std::string::npos);
+    CHECK(mode.find("network_.get_peer_conn(replica.peer_id)") !=
+          std::string::npos);
+}
+
+TEST_CASE(
     "checkpoint4 v3 uses the unified facade route with timed ingress",
     "[.][intentional-red][adaptive-v3][manager-route][checkpoint4]")
 {
