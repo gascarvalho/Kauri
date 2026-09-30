@@ -541,6 +541,7 @@ using hotstuff::AdaptiveAggregationStructuredEvent;
 using hotstuff::AdaptiveAggregationTransition;
 using hotstuff::AdaptiveStructuredEventEmitter;
 using hotstuff::AdaptiveV2ConvergenceStructuredEvent;
+using hotstuff::AdaptiveV2ConvergenceStartedStructuredEvent;
 using hotstuff::AdaptiveV2ConvergenceTransition;
 using hotstuff::AdaptiveV2EvidenceSnapshotStructuredEvent;
 using hotstuff::AdaptiveV2SelectionDecidedStructuredEvent;
@@ -882,6 +883,21 @@ AdaptiveV2EpochChangeIdentity convergence_event_identity()
         digest("convergence-audit-command-block"),
         20,
         2365};
+}
+
+AdaptiveV2ConvergenceStartedStructuredEvent convergence_started_event()
+{
+    AdaptiveV2ConvergenceStartedStructuredEvent event;
+    event.cycle_ordinal = 0;
+    event.predecessor_epoch_number = 0;
+    event.predecessor_epoch_digest = digest("convergence-started-e0");
+    event.successor_epoch_number = 1;
+    event.successor_epoch_digest = digest("convergence-started-e1");
+    event.command_payload_digest = digest("convergence-started-command");
+    event.evidence_snapshot_id = "selected-e0-evidence-snapshot";
+    event.baseline_evidence_cutoff = 44;
+    event.evidence_cutoff = 52;
+    return event;
 }
 
 AdaptiveV2EvidenceSnapshotStructuredEvent evidence_snapshot_event()
@@ -2165,8 +2181,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 20,
-        "the audit capability appends both fixed-E0 control observation forms");
+        std::variant_size<AuditStructuredEventPayload>::value == 21,
+        "the audit capability appends the manager convergence-start boundary");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -2227,6 +2243,11 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             std::variant_alternative_t<17, AuditStructuredEventPayload>,
             FixedE0ControlObservationStructuredEvent>::value,
         "the final audit payload is fixed-E0 control liveness evidence");
+    static_assert(
+        std::is_same<
+            std::variant_alternative_t<20, AuditStructuredEventPayload>,
+            AdaptiveV2ConvergenceStartedStructuredEvent>::value,
+        "the appended audit payload is the manager convergence-start boundary");
     static_assert(
         std::is_base_of<
             AuditStructuredEventEmitter,
@@ -2296,11 +2317,54 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
     CHECK(std::string(
               hotstuff::structured_event_type_name(retention_type)) ==
           "adaptive_v2.cross_commit_retention_ready");
+
+    const auto convergence_started_type = hotstuff::structured_event_type(
+        AuditStructuredEventPayload{convergence_started_event()});
+    CHECK(convergence_started_type ==
+          StructuredEventType::adaptive_v2_convergence_started);
+    CHECK(std::string(
+              hotstuff::structured_event_type_name(convergence_started_type)) ==
+          "adaptive_v2.convergence_started");
 }
 
 TEST_CASE("AE01 serializes exact command and accepted reputation identities",
           "[adaptive-v2][structured-event][audit][ndjson]")
 {
+    SECTION("convergence start binds E0, E1, evidence, and the raw envelope time")
+    {
+        const auto event = convergence_started_event();
+        const auto expected =
+            std::string{"{\"event_schema_version\":1,"} +
+            "\"run_id\":\"run-structured-event\","
+            "\"source_kind\":\"adaptation_manager\","
+            "\"source_id\":\"adaptive-manager\","
+            "\"source_instance\":\"manager-spawn-4\","
+            "\"source_sequence\":1,"
+            "\"source_monotonic_ns\":7006,"
+            "\"event_type\":\"adaptive_v2.convergence_started\","
+            "\"payload\":{\"cycle_ordinal\":0,"
+            "\"predecessor_epoch_number\":0,"
+            "\"predecessor_epoch_digest\":\"" +
+            event.predecessor_epoch_digest.to_hex() + "\","
+            "\"successor_epoch_number\":1,"
+            "\"successor_epoch_digest\":\"" +
+            event.successor_epoch_digest.to_hex() + "\","
+            "\"command_payload_digest\":\"" +
+            event.command_payload_digest.to_hex() + "\","
+            "\"evidence_snapshot_id\":\"selected-e0-evidence-snapshot\","
+            "\"baseline_evidence_cutoff\":44,"
+            "\"evidence_cutoff\":52}}\n";
+        FakeClock clock({7006});
+        MemoryOutput output;
+        StructuredEventSink sink(manager_event_config(), clock, output);
+        sink.emit_audit(AuditStructuredEventPayload{event});
+        sink.shutdown();
+
+        CHECK(sink.health().healthy);
+        CHECK(sink.health().complete_records == 1);
+        CHECK(rendered(output) == expected);
+    }
+
     SECTION("shape decision contains the complete recomputable record")
     {
         const auto event = shape_decision_event();
@@ -2850,6 +2914,27 @@ TEST_CASE("AE01 rejects incomplete or source-confused audit events atomically",
                failed.dropped_records == 1 && clock.calls() == 0 &&
                output.bytes().empty() && output.write_calls() == 0;
     };
+
+    SECTION("convergence start preserves exact E0-to-E1 identity bindings")
+    {
+        CHECK(rejects(event_config(), convergence_started_event()));
+
+        auto invalid = convergence_started_event();
+        invalid.successor_epoch_number = 2;
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = convergence_started_event();
+        invalid.predecessor_epoch_digest = uint256_t{};
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = convergence_started_event();
+        invalid.evidence_snapshot_id.clear();
+        CHECK(rejects(manager_event_config(), invalid));
+
+        invalid = convergence_started_event();
+        invalid.evidence_cutoff = invalid.baseline_evidence_cutoff;
+        CHECK(rejects(manager_event_config(), invalid));
+    }
 
     SECTION("command identity and derived activation must be exact")
     {

@@ -276,6 +276,24 @@ struct AdaptiveV2ConvergenceStructuredEvent
     std::string failure_reason;
 };
 
+/**
+ * Manager-owned boundary between selecting a v2 successor and attempting its
+ * first delivery. This is observational only; it neither authorizes a
+ * command nor changes convergence, timeout, or quorum state.
+ */
+struct AdaptiveV2ConvergenceStartedStructuredEvent
+{
+    std::uint64_t cycle_ordinal{0};
+    std::uint32_t predecessor_epoch_number{0};
+    uint256_t predecessor_epoch_digest;
+    std::uint32_t successor_epoch_number{0};
+    uint256_t successor_epoch_digest;
+    uint256_t command_payload_digest;
+    std::string evidence_snapshot_id;
+    std::uint64_t baseline_evidence_cutoff{0};
+    std::uint64_t evidence_cutoff{0};
+};
+
 /** Bounded commitment to the accepted evidence that caused one transition. */
 struct AdaptiveV2EvidenceSnapshotStructuredEvent
 {
@@ -591,7 +609,8 @@ using AuditStructuredEventPayload = std::variant<
     AdaptiveV2SelectionDecidedStructuredEvent,
     FixedE0ControlObservationStructuredEvent,
     ScheduledFixedE0ControlObservationStructuredEvent,
-    ScheduledFixedE0ControlTerminalStructuredEvent>;
+    ScheduledFixedE0ControlTerminalStructuredEvent,
+    AdaptiveV2ConvergenceStartedStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -719,6 +738,7 @@ enum class StructuredEventType : std::uint8_t
     fixed_e0_control_observation,
     scheduled_fixed_e0_control_observation,
     scheduled_fixed_e0_control_terminal,
+    adaptive_v2_convergence_started,
 };
 
 StructuredEventType structured_event_type(

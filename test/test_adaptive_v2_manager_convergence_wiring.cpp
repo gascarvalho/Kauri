@@ -303,6 +303,45 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "manager emits one exact V2 convergence-start boundary before delivery",
+    "[adaptive-v2][convergence][manager][audit][started][wiring]")
+{
+    const auto manager = code_without_comments_or_literals(
+        source("examples/adaptation_manager.cpp"));
+    const auto emit = function_body(manager, "void emit_convergence_started(");
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(emit.empty());
+    REQUIRE_FALSE(evaluate.empty());
+
+    CHECK(count_occurrences(manager, "void emit_convergence_started(") == 1);
+    CHECK(count_occurrences(
+              emit,
+              "AdaptiveV2ConvergenceStartedStructuredEvent event") == 1);
+    CHECK(contains_in_order(
+        emit,
+        {"cycle.convergence_started_emitted",
+         "session_.ingress().current_epoch()",
+         "bundle.definition()",
+         "bundle.command().payload",
+         "epoch_change_payload_digest(payload)",
+         "event.evidence_snapshot_id = definition.evidence_snapshot_id",
+         "event.baseline_evidence_cutoff = cycle.baseline_evidence_cutoff",
+         "event.evidence_cutoff = cycle.current_evidence_cutoff",
+         "structured_event_sink_.emit_audit(",
+         "structured_event_sink_.drain()",
+         "cycle.convergence_started_emitted = true"}));
+    CHECK(emit.find("cycle.convergence_started_emitted ||") !=
+          std::string::npos);
+    CHECK(emit.find("!cycle.evidence_snapshot_emitted") !=
+          std::string::npos);
+    CHECK(contains_in_order(
+        evaluate,
+        {"session_.start_convergence(convergence_tick_)",
+         "emit_convergence_started(*request, *bundle)",
+         "drive_convergence()"}));
+}
+
+TEST_CASE(
     "manager authenticates and registers both convergence observation handlers",
     "[adaptive-v2][convergence][c6][manager][tls][handlers][wiring]")
 {

@@ -193,6 +193,7 @@ struct CycleAuditContext
     bool selection_decided_emitted{false};
     bool fault_containment_coverage_ready_emitted{false};
     bool cross_commit_retention_ready_emitted{false};
+    bool convergence_started_emitted{false};
 };
 
 struct FaultWindowArmBindings
@@ -5408,6 +5409,66 @@ private:
         }
     }
 
+    void emit_convergence_started(
+        const TransitionRequest &request,
+        const hotstuff::AdaptiveV2EpochChangeBundle &bundle)
+    {
+        if (cycle_audits_.empty() ||
+            request_sequence_.cursor() != cycle_audits_.size() - 1)
+        {
+            throw std::logic_error(
+                "convergence start has no exact cycle audit context");
+        }
+
+        auto &cycle = cycle_audits_.back();
+        if (cycle.convergence_started_emitted ||
+            !cycle.evidence_snapshot_emitted ||
+            cycle.transition_artifact_id != request.transition_artifact_id)
+        {
+            throw std::logic_error(
+                "convergence start was duplicated or lacks its evidence snapshot");
+        }
+
+        const auto &predecessor = session_.ingress().current_epoch();
+        const auto &definition = bundle.definition();
+        const auto &payload = bundle.command().payload;
+        if (request.predecessor_epoch_number != predecessor.epoch_number() ||
+            request.successor_epoch_number != payload.successor_epoch_number ||
+            payload.predecessor_epoch_digest != predecessor.epoch_digest() ||
+            definition.previous_epoch_digest != predecessor.epoch_digest() ||
+            definition.epoch_number != payload.successor_epoch_number ||
+            definition.epoch_digest != payload.successor_epoch_digest ||
+            definition.evidence_snapshot_id.empty() ||
+            definition.evidence_cutoff != cycle.current_evidence_cutoff ||
+            cycle.baseline_evidence_cutoff == 0 ||
+            cycle.current_evidence_cutoff <= cycle.baseline_evidence_cutoff)
+        {
+            throw std::logic_error(
+                "convergence start identity does not bind the selected evidence");
+        }
+
+        hotstuff::AdaptiveV2ConvergenceStartedStructuredEvent event;
+        event.cycle_ordinal = request_sequence_.cursor();
+        event.predecessor_epoch_number = predecessor.epoch_number();
+        event.predecessor_epoch_digest = predecessor.epoch_digest();
+        event.successor_epoch_number = payload.successor_epoch_number;
+        event.successor_epoch_digest = payload.successor_epoch_digest;
+        event.command_payload_digest =
+            hotstuff::epoch_change_payload_digest(payload);
+        event.evidence_snapshot_id = definition.evidence_snapshot_id;
+        event.baseline_evidence_cutoff = cycle.baseline_evidence_cutoff;
+        event.evidence_cutoff = cycle.current_evidence_cutoff;
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{std::move(event)});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+        {
+            throw std::runtime_error(
+                "convergence start audit drain failed");
+        }
+        cycle.convergence_started_emitted = true;
+    }
+
     const TransitionRequest *current_transition_request() const noexcept
     {
         const auto cursor = request_sequence_.cursor();
@@ -7352,6 +7413,7 @@ private:
             if (!session_.start_convergence(convergence_tick_))
                 throw std::runtime_error(
                     "manager session rejected convergence start");
+            emit_convergence_started(*request, *bundle);
             const auto &payload = bundle->command().payload;
             HOTSTUFF_LOG_INFO(
                 "KAURI_ADAPTIVE_MANAGER convergence_started "

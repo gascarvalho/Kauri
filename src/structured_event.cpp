@@ -534,6 +534,9 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 19:
             type = StructuredEventType::scheduled_fixed_e0_control_terminal;
             return true;
+        case 20:
+            type = StructuredEventType::adaptive_v2_convergence_started;
+            return true;
         case 4:
             type = StructuredEventType::adaptive_v2_session_terminal;
             return true;
@@ -1232,6 +1235,24 @@ bool valid_convergence_payload(
                  event.replica_id.has_value());
     }
     return false;
+}
+
+bool valid_convergence_started_payload(
+    const AdaptiveV2ConvergenceStartedStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    return config.source.kind ==
+               StructuredEventSourceKind::adaptation_manager &&
+        event.successor_epoch_number == event.predecessor_epoch_number + 1 &&
+        event.predecessor_epoch_digest != uint256_t{} &&
+        event.successor_epoch_digest != uint256_t{} &&
+        event.command_payload_digest != uint256_t{} &&
+        !event.evidence_snapshot_id.empty() &&
+        event.evidence_snapshot_id.size() <=
+            config.limits.maximum_identity_bytes &&
+        valid_utf8(event.evidence_snapshot_id) &&
+        event.baseline_evidence_cutoff != 0 &&
+        event.evidence_cutoff > event.baseline_evidence_cutoff;
 }
 
 bool valid_evidence_snapshot_payload(
@@ -2194,6 +2215,11 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 19:
             return valid_scheduled_fixed_e0_control_terminal_payload(
                 std::get<ScheduledFixedE0ControlTerminalStructuredEvent>(
+                    payload),
+                config);
+        case 20:
+            return valid_convergence_started_payload(
+                std::get<AdaptiveV2ConvergenceStartedStructuredEvent>(
                     payload),
                 config);
         default:
@@ -3215,6 +3241,31 @@ void append_convergence_payload(
     builder.append('}');
 }
 
+void append_convergence_started_payload(
+    JsonLineBuilder &builder,
+    const AdaptiveV2ConvergenceStartedStructuredEvent &event)
+{
+    builder.append("{\"cycle_ordinal\":");
+    builder.append_integer(event.cycle_ordinal);
+    builder.append(",\"predecessor_epoch_number\":");
+    builder.append_integer(event.predecessor_epoch_number);
+    builder.append(",\"predecessor_epoch_digest\":");
+    builder.append_escaped(event.predecessor_epoch_digest.to_hex());
+    builder.append(",\"successor_epoch_number\":");
+    builder.append_integer(event.successor_epoch_number);
+    builder.append(",\"successor_epoch_digest\":");
+    builder.append_escaped(event.successor_epoch_digest.to_hex());
+    builder.append(",\"command_payload_digest\":");
+    builder.append_escaped(event.command_payload_digest.to_hex());
+    builder.append(",\"evidence_snapshot_id\":");
+    builder.append_escaped(event.evidence_snapshot_id);
+    builder.append(",\"baseline_evidence_cutoff\":");
+    builder.append_integer(event.baseline_evidence_cutoff);
+    builder.append(",\"evidence_cutoff\":");
+    builder.append_integer(event.evidence_cutoff);
+    builder.append('}');
+}
+
 void append_manager_session_terminal_payload(
     JsonLineBuilder &builder,
     const AdaptiveV2ManagerSessionTerminalStructuredEvent &event)
@@ -3695,6 +3746,12 @@ std::string serialize_audit_event(
             append_scheduled_fixed_e0_control_terminal_payload(
                 builder,
                 std::get<ScheduledFixedE0ControlTerminalStructuredEvent>(
+                    event));
+            break;
+        case 20:
+            append_convergence_started_payload(
+                builder,
+                std::get<AdaptiveV2ConvergenceStartedStructuredEvent>(
                     event));
             break;
         default:
@@ -4219,6 +4276,8 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "scheduled_fixed_e0_control.observation";
         case StructuredEventType::scheduled_fixed_e0_control_terminal:
             return "scheduled_fixed_e0_control.terminal";
+        case StructuredEventType::adaptive_v2_convergence_started:
+            return "adaptive_v2.convergence_started";
         case StructuredEventType::fault_injection_armed:
             return "fault.injection_armed";
         case StructuredEventType::fault_aggregate_omitted:
