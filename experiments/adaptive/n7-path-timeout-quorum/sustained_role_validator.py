@@ -219,6 +219,29 @@ def _marker_fields(raw: bytes) -> list[dict[str, str]]:
     return result
 
 
+def _reject_cross_replica_fault_evidence(
+        streams: Mapping[str, Sequence[Mapping[str, Any]]],
+        logs: Mapping[int, bytes]) -> None:
+    """Bind the single scheduled omission to replica 1's raw evidence.
+
+    The profile targets actor 1 only.  A physical opportunity or native fault
+    marker from any other replica means the bundle no longer
+    represents the frozen one-target execution, irrespective of whether the
+    extra event would otherwise affect the selected metric.
+    """
+    for replica in range(7):
+        if replica == 1:
+            continue
+        source = f"replica-{replica}"
+        if any(event["event_type"] == "fault.contribution_opportunity"
+               for event in streams[source]):
+            raise ValidationError(
+                f"{source} records a physical fault opportunity outside actor 1")
+        if _marker_fields(logs[replica]):
+            raise ValidationError(
+                f"{source} log records a physical fault marker outside actor 1")
+
+
 def _opportunity_identity(event: Mapping[str, Any]) -> tuple[str, ...]:
     payload = event.get("payload")
     if not isinstance(payload, Mapping) or event.get("event_type") != "fault.contribution_opportunity":
@@ -1138,6 +1161,7 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
         replica: _read_descriptor(root, descriptor, f"replica-{replica} log", _MAX_RAW)
         for replica, descriptor in enumerate(replica_logs)
     }
+    _reject_cross_replica_fault_evidence(streams, logs)
     manager_events = _parse_jsonl(
         _read_descriptor(root, artifacts["manager_events"], "manager events", _MAX_RAW),
         run_id=run_id, source_id="adaptive-manager",
@@ -1314,7 +1338,7 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
     if any(not stream or stream[-1]["source_monotonic_ns"] < anchor["monotonic_ns"] + _HORIZON_NS for stream in streams.values()):
         raise ValidationError("replica streams do not cover the common horizon")
     opportunities = [_opportunity_identity(item) for item in streams["replica-1"] if item["event_type"] == "fault.contribution_opportunity"]
-    markers = [_marker_identity(marker) for marker in _marker_fields(logs[1]) if marker.get("fault") == "role_scoped_persistent_selected_omission_v1"]
+    markers = [_marker_identity(marker) for marker in _marker_fields(logs[1])]
     if not opportunities or len(opportunities) != len(set(opportunities)) or sorted(opportunities) != sorted(markers):
         raise ValidationError("structured fault opportunities do not biject native KAURI_FAULT markers")
     e1_digest = None

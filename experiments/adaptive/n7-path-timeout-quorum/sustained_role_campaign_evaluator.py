@@ -110,6 +110,13 @@ FROZEN_DESIGN: dict[str, Any] = {
         "primary_pair_effect": "adaptive_count_minus_fixed_count",
         "ratio_policy": "null-when-fixed-zero",
     },
+    "late_fault_exposure_policy": (
+        "use physical decision time in [anchor+20s,anchor+60s), require event time "
+        "not before decision, reject other replicas' opportunities and fault markers, "
+        "and require every "
+        "actor-1 persistent selected omission to bind the arm's epoch digest, role, "
+        "message, and action"
+    ),
     "improvement_gate": {
         "required_accepted_pairs": 6,
         "required_positive_pairs": 5,
@@ -612,32 +619,39 @@ def _late_fault_gate(streams: Mapping[str, Sequence[Mapping[str, Any]]], *,
     start_ns = anchor_ns + LATE_START_NS
     end_ns = anchor_ns + LATE_END_NS
     count = 0
+    for source, events in streams.items():
+        if source != "replica-1" and any(
+                event.get("event_type") == "fault.contribution_opportunity" for event in events):
+            _fail(f"{source} has an unexpected physical fault opportunity")
     for event in streams["replica-1"]:
         if event.get("event_type") != "fault.contribution_opportunity":
             continue
-        timestamp = event["source_monotonic_ns"]
-        if not start_ns <= timestamp < end_ns:
-            continue
         payload = event.get("payload")
         proposal = payload.get("proposal") if isinstance(payload, Mapping) else None
-        if (not isinstance(payload, Mapping) or not isinstance(proposal, Mapping) or
-                payload.get("actor") != 1 or
+        if not isinstance(payload, Mapping) or payload.get("actor") != 1 or (
                 payload.get("fault_mode") != "role_scoped_persistent_selected_omission_v1"):
             continue
+        decision_ns = payload.get("decision_monotonic_ns")
+        if type(decision_ns) is not int or event["source_monotonic_ns"] < decision_ns:
+            _fail(f"{arm} physical omission has invalid decision or event time")
+        if not start_ns <= decision_ns < end_ns:
+            continue
+        if not isinstance(proposal, Mapping):
+            _fail(f"{arm} late physical omission lacks a proposal identity")
         if arm == ADAPTIVE_ARM:
-            expected = (1, "leaf", "direct_vote", "omit_direct_vote")
+            expected = (expected_epoch_number, "leaf", "direct_vote", "omit_direct_vote")
         else:
-            expected = (0, payload.get("physical_role"), payload.get("expected_message_type"),
+            expected = (expected_epoch_number, payload.get("physical_role"), payload.get("expected_message_type"),
                         payload.get("scheduled_action"))
             if expected[1:] not in {
                 ("internal", "aggregate_relay", "omit_aggregate"),
                 ("leaf", "direct_vote", "omit_direct_vote"),
             }:
-                continue
+                _fail(f"{arm} late physical omission has an unexpected role or action")
         observed = (proposal.get("epoch_number"), payload.get("physical_role"),
                     payload.get("expected_message_type"), payload.get("scheduled_action"))
         if observed != expected:
-            continue
+            _fail(f"{arm} late physical omission has an unexpected epoch, role, or action")
         if (_hex(proposal.get("epoch_digest"), 64, "late fault proposal epoch digest") !=
                 expected_epoch_digest):
             _fail(f"{arm} late physical omission does not bind the expected epoch digest")

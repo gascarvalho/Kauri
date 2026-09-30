@@ -164,6 +164,7 @@ def _cell(tmp_path: Path, *, ordinal: int, pair_index: int, arm: str, count: int
                                                      "epoch_digest": "f" * 64, "activation_height": 20}))
             sequence += 1
         fault_payload = {"actor": 1, "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                         "decision_monotonic_ns": anchor + 21_000_000_000,
                          "physical_role": "leaf" if arm == subject.ADAPTIVE_ARM else "internal",
                          "expected_message_type": "direct_vote" if arm == subject.ADAPTIVE_ARM else "aggregate_relay",
                          "scheduled_action": "omit_direct_vote" if arm == subject.ADAPTIVE_ARM else "omit_aggregate",
@@ -678,6 +679,97 @@ def test_rejects_adaptive_late_fault_from_foreign_epoch_one_digest(tmp_path: Pat
     cell["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
     with pytest.raises(subject.CampaignEvaluationError, match="late physical omission does not bind"):
         subject.evaluate_campaign(_freeze(), cells)
+
+
+def test_rejects_adaptive_late_predecessor_omission_after_valid_leaf_omission() -> None:
+    valid = {
+        "event_type": "fault.contribution_opportunity",
+        "source_monotonic_ns": 21_000_000_000,
+        "payload": {
+            "actor": 1,
+            "fault_mode": "role_scoped_persistent_selected_omission_v1",
+            "decision_monotonic_ns": 21_000_000_000,
+            "physical_role": "leaf",
+            "expected_message_type": "direct_vote",
+            "scheduled_action": "omit_direct_vote",
+            "proposal": {"epoch_number": 1, "epoch_digest": "f" * 64},
+        },
+    }
+    predecessor = deepcopy(valid)
+    predecessor["source_monotonic_ns"] = 22_000_000_000
+    predecessor["payload"].update({
+        "decision_monotonic_ns": 22_000_000_000,
+        "physical_role": "internal",
+        "expected_message_type": "aggregate_relay",
+        "scheduled_action": "omit_aggregate",
+        "proposal": {"epoch_number": 0, "epoch_digest": "e" * 64},
+    })
+    with pytest.raises(subject.CampaignEvaluationError, match="unexpected epoch, role, or action"):
+        subject._late_fault_gate(
+            {"replica-1": [valid, predecessor]}, anchor_ns=0,
+            arm=subject.ADAPTIVE_ARM, expected_epoch_number=1,
+            expected_epoch_digest="f" * 64,
+        )
+
+
+def test_late_fault_gate_uses_physical_decision_not_event_emission_time() -> None:
+    event = {
+        "event_type": "fault.contribution_opportunity",
+        "source_monotonic_ns": 21_000_000_000,
+        "payload": {
+            "actor": 1,
+            "fault_mode": "role_scoped_persistent_selected_omission_v1",
+            "decision_monotonic_ns": 19_999_999_999,
+            "physical_role": "leaf",
+            "expected_message_type": "direct_vote",
+            "scheduled_action": "omit_direct_vote",
+            "proposal": {"epoch_number": 1, "epoch_digest": "f" * 64},
+        },
+    }
+    with pytest.raises(subject.CampaignEvaluationError, match="no physical omission"):
+        subject._late_fault_gate(
+            {"replica-1": [event]}, anchor_ns=0, arm=subject.ADAPTIVE_ARM,
+            expected_epoch_number=1, expected_epoch_digest="f" * 64,
+        )
+    event["payload"]["decision_monotonic_ns"] = 20_000_000_000
+    assert subject._late_fault_gate(
+        {"replica-1": [event]}, anchor_ns=0, arm=subject.ADAPTIVE_ARM,
+        expected_epoch_number=1, expected_epoch_digest="f" * 64,
+    ) == 1
+    event["payload"]["decision_monotonic_ns"] = 60_000_000_000
+    event["source_monotonic_ns"] = 60_000_000_001
+    with pytest.raises(subject.CampaignEvaluationError, match="no physical omission"):
+        subject._late_fault_gate(
+            {"replica-1": [event]}, anchor_ns=0, arm=subject.ADAPTIVE_ARM,
+            expected_epoch_number=1, expected_epoch_digest="f" * 64,
+        )
+    event["payload"]["decision_monotonic_ns"] = 59_999_999_999
+    assert subject._late_fault_gate(
+        {"replica-1": [event]}, anchor_ns=0, arm=subject.ADAPTIVE_ARM,
+        expected_epoch_number=1, expected_epoch_digest="f" * 64,
+    ) == 1
+
+
+def test_late_fault_gate_rejects_other_replica_after_valid_actor_one() -> None:
+    valid = {
+        "event_type": "fault.contribution_opportunity",
+        "source_monotonic_ns": 21_000_000_000,
+        "payload": {
+            "actor": 1,
+            "fault_mode": "role_scoped_persistent_selected_omission_v1",
+            "decision_monotonic_ns": 21_000_000_000,
+            "physical_role": "leaf",
+            "expected_message_type": "direct_vote",
+            "scheduled_action": "omit_direct_vote",
+            "proposal": {"epoch_number": 1, "epoch_digest": "f" * 64},
+        },
+    }
+    with pytest.raises(subject.CampaignEvaluationError, match="replica-2 has an unexpected physical fault"):
+        subject._late_fault_gate(
+            {"replica-1": [valid], "replica-2": [deepcopy(valid)]}, anchor_ns=0,
+            arm=subject.ADAPTIVE_ARM, expected_epoch_number=1,
+            expected_epoch_digest="f" * 64,
+        )
 
 
 def test_rejects_causal_main_config_drift_even_with_fresh_valid_identity_material(

@@ -190,6 +190,59 @@ def test_validator_accepts_exact_fixed_e0_raw_replay_with_bounded_receipt(tmp_pa
     assert verdict["commit_metric"]["counts"] == {"common_completed_commits": 1}
 
 
+def test_validator_rejects_cross_replica_physical_fault_opportunity(tmp_path: Path) -> None:
+    receipt_path = _accepted_fixed_bundle(tmp_path)
+    receipt = json.loads(receipt_path.read_text())
+    descriptor = receipt["artifacts"]["replica_events"][2]
+    path = tmp_path / descriptor["path"]
+    events = [json.loads(line) for line in path.read_text().splitlines()]
+    events.append(_event("replica-2", 6, events[-1]["source_monotonic_ns"],
+                         "fault.contribution_opportunity", {}))
+    receipt["artifacts"]["replica_events"][2] = _write(
+        tmp_path, descriptor["path"], _jsonl(events))
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical({
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    })).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt))
+    with pytest.raises(subject.ValidationError, match="replica-2 records a physical fault opportunity"):
+        subject.validate_raw_bundle(tmp_path, receipt_path.name)
+
+
+def test_validator_rejects_cross_replica_foreign_fault_marker(tmp_path: Path) -> None:
+    receipt_path = _accepted_fixed_bundle(tmp_path)
+    receipt = json.loads(receipt_path.read_text())
+    source_marker = receipt["artifacts"]["replica_logs"][1]
+    target_marker = receipt["artifacts"]["replica_logs"][3]
+    marker_bytes = (tmp_path / source_marker["path"]).read_bytes().replace(
+        b"fault=role_scoped_persistent_selected_omission_v1", b"fault=foreign_fault_mode_v1")
+    receipt["artifacts"]["replica_logs"][3] = _write(
+        tmp_path, target_marker["path"], marker_bytes)
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical({
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    })).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt))
+    with pytest.raises(subject.ValidationError, match="replica-3 log records a physical fault marker"):
+        subject.validate_raw_bundle(tmp_path, receipt_path.name)
+
+
+def test_validator_rejects_replica_one_foreign_fault_marker(tmp_path: Path) -> None:
+    receipt_path = _accepted_fixed_bundle(tmp_path)
+    receipt = json.loads(receipt_path.read_text())
+    descriptor = receipt["artifacts"]["replica_logs"][1]
+    path = tmp_path / descriptor["path"]
+    marker_bytes = path.read_bytes()
+    path.write_bytes(marker_bytes + marker_bytes.replace(
+        b"fault=role_scoped_persistent_selected_omission_v1", b"fault=foreign_fault_mode_v1"))
+    receipt["artifacts"]["replica_logs"][1] = _write(
+        tmp_path, descriptor["path"], path.read_bytes())
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical({
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    })).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt))
+    with pytest.raises(subject.ValidationError, match="fault opportunities do not biject"):
+        subject.validate_raw_bundle(tmp_path, receipt_path.name)
+
+
 def test_validator_rejects_phase_gated_anchor_outside_tree_four(tmp_path: Path) -> None:
     receipt_path = _accepted_fixed_bundle(tmp_path)
     receipt = json.loads(receipt_path.read_text())
