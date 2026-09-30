@@ -676,6 +676,33 @@ def test_commit_replay_rejects_duplicate_witness_and_ignores_local_batch_index()
                                          arm="fixed_e0", designated_observer=0)
 
 
+def test_commit_replay_rejects_conflicting_hashes_at_one_height() -> None:
+    """A height identifies one committed block across all raw witnesses."""
+    digest, block, conflicting = "a" * 64, "b" * 64, "c" * 64
+    authoritative = {
+        "block_height": 3, "block_hash": block, "parent_hash": None,
+        "transaction_count": 1, "designated_observer": True,
+        "decision_proof": {"epoch_number": 0, "tree_id": 0,
+                           "epoch_digest": digest, "block_hash": block},
+        "view_generation": 0, "commit_batch_index": 0,
+    }
+    streams = {
+        f"replica-{replica}": [
+            _event(f"replica-{replica}", 1, 11, "block.commit_observed",
+                   {"block_height": 3, "block_hash": block, "parent_hash": None,
+                    "transaction_count": 1, "commit_batch_index": replica}),
+        ] for replica in range(7)
+    }
+    streams["replica-0"].insert(0, _event("replica-0", 1, 10, "block.committed", authoritative))
+    streams["replica-1"].append(_event(
+        "replica-1", 2, 12, "block.commit_observed",
+        {"block_height": 3, "block_hash": conflicting, "parent_hash": None,
+         "transaction_count": 1, "commit_batch_index": 1}))
+    with pytest.raises(subject.ValidationError, match="conflicting commit hashes at block height 3"):
+        subject._validate_commit_metrics(streams, anchor_ns=10, e0_digest=digest,
+                                         arm="fixed_e0", designated_observer=0)
+
+
 def test_commit_replay_allows_empty_common_horizon_as_a_negative_measurement() -> None:
     streams = {f"replica-{replica}": [] for replica in range(7)}
     assert subject._validate_commit_metrics(streams, anchor_ns=10, e0_digest="a" * 64,

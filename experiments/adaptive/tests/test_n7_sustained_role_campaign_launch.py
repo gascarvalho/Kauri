@@ -22,20 +22,24 @@ SPEC.loader.exec_module(subject)
 
 def test_scope_command_is_one_cell_and_cgroup_bounded(tmp_path: Path) -> None:
     command = subject.scope_command(unit="kauri-w19-cell-01-abc", arm="fixed_e0",
-                                    run_root=tmp_path / "cell", authorization=tmp_path / "approval.json")
+                                    run_root=tmp_path / "cell", authorization=tmp_path / "approval.json",
+                                    authorization_sha256="a" * 64)
     assert command[:5] == ["systemd-run", "--user", "--scope", "--unit", "kauri-w19-cell-01-abc"]
     assert "--wait" not in command
     assert "RuntimeMaxSec=210s" in command
     assert "KillMode=control-group" in command
     assert command[-1] == "--execute"
-    assert "sustained_role_fixed_e0_launcher.py" in command[-6]
+    assert any("sustained_role_fixed_e0_launcher.py" in item for item in command)
+    assert command[-3:-1] == ["--expected-authorization-sha256", "a" * 64]
 
 
 def test_scope_command_selects_only_the_adaptive_one_shot_launcher(tmp_path: Path) -> None:
     command = subject.scope_command(unit="kauri-w19-cell-02-abc", arm="adaptive_e1",
-                                    run_root=tmp_path / "cell", authorization=tmp_path / "approval.json")
-    assert "sustained_role_adaptive_e1_launcher.py" in command[-6]
+                                    run_root=tmp_path / "cell", authorization=tmp_path / "approval.json",
+                                    authorization_sha256="b" * 64)
+    assert any("sustained_role_adaptive_e1_launcher.py" in item for item in command)
     assert "sustained_role_fixed_e0_launcher.py" not in command
+    assert command[-3:-1] == ["--expected-authorization-sha256", "b" * 64]
 
 
 def test_scope_abort_is_immutable_and_no_retry(tmp_path: Path) -> None:
@@ -170,6 +174,16 @@ def test_prelaunch_rejects_changed_linux_boot(tmp_path: Path, monkeypatch: pytes
         subject.verify_one_cell({}, {}, campaign_root=tmp_path, ordinal=1, authorization=approval)
 
 
+def test_prelaunch_pins_resolved_external_approval_bytes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _run_root, approval = _prepared_cell(tmp_path, monkeypatch)
+    prepared = subject.verify_one_cell({}, {}, campaign_root=tmp_path, ordinal=1,
+                                       authorization=approval)
+    assert prepared["authorization_path"] == approval.resolve()
+    assert prepared["authorization_sha256"] == hashlib.sha256(approval.read_bytes()).hexdigest()
+
+
 def test_prelaunch_rejects_approval_before_freeze(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _run_root, approval = _prepared_cell(tmp_path, monkeypatch, approved_utc="2026-09-30T15:59:59Z")
     with pytest.raises(subject.CampaignLaunchError, match="postdate"):
@@ -223,11 +237,14 @@ def test_scope_status_uncertainty_seals_honest_no_retry_abort(tmp_path: Path,
     cell = {"ordinal": 1, "pair_index": 1, "arm": "fixed_e0", "run_id": "cell01"}
     monkeypatch.setattr(subject, "verify_one_cell", lambda *_args, **_kwargs: {
         "cell": cell, "run_root": run_root, "stage_receipt_path": str(subject.STAGE_PATH),
-        "stage_receipt_sha256": "a" * 64})
+        "stage_receipt_sha256": "a" * 64,
+        "authorization_path": tmp_path / "verified-approval.json", "authorization_sha256": "b" * 64})
     monkeypatch.setattr(subject.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeefcafe"))
     monkeypatch.setattr(subject, "_scope_empty", lambda *_args: (_ for _ in ()).throw(
         subject.CampaignLaunchError("scope status unavailable")))
     def runner(_command: list[str], **_kwargs: object) -> object:
+        assert _command[_command.index("--authorization") + 1] == str(tmp_path / "verified-approval.json")
+        assert _command[_command.index("--expected-authorization-sha256") + 1] == "b" * 64
         return SimpleNamespace(returncode=0, stdout="Running scope as unit: kauri-w19-cell01-deadbeefcafe.scope\n", stderr="")
     with pytest.raises(subject.CampaignLaunchError, match="cleanup could not be verified"):
         subject.execute_one_cell({}, {}, campaign_root=tmp_path, ordinal=1,
@@ -237,6 +254,32 @@ def test_scope_status_uncertainty_seals_honest_no_retry_abort(tmp_path: Path,
     assert abort["no_retry"] is True
 
 
+def test_failed_scope_seals_bounded_stderr_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_root = tmp_path / "cells/cell01"
+    run_root.mkdir(parents=True)
+    cell = {"ordinal": 1, "pair_index": 1, "arm": "fixed_e0", "run_id": "cell01"}
+    monkeypatch.setattr(subject, "verify_one_cell", lambda *_args, **_kwargs: {
+        "cell": cell, "run_root": run_root, "stage_receipt_path": str(subject.STAGE_PATH),
+        "stage_receipt_sha256": "a" * 64,
+        "authorization_path": tmp_path / "verified-approval.json", "authorization_sha256": "b" * 64})
+    monkeypatch.setattr(subject.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeefcafe"))
+    stderr = "x" * 600 + "\nFAIL\t"
+    def runner(_command: list[str], **_kwargs: object) -> object:
+        return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+    with pytest.raises(subject.CampaignLaunchError, match="did not confirm"):
+        subject.execute_one_cell({}, {}, campaign_root=tmp_path, ordinal=1,
+                                 authorization=tmp_path / "caller-path.json", runner=runner)
+    abort = json.loads((run_root / subject.ABORT_PATH).read_bytes())
+    diagnostic = abort["scope_diagnostics"]
+    assert diagnostic["scope_unit"] == "kauri-w19-cell01-deadbeefcafe.scope"
+    assert diagnostic["exit_code"] == 1
+    assert diagnostic["stderr_sha256"] == hashlib.sha256(stderr.encode()).hexdigest()
+    assert len(diagnostic["stderr_tail_escaped"]) <= 270
+    assert "\\nFAIL\\t" in diagnostic["stderr_tail_escaped"]
+
+
 def test_immediate_raw_replay_failure_seals_rejection_abort(tmp_path: Path,
                                                            monkeypatch: pytest.MonkeyPatch) -> None:
     run_root = tmp_path / "cells/cell01"
@@ -244,7 +287,8 @@ def test_immediate_raw_replay_failure_seals_rejection_abort(tmp_path: Path,
     cell = {"ordinal": 1, "pair_index": 1, "arm": "fixed_e0", "run_id": "cell01"}
     monkeypatch.setattr(subject, "verify_one_cell", lambda *_args, **_kwargs: {
         "cell": cell, "run_root": run_root, "stage_receipt_path": str(subject.STAGE_PATH),
-        "stage_receipt_sha256": "a" * 64})
+        "stage_receipt_sha256": "a" * 64,
+        "authorization_path": tmp_path / "verified-approval.json", "authorization_sha256": "b" * 64})
     monkeypatch.setattr(subject.uuid, "uuid4", lambda: SimpleNamespace(hex="deadbeefcafe"))
     monkeypatch.setattr(subject, "_scope_empty", lambda *_args: "ActiveState=inactive\nControlGroup=\n")
     monkeypatch.setattr(subject.evaluator, "_check_freeze", lambda *_args: datetime(2026, 9, 30, 16, tzinfo=timezone.utc))

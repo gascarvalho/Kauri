@@ -389,6 +389,7 @@ def _fault_window_arm_ack(
 def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
         spawn: Callable[..., Any], event_streams: Callable[[Path], Mapping[str, Sequence[Mapping[str, Any]]]],
         cleanup: Callable[[Path, Sequence[Any]], Mapping[str, Any]], raw_clock: Callable[[], int],
+        expected_authorization_sha256: str,
         monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     root, records = Path(run_directory).resolve(), []
     try:
@@ -401,6 +402,7 @@ def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
         approval = fixed._exact_approval(
             root, Path(authorization_path), plan, request_bytes,
             kind=AUTH_KIND, archive_path=APPROVAL,
+            expected_authorization_sha256=expected_authorization_sha256,
         )
         fixed._verify_approved_launch_inputs(root, plan)
         first_omission_tree = fixed._first_omission_tree(plan)
@@ -498,12 +500,12 @@ def _production_cleanup(root: Path, records: Sequence[Any]) -> Mapping[str, Any]
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one authorized W19 adaptive-E1 local pilot")
-    parser.add_argument("--run-root", type=Path, required=True); parser.add_argument("--authorization", type=Path, required=True); parser.add_argument("--execute", action="store_true")
+    parser.add_argument("--run-root", type=Path, required=True); parser.add_argument("--authorization", type=Path, required=True); parser.add_argument("--expected-authorization-sha256", required=True); parser.add_argument("--execute", action="store_true")
     args = parser.parse_args(argv)
     if not args.execute: parser.error("refusing to launch without --execute")
     base = _load("w19_adaptive_base_runtime", KAURI / "experiments/adaptive/n7-crash-recovery/run.py")
     try:
-        result = execute_adaptive_e1_pilot(args.run_root, args.authorization, spawn=base.spawn_process, event_streams=base._event_streams, cleanup=_production_cleanup, raw_clock=lambda: time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW))
+        result = execute_adaptive_e1_pilot(args.run_root, args.authorization, spawn=base.spawn_process, event_streams=base._event_streams, cleanup=_production_cleanup, raw_clock=lambda: time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW), expected_authorization_sha256=args.expected_authorization_sha256)
     except (LaunchError, OSError, ValueError, KeyError, TypeError) as exc: parser.error(str(exc))
     print(json.dumps(result, sort_keys=True, separators=(",", ":"))); return 0
 

@@ -142,7 +142,7 @@ def verify_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, c
         pass
     else:
         raise CampaignLaunchError("authorization must remain external to the run archive")
-    approval, _approval_raw = _read_json(authorization, "external authorization")
+    approval, approval_raw = _read_json(authorization, "external authorization")
     kind = ("kauri-n7-sustained-role-fixed-e0-launch-authorization-v1" if cell["arm"] == "fixed_e0"
             else "kauri-n7-sustained-role-adaptive-e1-launch-authorization-v1")
     expected_approval = {"schema_version", "kind", "request_sha256", "plan_sha256", "approval_reference", "approved_utc", "no_retry"}
@@ -155,18 +155,22 @@ def verify_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, c
     approval_time = datetime.fromisoformat(approval["approved_utc"].removesuffix("Z") + "+00:00")
     if approval_time.tzinfo != timezone.utc or approval_time <= evaluator._check_freeze(frozen):
         raise CampaignLaunchError("external approval does not postdate the campaign freeze")
-    return {"cell": cell, "run_root": run_root, "stage_receipt_path": str(STAGE_PATH),
-            "stage_receipt_sha256": stage_record["stage_receipt_sha256"]}
+    return {"cell": cell, "run_root": run_root, "authorization_path": authorization,
+            "stage_receipt_path": str(STAGE_PATH),
+            "stage_receipt_sha256": stage_record["stage_receipt_sha256"],
+            "authorization_sha256": hashlib.sha256(approval_raw).hexdigest()}
 
 
-def scope_command(*, unit: str, arm: str, run_root: Path, authorization: Path) -> list[str]:
+def scope_command(*, unit: str, arm: str, run_root: Path, authorization: Path,
+                  authorization_sha256: str) -> list[str]:
     launcher = HERE / ("sustained_role_fixed_e0_launcher.py" if arm == "fixed_e0" else "sustained_role_adaptive_e1_launcher.py")
     # systemd 249 rejects --wait together with --scope.  The supervisor is
     # deliberately outside this scope and polls its cgroup state below.
     return ["systemd-run", "--user", "--scope", "--unit", unit,
             "-p", f"RuntimeMaxSec={SCOPE_SECONDS}s", "-p", "KillMode=control-group",
             "-p", "SendSIGKILL=yes", str(sys.executable), str(launcher),
-            "--run-root", str(run_root), "--authorization", str(authorization), "--execute"]
+            "--run-root", str(run_root), "--authorization", str(authorization),
+            "--expected-authorization-sha256", authorization_sha256, "--execute"]
 
 
 def _cgroup_empty(control_group: str) -> bool:
@@ -230,7 +234,8 @@ def _scope_empty(unit: str, runner: Callable[..., Any], *, monotonic: Callable[[
 
 
 def _seal_abort(root: Path, *, cell: Mapping[str, Any], detail: str,
-                state: str = "ABORTED_NO_RETRY_SCOPE_CLEAN") -> None:
+                state: str = "ABORTED_NO_RETRY_SCOPE_CLEAN",
+                diagnostics: Mapping[str, Any] | None = None) -> None:
     """Leave an immutable no-retry outcome when the scoped launcher fails."""
     path = root / ABORT_PATH
     if path.exists() or path.is_symlink():
@@ -242,10 +247,20 @@ def _seal_abort(root: Path, *, cell: Mapping[str, Any], detail: str,
                "state": state, "ordinal": cell["ordinal"],
                "arm": cell["arm"], "run_id": cell["run_id"], "no_retry": True,
                "claim_eligible": False, "figure_eligible": False, "detail": detail[:512]}
+    if diagnostics is not None:
+        payload["scope_diagnostics"] = dict(diagnostics)
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
     with os.fdopen(descriptor, "wb") as stream:
         stream.write(_canonical(payload)); stream.flush(); os.fsync(stream.fileno())
+
+
+def _scope_diagnostics(completed: Any, unit: str) -> dict[str, Any]:
+    stderr = str(completed.stderr or "")
+    escaped_tail = repr(stderr[-256:])[-256:]
+    return {"scope_unit": f"{unit}.scope", "exit_code": completed.returncode,
+            "stderr_sha256": hashlib.sha256(stderr.encode("utf-8", errors="replace")).hexdigest(),
+            "stderr_tail_escaped": escaped_tail}
 
 
 def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, campaign_root: Path,
@@ -256,27 +271,33 @@ def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, 
     cell, root = prepared["cell"], prepared["run_root"]
     unit = f"kauri-w19-{cell['run_id']}-{uuid.uuid4().hex[:12]}"
     try:
-        completed = runner(scope_command(unit=unit, arm=cell["arm"], run_root=root, authorization=authorization),
+        completed = runner(scope_command(unit=unit, arm=cell["arm"], run_root=root,
+                                         authorization=prepared["authorization_path"],
+                                         authorization_sha256=prepared["authorization_sha256"]),
                            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
     except BaseException as exc:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_SCOPE_STATUS_UNVERIFIED",
                     detail="scope supervisor did not return; process state requires manual verification")
         raise CampaignLaunchError("scoped launch supervisor did not return; no retry") from exc
     launch_output = str(completed.stdout or "") + "\n" + str(completed.stderr or "")
+    diagnostics = _scope_diagnostics(completed, unit)
     if f"Running scope as unit: {unit}.scope" not in launch_output:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_SCOPE_STATUS_UNVERIFIED",
-                    detail="systemd did not confirm the exact transient scope")
+                    detail="systemd did not confirm the exact transient scope",
+                    diagnostics=diagnostics)
         raise CampaignLaunchError("systemd did not confirm the exact transient scope; no retry")
     try:
         scope_status = _scope_empty(unit, runner)
     except BaseException as exc:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_SCOPE_STATUS_UNVERIFIED",
-                    detail="scope cleanup could not be verified; process state requires manual verification")
+                    detail="scope cleanup could not be verified; process state requires manual verification",
+                    diagnostics=diagnostics)
         raise CampaignLaunchError("scope cleanup could not be verified; no retry") from exc
     receipt_path = root / RECEIPTS[cell["arm"]]
     if completed.returncode != 0 or receipt_path.is_symlink() or not receipt_path.is_file():
         _seal_abort(root, cell=cell, detail=("scoped launcher failed or lacked raw receipt; " +
-                                               scope_status.replace("\n", "; ")[:300]))
+                                               scope_status.replace("\n", "; ")[:300]),
+                    diagnostics=diagnostics)
         raise CampaignLaunchError("scope failed or launcher did not seal its raw receipt; no retry")
     raw = receipt_path.read_bytes()
     record = {"pair_index": cell["pair_index"], "ordinal": cell["ordinal"], "arm": cell["arm"],
@@ -291,7 +312,8 @@ def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, 
                             expected_arm=cell["arm"], freeze=freeze, frozen_at=evaluator._check_freeze(freeze))
     except BaseException as exc:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_VALIDATION_REJECTED_SCOPE_CLEAN",
-                    detail="independent immediate per-cell replay rejected the sealed raw bundle")
+                    detail="independent immediate per-cell replay rejected the sealed raw bundle",
+                    diagnostics=diagnostics)
         raise CampaignLaunchError("independent per-cell replay rejected the raw bundle; no retry") from exc
     return record
 

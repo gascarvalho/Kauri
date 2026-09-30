@@ -557,6 +557,7 @@ def _late_common_commits(streams: Mapping[str, Sequence[Mapping[str, Any]]], *,
     end_ns = anchor_ns + LATE_END_NS
     authoritative: dict[tuple[int, str], tuple[tuple[Any, ...], int]] = {}
     observations: dict[tuple[int, str], dict[str, tuple[tuple[Any, ...], int]]] = {}
+    height_hashes: dict[int, str] = {}
     observer = f"replica-{DESIGNATED_OBSERVER}"
     for source, events in streams.items():
         for event in events:
@@ -570,6 +571,10 @@ def _late_common_commits(streams: Mapping[str, Sequence[Mapping[str, Any]]], *,
                     event, authoritative=True,
                     expected_epoch_number=expected_epoch_number,
                     expected_epoch_digest=expected_epoch_digest)
+                height, block_hash = key
+                prior_hash = height_hashes.setdefault(height, block_hash)
+                if prior_hash != block_hash:
+                    _fail(f"conflicting late commit hashes at block height {height}")
                 if key in authoritative:
                     _fail("designated observer repeats a late authoritative commit")
                 authoritative[key] = (metadata, timestamp)
@@ -578,6 +583,10 @@ def _late_common_commits(streams: Mapping[str, Sequence[Mapping[str, Any]]], *,
                     event, authoritative=False,
                     expected_epoch_number=expected_epoch_number,
                     expected_epoch_digest=expected_epoch_digest)
+                height, block_hash = key
+                prior_hash = height_hashes.setdefault(height, block_hash)
+                if prior_hash != block_hash:
+                    _fail(f"conflicting late commit hashes at block height {height}")
                 by_source = observations.setdefault(key, {})
                 if source in by_source:
                     _fail(f"{source} repeats a late commit observation")

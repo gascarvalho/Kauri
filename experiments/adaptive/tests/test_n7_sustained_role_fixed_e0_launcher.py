@@ -120,9 +120,13 @@ def test_exact_external_approval_cannot_be_reused_for_another_plan(tmp_path: Pat
     plan = {"plan_sha256": "a" * 64}; request = {"request": "one"}; request_bytes = _canon(request)
     approval = {"schema_version": 1, "kind": subject.AUTH_KIND, "request_sha256": hashlib.sha256(request_bytes).hexdigest(), "plan_sha256": "a" * 64, "approval_reference": "operator", "approved_utc": "2026-09-30T12:00:00Z", "no_retry": True}
     external = tmp_path / "approval.json"; external.write_bytes(_canon(approval))
-    assert subject._exact_approval(root, external, plan, request_bytes)["no_retry"] is True
+    approval_sha = hashlib.sha256(external.read_bytes()).hexdigest()
+    assert subject._exact_approval(
+        root, external, plan, request_bytes,
+        expected_authorization_sha256=approval_sha)["no_retry"] is True
     with pytest.raises(subject.LaunchError, match="refusing"):
-        subject._exact_approval(root, external, plan, request_bytes)
+        subject._exact_approval(root, external, plan, request_bytes,
+                                expected_authorization_sha256=approval_sha)
     assert (root / subject.APPROVAL).is_file()
 
 
@@ -134,7 +138,27 @@ def test_external_approval_requires_parseable_utc_timestamp(tmp_path: Path):
                 "approval_reference": "operator", "approved_utc": "not-a-utcZ", "no_retry": True}
     external = tmp_path / "approval.json"; external.write_bytes(_canon(approval))
     with pytest.raises(subject.LaunchError, match="not exact"):
-        subject._exact_approval(root, external, plan, request_bytes)
+        subject._exact_approval(root, external, plan, request_bytes,
+                                expected_authorization_sha256=hashlib.sha256(external.read_bytes()).hexdigest())
+
+
+def test_campaign_approval_pin_rejects_changed_reference_before_archive(tmp_path: Path):
+    root = tmp_path / "run"; (root / "runtime").mkdir(parents=True)
+    request_bytes = _canon({"request": "one"})
+    approval = {"schema_version": 1, "kind": subject.AUTH_KIND,
+                "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                "plan_sha256": "a" * 64, "approval_reference": "approved-campaign",
+                "approved_utc": "2026-09-30T17:00:00Z", "no_retry": True}
+    external = tmp_path / "approval.json"
+    external.write_bytes(_canon(approval))
+    verified_sha = hashlib.sha256(external.read_bytes()).hexdigest()
+    approval["approval_reference"] = "different-campaign"
+    approval["approved_utc"] = "2026-09-29T00:00:00Z"
+    external.write_bytes(_canon(approval))
+    with pytest.raises(subject.LaunchError, match="changed after campaign verification"):
+        subject._exact_approval(root, external, {"plan_sha256": "a" * 64}, request_bytes,
+                                expected_authorization_sha256=verified_sha)
+    assert not (root / subject.APPROVAL).exists()
 
 def test_prearm_requires_a_common_e0_commit_from_every_replica():
     streams = {f"replica-{i}": [{"event_type": "block.commit_observed", "source_monotonic_ns": 9, "payload": {"block_height": 7, "block_hash": "b" * 64}}] for i in range(7)}

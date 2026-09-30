@@ -303,8 +303,14 @@ def _e0_identity_helper(root: Path, identity_path: Path) -> Path:
 
 
 def _exact_approval(root: Path, supplied: Path, plan: Mapping[str, Any], request_bytes: bytes,
-                    *, kind: str = AUTH_KIND, archive_path: Path = APPROVAL) -> dict[str, Any]:
+                    *, kind: str = AUTH_KIND, archive_path: Path = APPROVAL,
+                    expected_authorization_sha256: str) -> dict[str, Any]:
     approval, raw = _read(supplied.resolve(), "external authorization")
+    if (not isinstance(expected_authorization_sha256, str) or
+            len(expected_authorization_sha256) != 64 or
+            any(character not in _HEX for character in expected_authorization_sha256) or
+            _sha(raw) != expected_authorization_sha256):
+        raise LaunchError("external authorization changed after campaign verification")
     expected = {"schema_version", "kind", "request_sha256", "plan_sha256", "approval_reference", "approved_utc", "no_retry"}
     if (set(approval) != expected or approval.get("schema_version") != 1 or approval.get("kind") != kind or
             approval.get("request_sha256") != _sha(request_bytes) or approval.get("plan_sha256") != plan.get("plan_sha256") or
@@ -484,6 +490,7 @@ def _await_fixed_manager_completion(
 def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
                            spawn: Callable[..., Any], event_streams: Callable[[Path], Mapping[str, Sequence[Mapping[str, Any]]]],
                            cleanup: Callable[[Path, Sequence[Any]], Mapping[str, Any]], raw_clock: Callable[[], int],
+                           expected_authorization_sha256: str,
                            monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep) -> dict[str, Any]:
     """Launch exactly once, preserving a complete receipt or a sealed abort."""
     root = Path(run_directory).resolve(); records: list[Any] = []
@@ -494,7 +501,8 @@ def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
                 plan.get("no_retry") is not True or _plan_digest(plan) != plan.get("plan_sha256") or
                 request.get("execution_plan_sha256") != plan.get("plan_sha256") or request.get("no_retry") is not True):
             raise LaunchError("fixed-E0 plan/request identity drift")
-        approval = _exact_approval(root, authorization_path, plan, request_bytes)
+        approval = _exact_approval(root, authorization_path, plan, request_bytes,
+                                   expected_authorization_sha256=expected_authorization_sha256)
         _verify_approved_launch_inputs(root, plan)
         e0_digest, e0_path = _source_e0(root)
         e0_helper = _e0_identity_helper(root, e0_path)
@@ -592,7 +600,8 @@ def _run_id_from_plan(root: Path) -> str:
     return _option(argv, "--structured-event-run-id")
 
 
-def execute_production_fixed_e0_pilot(run_directory: Path, authorization_path: Path) -> dict[str, Any]:
+def execute_production_fixed_e0_pilot(run_directory: Path, authorization_path: Path,
+                                      *, expected_authorization_sha256: str) -> dict[str, Any]:
     """Production adapter used solely by the explicit CLI execution command."""
     base = _load("w19_sustained_base_runtime", KAURI / "experiments/adaptive/n7-crash-recovery/run.py")
     return execute_fixed_e0_pilot(
@@ -601,6 +610,7 @@ def execute_production_fixed_e0_pilot(run_directory: Path, authorization_path: P
         event_streams=base._event_streams,
         cleanup=_production_cleanup,
         raw_clock=lambda: time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW),
+        expected_authorization_sha256=expected_authorization_sha256,
     )
 
 
@@ -608,12 +618,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Run one authorized W19 fixed-E0 local pilot")
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--authorization", type=Path, required=True)
+    parser.add_argument("--expected-authorization-sha256", required=True)
     parser.add_argument("--execute", action="store_true", help="explicitly permit the one-shot local launch")
     args = parser.parse_args(argv)
     if not args.execute:
         parser.error("refusing to launch without --execute")
     try:
-        result = execute_production_fixed_e0_pilot(args.run_root, args.authorization)
+        result = execute_production_fixed_e0_pilot(
+            args.run_root, args.authorization,
+            expected_authorization_sha256=args.expected_authorization_sha256)
     except (LaunchError, OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(str(exc))
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))

@@ -588,6 +588,29 @@ def test_rejects_late_commit_without_all_seven_witnesses(tmp_path: Path) -> None
         subject.evaluate_campaign(_freeze(), cells)
 
 
+def test_late_common_commits_rejects_conflicting_hashes_at_one_height() -> None:
+    """A same-height fork is invalid evidence even when every replica saw it."""
+    anchor = 1_000
+    height, block, conflicting = 42, "a" * 64, "b" * 64
+    timestamp = anchor + subject.LATE_START_NS + 1
+    streams: dict[str, list[dict[str, Any]]] = {}
+    for replica in range(7):
+        events: list[dict[str, Any]] = []
+        if replica == subject.DESIGNATED_OBSERVER:
+            events.append(_event("conflicting-height", replica, 1, timestamp,
+                                 "block.committed", _committed(height, block, subject.FIXED_ARM)))
+        events.append(_event("conflicting-height", replica, 2, timestamp + 1,
+                             "block.commit_observed", _observed(height, block)))
+        events.append(_event("conflicting-height", replica, 3, timestamp + 2,
+                             "block.commit_observed", _observed(height, conflicting)))
+        streams[f"replica-{replica}"] = events
+    with pytest.raises(subject.CampaignEvaluationError,
+                       match="conflicting late commit hashes at block height 42"):
+        subject._late_common_commits(
+            streams, anchor_ns=anchor, expected_epoch_number=0,
+            expected_epoch_digest="e" * 64)
+
+
 def test_rejects_missing_post_twenty_second_fault(tmp_path: Path) -> None:
     cells = _campaign(tmp_path)
     root = Path(cells[0]["root"])

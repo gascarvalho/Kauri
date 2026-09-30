@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -11,6 +13,50 @@ PATH = ROOT / "n7-path-timeout-quorum" / "sustained_role_adaptive_e1_launcher.py
 spec = importlib.util.spec_from_file_location("w19_adaptive_launcher", PATH)
 assert spec and spec.loader
 subject = importlib.util.module_from_spec(spec); spec.loader.exec_module(subject)
+
+
+def test_adaptive_approval_uses_outer_verified_raw_hash(tmp_path: Path):
+    root = tmp_path / "run"; (root / "runtime").mkdir(parents=True)
+    request_bytes = b'{"request":"one"}\n'
+    approval = {"schema_version": 1, "kind": subject.AUTH_KIND,
+                "request_sha256": hashlib.sha256(request_bytes).hexdigest(),
+                "plan_sha256": "a" * 64, "approval_reference": "approved-campaign",
+                "approved_utc": "2026-09-30T17:00:00Z", "no_retry": True}
+    external = tmp_path / "approval.json"
+    original = json.dumps(approval, sort_keys=True, separators=(",", ":")).encode() + b"\n"
+    external.write_bytes(original)
+    verified_sha = hashlib.sha256(original).hexdigest()
+    accepted = subject.fixed._exact_approval(
+        root, external, {"plan_sha256": "a" * 64}, request_bytes,
+        kind=subject.AUTH_KIND, archive_path=subject.APPROVAL,
+        expected_authorization_sha256=verified_sha)
+    assert accepted["approval_reference"] == "approved-campaign"
+    assert (root / subject.APPROVAL).read_bytes() == original
+
+
+def test_adaptive_execution_threads_required_approval_hash_before_spawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    root = tmp_path / "run"; (root / "runtime").mkdir(parents=True)
+    plan = {"state": "PREPARED_DRY_RUN_EXTERNAL_APPROVAL_REQUIRED",
+            "comparison": {"arm": "adaptive_e1"}, "no_retry": True,
+            "plan_sha256": "a" * 64}
+    request = {"execution_plan_sha256": "a" * 64, "no_retry": True}
+    monkeypatch.setattr(subject.fixed, "_read", lambda path, _label: (
+        (plan, b"plan") if path.name == subject.PLAN.name else (request, b"request")))
+    monkeypatch.setattr(subject.fixed, "_plan_digest", lambda _plan: "a" * 64)
+    observed: list[str] = []
+    def approval(*_args: object, **kwargs: object) -> object:
+        observed.append(kwargs["expected_authorization_sha256"])
+        raise subject.LaunchError("pin checked before spawn")
+    monkeypatch.setattr(subject.fixed, "_exact_approval", approval)
+    with pytest.raises(subject.LaunchError, match="pin checked before spawn"):
+        subject.execute_adaptive_e1_pilot(
+            root, tmp_path / "approval.json", expected_authorization_sha256="b" * 64,
+            spawn=lambda *_args, **_kwargs: pytest.fail("must not spawn"),
+            event_streams=lambda _root: {}, cleanup=lambda *_args: {}, raw_clock=lambda: 0,
+        )
+    assert observed == ["b" * 64]
 
 
 def test_adaptive_manager_requires_native_signed_successor_bindings():

@@ -606,6 +606,7 @@ def _validate_commit_metrics(streams: Mapping[str, Sequence[Mapping[str, Any]]],
     end_ns = anchor_ns + _HORIZON_NS
     authoritative: dict[tuple[int, str], tuple[Any, ...]] = {}
     observed: dict[tuple[int, str], dict[str, tuple[Any, ...]]] = {}
+    height_hashes: dict[int, str] = {}
     for source, events in streams.items():
         prior_ns = -1
         for event in events:
@@ -629,7 +630,11 @@ def _validate_commit_metrics(streams: Mapping[str, Sequence[Mapping[str, Any]]],
                 _hex64(parent, "commit-derived parent hash")
             if type(payload["transaction_count"]) is not int or payload["transaction_count"] < 0 or type(payload["commit_batch_index"]) is not int or payload["commit_batch_index"] < 0:
                 raise ValidationError("commit-derived metric counters are invalid")
-            key = (payload["block_height"], block_hash)
+            height = payload["block_height"]
+            prior_hash = height_hashes.setdefault(height, block_hash)
+            if prior_hash != block_hash:
+                raise ValidationError(f"conflicting commit hashes at block height {height}")
+            key = (height, block_hash)
             # Batch indices are local to each reporter, not a block identity.
             metadata = (parent, payload["transaction_count"])
             if event["event_type"] == "block.commit_observed":
