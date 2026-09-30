@@ -450,8 +450,16 @@ def _plan_manager_argv(plan: Mapping[str, Any], *, e0_digest: str, arm: str) -> 
     schedule = plan.get("scheduled_window")
     native = plan.get("native_fault_schedule")
     descriptor = native.get("descriptor") if isinstance(native, Mapping) else None
-    if (not isinstance(schedule, Mapping) or set(schedule) != {"start_monotonic_ns", "end_monotonic_ns"} or
-            type(schedule["start_monotonic_ns"]) is not int or type(schedule["end_monotonic_ns"]) is not int):
+    expected_schedule = {"start_monotonic_ns", "end_monotonic_ns", "argv_pinned_before_launch", "attestation"}
+    expected_attestation = {
+        "must_be_written": "after_prearm_all_seven_e0_common_commit_before_scheduled_start",
+        "is_not": "an_arm_or_gate",
+    }
+    if (not isinstance(schedule, Mapping) or set(schedule) != expected_schedule or
+            type(schedule["start_monotonic_ns"]) is not int or
+            type(schedule["end_monotonic_ns"]) is not int or
+            schedule["argv_pinned_before_launch"] is not True or
+            schedule["attestation"] != expected_attestation):
         raise ValidationError("fixed-E0 plan schedule is malformed")
     profile_sha = _descriptor_digest(descriptor, "native profile")
     if argv.count("--structured-event-run-id") != 1:
@@ -1088,7 +1096,9 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
             request["execution_plan_sha256"] != receipt["plan_sha256"] or
             request["repository_revision"] != plan.get("repository_revision") or
             request["arm"] != receipt["arm"] or
-            request["scheduled_window"] != receipt["launch_binding"]["scheduled_window"] or
+            request["scheduled_window"] != plan.get("scheduled_window") or
+            {key: request["scheduled_window"].get(key) for key in ("start_monotonic_ns", "end_monotonic_ns")} !=
+            receipt["launch_binding"]["scheduled_window"] or
             type(request["hard_timeout_seconds"]) is not int or
             request["hard_timeout_seconds"] < 120 or request["no_retry"] is not True or
             request["claim_eligible"] is not False or request["figure_eligible"] is not False):

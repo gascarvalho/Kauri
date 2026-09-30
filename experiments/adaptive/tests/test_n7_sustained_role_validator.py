@@ -48,6 +48,14 @@ def _accepted_fixed_bundle(root: Path) -> Path:
     )
     e0 = subject._source_adaptive_v2_epoch_zero_digest(tree_raw)
     baseline_block = "c" * 64; block = "b" * 64; profile = b"native profile\n"; start = 10; end = 60_000_000_010
+    scheduled_window = {
+        "start_monotonic_ns": start, "end_monotonic_ns": end,
+        "argv_pinned_before_launch": True,
+        "attestation": {
+            "must_be_written": "after_prearm_all_seven_e0_common_commit_before_scheduled_start",
+            "is_not": "an_arm_or_gate",
+        },
+    }
     _write(root, "config/epoch0.tree", tree_raw)
     helper_raw = ("#!/bin/sh\nprintf '%s\\n' " + e0 + "\n").encode("ascii")
     helper = root / "runtime/e0-helper"
@@ -91,12 +99,11 @@ def _accepted_fixed_bundle(root: Path) -> Path:
             "epoch0": {"tree": tree_descriptor},
             "native_fault_schedule": {"descriptor": profile_descriptor},
             "manager_selection_policy": {"descriptor": selection_descriptor},
-            "scheduled_window": {"start_monotonic_ns": start, "end_monotonic_ns": end}}
+            "scheduled_window": scheduled_window}
     plan["plan_sha256"] = hashlib.sha256(_canonical(plan)).hexdigest()
     request = {"schema_version": 1, "kind": "kauri-n7-sustained-role-execution-authorization-request-v1",
                "execution_plan_sha256": plan["plan_sha256"], "repository_revision": "c" * 40,
-               "arm": "fixed_e0", "scheduled_window": {"start_monotonic_ns": start,
-                                                        "end_monotonic_ns": end},
+               "arm": "fixed_e0", "scheduled_window": scheduled_window,
                "hard_timeout_seconds": 180, "no_retry": True,
                "claim_eligible": False, "figure_eligible": False}
     approval = {"schema_version": 1, "kind": "kauri-n7-sustained-role-fixed-e0-launch-authorization-v1",

@@ -113,3 +113,30 @@ def test_materialized_e0_authority_reopens_identically_in_launcher_and_validator
     assert reopened["epoch_digest"] == e0_digest
     assert reopened["tree_file"] == "config/epoch0.tree"
     assert reopened["tree_file_sha256"] == plan["epoch0"]["tree"]["sha256"]
+
+
+def test_fixed_no_launch_schedule_is_replayed_by_independent_validator(tmp_path: Path) -> None:
+    """Use the real producer schema, not a hand-built two-field schedule."""
+    root = tmp_path / "fixed-materialized"
+    start = 1_000_000_000
+    local.prepare_materialized_dry_run(
+        root,
+        arm="fixed_e0",
+        materialize=lambda owned: local.materialize_runtime_inputs(
+            owned, arm="fixed_e0", run_id="w19-fixed-schema-contract",
+            peer_port=18271, client_port=19271, manager_port=20271,
+            hard_timeout_seconds=180, **_built_binaries(),
+        ),
+        window_start_monotonic_ns=start,
+        window_end_monotonic_ns=(start + local.profile.COMMON_HORIZON_NS
+                                 + local.profile.MINIMUM_POST_START_ANCHOR_SLACK_NS),
+        repository_snapshot=lambda _path: SimpleNamespace(revision="a" * 40, worktree_clean=True),
+        native_mode_revision_check=lambda _revision: True,
+    )
+    plan = json.loads((root / local.PLAN).read_text(encoding="utf-8"))
+    request = json.loads((root / local.REQUEST).read_text(encoding="utf-8"))
+    digest, _ = fixed._source_e0(root)
+    effective = validator._plan_manager_argv(plan, e0_digest=digest, arm="fixed_e0")
+    assert effective == list(fixed._scheduled_manager(plan, e0_digest=digest))
+    assert request["scheduled_window"] == plan["scheduled_window"]
+    assert not (root / "logs").exists() and not (root / "raw").exists()
