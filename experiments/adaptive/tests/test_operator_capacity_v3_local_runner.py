@@ -57,19 +57,30 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[str], list[list[str]], Path, Pa
 
 
 class _FakeLifecycle:
-    def __init__(self) -> None: self.calls: list[str] = []
+    def __init__(self, *, terminal: bool = True) -> None:
+        self.calls: list[str] = []
+        self.terminal = terminal
+        self.terminated = False
     def start_replica(self, replica_id: int, argv: list[str], log: Path) -> None: self.calls.append(f"replica-{replica_id}")
     def start_manager(self, argv: list[str], log: Path) -> None: self.calls.append("manager")
-    def wait_manager(self, deadline_monotonic: float) -> int: self.calls.append("wait"); return 0
+    def await_e1_measurement_window(self, deadline_monotonic: float) -> dict[str, object]: self.calls.append("e1-window"); return {"activated_replica_ids": list(range(31)), "post_e1_commit": {"block_height": 1}}
+    def manager_exit_status(self) -> int | None:
+        self.calls.append("manager-status")
+        return -15 if self.terminated else None
+    def manager_success_terminal_verified(self) -> bool:
+        self.calls.append("terminal")
+        return self.terminal
     def stop_monitor(self) -> None: self.calls.append("stop-monitor")
-    def terminate_manager_and_replicas(self) -> None: self.calls.append("terminate-processes")
+    def terminate_manager_and_replicas(self) -> None:
+        self.calls.append("terminate-processes")
+        self.terminated = True
     def terminate_owned_replica_scopes(self, deadline_monotonic: float) -> dict[str, object]: self.calls.append("terminate-scopes"); return {"units": []}
     def verify_scope_cleanup(self, deadline_monotonic: float) -> dict[str, object]: self.calls.append("verify-cleanup"); return {"verified": True}
 
 
 def _contract() -> cpu_quota.CpuQuotaContract:
     assignments = tuple(cpu_quota.CpuQuotaAssignment(replica, "slow" if replica < 6 else "fast", 25 if replica < 6 else 100) for replica in range(31))
-    return cpu_quota.CpuQuotaContract(schema_version=1, contract_id="n31-static-resource-cpu-sham-quota-v1", enabled=True, figure_eligible=False, launcher="systemd-user-scope-cpu-quota-v1", manager_visibility="none", sampling_interval_ms=1000, base_profile_id="n31-static-resource-cpu-sham-v1", base_profile_sha256="285aa55cb33637009ccd491d74830cd7485bcd83cb993c33c488dbff6fe4bf09", base_profile_canonical_sha256="2ed182ed95fe8514c80eb861ed2e86654afaaf6b881a2ede6fc1a03d0565b766", assignments=assignments, contract_sha256="0" * 64)
+    return cpu_quota.CpuQuotaContract(schema_version=1, contract_id="n31-static-resource-cpu-sham-quota-v1", enabled=True, figure_eligible=False, launcher="systemd-user-scope-cpu-quota-v1", manager_visibility="none", sampling_interval_ms=1000, base_profile_id="n31-static-resource-cpu-sham-v1", base_profile_sha256="285aa55cb33637009ccd491d74830cd7485bcd83cb993c33c488dbff6fe4bf09", base_profile_canonical_sha256="2ed182ed95fe8514c80eb861ed2e86654afaaf6b881a2ede6fc1a03d0565b766", assignments=assignments, contract_sha256=hashlib.sha256(_canonical(_EXPECTED_QUOTA_PROFILE)).hexdigest())
 
 
 def _bind_materialization_to_authority(root: Path, authority: dict[str, object]) -> None:
@@ -168,8 +179,86 @@ def test_valid_authority_reaches_fake_lifecycle_and_mutated_binary_cannot(tmp_pa
     result = subject.execute_excluded_local_shakedown(materialization_root=root, manager_argv=manager, replica_argv=replicas, quota_profile=quota, authorization_request=request, authorization_receipt=receipt, tool_identity_approval_path=approval, execute=True, timeout_s=1200, current_revision=lambda: "a" * 40, worktree_clean=lambda: True, lifecycle_factory=factory, pre_spawn_authority=authority, quota_contract=_contract(), native_verifier_run=_native_verifier_copying_retained_receipt(authority))
     assert result["verdict"] == "PROCESS_COMPLETED_PENDING_RAW_VALIDATION"
     assert constructed == [True] and (root / "runtime/factory-side-effect").read_bytes() == b"owned"
-    assert lifecycle.calls[:32] == [*(f"replica-{replica}" for replica in range(31)), "manager"]
-    assert lifecycle.calls[-5:] == ["wait", "stop-monitor", "terminate-processes", "terminate-scopes", "verify-cleanup"]
+    assert (root / "runtime/stage-a-verifier-receipt.json").read_bytes() == Path(str(authority["native_receipt"])).read_bytes()
+    assert lifecycle.calls[:33] == [*(f"replica-{replica}" for replica in range(31)), "manager", "e1-window"]
+    assert lifecycle.calls[-7:] == ["terminal", "manager-status", "stop-monitor", "terminate-processes", "manager-status", "terminate-scopes", "verify-cleanup"]
+    assert result["e1_measurement_window"] == {"activated_replica_ids": list(range(31)), "post_e1_commit": {"block_height": 1}}
+    assert result["manager_exit_code"] is None
+    assert result["manager_exit_code_after_cleanup"] == -15
+    assert result["manager_success_terminal_verified"] is True
+    assert (root / "runtime/frozen-cpu-quota-contract.json").read_bytes() == quota.read_bytes()
+    assert json.loads((root / "runtime/manager-argv.json").read_text(encoding="ascii")) == manager
+
+
+def test_live_manager_is_cleaned_after_window_without_waiting_for_spontaneous_exit(tmp_path: Path) -> None:
+    root, manager, replicas, quota, approval, binaries = _fixture(tmp_path)
+    authority = _authority(tmp_path, root, quota, approval, binaries)
+    _bind_materialization_to_authority(root, authority)
+    _plan, request, receipt = _authorized(root, manager, replicas, quota)
+    lifecycle = _FakeLifecycle()
+    result = subject.execute_excluded_local_shakedown(
+        materialization_root=root, manager_argv=manager, replica_argv=replicas,
+        quota_profile=quota, authorization_request=request, authorization_receipt=receipt,
+        tool_identity_approval_path=approval, execute=True, timeout_s=1200,
+        current_revision=lambda: "a" * 40, worktree_clean=lambda: True,
+        lifecycle_factory=lambda: lifecycle, pre_spawn_authority=authority,
+        quota_contract=_contract(), native_verifier_run=_native_verifier_copying_retained_receipt(authority),
+    )
+    assert result["verdict"] == "PROCESS_COMPLETED_PENDING_RAW_VALIDATION"
+    assert "wait" not in lifecycle.calls
+    assert result["manager_exit_code"] is None
+    assert result["manager_exit_code_after_cleanup"] == -15
+
+
+def test_missing_successor_terminal_seals_abort_even_if_window_completes(tmp_path: Path) -> None:
+    root, manager, replicas, quota, approval, binaries = _fixture(tmp_path)
+    authority = _authority(tmp_path, root, quota, approval, binaries)
+    _bind_materialization_to_authority(root, authority)
+    _plan, request, receipt = _authorized(root, manager, replicas, quota)
+    lifecycle = _FakeLifecycle(terminal=False)
+    result = subject.execute_excluded_local_shakedown(
+        materialization_root=root, manager_argv=manager, replica_argv=replicas,
+        quota_profile=quota, authorization_request=request, authorization_receipt=receipt,
+        tool_identity_approval_path=approval, execute=True, timeout_s=1200,
+        current_revision=lambda: "a" * 40, worktree_clean=lambda: True,
+        lifecycle_factory=lambda: lifecycle, pre_spawn_authority=authority,
+        quota_contract=_contract(), native_verifier_run=_native_verifier_copying_retained_receipt(authority),
+    )
+    assert result["verdict"] == "ABORTED"
+    assert "successor-converged terminal" in str(result["failure"])
+    assert result["manager_success_terminal_verified"] is False
+
+
+def test_frozen_profile_archive_requires_exact_contract_and_authority_bytes(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"; runtime.mkdir()
+    profile = tmp_path / "quota.json"; profile.write_bytes(_canonical(_EXPECTED_QUOTA_PROFILE))
+    authority_profile = tmp_path / "authority-quota.json"; authority_profile.write_bytes(profile.read_bytes())
+    assert subject._archive_frozen_quota_contract(
+        quota_profile=profile, contract=_contract(), authority={"quota_profile": authority_profile}, runtime=runtime,
+    ) == hashlib.sha256(profile.read_bytes()).hexdigest()
+    assert (runtime / "frozen-cpu-quota-contract.json").read_bytes() == profile.read_bytes()
+    authority_profile.write_bytes(b"{}\n")
+    with pytest.raises(subject.OperatorCapacityV3LocalRunnerError, match="pre-spawn authority"):
+        subject._archive_frozen_quota_contract(
+            quota_profile=profile, contract=_contract(), authority={"quota_profile": authority_profile}, runtime=tmp_path,
+        )
+
+
+def test_quota_monitor_requires_a_complete_round_after_raw_window_phase_offset(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"; raw.mkdir()
+    lifecycle = object.__new__(subject.CpuQuotaLocalLifecycle)
+    lifecycle._root = tmp_path
+    def append_round(timestamp: int) -> None:
+        with (raw / "cpu-quota-samples.jsonl").open("a", encoding="ascii") as handle:
+            for replica in range(31):
+                handle.write(json.dumps({"source_monotonic_ns": timestamp, "replica_id": replica}) + "\n")
+        with (raw / "cpu-quota-monitor-rounds.jsonl").open("a", encoding="ascii") as handle:
+            handle.write(json.dumps({"sample_monotonic_ns": timestamp,
+                                     "finished_monotonic_ns": timestamp + 1}) + "\n")
+    append_round(99)
+    assert lifecycle._complete_quota_round_at_or_after(100) is False
+    append_round(100)
+    assert lifecycle._complete_quota_round_at_or_after(100) is True
 
     root, manager, replicas, quota, approval, binaries = _fixture(tmp_path / "mutated")
     authority = _authority(tmp_path / "mutated", root, quota, approval, binaries); _bind_materialization_to_authority(root, authority); _plan, request, receipt = _authorized(root, manager, replicas, quota)
@@ -208,3 +297,83 @@ def test_native_verifier_failure_seals_abort_before_any_process_spawn(tmp_path: 
     assert constructed == []
     sealed = json.loads((root / "runtime/local-shakedown-abort.json").read_text(encoding="ascii"))
     assert sealed == result
+
+
+def test_e1_measurement_window_requires_every_replica_activation_and_post_e1_observer_commit(tmp_path: Path) -> None:
+    root = tmp_path
+    raw = root / "raw"; raw.mkdir()
+    for replica in range(31):
+        event = {"source_kind": "replica", "source_id": f"replica-{replica}",
+                 "source_sequence": 1, "source_monotonic_ns": 100 + replica,
+                 "event_type": "epoch.activated", "payload": {"epoch_number": 1,
+                 "tree_id": 0, "epoch_digest": "a" * 64, "activation_height": 5,
+                 "certificate_apply_committed_height": 4,
+                 "activation_readiness_certificate_digest": "c" * 64}}
+        (raw / f"replica-{replica}.jsonl").write_text(json.dumps(event) + "\n", encoding="ascii")
+    assert subject._e1_measurement_window(root) is None
+    with (raw / "replica-0.jsonl").open("a", encoding="ascii") as handle:
+        handle.write(json.dumps({"source_kind": "replica", "source_id": "replica-0", "source_monotonic_ns": 200,
+                                 "event_type": "block.committed",
+                                 "payload": {"decision_proof": {"epoch_number": 1,
+                                             "tree_id": 0, "epoch_digest": "a" * 64,
+                                             "block_hash": "b" * 64}, "designated_observer": True,
+                                             "block_height": 7}}) + "\n")
+    result = subject._e1_measurement_window(root)
+    assert result is not None
+    assert result["activated_replica_ids"] == list(range(31))
+    assert result["all_replica_e1_activation_monotonic_ns"] == 130
+    assert result["post_e1_window_start_monotonic_ns"] == 130
+    assert result["post_e1_window_end_monotonic_ns"] == 130 + subject._POST_E1_WINDOW_NS
+    assert result["post_e1_commit"] == {
+        "block_height": 7, "source_monotonic_ns": 200, "epoch_digest": "a" * 64,
+    }
+
+
+def test_e1_measurement_window_rejects_legacy_nested_activation_or_nonreplica_source(tmp_path: Path) -> None:
+    root = tmp_path
+    raw = root / "raw"; raw.mkdir()
+    for replica in range(31):
+        payload = {"epoch_number": 1, "tree_id": 0, "epoch_digest": "a" * 64,
+                   "activation_height": 5}
+        if replica == 7:
+            payload = {"configuration": payload}
+        event = {"source_kind": "replica", "source_id": f"replica-{replica}",
+                 "event_type": "epoch.activated", "payload": payload}
+        (raw / f"replica-{replica}.jsonl").write_text(json.dumps(event) + "\n", encoding="ascii")
+    with (raw / "replica-0.jsonl").open("a", encoding="ascii") as handle:
+        handle.write(json.dumps({"source_kind": "manager", "source_id": "replica-0",
+                                 "event_type": "block.committed",
+                                 "payload": {"decision_proof": {"epoch_number": 1},
+                                             "designated_observer": True, "block_height": 7}}) + "\n")
+    assert subject._e1_measurement_window(root) is None
+
+
+def test_manager_success_terminal_requires_run_bound_e1_success(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"; raw.mkdir()
+    terminal = {"run_id": "run-1", "source_kind": "adaptation_manager",
+                "event_type": "adaptive_v2_session_terminal",
+                "payload": {"outcome": "advanced", "reason": "successor_converged",
+                            "successor_epoch_number": 1}}
+    (raw / "manager-events.jsonl").write_text(json.dumps(terminal) + "\n", encoding="ascii")
+    assert subject._manager_success_terminal(tmp_path, "run-1") is True
+    assert subject._manager_success_terminal(tmp_path, "other-run") is False
+    terminal["payload"]["successor_epoch_number"] = 2
+    (raw / "manager-events.jsonl").write_text(json.dumps(terminal) + "\n", encoding="ascii")
+    assert subject._manager_success_terminal(tmp_path, "run-1") is False
+
+
+def test_e1_measurement_window_rejects_commit_before_raw_anchor_or_different_e1_digest(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"; raw.mkdir()
+    for replica in range(31):
+        digest = "b" * 64 if replica == 30 else "a" * 64
+        event = {"source_kind": "replica", "source_id": f"replica-{replica}",
+                 "source_sequence": 1, "source_monotonic_ns": 100 + replica,
+                 "event_type": "epoch.activated", "payload": {"epoch_number": 1,
+                 "tree_id": 0, "epoch_digest": digest, "activation_height": 5}}
+        (raw / f"replica-{replica}.jsonl").write_text(json.dumps(event) + "\n", encoding="ascii")
+    with (raw / "replica-0.jsonl").open("a", encoding="ascii") as handle:
+        handle.write(json.dumps({"source_kind": "replica", "source_id": "replica-0",
+                                 "source_monotonic_ns": 129, "event_type": "block.committed",
+                                 "payload": {"decision_proof": {"epoch_number": 1, "epoch_digest": "a" * 64},
+                                             "designated_observer": True, "block_height": 1}}) + "\n")
+    assert subject._e1_measurement_window(tmp_path) is None

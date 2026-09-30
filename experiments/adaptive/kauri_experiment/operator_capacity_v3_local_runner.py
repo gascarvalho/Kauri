@@ -25,6 +25,7 @@ from .processes import ProcessRegistry
 _KIND = "kauri-n31-operator-capacity-v3-local-execution-request-v1"
 _AUTH_KIND = "kauri-n31-operator-capacity-v3-local-execution-authorization-v1"
 _MAX_TIMEOUT_S = 20 * 60
+_POST_E1_WINDOW_NS = 30 * 1_000_000_000
 
 
 class OperatorCapacityV3LocalRunnerError(RuntimeError):
@@ -255,6 +256,89 @@ def _verify_fresh_runtime(root: Path) -> tuple[Path, Path]:
     return logs, runtime
 
 
+def _e1_measurement_window(root: Path) -> dict[str, object] | None:
+    """Return a minimal, fail-closed E1 gate from complete JSONL records.
+
+    Every replica must report an exact Epoch-1 activation.  A designated
+    observer commit under Epoch-1 is then the first admissible measurement
+    sample.  Malformed or partial lines are ignored while a writer is active;
+    no noncanonical event can satisfy the gate.
+    """
+    activated: dict[int, dict[str, object]] = {}
+    first_commit: dict[str, object] | None = None
+    for replica in range(31):
+        path = root / "raw" / f"replica-{replica}.jsonl"
+        if not path.exists() or path.is_symlink() or not path.is_file():
+            continue
+        try:
+            lines = path.read_text(encoding="ascii").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (not isinstance(event, dict) or event.get("source_kind") != "replica" or
+                    event.get("source_id") != f"replica-{replica}"):
+                continue
+            payload = event.get("payload")
+            if not isinstance(payload, dict):
+                continue
+            if (event.get("event_type") == "epoch.activated" and
+                    payload.get("epoch_number") == 1 and
+                    isinstance(event.get("source_monotonic_ns"), int) and
+                    event["source_monotonic_ns"] > 0):
+                activated[replica] = {"replica_id": replica,
+                                      "source_id": event["source_id"],
+                                      "source_sequence": event.get("source_sequence"),
+                                      "source_monotonic_ns": event["source_monotonic_ns"],
+                                      "epoch_digest": payload.get("epoch_digest")}
+            if (replica == 0 and event.get("event_type") == "block.committed" and
+                    payload.get("designated_observer") is True and
+                    isinstance(payload.get("decision_proof"), dict) and
+                    payload["decision_proof"].get("epoch_number") == 1 and
+                    isinstance(payload.get("block_height"), int) and payload["block_height"] > 0):
+                first_commit = {"block_height": payload["block_height"],
+                                "source_monotonic_ns": event.get("source_monotonic_ns"),
+                                "epoch_digest": payload["decision_proof"].get("epoch_digest")}
+    if set(activated) != set(range(31)) or first_commit is None:
+        return None
+    digests = {value["epoch_digest"] for value in activated.values()}
+    if len(digests) != 1 or not isinstance(next(iter(digests)), str) or not next(iter(digests)):
+        return None
+    if next(iter(digests)) != first_commit["epoch_digest"]:
+        return None
+    if (not isinstance(first_commit["source_monotonic_ns"], int) or
+            first_commit["source_monotonic_ns"] < max(
+                value["source_monotonic_ns"] for value in activated.values())):
+        return None
+    anchor = max(value["source_monotonic_ns"] for value in activated.values())
+    return {"activated_replica_ids": list(range(31)),
+            "all_replica_e1_activation_events": [activated[replica] for replica in range(31)],
+            "all_replica_e1_activation_monotonic_ns": anchor,
+            "post_e1_window_start_monotonic_ns": anchor,
+            "post_e1_window_end_monotonic_ns": anchor + _POST_E1_WINDOW_NS,
+            "post_e1_commit": first_commit}
+
+
+def _manager_success_terminal(root: Path, run_id: str) -> bool:
+    path = root / "raw" / "manager-events.jsonl"
+    if not path.is_file() or path.is_symlink():
+        return False
+    try:
+        events = (json.loads(line) for line in path.read_text(encoding="ascii").splitlines())
+        return any(isinstance(event, dict) and event.get("run_id") == run_id and
+                   event.get("source_kind") == "adaptation_manager" and
+                   event.get("event_type") == "adaptive_v2_session_terminal" and
+                   isinstance(event.get("payload"), dict) and
+                   event["payload"].get("outcome") == "advanced" and
+                   event["payload"].get("reason") == "successor_converged" and
+                   event["payload"].get("successor_epoch_number") == 1 for event in events)
+    except (OSError, json.JSONDecodeError):
+        return False
+
+
 def verify_execution_admission(
     *, plan: Mapping[str, object], materialization_root: Path,
     manager_argv: Sequence[str], replica_argv: Sequence[Sequence[str]],
@@ -291,7 +375,9 @@ def verify_execution_admission(
 class _Lifecycle(Protocol):
     def start_replica(self, replica_id: int, argv: Sequence[str], log: Path) -> None: ...
     def start_manager(self, argv: Sequence[str], log: Path) -> None: ...
-    def wait_manager(self, deadline_monotonic: float) -> int: ...
+    def await_e1_measurement_window(self, deadline_monotonic: float) -> Mapping[str, object]: ...
+    def manager_exit_status(self) -> int | None: ...
+    def manager_success_terminal_verified(self) -> bool: ...
     def stop_monitor(self) -> None: ...
     def terminate_manager_and_replicas(self) -> None: ...
     def terminate_owned_replica_scopes(self, deadline_monotonic: float) -> Mapping[str, object]: ...
@@ -334,15 +420,82 @@ class CpuQuotaLocalLifecycle:
             start_new_session=True,
         )
 
-    def wait_manager(self, deadline_monotonic: float) -> int:
+    def await_e1_measurement_window(self, deadline_monotonic: float) -> Mapping[str, object]:
+        """Keep all owned processes alive until E1 activation and a post-E1 commit.
+
+        This is only a launch safety gate, not an evidence validator.  The raw
+        validator independently establishes event identity and throughput.
+        """
+        if self._manager is None:
+            _fail("manager must be launched before E1 measurement")
+        observed: Mapping[str, object] | None = None
+        # This outer deadline is an independent Python monotonic timeout.  It
+        # is never compared with the persisted CLOCK_MONOTONIC_RAW evidence
+        # anchor below.
+        run_id = _value(self._manager.args if isinstance(self._manager.args, (tuple, list)) else (), "--structured-event-run-id")
+        while time.monotonic() < deadline_monotonic:
+            if any(record.process.poll() is not None for record in self._registry.records):
+                _fail("a replica exited before the E1 measurement window completed")
+            manager_status = self._manager.poll()
+            if manager_status not in (None, 0):
+                _fail("manager exited unsuccessfully before the E1 measurement window completed")
+            terminal_verified = _manager_success_terminal(self._root, run_id)
+            if manager_status == 0 and not terminal_verified:
+                _fail("manager exited without a verified successor-converged terminal")
+            observed = _e1_measurement_window(self._root)
+            if observed is not None:
+                end_ns = observed["post_e1_window_end_monotonic_ns"]
+                if not isinstance(end_ns, int):
+                    _fail("E1 measurement window end is malformed")
+                if time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW) >= end_ns:
+                    if not terminal_verified:
+                        _fail("manager did not retain a verified successor-converged terminal")
+                    if self._complete_quota_round_at_or_after(end_ns):
+                        return observed
+            time.sleep(0.1)
+        raise TimeoutError("local W18 E1 measurement window did not open before hard timeout")
+
+    def manager_exit_status(self) -> int | None:
         if self._manager is None:
             _fail("manager was not launched")
-        while time.monotonic() < deadline_monotonic:
-            status = self._manager.poll()
-            if status is not None:
-                return status
-            time.sleep(0.1)
-        raise TimeoutError("local W18 manager exceeded hard timeout")
+        return self._manager.poll()
+
+    def manager_success_terminal_verified(self) -> bool:
+        if self._manager is None:
+            _fail("manager was not launched")
+        run_id = _value(
+            self._manager.args if isinstance(self._manager.args, (tuple, list)) else (),
+            "--structured-event-run-id",
+        )
+        return _manager_success_terminal(self._root, run_id)
+
+    def _complete_quota_round_at_or_after(self, end_ns: int) -> bool:
+        """Observe a fully written all-31 sample round beyond the RAW boundary.
+
+        The monitor writes samples before its round receipt.  While it is live,
+        incomplete JSON lines are simply not evidence; a later complete round
+        is required before the runner may begin cleanup.
+        """
+        samples_path = self._root / "raw/cpu-quota-samples.jsonl"
+        rounds_path = self._root / "raw/cpu-quota-monitor-rounds.jsonl"
+        try:
+            samples: dict[int, set[int]] = {}
+            for line in samples_path.read_text(encoding="ascii").splitlines():
+                row = json.loads(line)
+                if (isinstance(row, dict) and type(row.get("source_monotonic_ns")) is int and
+                        type(row.get("replica_id")) is int and row["replica_id"] in range(31)):
+                    samples.setdefault(row["source_monotonic_ns"], set()).add(row["replica_id"])
+            for line in rounds_path.read_text(encoding="ascii").splitlines():
+                row = json.loads(line)
+                sample_ns = row.get("sample_monotonic_ns") if isinstance(row, dict) else None
+                if (type(sample_ns) is int and sample_ns >= end_ns and
+                        type(row.get("finished_monotonic_ns")) is int and
+                        row["finished_monotonic_ns"] >= sample_ns and
+                        samples.get(sample_ns) == set(range(31))):
+                    return True
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return False
 
     def stop_monitor(self) -> None:
         if self._monitor_started:
@@ -374,9 +527,32 @@ class CpuQuotaLocalLifecycle:
         return self._quota.verify_cleanup(deadline_ns=int(deadline_monotonic * 1_000_000_000))
 
 
-def _write_new(path: Path, payload: Mapping[str, object]) -> None:
+def _write_new(path: Path, payload: object) -> None:
     with path.open("xb") as handle:
         handle.write(_canonical(payload))
+
+
+def _archive_frozen_quota_contract(
+    *, quota_profile: Path, contract: cpu_quota.CpuQuotaContract,
+    authority: Mapping[str, object], runtime: Path,
+) -> str:
+    """Retain the exact externally authorized quota bytes before any spawn.
+
+    ``CpuQuotaRuntime`` writes a canonical runtime rendering of the parsed
+    contract.  Its bytes need not be the same as the frozen input file, so the
+    launch receipt is explicitly bound to this archive rather than to an
+    inferred re-serialization.
+    """
+    raw = _regular(Path(quota_profile), "frozen CPU quota profile")
+    if _sha(raw) != contract.contract_sha256:
+        _fail("frozen CPU quota profile differs from the loaded contract raw SHA-256")
+    authority_quota = _regular(Path(str(authority["quota_profile"])), "pre-spawn CPU quota profile")
+    if raw != authority_quota:
+        _fail("frozen CPU quota profile differs from pre-spawn authority bytes")
+    target = runtime / "frozen-cpu-quota-contract.json"
+    with target.open("xb") as handle:
+        handle.write(raw)
+    return _sha(raw)
 
 
 def _rerun_native_stage_a_verifier(
@@ -456,11 +632,31 @@ def execute_excluded_local_shakedown(
     logs.mkdir(mode=0o700)
     runtime.mkdir(mode=0o700)
     _write_new(runtime / "execution-authorization.json", dict(authorization_receipt))
+    # Preserve the exact argv that passed pre-spawn admission.  Post-run
+    # authorities use this only to recover immutable verifier bindings; they
+    # still rehash it against the materialization manifest before use.
+    _write_new(runtime / "manager-argv.json", list(manager_argv))
     with (runtime / "tool-identity-approval.json").open("xb") as handle:
         handle.write(tool_approval)
+    # Retain the original externally verified receipt byte-for-byte. Its
+    # timestamp differs from the fresh pre-spawn re-verification, while the
+    # materialization manifest pins these original bytes exactly.
+    original_stage_a = _regular(Path(str(pre_spawn_authority["native_receipt"])),
+                                "native Stage-A receipt")
+    if _sha(original_stage_a) != plan["stage_a"]["native_receipt_sha256"]:
+        _fail("native Stage-A receipt changed after pre-spawn validation")
+    with (runtime / "stage-a-verifier-receipt.json").open("xb") as handle:
+        handle.write(original_stage_a)
+    _archive_frozen_quota_contract(
+        quota_profile=quota_profile, contract=quota_contract,
+        authority=pre_spawn_authority, runtime=runtime,
+    )
     deadline = time.monotonic() + timeout_s
     failure: str | None = None
     manager_exit: int | None = None
+    manager_exit_after_cleanup: int | None = None
+    manager_terminal_verified = False
+    e1_measurement_window: Mapping[str, object] | None = None
     cleanup: dict[str, object] = {}
     lifecycle: _Lifecycle | None = None
     fresh_native_stage_a_receipt_sha256: str | None = None
@@ -476,9 +672,13 @@ def execute_excluded_local_shakedown(
         for replica_id, argv in enumerate(replica_argv):
             lifecycle.start_replica(replica_id, argv, logs / f"replica-{replica_id}.log")
         lifecycle.start_manager(manager_argv, logs / "manager.log")
-        manager_exit = lifecycle.wait_manager(deadline)
-        if manager_exit != 0:
-            failure = f"manager exited with {manager_exit}"
+        e1_measurement_window = lifecycle.await_e1_measurement_window(deadline)
+        manager_terminal_verified = lifecycle.manager_success_terminal_verified()
+        if not manager_terminal_verified:
+            _fail("manager did not retain a verified successor-converged terminal")
+        manager_exit = lifecycle.manager_exit_status()
+        if manager_exit not in (None, 0):
+            _fail(f"manager exited with {manager_exit} before controlled cleanup")
     except BaseException as exc:
         failure = str(exc).strip() or type(exc).__name__
         fresh = runtime / "fresh-native-stage-a-receipt.json"
@@ -506,6 +706,11 @@ def execute_excluded_local_shakedown(
                 except BaseException as exc:
                     cleanup[name] = f"failed:{str(exc).strip() or type(exc).__name__}"
                     failure = failure or f"{name} failed"
+            try:
+                manager_exit_after_cleanup = lifecycle.manager_exit_status()
+            except BaseException as exc:
+                cleanup["manager_exit_after_cleanup"] = f"failed:{str(exc).strip() or type(exc).__name__}"
+                failure = failure or "manager exit status could not be observed after cleanup"
             for name, operation in (
                 ("terminate_owned_replica_scopes", lifecycle.terminate_owned_replica_scopes),
                 ("verify_scope_cleanup", lifecycle.verify_scope_cleanup),
@@ -520,7 +725,10 @@ def execute_excluded_local_shakedown(
         "verdict": "ABORTED" if failure else "PROCESS_COMPLETED_PENDING_RAW_VALIDATION",
         "claim_eligible": False, "figure_eligible": False, "automatic_retries": 0,
         "execution_request_sha256": _sha(authorization_request), "manager_exit_code": manager_exit,
+        "manager_exit_code_after_cleanup": manager_exit_after_cleanup,
+        "manager_success_terminal_verified": manager_terminal_verified,
         "failure": failure, "cleanup": cleanup,
+        "e1_measurement_window": dict(e1_measurement_window) if e1_measurement_window else None,
         "fresh_native_stage_a_receipt_sha256": fresh_native_stage_a_receipt_sha256,
         "raw_validation_required": True,
     }

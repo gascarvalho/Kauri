@@ -53,7 +53,7 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[str], list[list[str]], Path]:
         "claim_eligible": False, "figure_eligible": False, "arm": "treatment", "stage_a_native_arm": "fast_priority_treatment",
         "protocol": {"N": 31, "Q": 21, "tree_count": 21}, "slow_root_ids": list(range(6)), "revision": "a" * 40,
         "epoch0_tree": {"sha256": artifacts["config/epoch0.tree"], "topology_digest": "c" * 64}, "binary_sha256": {
-            "adaptation_manager": "d" * 64, "hotstuff_app": "e" * 64,
+        "adaptation_manager": "d" * 64, "hotstuff_app": "e" * 64,
             "identity_parity_verifier": "0" * 64,
         },
         "artifact_sha256": artifacts, "manager_argv_sha256": subject._argv_digest(manager),
@@ -130,5 +130,12 @@ def test_backend_rejects_manifest_missing_external_tool_identity_approval(tmp_pa
     with pytest.raises(subject.OperatorCapacityV3BackendError, match="schema differs"):
         subject.prepare_no_launch_backend(
             materialization_root=root, manager_argv=manager,
-            replica_argv=replicas, quota_profile=quota,
+                replica_argv=replicas, quota_profile=quota,
         )
+
+
+def test_backend_rejects_materialized_config_that_differs_from_manifest(tmp_path: Path) -> None:
+    root, manager, replicas, quota = _fixture(tmp_path / "changed-config")
+    (root / "config/hotstuff.gen.conf").write_text("changed\n")
+    with pytest.raises(subject.OperatorCapacityV3BackendError, match="materialization artifact"):
+        subject.prepare_no_launch_backend(materialization_root=root, manager_argv=manager, replica_argv=replicas, quota_profile=quota)
