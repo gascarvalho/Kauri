@@ -2125,3 +2125,84 @@ TEST_CASE(
     CHECK(emit.find("fault_window_arm_sha256_") != std::string::npos);
     CHECK(emit.find("session_.") == std::string::npos);
 }
+
+TEST_CASE(
+    "scheduled fixed-E0 control is profile-bound, self-terminating, and never infers omission",
+    "[adaptive-v2][manager][scheduled-fixed-e0][wiring]")
+{
+    const auto raw_manager = source("examples/adaptation_manager.cpp");
+    const auto manager = code_without_comments_or_literals(raw_manager);
+
+    CHECK(raw_manager.find("scheduled-fixed-e0-control") != std::string::npos);
+    CHECK(raw_manager.find("scheduled-fixed-e0-profile-sha256") !=
+          std::string::npos);
+    CHECK(raw_manager.find("scheduled-fixed-e0-epoch-zero-digest") !=
+          std::string::npos);
+    CHECK(raw_manager.find("scheduled-fixed-e0-window-start-monotonic-ns") !=
+          std::string::npos);
+    CHECK(raw_manager.find("scheduled-fixed-e0-window-end-monotonic-ns") !=
+          std::string::npos);
+    CHECK(raw_manager.find("scheduled fixed-E0 control rejects manager fault-window arms") !=
+          std::string::npos);
+    CHECK(raw_manager.find("kScheduledFixedE0MinimumHorizonNs") !=
+          std::string::npos);
+
+    const auto begin = function_body(
+        manager, "bool begin_scheduled_fixed_e0_control_cycle()");
+    REQUIRE_FALSE(begin.empty());
+    CHECK(begin.find("options_.fault_window_arm.has_value()") !=
+          std::string::npos);
+    CHECK(begin.find("options_.transition_requests.empty()") !=
+          std::string::npos);
+    CHECK(begin.find("session_.begin_cycle(policy)") != std::string::npos);
+    CHECK(begin.find("session_.start_convergence(") == std::string::npos);
+
+    const auto timer = function_body(
+        manager, "void handle_scheduled_fixed_e0_control_timer()");
+    REQUIRE_FALSE(timer.empty());
+    CHECK(contains_in_order(
+        timer, {"monotonic_raw_clock_.now_ns()",
+                "now >= binding.window_end_monotonic_ns",
+                "complete_scheduled_fixed_e0_control()",
+                "now >= binding.window_start_monotonic_ns",
+                "emit_scheduled_fixed_e0_control_observation()"}));
+    CHECK(timer.find("session_.") == std::string::npos);
+    CHECK(timer.find("FaultContributionOpportunity") == std::string::npos);
+    CHECK(timer.find("KAURI_FAULT") == std::string::npos);
+
+    const auto emit = function_body(
+        manager, "void emit_scheduled_fixed_e0_control_observation()");
+    REQUIRE_FALSE(emit.empty());
+    CHECK(emit.find("ScheduledFixedE0ControlObservationStructuredEvent") !=
+          std::string::npos);
+    CHECK(emit.find("profile_sha256") != std::string::npos);
+    CHECK(emit.find("epoch_zero_digest") != std::string::npos);
+    CHECK(emit.find("session_.") == std::string::npos);
+
+    const auto terminal = function_body(
+        manager, "void complete_scheduled_fixed_e0_control()");
+    REQUIRE_FALSE(terminal.empty());
+    CHECK(terminal.find("ScheduledFixedE0ControlTerminalStructuredEvent") !=
+          std::string::npos);
+    CHECK(terminal.find("event_context_.stop()") != std::string::npos);
+    CHECK(terminal.find("session_.") == std::string::npos);
+
+    const auto evaluate = function_body(manager, "void evaluate()");
+    REQUIRE_FALSE(evaluate.empty());
+    const auto scheduled_start = evaluate.find(
+        "if (options_.scheduled_fixed_e0_control.has_value())");
+    const auto normal_start = evaluate.find("const auto *request = current_transition_request()");
+    REQUIRE(scheduled_start != std::string::npos);
+    REQUIRE(normal_start != std::string::npos);
+    const auto scheduled = evaluate.substr(scheduled_start,
+                                           normal_start - scheduled_start);
+    CHECK(scheduled.find("session_.evaluate()") != std::string::npos);
+    CHECK(scheduled.find("schedule_scheduled_fixed_e0_control()") !=
+          std::string::npos);
+    CHECK(scheduled.find("session_.start_convergence(") == std::string::npos);
+    CHECK(scheduled.find("write_exclusive_bundle(") == std::string::npos);
+
+    CHECK(raw_manager.find("FaultContributionOpportunityStructuredEvent") ==
+          std::string::npos);
+    CHECK(raw_manager.find("KAURI_FAULT") == std::string::npos);
+}

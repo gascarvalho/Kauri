@@ -138,6 +138,8 @@ constexpr double kEvaluationCoalescingSeconds = 0.05;
 // Fixed-E0 controls remain source-observable after their verified arm.  This
 // is experiment-only liveness evidence; it never enters the controller.
 constexpr double kFixedE0ControlObservationSeconds = 1.0;
+constexpr std::uint64_t kScheduledFixedE0MinimumHorizonNs =
+    60 * kNanosecondsPerSecond;
 // Cover the replica outbox's one-second capped ACK retry backoff and leave
 // one convergence timer interval for scheduling and transport dispatch.
 constexpr double kConvergenceAckDrainSeconds = 1.1;
@@ -223,6 +225,15 @@ struct FaultWindowArmDocument
     hotstuff::FaultWindowArmedStructuredEvent event;
 };
 
+struct ScheduledFixedE0ControlBindings
+{
+    std::string run_id;
+    std::string profile_sha256;
+    std::string epoch_zero_digest;
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+};
+
 /** Raw CLI material. It is verified only by the adaptive-v3 startup path. */
 struct OperatorCapacityCliInput
 {
@@ -297,6 +308,10 @@ struct ManagerOptions
     // Experimental fixed-E0 control: arm the exact same verified omission
     // boundary as the adaptive arm, but never construct a successor epoch.
     bool fault_window_arm_control_only{false};
+    // Experimental scheduled-actor fixed-E0 control.  This is deliberately
+    // separate from manager-side static fault-window arms.
+    std::optional<ScheduledFixedE0ControlBindings>
+        scheduled_fixed_e0_control;
     std::uint64_t cycle_1_selection_not_before_monotonic_ns{0};
     bool cycle_1_inherited_wait_exempt_eligibility_gate{false};
     bool cycle_1_responsive_cross_commit_retention_readiness_gate{false};
@@ -2322,6 +2337,15 @@ ManagerOptions parse_options(int argc, char **argv)
     auto opt_fault_window_arm_selection_cardinality_policy = Config::OptValStr::create();
     auto opt_fault_window_arm_control_only =
         Config::OptValFlag::create(false);
+    auto opt_scheduled_fixed_e0_control =
+        Config::OptValFlag::create(false);
+    auto opt_scheduled_fixed_e0_run_id = Config::OptValStr::create();
+    auto opt_scheduled_fixed_e0_profile_sha256 = Config::OptValStr::create();
+    auto opt_scheduled_fixed_e0_epoch_zero_digest = Config::OptValStr::create();
+    auto opt_scheduled_fixed_e0_window_start_monotonic_ns =
+        Config::OptValStr::create();
+    auto opt_scheduled_fixed_e0_window_end_monotonic_ns =
+        Config::OptValStr::create();
     auto opt_cycle_1_selection_not_before_monotonic_ns =
         Config::OptValStr::create("0");
     auto opt_cycle_1_inherited_wait_exempt_eligibility_gate =
@@ -2519,6 +2543,20 @@ ManagerOptions parse_options(int argc, char **argv)
                    Config::SET_VAL);
     config.add_opt("fault-window-arm-control-only",
                    opt_fault_window_arm_control_only, Config::SWITCH_ON);
+    config.add_opt("scheduled-fixed-e0-control",
+                   opt_scheduled_fixed_e0_control, Config::SWITCH_ON);
+    config.add_opt("scheduled-fixed-e0-run-id", opt_scheduled_fixed_e0_run_id,
+                   Config::SET_VAL);
+    config.add_opt("scheduled-fixed-e0-profile-sha256",
+                   opt_scheduled_fixed_e0_profile_sha256, Config::SET_VAL);
+    config.add_opt("scheduled-fixed-e0-epoch-zero-digest",
+                   opt_scheduled_fixed_e0_epoch_zero_digest, Config::SET_VAL);
+    config.add_opt("scheduled-fixed-e0-window-start-monotonic-ns",
+                   opt_scheduled_fixed_e0_window_start_monotonic_ns,
+                   Config::SET_VAL);
+    config.add_opt("scheduled-fixed-e0-window-end-monotonic-ns",
+                   opt_scheduled_fixed_e0_window_end_monotonic_ns,
+                   Config::SET_VAL);
     config.add_opt(
         "cycle-1-selection-not-before-monotonic-ns",
         opt_cycle_1_selection_not_before_monotonic_ns,
@@ -2919,23 +2957,84 @@ ManagerOptions parse_options(int argc, char **argv)
             "fault-window arm conflicts with legacy static coverage");
     options.fault_window_arm_control_only =
         opt_fault_window_arm_control_only->get();
+    const bool scheduled_fixed_e0_control =
+        opt_scheduled_fixed_e0_control->get();
     if (options.fault_window_arm_control_only &&
         !options.fault_window_arm.has_value())
     {
         throw std::invalid_argument(
             "fixed-E0 control mode requires a fault-window arm");
     }
+    const std::array<const std::string *, 5> scheduled_values{
+        &opt_scheduled_fixed_e0_run_id->get(),
+        &opt_scheduled_fixed_e0_profile_sha256->get(),
+        &opt_scheduled_fixed_e0_epoch_zero_digest->get(),
+        &opt_scheduled_fixed_e0_window_start_monotonic_ns->get(),
+        &opt_scheduled_fixed_e0_window_end_monotonic_ns->get()};
+    const auto has_scheduled_value = std::any_of(
+        scheduled_values.begin(), scheduled_values.end(),
+        [](const auto *value) { return !value->empty(); });
+    if (scheduled_fixed_e0_control != has_scheduled_value ||
+        (has_scheduled_value && !std::all_of(
+                                    scheduled_values.begin(),
+                                    scheduled_values.end(),
+                                    [](const auto *value) {
+                                        return !value->empty();
+                                    })))
+    {
+        throw std::invalid_argument(
+            "scheduled fixed-E0 control requires its complete binding");
+    }
+    if (scheduled_fixed_e0_control)
+    {
+        if (options.fault_window_arm_control_only ||
+            options.fault_window_arm.has_value())
+        {
+            throw std::invalid_argument(
+                "scheduled fixed-E0 control rejects manager fault-window arms");
+        }
+        ScheduledFixedE0ControlBindings bindings;
+        bindings.run_id = opt_scheduled_fixed_e0_run_id->get();
+        bindings.profile_sha256 = opt_scheduled_fixed_e0_profile_sha256->get();
+        bindings.epoch_zero_digest =
+            opt_scheduled_fixed_e0_epoch_zero_digest->get();
+        bindings.window_start_monotonic_ns = parse_unsigned<std::uint64_t>(
+            opt_scheduled_fixed_e0_window_start_monotonic_ns->get(),
+            "scheduled fixed-E0 window start", true);
+        bindings.window_end_monotonic_ns = parse_unsigned<std::uint64_t>(
+            opt_scheduled_fixed_e0_window_end_monotonic_ns->get(),
+            "scheduled fixed-E0 window end", true);
+        const auto valid_digest = [](const std::string &value) {
+            return value.size() == 64 && std::all_of(
+                value.begin(), value.end(), [](unsigned char character) {
+                    return (character >= '0' && character <= '9') ||
+                        (character >= 'a' && character <= 'f');
+                });
+        };
+        if (bindings.run_id.empty() || !valid_digest(bindings.profile_sha256) ||
+            !valid_digest(bindings.epoch_zero_digest) ||
+            bindings.window_end_monotonic_ns <=
+                bindings.window_start_monotonic_ns ||
+            bindings.window_end_monotonic_ns -
+                    bindings.window_start_monotonic_ns <
+                kScheduledFixedE0MinimumHorizonNs)
+        {
+            throw std::invalid_argument(
+                "scheduled fixed-E0 control binding is invalid");
+        }
+        options.scheduled_fixed_e0_control = std::move(bindings);
+    }
 
     const auto &raw_transition_requests =
         opt_transition_requests->get();
     const auto &bundle_outputs = opt_bundle_outputs->get();
-    if (options.fault_window_arm_control_only &&
+    if ((options.fault_window_arm_control_only || scheduled_fixed_e0_control) &&
         (!raw_transition_requests.empty() || !bundle_outputs.empty()))
     {
         throw std::invalid_argument(
             "fixed-E0 control mode rejects transition requests and bundle outputs");
     }
-    if (!options.fault_window_arm_control_only &&
+    if (!options.fault_window_arm_control_only && !scheduled_fixed_e0_control &&
         (raw_transition_requests.empty() ||
          raw_transition_requests.size() != bundle_outputs.size()))
     {
@@ -3157,6 +3256,20 @@ ManagerOptions parse_options(int argc, char **argv)
     {
         throw std::invalid_argument(
             "structured-event and artifact outputs must be distinct");
+    }
+    if (options.scheduled_fixed_e0_control.has_value() &&
+        options.scheduled_fixed_e0_control->run_id !=
+            options.structured_event_run_id)
+    {
+        throw std::invalid_argument(
+            "scheduled fixed-E0 run ID must bind the structured-event run ID");
+    }
+    if (options.scheduled_fixed_e0_control.has_value() &&
+        options.scheduled_fixed_e0_control->epoch_zero_digest !=
+            hotstuff::compute_epoch_digest(manager_epoch_zero(options)).to_hex())
+    {
+        throw std::invalid_argument(
+            "scheduled fixed-E0 epoch-zero identity does not match manager input");
     }
     if (options.fault_window_arm.has_value())
     {
@@ -5061,6 +5174,10 @@ public:
             event_context_, [this](salticidae::TimerEvent &) {
                 handle_fixed_e0_control_observation_timer();
             });
+        scheduled_fixed_e0_control_timer = salticidae::TimerEvent(
+            event_context_, [this](salticidae::TimerEvent &) {
+                handle_scheduled_fixed_e0_control_timer();
+            });
         if (options_.fault_window_arm.has_value())
         {
             const auto seconds = options_.fault_window_arm->deadline_seconds;
@@ -5130,7 +5247,9 @@ public:
 
             if (options_.fault_window_arm_control_only
                     ? !begin_fixed_e0_control_cycle()
-                    : !begin_current_cycle())
+                    : (options_.scheduled_fixed_e0_control.has_value()
+                           ? !begin_scheduled_fixed_e0_control_cycle()
+                           : !begin_current_cycle()))
                 fail("manager_cycle_start_failed");
             else
                 evaluate();
@@ -5166,6 +5285,7 @@ public:
             if (!structured_event_sink_.health().healthy)
                 failed_ = true;
             return failed_ || (!options_.fault_window_arm_control_only &&
+                               !options_.scheduled_fixed_e0_control.has_value() &&
                                !request_sequence_.shutdown_eligible())
                 ? 1
                 : 0;
@@ -5480,6 +5600,58 @@ private:
                 return false;
             cycle_audits_.push_back(CycleAuditContext{
                 "fixed-e0-control/" + options_.structured_event_run_id,
+                generation, 0, 0});
+            if (!session_.begin_cycle(policy))
+            {
+                cycle_audits_.pop_back();
+                return false;
+            }
+            return true;
+        }
+        catch (...) { return false; }
+    }
+
+    bool begin_scheduled_fixed_e0_control_cycle() noexcept
+    {
+        if (!options_.scheduled_fixed_e0_control.has_value() ||
+            options_.fault_window_arm.has_value() ||
+            !options_.transition_requests.empty())
+            return false;
+        try
+        {
+            AdaptiveV2TransitionPolicy policy;
+            policy.intent = TreePolicyKind::fault_containment;
+            policy.apply_shape_selection = false;
+            const auto &trees = session_.ingress().current_epoch().trees();
+            const auto placement_tree_count =
+                options_.runtime_shape.tree_shape.tree_count;
+            if (trees.size() < placement_tree_count)
+                return false;
+            for (const auto &tree : trees)
+            {
+                if (tree.tree_id >= placement_tree_count)
+                    continue;
+                if (tree.members_breadth_first.empty())
+                    return false;
+                policy.containment_baseline_roots.push_back(
+                    hotstuff::BaselineRoot{tree.tree_id,
+                                             tree.members_breadth_first.front()});
+            }
+            if (policy.containment_baseline_roots.size() !=
+                placement_tree_count)
+                return false;
+            std::sort(policy.containment_baseline_roots.begin(),
+                      policy.containment_baseline_roots.end(),
+                      [](const auto &left, const auto &right) {
+                          return left.tree_id < right.tree_id;
+                      });
+            const auto generation =
+                session_.ingress().activation_generation();
+            if (generation == 0)
+                return false;
+            cycle_audits_.push_back(CycleAuditContext{
+                "scheduled-fixed-e0-control/" +
+                    options_.scheduled_fixed_e0_control->run_id,
                 generation, 0, 0});
             if (!session_.begin_cycle(policy))
             {
@@ -6367,6 +6539,7 @@ private:
         cancel_post_baseline_observation();
         cancel_cycle_1_selection_gate();
         fixed_e0_control_observation_timer.del();
+        scheduled_fixed_e0_control_timer.del();
         if (network_stop_required_ && !network_stopped_)
         {
             network_stopped_ = true;
@@ -6384,10 +6557,15 @@ private:
         if (!session_stopped_)
         {
             session_stopped_ = true;
-            if (options_.fault_window_arm_control_only && !failed_)
+            if ((options_.fault_window_arm_control_only ||
+                 options_.scheduled_fixed_e0_control.has_value()) &&
+                !failed_)
             {
                 refresh_cycle_audit();
-                if (!fault_window_armed_ ||
+                if ((options_.fault_window_arm_control_only &&
+                     !fault_window_armed_) ||
+                    (options_.scheduled_fixed_e0_control.has_value() &&
+                     !scheduled_fixed_e0_terminal_emitted_) ||
                     !session_.finalize_noop_cycle(
                         AdaptiveV2ManagerCycleTerminalReason::explicit_no_op))
                 {
@@ -6605,6 +6783,102 @@ private:
         }
     }
 
+    void emit_scheduled_fixed_e0_control_observation() noexcept
+    {
+        const auto &binding = options_.scheduled_fixed_e0_control;
+        if (!binding.has_value() || scheduled_fixed_e0_terminal_emitted_)
+        {
+            fail("scheduled_fixed_e0_control_configuration_drift");
+            return;
+        }
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{
+                hotstuff::ScheduledFixedE0ControlObservationStructuredEvent{
+                    binding->run_id, binding->profile_sha256,
+                    binding->epoch_zero_digest,
+                    binding->window_start_monotonic_ns,
+                    binding->window_end_monotonic_ns}});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+            fail("scheduled_fixed_e0_control_observation_emit_failed");
+    }
+
+    void complete_scheduled_fixed_e0_control() noexcept
+    {
+        const auto &binding = options_.scheduled_fixed_e0_control;
+        if (!binding.has_value() || scheduled_fixed_e0_terminal_emitted_)
+        {
+            fail("scheduled_fixed_e0_control_terminal_context_invalid");
+            return;
+        }
+        structured_event_sink_.emit_audit(
+            hotstuff::AuditStructuredEventPayload{
+                hotstuff::ScheduledFixedE0ControlTerminalStructuredEvent{
+                    binding->run_id, binding->profile_sha256,
+                    binding->epoch_zero_digest,
+                    binding->window_start_monotonic_ns,
+                    binding->window_end_monotonic_ns}});
+        structured_event_sink_.drain();
+        if (!structured_event_sink_.health().healthy)
+        {
+            fail("scheduled_fixed_e0_control_terminal_emit_failed");
+            return;
+        }
+        scheduled_fixed_e0_terminal_emitted_ = true;
+        event_context_.stop();
+    }
+
+    void handle_scheduled_fixed_e0_control_timer() noexcept
+    {
+        if (failed_ || !options_.scheduled_fixed_e0_control.has_value() ||
+            scheduled_fixed_e0_terminal_emitted_)
+            return;
+        const auto now = monotonic_raw_clock_.now_ns();
+        const auto &binding = *options_.scheduled_fixed_e0_control;
+        if (now == 0)
+        {
+            fail("scheduled_fixed_e0_control_clock_failed");
+            return;
+        }
+        if (now >= binding.window_end_monotonic_ns)
+        {
+            complete_scheduled_fixed_e0_control();
+            return;
+        }
+        if (now >= binding.window_start_monotonic_ns)
+        {
+            emit_scheduled_fixed_e0_control_observation();
+            if (failed_)
+                return;
+        }
+        try
+        {
+            scheduled_fixed_e0_control_timer.add(
+                kFixedE0ControlObservationSeconds);
+        }
+        catch (...)
+        {
+            fail("scheduled_fixed_e0_control_timer_failed");
+        }
+    }
+
+    void schedule_scheduled_fixed_e0_control() noexcept
+    {
+        if (!options_.scheduled_fixed_e0_control.has_value() ||
+            scheduled_fixed_e0_control_timer_pending_ ||
+            scheduled_fixed_e0_terminal_emitted_)
+            return;
+        const auto now = monotonic_raw_clock_.now_ns();
+        if (now == 0 || now >=
+            options_.scheduled_fixed_e0_control->window_end_monotonic_ns)
+        {
+            fail("scheduled_fixed_e0_control_window_unavailable");
+            return;
+        }
+        scheduled_fixed_e0_control_timer_pending_ = true;
+        handle_scheduled_fixed_e0_control_timer();
+    }
+
     void schedule_fault_window_arm() noexcept
     {
         if (!options_.fault_window_arm.has_value() || fault_window_armed_ ||
@@ -6651,6 +6925,7 @@ private:
     {
         if (failed_ ||
             (!options_.fault_window_arm_control_only &&
+             !options_.scheduled_fixed_e0_control.has_value() &&
              request_sequence_.shutdown_eligible()) ||
             predecessor_residency_pending_ ||
             post_baseline_observation_pending_ ||
@@ -6880,6 +7155,7 @@ private:
     {
         if (failed_ ||
             (!options_.fault_window_arm_control_only &&
+             !options_.scheduled_fixed_e0_control.has_value() &&
              request_sequence_.shutdown_eligible()) ||
             predecessor_residency_pending_ ||
             post_baseline_observation_pending_)
@@ -6928,6 +7204,35 @@ private:
                 status == AdaptiveV2ManagerControllerStatus::already_ready)
             {
                 fail("fixed_e0_control_unexpected_successor");
+            }
+            return;
+        }
+        if (options_.scheduled_fixed_e0_control.has_value())
+        {
+            if (options_.fault_window_arm.has_value() ||
+                !options_.transition_requests.empty())
+            {
+                fail("scheduled_fixed_e0_control_configuration_drift");
+                return;
+            }
+            if (scheduled_fixed_e0_control_timer_pending_ ||
+                scheduled_fixed_e0_terminal_emitted_)
+                return;
+            const auto status = session_.evaluate();
+            if (status == AdaptiveV2ManagerControllerStatus::unhealthy)
+            {
+                fail("scheduled_fixed_e0_control_controller_unhealthy");
+                return;
+            }
+            if (status == AdaptiveV2ManagerControllerStatus::baseline_frozen)
+            {
+                schedule_scheduled_fixed_e0_control();
+                return;
+            }
+            if (status == AdaptiveV2ManagerControllerStatus::successor_ready ||
+                status == AdaptiveV2ManagerControllerStatus::already_ready)
+            {
+                fail("scheduled_fixed_e0_control_unexpected_successor");
             }
             return;
         }
@@ -7423,6 +7728,7 @@ private:
         Ingest &&operation)
     {
         if (!options_.fault_window_arm_control_only &&
+            !options_.scheduled_fixed_e0_control.has_value() &&
             request_sequence_.shutdown_eligible())
             return;
         const auto source = authenticated_source(connection);
@@ -7800,6 +8106,7 @@ private:
     salticidae::TimerEvent evaluation_timer;
     salticidae::TimerEvent fault_window_arm_timer;
     salticidae::TimerEvent fixed_e0_control_observation_timer;
+    salticidae::TimerEvent scheduled_fixed_e0_control_timer;
     std::chrono::steady_clock::time_point
         predecessor_residency_deadline_{};
     std::chrono::steady_clock::time_point
@@ -7824,6 +8131,8 @@ private:
     bool cycle_1_selection_gate_pending_{false};
     bool evaluation_timer_pending_{false};
     bool fault_window_arm_timer_pending_{false};
+    bool scheduled_fixed_e0_control_timer_pending_{false};
+    bool scheduled_fixed_e0_terminal_emitted_{false};
     bool fault_window_armed_{false};
     std::string fault_window_arm_sha256_;
     dev_t fault_window_arm_device_{0};

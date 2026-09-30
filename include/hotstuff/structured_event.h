@@ -393,6 +393,32 @@ struct FixedE0ControlObservationStructuredEvent
     std::string fault_window_arm_sha256;
 };
 
+/**
+ * Manager-owned heartbeat for the scheduled-actor fixed-E0 control.
+ *
+ * Unlike the static fault-window control, this binds the manager to the
+ * scheduled actor profile rather than a manager-side fault capability.  It
+ * remains observational and does not attest that a replica omitted anything.
+ */
+struct ScheduledFixedE0ControlObservationStructuredEvent
+{
+    std::string run_id;
+    std::string profile_sha256;
+    std::string epoch_zero_digest;
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+};
+
+/** Source-bound clean terminal for a completed scheduled fixed-E0 window. */
+struct ScheduledFixedE0ControlTerminalStructuredEvent
+{
+    std::string run_id;
+    std::string profile_sha256;
+    std::string epoch_zero_digest;
+    std::uint64_t window_start_monotonic_ns{0};
+    std::uint64_t window_end_monotonic_ns{0};
+};
+
 /** Replica-local acknowledgement that the N7 omission gate became valid. */
 struct FaultInjectionArmedStructuredEvent
 {
@@ -563,7 +589,9 @@ using AuditStructuredEventPayload = std::variant<
     FaultInjectionArmedStructuredEvent,
     FaultAggregateOmittedStructuredEvent,
     AdaptiveV2SelectionDecidedStructuredEvent,
-    FixedE0ControlObservationStructuredEvent>;
+    FixedE0ControlObservationStructuredEvent,
+    ScheduledFixedE0ControlObservationStructuredEvent,
+    ScheduledFixedE0ControlTerminalStructuredEvent>;
 
 enum class AdaptiveAggregationTransition : std::uint8_t
 {
@@ -689,6 +717,8 @@ enum class StructuredEventType : std::uint8_t
     adaptive_v3_command_terminal,
     adaptive_v3_observation_retry_exhausted,
     fixed_e0_control_observation,
+    scheduled_fixed_e0_control_observation,
+    scheduled_fixed_e0_control_terminal,
 };
 
 StructuredEventType structured_event_type(

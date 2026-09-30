@@ -135,6 +135,25 @@ AdaptiveV3ManagerOptions parse_adaptive_v3_test_options(
         });
 }
 
+ManagerOptions parse_manager_test_options(std::vector<std::string> arguments)
+{
+    optind = 1;
+#if defined(__APPLE__)
+    optreset = 1;
+#endif
+    return with_arguments<ManagerOptions>(
+        std::move(arguments),
+        [](int argc, char **argv) { return parse_options(argc, argv); });
+}
+
+void erase_option(std::vector<std::string> &arguments, const std::string &name)
+{
+    const auto option = std::find(arguments.begin(), arguments.end(), name);
+    REQUIRE(option != arguments.end());
+    REQUIRE(std::next(option) != arguments.end());
+    arguments.erase(option, std::next(option, 2));
+}
+
 struct AdaptiveV3CliFixture
 {
     std::vector<std::unique_ptr<hotstuff::PrivKeyBLS>> readiness_keys;
@@ -410,6 +429,58 @@ TEST_CASE(
             tree_file.string(), n7_membership()));
     CHECK(hotstuff::compute_epoch_digest(manager_input) ==
           hotstuff::compute_epoch_digest(replica_input));
+}
+
+TEST_CASE("scheduled fixed-E0 control requires an exact independent binding",
+          "[adaptive-v2][scheduled-fixed-e0][manager][parser]")
+{
+    AdaptiveV3CliFixture fixture;
+    auto arguments = fixture.arguments();
+    erase_option(arguments, "--protocol-mode");
+    erase_option(arguments, "--transition-request");
+    erase_option(arguments, "--bundle-output");
+    ManagerOptions epoch_zero_options;
+    epoch_zero_options.membership = n7_membership();
+    const auto runtime_shape = hotstuff::derive_adaptive_v2_manager_runtime_shape(
+        epoch_zero_options.membership, 2, 2);
+    REQUIRE(runtime_shape.has_value());
+    epoch_zero_options.runtime_shape = *runtime_shape;
+    const auto expected_epoch_zero_digest =
+        hotstuff::compute_epoch_digest(
+            manager_epoch_zero(epoch_zero_options)).to_hex();
+    arguments.insert(arguments.end(), {
+        "--scheduled-fixed-e0-control",
+        "--scheduled-fixed-e0-run-id", "cert13-m1",
+        "--scheduled-fixed-e0-profile-sha256", std::string(64, 'a'),
+        "--scheduled-fixed-e0-epoch-zero-digest", expected_epoch_zero_digest,
+        "--scheduled-fixed-e0-window-start-monotonic-ns", "100",
+        "--scheduled-fixed-e0-window-end-monotonic-ns", "60000000100"});
+    const auto options = parse_manager_test_options(arguments);
+    REQUIRE(options.scheduled_fixed_e0_control.has_value());
+    CHECK(options.scheduled_fixed_e0_control->run_id ==
+          options.structured_event_run_id);
+    CHECK(options.transition_requests.empty());
+    CHECK_FALSE(options.fault_window_arm.has_value());
+
+    auto short_window = arguments;
+    const auto end = std::find(short_window.begin(), short_window.end(),
+                               "60000000100");
+    REQUIRE(end != short_window.end());
+    *end = "60000000099";
+    CHECK_THROWS_AS(parse_manager_test_options(short_window),
+                    std::invalid_argument);
+
+    auto wrong_run = arguments;
+    const auto run = std::find(wrong_run.begin(), wrong_run.end(), "cert13-m1");
+    REQUIRE(run != wrong_run.end());
+    *run = "different-run";
+    CHECK_THROWS_AS(parse_manager_test_options(wrong_run),
+                    std::invalid_argument);
+
+    auto static_arm = arguments;
+    static_arm.push_back("--fault-window-arm-control-only");
+    CHECK_THROWS_AS(parse_manager_test_options(static_arm),
+                    std::invalid_argument);
 }
 
 TEST_CASE("fault-window parser accepts exact canonical publisher bytes",

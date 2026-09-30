@@ -574,6 +574,8 @@ using hotstuff::ExclusiveFileStructuredEventOutput;
 using hotstuff::ExpectedMessageType;
 using hotstuff::FaultWindowArmedStructuredEvent;
 using hotstuff::FixedE0ControlObservationStructuredEvent;
+using hotstuff::ScheduledFixedE0ControlObservationStructuredEvent;
+using hotstuff::ScheduledFixedE0ControlTerminalStructuredEvent;
 using hotstuff::FaultAggregateOmittedStructuredEvent;
 using hotstuff::FaultContributionOpportunityStructuredEvent;
 using hotstuff::MonotonicRawStructuredEventClock;
@@ -2163,8 +2165,8 @@ TEST_CASE("AE01 maps exact command and accepted reputation audit events",
             AuditEmit>::value,
         "audit emission cannot influence protocol or manager control flow");
     static_assert(
-        std::variant_size<AuditStructuredEventPayload>::value == 18,
-        "the audit capability appends fixed-E0 control observation evidence");
+        std::variant_size<AuditStructuredEventPayload>::value == 20,
+        "the audit capability appends both fixed-E0 control observation forms");
     static_assert(
         std::is_same<
             std::variant_alternative_t<2, AuditStructuredEventPayload>,
@@ -3379,6 +3381,46 @@ TEST_CASE("fixed-E0 control observation is a manager-only arm-bound event",
     const auto invalid_health = invalid_sink.health();
     CHECK_FALSE(invalid_health.healthy);
     CHECK(invalid_health.first_failure == StructuredEventFailure::invalid_payload);
+}
+
+TEST_CASE("scheduled fixed-E0 control events bind only the scheduled profile",
+          "[adaptive-v2][structured-event][scheduled-fixed-e0][behavior]")
+{
+    const auto profile_sha = digest("scheduled-fixed-e0-profile").to_hex();
+    const auto epoch_zero_digest = digest("scheduled-fixed-e0-epoch-zero").to_hex();
+    const auto observation = ScheduledFixedE0ControlObservationStructuredEvent{
+        "n7-scheduled-fixed-e0", profile_sha, epoch_zero_digest,
+        100, 60'000'000'100ULL};
+    const auto terminal = ScheduledFixedE0ControlTerminalStructuredEvent{
+        "n7-scheduled-fixed-e0", profile_sha, epoch_zero_digest,
+        100, 60'000'000'100ULL};
+
+    FakeClock clock({8'300});
+    MemoryOutput output;
+    StructuredEventSink sink(manager_event_config(), clock, output);
+    sink.emit_audit(AuditStructuredEventPayload{observation});
+    sink.emit_audit(AuditStructuredEventPayload{terminal});
+    sink.shutdown();
+    CHECK(sink.health().healthy);
+    const auto text = rendered(output);
+    CHECK(text.find("\"event_type\":\"scheduled_fixed_e0_control.observation\"") !=
+          std::string::npos);
+    CHECK(text.find("\"event_type\":\"scheduled_fixed_e0_control.terminal\"") !=
+          std::string::npos);
+    CHECK(text.find("\"profile_sha256\":\"" + profile_sha + "\"") !=
+          std::string::npos);
+    CHECK(text.find("fault_window_arm_sha256") == std::string::npos);
+
+    auto invalid = observation;
+    invalid.profile_sha256 = "not-a-digest";
+    FakeClock invalid_clock({8'301});
+    MemoryOutput invalid_output;
+    StructuredEventSink invalid_sink(manager_event_config(), invalid_clock,
+                                     invalid_output);
+    invalid_sink.emit_audit(AuditStructuredEventPayload{invalid});
+    CHECK_FALSE(invalid_sink.health().healthy);
+    CHECK(invalid_sink.health().first_failure ==
+          StructuredEventFailure::invalid_payload);
 }
 
 TEST_CASE("N7 static aggregate omission has a source-sequenced audit marker",

@@ -528,6 +528,12 @@ bool audit_payload_type(const AuditStructuredEventPayload &payload,
         case 17:
             type = StructuredEventType::fixed_e0_control_observation;
             return true;
+        case 18:
+            type = StructuredEventType::scheduled_fixed_e0_control_observation;
+            return true;
+        case 19:
+            type = StructuredEventType::scheduled_fixed_e0_control_terminal;
+            return true;
         case 4:
             type = StructuredEventType::adaptive_v2_session_terminal;
             return true;
@@ -1614,6 +1620,35 @@ bool valid_fixed_e0_control_observation_payload(
         valid_digest(event.fault_window_arm_sha256);
 }
 
+bool valid_scheduled_fixed_e0_control_payload(
+    const ScheduledFixedE0ControlObservationStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    const auto valid_digest = [](const std::string &value) {
+        return value.size() == 64 && std::all_of(
+            value.begin(), value.end(), [](unsigned char character) {
+                return (character >= '0' && character <= '9') ||
+                    (character >= 'a' && character <= 'f');
+            });
+    };
+    return config.source.kind == StructuredEventSourceKind::adaptation_manager &&
+        !event.run_id.empty() && valid_digest(event.profile_sha256) &&
+        valid_digest(event.epoch_zero_digest) &&
+        event.window_start_monotonic_ns != 0 &&
+        event.window_end_monotonic_ns > event.window_start_monotonic_ns;
+}
+
+bool valid_scheduled_fixed_e0_control_terminal_payload(
+    const ScheduledFixedE0ControlTerminalStructuredEvent &event,
+    const StructuredEventConfig &config) noexcept
+{
+    return valid_scheduled_fixed_e0_control_payload(
+        ScheduledFixedE0ControlObservationStructuredEvent{
+            event.run_id, event.profile_sha256, event.epoch_zero_digest,
+            event.window_start_monotonic_ns, event.window_end_monotonic_ns},
+        config);
+}
+
 bool valid_fault_injection_armed_payload(
     const FaultInjectionArmedStructuredEvent &event,
     const StructuredEventConfig &config) noexcept
@@ -2150,6 +2185,16 @@ bool valid_audit_payload(const AuditStructuredEventPayload &payload,
         case 17:
             return valid_fixed_e0_control_observation_payload(
                 std::get<FixedE0ControlObservationStructuredEvent>(payload),
+                config);
+        case 18:
+            return valid_scheduled_fixed_e0_control_payload(
+                std::get<ScheduledFixedE0ControlObservationStructuredEvent>(
+                    payload),
+                config);
+        case 19:
+            return valid_scheduled_fixed_e0_control_terminal_payload(
+                std::get<ScheduledFixedE0ControlTerminalStructuredEvent>(
+                    payload),
                 config);
         default:
             return false;
@@ -2884,6 +2929,44 @@ void append_fixed_e0_control_observation_payload(
     builder.append('}');
 }
 
+void append_scheduled_fixed_e0_control_payload(
+    JsonLineBuilder &builder,
+    const std::string &run_id,
+    const std::string &profile_sha256,
+    const std::string &epoch_zero_digest,
+    std::uint64_t window_start_monotonic_ns,
+    std::uint64_t window_end_monotonic_ns)
+{
+    builder.append("{\"run_id\":"); builder.append_escaped(run_id);
+    builder.append(",\"profile_sha256\":");
+    builder.append_escaped(profile_sha256);
+    builder.append(",\"epoch_zero_digest\":");
+    builder.append_escaped(epoch_zero_digest);
+    builder.append(",\"window_start_monotonic_ns\":");
+    builder.append_integer(window_start_monotonic_ns);
+    builder.append(",\"window_end_monotonic_ns\":");
+    builder.append_integer(window_end_monotonic_ns);
+    builder.append('}');
+}
+
+void append_scheduled_fixed_e0_control_observation_payload(
+    JsonLineBuilder &builder,
+    const ScheduledFixedE0ControlObservationStructuredEvent &event)
+{
+    append_scheduled_fixed_e0_control_payload(
+        builder, event.run_id, event.profile_sha256, event.epoch_zero_digest,
+        event.window_start_monotonic_ns, event.window_end_monotonic_ns);
+}
+
+void append_scheduled_fixed_e0_control_terminal_payload(
+    JsonLineBuilder &builder,
+    const ScheduledFixedE0ControlTerminalStructuredEvent &event)
+{
+    append_scheduled_fixed_e0_control_payload(
+        builder, event.run_id, event.profile_sha256, event.epoch_zero_digest,
+        event.window_start_monotonic_ns, event.window_end_monotonic_ns);
+}
+
 void append_fault_injection_armed_payload(
     JsonLineBuilder &builder, const FaultInjectionArmedStructuredEvent &event)
 {
@@ -3602,6 +3685,18 @@ std::string serialize_audit_event(
                 builder,
                 std::get<FixedE0ControlObservationStructuredEvent>(event));
             break;
+        case 18:
+            append_scheduled_fixed_e0_control_observation_payload(
+                builder,
+                std::get<ScheduledFixedE0ControlObservationStructuredEvent>(
+                    event));
+            break;
+        case 19:
+            append_scheduled_fixed_e0_control_terminal_payload(
+                builder,
+                std::get<ScheduledFixedE0ControlTerminalStructuredEvent>(
+                    event));
+            break;
         default:
             throw std::bad_variant_access{};
     }
@@ -4120,6 +4215,10 @@ const char *structured_event_type_name(StructuredEventType type) noexcept
             return "fault_window_armed";
         case StructuredEventType::fixed_e0_control_observation:
             return "fixed_e0_control.observation";
+        case StructuredEventType::scheduled_fixed_e0_control_observation:
+            return "scheduled_fixed_e0_control.observation";
+        case StructuredEventType::scheduled_fixed_e0_control_terminal:
+            return "scheduled_fixed_e0_control.terminal";
         case StructuredEventType::fault_injection_armed:
             return "fault.injection_armed";
         case StructuredEventType::fault_aggregate_omitted:
