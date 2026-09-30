@@ -370,6 +370,14 @@ def materialize_next_cell(
     output = _lexical_child(root, cell["run_root"], "new cell")
     if output.exists():
         raise CampaignOperatorError("cell root already exists; no pilot or prior result may be reused")
+    # The producer acquires the cell itself with an exclusive mkdir, but its
+    # immutable manifest path is nested below a shared cells/ parent.
+    try:
+        output.parent.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise CampaignOperatorError("cannot create campaign cells parent") from exc
+    if output.parent.is_symlink() or not output.parent.is_dir():
+        raise CampaignOperatorError("campaign cells parent is not a regular directory")
     try:
         raw_before = _raw_clock()
     except Exception as exc:

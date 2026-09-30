@@ -58,7 +58,8 @@ def _local_linux_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def _prepare(root: Path, **kwargs: object) -> dict[str, object]:
-    root.mkdir(parents=True)
+    # Mirror the real producer: it exclusively creates the cell, not parents.
+    root.mkdir(mode=0o700)
     window = {"start_monotonic_ns": kwargs["window_start_monotonic_ns"],
               "end_monotonic_ns": kwargs["window_end_monotonic_ns"],
               "argv_pinned_before_launch": True,
