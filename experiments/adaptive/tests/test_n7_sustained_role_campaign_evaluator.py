@@ -275,6 +275,60 @@ def _campaign(tmp_path: Path, *, fixed_counts: list[int] | None = None,
     return cells
 
 
+def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
+    """Build a complete synthetic v2 fixture with stage receipts.
+
+    The stage receipt is intentionally separate from the raw bundle: a raw
+    receipt alone cannot prove that a caller did not choose its root after the
+    campaign completed.
+    """
+    campaign_root = tmp_path / "campaign"
+    cells = _campaign(campaign_root / "cells")
+    freeze = _freeze()
+    manifest_cells: list[dict[str, Any]] = []
+    for cell in cells:
+        root = Path(cell["root"])
+        relative_root = str(root.relative_to(campaign_root))
+        receipt = json.loads((root / cell["receipt_path"]).read_text(encoding="ascii"))
+        manifest_cells.append({
+            "ordinal": cell["ordinal"], "pair_index": cell["pair_index"], "arm": cell["arm"],
+            "run_id": receipt["run_id"], "run_root": relative_root,
+            "target_host": "proteina02", "hard_timeout_seconds": 210, "retry_policy": "none",
+        })
+    manifest: dict[str, Any] = {
+        "schema_version": 1, "kind": subject.MANIFEST_KIND,
+        "campaign_id": freeze["campaign_id"], "freeze_sha256": freeze["freeze_sha256"],
+        "repository_revision": freeze["repository_revision"],
+        "prepared_utc": "2026-09-30T00:01:00Z", "cells": manifest_cells,
+    }
+    manifest["manifest_sha256"] = hashlib.sha256(_canonical(manifest)).hexdigest()
+    for cell, expected in zip(cells, manifest_cells):
+        root = Path(cell["root"])
+        raw_receipt = json.loads((root / cell["receipt_path"]).read_text(encoding="ascii"))
+        stage = {
+            "schema_version": 1, "kind": subject.STAGE_RECEIPT_KIND,
+            "state": "MATERIALIZED_NO_LAUNCH_EXTERNAL_EXACT_APPROVAL_REQUIRED",
+            "manifest_sha256": manifest["manifest_sha256"], "freeze_sha256": freeze["freeze_sha256"],
+            "ordinal": expected["ordinal"], "pair_index": expected["pair_index"], "arm": expected["arm"],
+            "run_id": expected["run_id"], "run_root": expected["run_root"],
+            "target_host": expected["target_host"],
+            "host_identity": {"hostname": "proteina02", "linux_boot_id": "a" * 8 + "-aaaa-aaaa-aaaa-" + "a" * 12},
+            "clock": "CLOCK_MONOTONIC_RAW",
+            "scheduled_window": {"start_monotonic_ns": 1, "end_monotonic_ns": 2},
+            "hard_timeout_seconds": 210, "no_retry": True,
+            "authorization_request_sha256": raw_receipt["artifacts"]["authorization_request"]["sha256"],
+            "claim_eligible": False, "figure_eligible": False,
+        }
+        stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+        stage_path = root / "runtime/stage-receipt.json"
+        stage_path.parent.mkdir(exist_ok=True)
+        stage_raw = _canonical(stage)
+        stage_path.write_bytes(stage_raw)
+        cell["stage_receipt_path"] = "runtime/stage-receipt.json"
+        cell["stage_receipt_sha256"] = hashlib.sha256(stage_raw).hexdigest()
+    return manifest, campaign_root, cells
+
+
 def test_fault_schedule_accepts_legacy_absence_and_binds_phase_gate_tree_four() -> None:
     legacy = subject._fault_schedule_invariants(
         {"native_fault_schedule": _native_fault_schedule(10)}, label="legacy")
@@ -326,6 +380,102 @@ def test_six_pair_counterbalanced_campaign_passes_frozen_gate(tmp_path: Path) ->
     assert "one N=7" in result["claim_boundary"]
 
 
+def test_manifest_bound_campaign_pins_all_roots_host_and_no_claim_state(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    result = subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+    assert result["schema_version"] == 2
+    assert result["kind"] == subject.MANIFEST_BOUND_RESULT_KIND
+    assert result["manifest_sha256"] == manifest["manifest_sha256"]
+    assert result["target_host"] == "proteina02"
+    assert result["linux_boot_id"] == "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    assert result["technical_improvement_gate_passed"] is True
+    assert result["claim_eligible"] is False
+    assert result["figure_eligible"] is False
+
+
+def test_manifest_bound_campaign_rejects_post_hoc_root_substitution(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    cells[0]["root"] = cells[1]["root"]
+    with pytest.raises(subject.CampaignEvaluationError, match="manifest-pinned root"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_cell_root_symlink_substitution(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    original = Path(cells[0]["root"])
+    alternate = campaign_root / "alternate-cell"
+    original.rename(alternate)
+    original.symlink_to(alternate, target_is_directory=True)
+    with pytest.raises(subject.CampaignEvaluationError, match="symlink ancestor"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_cross_boot_raw_clock(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[1]["root"])
+    stage_path = root / cells[1]["stage_receipt_path"]
+    stage = json.loads(stage_path.read_text(encoding="ascii"))
+    stage["host_identity"]["linux_boot_id"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    stage.pop("stage_receipt_sha256")
+    stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+    raw = _canonical(stage)
+    stage_path.write_bytes(raw)
+    cells[1]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="more than one Linux boot"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+@pytest.mark.parametrize("marker", subject.NEGATIVE_MARKERS)
+def test_manifest_bound_campaign_rejects_sealed_negative_marker_even_with_raw_receipt(
+    tmp_path: Path, marker: str,
+) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    path = Path(cells[0]["root"]) / marker
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(_canonical({"state": "ABORTED_NO_RETRY_SCOPE_STATUS_UNVERIFIED"}))
+    with pytest.raises(subject.CampaignEvaluationError, match="negative marker"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_rehashed_post_hoc_cell_identity(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    manifest["cells"][0]["run_id"] = "post-hoc-replacement"
+    manifest["manifest_sha256"] = hashlib.sha256(_canonical(
+        {key: value for key, value in manifest.items() if key != "manifest_sha256"})).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="stage receipt is not bound"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_stage_host_substitution(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    stage_path = root / cells[0]["stage_receipt_path"]
+    stage = json.loads(stage_path.read_text(encoding="ascii"))
+    stage["host_identity"]["hostname"] = "different-host"
+    stage.pop("stage_receipt_sha256")
+    stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+    raw = _canonical(stage)
+    stage_path.write_bytes(raw)
+    cells[0]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="host identity"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_stage_request_substitution(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    stage_path = root / cells[0]["stage_receipt_path"]
+    stage = json.loads(stage_path.read_text(encoding="ascii"))
+    stage["authorization_request_sha256"] = "d" * 64
+    stage.pop("stage_receipt_sha256")
+    stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+    raw = _canonical(stage)
+    stage_path.write_bytes(raw)
+    cells[0]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="raw receipt request differs"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
 def test_zero_fixed_denominator_is_positive_raw_count_not_infinite_ratio(tmp_path: Path) -> None:
     result = subject.evaluate_campaign(
         _freeze(), _campaign(tmp_path, fixed_counts=[0] * 6, adaptive_counts=[1] * 6))
@@ -333,7 +483,8 @@ def test_zero_fixed_denominator_is_positive_raw_count_not_infinite_ratio(tmp_pat
     assert result["pairs"][0]["adaptive_to_fixed_ratio"] is None
     assert result["pairs"][0]["zero_denominator_outcome"] == "adaptive-progress-fixed-zero"
     assert result["aggregate"]["adaptive_to_fixed_ratio"] is None
-    assert result["technical_improvement_gate_passed"] is True
+    assert result["technical_improvement_gate_passed"] is False
+    assert result["thesis_integration_candidate"] is False
 
 
 def test_both_zero_is_neutral_and_campaign_gate_fails(tmp_path: Path) -> None:

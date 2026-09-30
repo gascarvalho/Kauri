@@ -40,7 +40,16 @@ FROZEN_PAIR_SCHEDULE = (
 
 FREEZE_KIND = "kauri-n7-sustained-role-matched-campaign-freeze-v1"
 RESULT_KIND = "kauri-n7-sustained-role-matched-campaign-result-v1"
+MANIFEST_BOUND_RESULT_KIND = "kauri-n7-sustained-role-matched-campaign-result-v2"
 RECEIPT_KIND = "kauri-n7-sustained-role-raw-bundle-receipt-v1"
+MANIFEST_KIND = "kauri-n7-sustained-role-serial-campaign-manifest-v1"
+STAGE_RECEIPT_KIND = "kauri-n7-sustained-role-serial-cell-stage-receipt-v1"
+NEGATIVE_MARKERS = (
+    "runtime/sustained-role-campaign-staging-abort.json",
+    "runtime/sustained-role-campaign-launch-abort.json",
+    "sustained-role-fixed-e0-abort.json",
+    "sustained-role-adaptive-e1-abort.json",
+)
 VALIDATOR_VERDICT = "PASS_COMPONENT_ONLY_NO_CLAIM"
 SCENARIO_SCOPE = "n7-one-hard-actor-role-scoped-persistent-selected-omission-v1"
 _HEX = frozenset("0123456789abcdef")
@@ -81,6 +90,7 @@ _REPLICA_ENTRY = re.compile(
     r"^127\.0\.0\.1:(?P<peer>[0-9]+);(?P<client>[0-9]+), "
     r"(?P<bls>[^,\s]+), (?P<tls>[^,\s]+)$"
 )
+_BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
 
 FROZEN_DESIGN: dict[str, Any] = {
@@ -106,6 +116,7 @@ FROZEN_DESIGN: dict[str, Any] = {
         "required_positive_pairs_per_order": 2,
         "aggregate_ratio_numerator": 11,
         "aggregate_ratio_denominator": 10,
+        "aggregate_positive_fixed_denominator_required": True,
         "zero_denominator_policy": {
             "fixed_zero_adaptive_positive": "positive-pair-ratio-null",
             "both_zero": "neutral-pair-ratio-null",
@@ -219,12 +230,25 @@ def _safe_child(root: Path, relative: object, label: str) -> Path:
     if (not isinstance(relative, str) or not relative or Path(relative).is_absolute() or
             ".." in Path(relative).parts):
         _fail(f"{label} path is not a safe relative child")
-    path = (root / relative).resolve()
+    lexical_root = _reject_lexical_symlink_ancestors(root, f"{label} root")
+    lexical_child = _reject_lexical_symlink_ancestors(lexical_root / relative, label)
+    path = lexical_child.resolve()
     try:
         path.relative_to(root.resolve())
     except ValueError as exc:
         raise CampaignEvaluationError(f"{label} path escapes its root") from exc
     return path
+
+
+def _reject_lexical_symlink_ancestors(path: Path, label: str) -> Path:
+    lexical = Path(path).absolute()
+    for ancestor in (lexical, *lexical.parents):
+        try:
+            if ancestor.is_symlink():
+                _fail(f"{label} has a symlink ancestor")
+        except OSError as exc:
+            raise CampaignEvaluationError(f"cannot inspect {label} ancestry") from exc
+    return lexical
 
 
 def _descriptor(root: Path, value: object, label: str, maximum: int) -> tuple[bytes, str]:
@@ -297,6 +321,130 @@ def _check_freeze(freeze: Mapping[str, Any]) -> datetime:
     if freeze.get("freeze_sha256") != _sha(_canonical(semantic)):
         _fail("campaign freeze SHA-256 does not recompute")
     return _timestamp(freeze.get("frozen_utc"), "campaign freeze timestamp")
+
+
+def _manifest_relative_root(value: object, label: str) -> str:
+    if (not isinstance(value, str) or not value or Path(value).is_absolute() or
+            ".." in Path(value).parts):
+        _fail(f"{label} is not a safe relative path")
+    return value
+
+
+def _check_campaign_manifest(freeze: Mapping[str, Any], manifest: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Validate the pre-run serial manifest without importing its operator.
+
+    This duplicated, deliberately small parser prevents the evaluator from
+    accepting a caller-selected subset after runs have completed.  The
+    operator imports this module, so importing its validation helper here
+    would create a circular trust dependency.
+    """
+    required = {"schema_version", "kind", "campaign_id", "freeze_sha256",
+                "repository_revision", "prepared_utc", "cells", "manifest_sha256"}
+    if (set(manifest) != required or manifest.get("schema_version") != 1 or
+            manifest.get("kind") != MANIFEST_KIND):
+        _fail("campaign manifest schema drifted")
+    if (manifest.get("campaign_id") != freeze.get("campaign_id") or
+            manifest.get("freeze_sha256") != freeze.get("freeze_sha256") or
+            manifest.get("repository_revision") != freeze.get("repository_revision")):
+        _fail("campaign manifest is not bound to the supplied freeze")
+    _timestamp(manifest.get("prepared_utc"), "campaign manifest preparation timestamp")
+    semantic = {key: value for key, value in manifest.items() if key != "manifest_sha256"}
+    if manifest.get("manifest_sha256") != _sha(_canonical(semantic)):
+        _fail("campaign manifest SHA-256 does not recompute")
+    values = manifest.get("cells")
+    if not isinstance(values, list) or len(values) != PAIR_COUNT * 2:
+        _fail("campaign manifest requires exactly twelve cells")
+    parsed: list[dict[str, Any]] = []
+    ordinal = 0
+    for pair_index, order in enumerate(FROZEN_PAIR_SCHEDULE, start=1):
+        for arm in order:
+            ordinal += 1
+            cell = values[ordinal - 1]
+            required_cell = {"ordinal", "pair_index", "arm", "run_id", "run_root",
+                             "target_host", "hard_timeout_seconds", "retry_policy"}
+            if not isinstance(cell, Mapping) or set(cell) != required_cell:
+                _fail(f"campaign manifest cell {ordinal} schema drifted")
+            if (cell.get("ordinal"), cell.get("pair_index"), cell.get("arm")) != (
+                    ordinal, pair_index, arm):
+                _fail(f"campaign manifest cell {ordinal} contradicts the frozen AB/BA schedule")
+            run_id = cell.get("run_id")
+            if not isinstance(run_id, str) or not run_id:
+                _fail(f"campaign manifest cell {ordinal} run ID is invalid")
+            target_host = cell.get("target_host")
+            if (not isinstance(target_host, str) or not target_host.strip() or
+                    cell.get("hard_timeout_seconds") != 210 or cell.get("retry_policy") != "none"):
+                _fail(f"campaign manifest cell {ordinal} host, timeout, or retry contract drifted")
+            parsed.append({"ordinal": ordinal, "pair_index": pair_index, "arm": arm,
+                           "run_id": run_id,
+                           "run_root": _manifest_relative_root(
+                               cell.get("run_root"), f"campaign manifest cell {ordinal} run root"),
+                           "target_host": target_host,
+                           "hard_timeout_seconds": 210, "retry_policy": "none"})
+    if len({cell["run_id"] for cell in parsed}) != len(parsed):
+        _fail("campaign manifest reuses a run ID")
+    if len({cell["run_root"] for cell in parsed}) != len(parsed):
+        _fail("campaign manifest reuses a run root")
+    if len({cell["target_host"] for cell in parsed}) != 1:
+        _fail("campaign manifest does not retain one target host")
+    return parsed
+
+
+def _stage_receipt(root: Path, record: Mapping[str, Any], expected: Mapping[str, Any],
+                   manifest: Mapping[str, Any], freeze: Mapping[str, Any],
+                   *, required_host_identity: Mapping[str, str] | None = None) -> str:
+    path = _safe_child(root, record.get("stage_receipt_path"),
+                       f"cell {expected['ordinal']} stage receipt")
+    raw = _read(path, f"cell {expected['ordinal']} stage receipt", _MAX_SMALL)
+    if _sha(raw) != _hex(record.get("stage_receipt_sha256"), 64,
+                         f"cell {expected['ordinal']} stage receipt pin"):
+        _fail(f"cell {expected['ordinal']} stage receipt differs from its campaign pin")
+    receipt = _strict_json(raw, f"cell {expected['ordinal']} stage receipt", canonical=True)
+    required = {"schema_version", "kind", "state", "manifest_sha256", "freeze_sha256",
+                "ordinal", "pair_index", "arm", "run_id", "run_root", "target_host",
+                "host_identity", "clock", "scheduled_window", "hard_timeout_seconds",
+                "no_retry", "authorization_request_sha256", "claim_eligible",
+                "figure_eligible", "stage_receipt_sha256"}
+    if set(receipt) != required or receipt.get("schema_version") != 1 or receipt.get("kind") != STAGE_RECEIPT_KIND:
+        _fail(f"cell {expected['ordinal']} stage receipt schema drifted")
+    semantic = {key: value for key, value in receipt.items() if key != "stage_receipt_sha256"}
+    if receipt.get("stage_receipt_sha256") != _sha(_canonical(semantic)):
+        _fail(f"cell {expected['ordinal']} stage receipt SHA-256 does not recompute")
+    required_values = {
+        "manifest_sha256": manifest["manifest_sha256"], "freeze_sha256": freeze["freeze_sha256"],
+        "ordinal": expected["ordinal"], "pair_index": expected["pair_index"], "arm": expected["arm"],
+        "run_id": expected["run_id"], "run_root": expected["run_root"],
+        "target_host": expected["target_host"], "clock": "CLOCK_MONOTONIC_RAW",
+        "hard_timeout_seconds": expected["hard_timeout_seconds"], "no_retry": True,
+        "claim_eligible": False, "figure_eligible": False,
+    }
+    if any(receipt.get(key) != value for key, value in required_values.items()):
+        _fail(f"cell {expected['ordinal']} stage receipt is not bound to the frozen manifest")
+    if (receipt.get("state") != "MATERIALIZED_NO_LAUNCH_EXTERNAL_EXACT_APPROVAL_REQUIRED" or
+            not isinstance(receipt.get("scheduled_window"), Mapping) or
+            type(receipt["scheduled_window"].get("start_monotonic_ns")) is not int or
+            type(receipt["scheduled_window"].get("end_monotonic_ns")) is not int or
+            receipt["scheduled_window"]["start_monotonic_ns"] >= receipt["scheduled_window"]["end_monotonic_ns"] or
+            not isinstance(receipt.get("authorization_request_sha256"), str) or
+            _hex(receipt["authorization_request_sha256"], 64,
+                 f"cell {expected['ordinal']} authorization request SHA-256") is None):
+        _fail(f"cell {expected['ordinal']} stage receipt materialization evidence is invalid")
+    identity = receipt.get("host_identity")
+    if (not isinstance(identity, Mapping) or set(identity) != {"hostname", "linux_boot_id"} or
+            identity.get("hostname") != expected["target_host"] or
+            not isinstance(identity.get("linux_boot_id"), str) or
+            _BOOT_ID.fullmatch(identity["linux_boot_id"]) is None):
+        _fail(f"cell {expected['ordinal']} stage receipt host identity is invalid")
+    if required_host_identity is not None and identity != required_host_identity:
+        _fail(f"cell {expected['ordinal']} stage receipt is from a different host or Linux boot")
+    return receipt["authorization_request_sha256"]
+
+
+def _reject_negative_markers(root: Path, *, ordinal: int) -> None:
+    """An inner raw receipt cannot override an outer no-retry abort."""
+    for relative in NEGATIVE_MARKERS:
+        path = _safe_child(root, relative, f"cell {ordinal} negative marker")
+        if path.exists() or path.is_symlink():
+            _fail(f"cell {ordinal} has a sealed negative marker: {relative}")
 
 
 _VALIDATOR_MODULE: ModuleType | None = None
@@ -880,7 +1028,7 @@ def evaluate_campaign(freeze: Mapping[str, Any], cells: Sequence[Mapping[str, An
     adaptive_total = sum(pair["adaptive_count"] for pair in pairs)
     forward_positive = sum(positives[::2])
     reverse_positive = sum(positives[1::2])
-    aggregate_gate = (adaptive_total > 0 and
+    aggregate_gate = (fixed_total > 0 and adaptive_total > 0 and
                       adaptive_total * FROZEN_DESIGN["improvement_gate"]["aggregate_ratio_denominator"] >=
                       fixed_total * FROZEN_DESIGN["improvement_gate"]["aggregate_ratio_numerator"])
     direction_gate = (sum(positives) >= 5 and forward_positive >= 2 and
@@ -924,4 +1072,87 @@ def evaluate_campaign(freeze: Mapping[str, Any], cells: Sequence[Mapping[str, An
         "claim_boundary": FROZEN_DESIGN["claim_scope"],
         "pilot_policy": FROZEN_DESIGN["pilot_policy"],
         "comparability_identity": common_identity,
+    }
+
+
+def evaluate_manifest_bound_campaign(
+        freeze: Mapping[str, Any], manifest: Mapping[str, Any], campaign_root: Path,
+        cells: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Evaluate exactly the twelve cells committed in a pre-run manifest.
+
+    ``evaluate_campaign`` remains for v1 artifact inspection.  This v2 entry
+    point is the only final campaign verdict: it binds each raw-bundle receipt
+    to the immutable manifest root, ordered cell identity, and staged target
+    host evidence before replaying the existing independent raw validator.
+    """
+    _check_freeze(freeze)
+    if not isinstance(manifest, Mapping):
+        _fail("campaign manifest is not an object")
+    expected_cells = _check_campaign_manifest(freeze, manifest)
+    root = _reject_lexical_symlink_ancestors(Path(campaign_root), "campaign root").resolve()
+    if not root.is_dir():
+        _fail("campaign root is not a regular directory")
+    if isinstance(cells, (str, bytes, Mapping)) or len(cells) != len(expected_cells):
+        _fail("manifest-bound campaign requires exactly twelve ordered cells")
+    raw_records: list[dict[str, Any]] = []
+    boot_ids: set[str] = set()
+    for expected, record in zip(expected_cells, cells):
+        required = {"pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256",
+                    "stage_receipt_path", "stage_receipt_sha256"}
+        if not isinstance(record, Mapping) or set(record) != required:
+            _fail(f"cell {expected['ordinal']} manifest-bound record schema drifted")
+        if (record.get("pair_index"), record.get("ordinal"), record.get("arm")) != (
+                expected["pair_index"], expected["ordinal"], expected["arm"]):
+            _fail(f"cell {expected['ordinal']} contradicts the manifest cell identity")
+        expected_root = _safe_child(root, expected["run_root"],
+                                    f"cell {expected['ordinal']} manifest root")
+        try:
+            expected_root.relative_to(root)
+        except ValueError as exc:
+            raise CampaignEvaluationError("manifest cell root escapes campaign root") from exc
+        supplied_root = record.get("root")
+        if not isinstance(supplied_root, str) or supplied_root != str(expected_root):
+            _fail(f"cell {expected['ordinal']} root is not the manifest-pinned root")
+        _reject_lexical_symlink_ancestors(Path(supplied_root), f"cell {expected['ordinal']} supplied root")
+        if not expected_root.is_dir():
+            _fail(f"cell {expected['ordinal']} manifest-pinned root is unavailable")
+        _reject_negative_markers(expected_root, ordinal=expected["ordinal"])
+        staged_request_sha = _stage_receipt(expected_root, record, expected, manifest, freeze)
+        stage_raw = _read(_safe_child(expected_root, record.get("stage_receipt_path"),
+                                     f"cell {expected['ordinal']} stage receipt"),
+                          f"cell {expected['ordinal']} stage receipt", _MAX_SMALL)
+        if _sha(stage_raw) != record.get("stage_receipt_sha256"):
+            _fail(f"cell {expected['ordinal']} stage receipt changed after validation")
+        stage = _strict_json(stage_raw, f"cell {expected['ordinal']} stage receipt", canonical=True)
+        boot_ids.add(stage["host_identity"]["linux_boot_id"])
+        receipt_raw = _read(_safe_child(expected_root, record.get("receipt_path"),
+                                        f"cell {expected['ordinal']} receipt"),
+                            f"cell {expected['ordinal']} receipt", _MAX_SMALL)
+        if _sha(receipt_raw) != _hex(record.get("receipt_sha256"), 64,
+                                     f"cell {expected['ordinal']} receipt pin"):
+            _fail(f"cell {expected['ordinal']} receipt differs from its campaign pin")
+        receipt = _strict_json(receipt_raw, f"cell {expected['ordinal']} receipt", canonical=True)
+        artifacts = receipt.get("artifacts")
+        if not isinstance(artifacts, Mapping):
+            _fail(f"cell {expected['ordinal']} receipt lacks artifacts")
+        _request_raw, request_sha = _descriptor(
+            expected_root, artifacts.get("authorization_request"),
+            f"cell {expected['ordinal']} authorization request", _MAX_SMALL)
+        if request_sha != staged_request_sha:
+            _fail(f"cell {expected['ordinal']} raw receipt request differs from staged request")
+        raw_records.append({key: record[key] for key in
+                            ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")})
+    if len(boot_ids) != 1:
+        _fail("campaign cells span more than one Linux boot and RAW clock domain")
+    result = evaluate_campaign(freeze, raw_records)
+    return {
+        **result,
+        "schema_version": 2,
+        "kind": MANIFEST_BOUND_RESULT_KIND,
+        "manifest_kind": MANIFEST_KIND,
+        "manifest_sha256": manifest["manifest_sha256"],
+        "target_host": expected_cells[0]["target_host"],
+        "linux_boot_id": next(iter(boot_ids)),
+        "claim_eligible": False,
+        "figure_eligible": False,
     }
