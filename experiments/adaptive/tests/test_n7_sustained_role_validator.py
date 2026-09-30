@@ -190,6 +190,15 @@ def test_validator_accepts_exact_fixed_e0_raw_replay_with_bounded_receipt(tmp_pa
     assert verdict["commit_metric"]["counts"] == {"common_completed_commits": 1}
 
 
+def test_executable_bound_accepts_debug_binary_without_relaxing_raw_bound(tmp_path: Path) -> None:
+    raw = b"x" * (subject._MAX_RAW + 1)
+    descriptor = _write(tmp_path, "inputs/debug-binary", raw)
+    assert subject._MAX_EXECUTABLE > len(raw)
+    assert subject._read_descriptor(tmp_path, descriptor, "executable", subject._MAX_EXECUTABLE) == raw
+    with pytest.raises(subject.ValidationError, match="bounded regular file"):
+        subject._read_descriptor(tmp_path, descriptor, "raw event stream", subject._MAX_RAW)
+
+
 def test_validator_rejects_cross_replica_physical_fault_opportunity(tmp_path: Path) -> None:
     receipt_path = _accepted_fixed_bundle(tmp_path)
     receipt = json.loads(receipt_path.read_text())

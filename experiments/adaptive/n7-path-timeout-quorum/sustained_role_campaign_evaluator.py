@@ -55,6 +55,7 @@ SCENARIO_SCOPE = "n7-one-hard-actor-role-scoped-persistent-selected-omission-v1"
 _HEX = frozenset("0123456789abcdef")
 _MAX_SMALL = 256 * 1024
 _MAX_RAW = 16 * 1024 * 1024
+_MAX_EXECUTABLE = 128 * 1024 * 1024
 _HERE = Path(__file__).resolve().parent
 
 _MAIN_CONFIG_FIXED = {
@@ -116,6 +117,10 @@ FROZEN_DESIGN: dict[str, Any] = {
         "and require every "
         "actor-1 persistent selected omission to bind the arm's epoch digest, role, "
         "message, and action"
+    ),
+    "scheduled_window_binding_policy": (
+        "plan and request carry the full prearm attestation; the sealed launch "
+        "binding carries the same start and end monotonic timestamps"
     ),
     "improvement_gate": {
         "required_accepted_pairs": 6,
@@ -936,7 +941,7 @@ def _one_cell(record: Mapping[str, Any], *, expected_pair: int, expected_ordinal
     if not isinstance(executables, Mapping) or set(executables) != {"hotstuff_app", "adaptation_manager"}:
         _fail(f"cell {expected_ordinal} executable descriptors drifted")
     executable_sha = {
-        name: _descriptor(root, descriptor, f"cell {expected_ordinal} {name}", _MAX_RAW)[1]
+        name: _descriptor(root, descriptor, f"cell {expected_ordinal} {name}", _MAX_EXECUTABLE)[1]
         for name, descriptor in executables.items()
     }
     profile_sha = _descriptor(root, artifacts.get("profile"), f"cell {expected_ordinal} profile", _MAX_SMALL)[1]
@@ -953,7 +958,17 @@ def _one_cell(record: Mapping[str, Any], *, expected_pair: int, expected_ordinal
     hard_timeout = request.get("hard_timeout_seconds")
     if type(hard_timeout) is not int or hard_timeout < 120:
         _fail(f"cell {expected_ordinal} hard timeout is invalid")
-    if plan.get("hard_timeout_seconds") != hard_timeout or plan.get("scheduled_window") != scheduled:
+    full_window = {
+        **scheduled,
+        "argv_pinned_before_launch": True,
+        "attestation": {
+            "must_be_written": "after_prearm_all_seven_e0_common_commit_before_scheduled_start",
+            "is_not": "an_arm_or_gate",
+        },
+    }
+    if (plan.get("hard_timeout_seconds") != hard_timeout or
+            plan.get("scheduled_window") != full_window or
+            request.get("scheduled_window") != full_window):
         _fail(f"cell {expected_ordinal} plan timing differs from its accepted launch binding")
     return {
         "pair_index": expected_pair,

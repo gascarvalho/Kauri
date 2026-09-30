@@ -21,6 +21,7 @@ KIND = "kauri-n7-sustained-role-raw-bundle-receipt-v1"
 _ARMS = frozenset({"fixed_e0", "adaptive_e1"})
 _HEX = frozenset("0123456789abcdef")
 _MAX_RAW = 16 * 1024 * 1024
+_MAX_EXECUTABLE = 128 * 1024 * 1024
 _MAX_SMALL = 256 * 1024
 _HORIZON_NS = 60_000_000_000
 _LATE_NS = 20_000_000_000
@@ -1147,7 +1148,7 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
     if not isinstance(executables, Mapping) or set(executables) != {"hotstuff_app", "adaptation_manager"}:
         raise ValidationError("receipt executable descriptors drifted")
     for key, descriptor in executables.items():
-        _read_descriptor(root, descriptor, key, _MAX_RAW)
+        _read_descriptor(root, descriptor, key, _MAX_EXECUTABLE)
     run_id = receipt["run_id"]
     streams = {
         f"replica-{replica}": _parse_jsonl(_read_descriptor(root, replica_events[replica], f"replica-{replica} events", _MAX_RAW), run_id=run_id, source_id=f"replica-{replica}")

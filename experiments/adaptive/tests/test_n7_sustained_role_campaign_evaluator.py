@@ -213,12 +213,21 @@ def _cell(tmp_path: Path, *, ordinal: int, pair_index: int, arm: str, count: int
     manager = _descriptor(root, "inputs/adaptation-manager", {"binary": "manager"})
     scheduled_window = {"start_monotonic_ns": start,
                         "end_monotonic_ns": start + 70_000_000_000}
+    full_window = {
+        **scheduled_window,
+        "argv_pinned_before_launch": True,
+        "attestation": {
+            "must_be_written": "after_prearm_all_seven_e0_common_commit_before_scheduled_start",
+            "is_not": "an_arm_or_gate",
+        },
+    }
     plan = {"repository_revision": revision, "comparison": {"arm": arm}, "no_retry": True,
-            "hard_timeout_seconds": 180, "scheduled_window": scheduled_window,
+            "hard_timeout_seconds": 180, "scheduled_window": full_window,
             "native_fault_schedule": _native_fault_schedule(start)}
     plan_descriptor = _descriptor(root, "inputs/execution-plan.json", plan)
     request = {"arm": arm, "hard_timeout_seconds": 180, "no_retry": True,
-               "claim_eligible": False, "figure_eligible": False}
+               "claim_eligible": False, "figure_eligible": False,
+               "scheduled_window": full_window}
     request_descriptor = _descriptor(root, "inputs/authorization-request.json", request)
     approval = {"approval_reference": "W19 campaign approval", "approved_utc": "2026-09-30T01:00:00Z"}
     approval_descriptor = _descriptor(root, "inputs/approved-authorization.json", approval)
@@ -274,6 +283,15 @@ def _campaign(tmp_path: Path, *, fixed_counts: list[int] | None = None,
                                count=(fixed_counts if arm == subject.FIXED_ARM else adaptive_counts)[pair_index - 1],
                                start=ordinal * 100_000_000_000))
     return cells
+
+
+def test_executable_bound_accepts_debug_binary_without_relaxing_raw_bound(tmp_path: Path) -> None:
+    raw = b"x" * (subject._MAX_RAW + 1)
+    descriptor = _raw_descriptor(tmp_path, "inputs/debug-binary", raw)
+    assert subject._MAX_EXECUTABLE > len(raw)
+    assert subject._descriptor(tmp_path, descriptor, "executable", subject._MAX_EXECUTABLE)[0] == raw
+    with pytest.raises(subject.CampaignEvaluationError, match="bounded non-empty regular file"):
+        subject._descriptor(tmp_path, descriptor, "raw event stream", subject._MAX_RAW)
 
 
 def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
@@ -789,6 +807,27 @@ def test_rejects_causal_main_config_drift_even_with_fresh_valid_identity_materia
     receipt_path.write_bytes(raw)
     cells[-1]["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
     with pytest.raises(subject.CampaignEvaluationError, match="causal settings"):
+        subject.evaluate_campaign(_freeze(), cells)
+
+
+def test_rejects_request_attestation_drift_from_full_plan_window(tmp_path: Path) -> None:
+    cells = _campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    receipt_path = root / cells[0]["receipt_path"]
+    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+    descriptor = receipt["artifacts"]["authorization_request"]
+    request_path = root / descriptor["path"]
+    request = json.loads(request_path.read_text(encoding="ascii"))
+    request["scheduled_window"]["attestation"]["is_not"] = "an_unverified_gate"
+    raw_request = _canonical(request)
+    request_path.write_bytes(raw_request)
+    descriptor["sha256"] = hashlib.sha256(raw_request).hexdigest()
+    receipt.pop("receipt_sha256")
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical(receipt)).hexdigest()
+    raw_receipt = _canonical(receipt)
+    receipt_path.write_bytes(raw_receipt)
+    cells[0]["receipt_sha256"] = hashlib.sha256(raw_receipt).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="plan timing differs"):
         subject.evaluate_campaign(_freeze(), cells)
 
 
