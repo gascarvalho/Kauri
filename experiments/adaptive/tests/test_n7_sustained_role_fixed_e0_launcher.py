@@ -67,6 +67,15 @@ def test_approved_launch_inputs_are_rehashed_before_spawn(tmp_path: Path):
     with pytest.raises(subject.LaunchError, match="manager argv differs"):
         subject._verify_approved_launch_inputs(root, plan)
 
+
+def test_authorized_launch_creates_fresh_log_and_raw_sinks_once(tmp_path: Path):
+    root = tmp_path / "run"; root.mkdir()
+    assert not (root / "logs").exists() and not (root / "raw").exists()
+    subject._prepare_exclusive_output_dirs(root)
+    assert (root / "logs").is_dir() and (root / "raw").is_dir()
+    with pytest.raises(subject.LaunchError, match="already exists"):
+        subject._prepare_exclusive_output_dirs(root)
+
 def test_exact_external_approval_cannot_be_reused_for_another_plan(tmp_path: Path):
     root = tmp_path / "run"; (root / "runtime").mkdir(parents=True)
     plan = {"plan_sha256": "a" * 64}; request = {"request": "one"}; request_bytes = _canon(request)

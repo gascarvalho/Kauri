@@ -413,6 +413,7 @@ def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
         # Native option parsing rejects a present arm file at process start.
         # Its later poll deliberately tolerates absence until our E0 prearm.
         _fault_window_arm_startup_path(root, manager)
+        fixed._prepare_exclusive_output_dirs(root)
         records.append(spawn("adaptive-manager", manager, root / "logs/adaptive-manager.log", root, replica_id=None))
         for i, row in enumerate(replicas):
             argv = row.get("argv") if isinstance(row, Mapping) else None

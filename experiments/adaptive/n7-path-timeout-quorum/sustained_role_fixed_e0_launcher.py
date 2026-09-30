@@ -133,6 +133,15 @@ def _verify_approved_launch_inputs(root: Path, plan: Mapping[str, Any]) -> None:
         _verified_launch_file(descriptor.get("path"), descriptor.get("sha256"), label=key)
 
 
+def _prepare_exclusive_output_dirs(root: Path) -> None:
+    """Create the raw/log sinks only at the authorized one-shot launch boundary."""
+    for name in ("raw", "logs"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            raise LaunchError(f"{name} output directory already exists before launch")
+        path.mkdir(mode=0o700)
+
+
 def _read(path: Path, label: str) -> tuple[dict[str, Any], bytes]:
     if path.is_symlink() or not path.is_file() or path.stat().st_size > 512 * 1024:
         raise LaunchError(f"{label} is not a bounded regular file")
@@ -458,6 +467,7 @@ def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
         start = plan["scheduled_window"]["start_monotonic_ns"]; end = plan["scheduled_window"]["end_monotonic_ns"]
         if raw_clock() >= start:
             raise LaunchError("scheduled window has already begun; no retry permitted")
+        _prepare_exclusive_output_dirs(root)
         records.append(spawn("adaptive-manager", manager, root / "logs/adaptive-manager.log", root, replica_id=None))
         for i, row in enumerate(replicas):
             argv = row.get("argv") if isinstance(row, Mapping) else None
