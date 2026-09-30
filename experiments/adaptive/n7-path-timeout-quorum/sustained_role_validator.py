@@ -30,11 +30,11 @@ _LATE_NS = 20_000_000_000
 # authorities.  An adaptive launcher must freeze all of them before this
 # independent validator can enable an accepting adaptive branch.
 ADAPTIVE_E1_REQUIRED_ARTIFACTS = (
-    "canonical signed adaptive-v3 E1 bundle bytes and SHA-256",
+    "canonical signed adaptive-v2 E1 bundle bytes and SHA-256",
     "canonical issuer public-key bytes and SHA-256",
     "independent native bundle decode/signature verification bound to that issuer",
     "decoded E1 predecessor E0 digest, successor E1 digest, and activation height",
-    "decoded all-tree N=7 membership with actor 1 wait-exempt leaf in every tree",
+    "decoded five-tree Q=5/N=7 membership with actor 1 wait-exempt leaf in every tree",
     "all-seven epoch.command_committed raw-event bindings to the decoded E0-to-E1 command",
     "all-seven epoch.activated raw events for that exact E1 digest by anchor plus 20 seconds",
     "seven replica JSONL streams, eight logs, and clean eight-process cleanup through anchor plus 60 seconds",
@@ -100,21 +100,61 @@ def _require_descriptor_list(artifacts: Mapping[str, Any], key: str, count: int)
 
 
 def _config_option(raw: bytes, option: str, label: str) -> str:
-    """Read one exact ``key = value`` entry from archived native config bytes.
+    """Read one effective assignment from archived native config bytes.
 
     Replica source instances and the designated observer are consumed by the
-    native application from configuration, not replica argv.  This deliberately
-    small parser is only used for those immutable scalar bindings.
+    native application from configuration, not replica argv.  Salticidae
+    splits each line at the first ``=`` and trims both sides; mirror that
+    parsing so alternate spacing cannot hide a duplicate trust assignment.
     """
     try:
         lines = raw.decode("utf-8").splitlines()
     except UnicodeDecodeError as exc:
         raise ValidationError(f"{label} is not UTF-8 configuration") from exc
-    prefix = f"{option} = "
-    values = [line[len(prefix):] for line in lines if line.startswith(prefix)]
-    if len(values) != 1 or not values[0] or values[0].strip() != values[0]:
+    values = [line.partition("=")[2].strip() for line in lines
+              if "=" in line and line.partition("=")[0].strip() == option]
+    if len(values) != 1 or not values[0]:
         raise ValidationError(f"{label} lacks one exact {option} binding")
     return values[0]
+
+
+def _validate_replica_trust_launch(root: Path, argv: Sequence[Any],
+                                   main_descriptor: Mapping[str, Any],
+                                   replica_descriptor: Mapping[str, Any],
+                                   replica_raw: bytes, label: str) -> None:
+    """Require the canonical two-config launch with no later trust override."""
+    if not isinstance(argv, list) or len(argv) < 5 or any(not isinstance(arg, str) for arg in argv):
+        raise ValidationError(f"{label} launch argv is malformed")
+    # The plan preserves the original absolute launch paths.  The receipt's
+    # portable descriptors are hashed copies, not the paths passed to Kauri.
+    planned_paths = (main_descriptor.get("path"), replica_descriptor.get("path"))
+    if (any(not isinstance(path, str) or not Path(path).is_absolute() for path in planned_paths) or
+            argv[1:5] != ["--conf", planned_paths[0], "--conf", planned_paths[1]]):
+        raise ValidationError(f"{label} does not load exactly the archived main and replica configs")
+    post = argv[5:]
+    trust_keys = {"epoch-protocol-mode", "epoch-change-issuer-id", "epoch-change-issuer-public-key"}
+    if any(arg.startswith("--epoch") for arg in post):
+        raise ValidationError(f"{label} argv overrides archived adaptive-v2 trust configuration")
+    allowed_overlay_options = {
+        "--experiment-byzantine-mode", "--experiment-byzantine-window",
+        "--experiment-rotating-omission-actors",
+        "--experiment-byzantine-window-start-monotonic-ns",
+        "--experiment-byzantine-window-end-monotonic-ns",
+        "--experiment-byzantine-max-omissions-per-proposal",
+        "--experiment-rotating-omission-context-limit",
+        "--experiment-byzantine-first-omission-tree",
+    }
+    if (len(post) % 2 != 0 or (label != "replica-1" and post) or
+            any(option not in allowed_overlay_options or value.startswith("-")
+                for option, value in zip(post[::2], post[1::2])) or
+            len(set(post[::2])) != len(post[::2])):
+        raise ValidationError(f"{label} has noncanonical post-config launch options")
+    try:
+        lines = replica_raw.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise ValidationError(f"{label} config is not UTF-8") from exc
+    if any(line.partition("=")[0].strip() in trust_keys for line in lines if "=" in line):
+        raise ValidationError(f"{label} config overrides archived adaptive-v2 trust configuration")
 
 
 def _parse_jsonl(raw: bytes, *, run_id: str, source_id: str) -> list[dict[str, Any]]:
@@ -785,6 +825,9 @@ def _factorial_bundle_decoder():
 
 def _validate_adaptive_bundle_and_activation(root: Path, artifacts: Mapping[str, Any], *, receipt: Mapping[str, Any], streams: Mapping[str, Sequence[Mapping[str, Any]]], anchor_ns: int) -> Any:
     """Verify native signed E1 bytes before joining them to raw activation."""
+    main_raw = _read_descriptor(root, artifacts["main_config"], "main config", _MAX_SMALL)
+    if _config_option(main_raw, "epoch-protocol-mode", "main config") != "adaptive_v2":
+        raise ValidationError("signed E1 bundle requires the archived adaptive-v2 protocol mode")
     issuer_raw = _read_descriptor(root, artifacts["issuer_public_key"], "E1 issuer public key", _MAX_SMALL)
     try:
         issuer = issuer_raw.decode("ascii")
@@ -792,17 +835,25 @@ def _validate_adaptive_bundle_and_activation(root: Path, artifacts: Mapping[str,
         raise ValidationError("E1 issuer public key is not ASCII") from exc
     if not re.fullmatch(r"[0-9a-f]{66}\n", issuer):
         raise ValidationError("E1 issuer public key is not canonical compressed secp256k1 text")
+    issuer_key = issuer[:-1]
+    if (_config_option(main_raw, "epoch-change-issuer-id", "main config") != "1" or
+            _config_option(main_raw, "epoch-change-issuer-public-key", "main config") != issuer_key):
+        raise ValidationError("signed E1 issuer differs from archived replica trust configuration")
     bundle_raw = _read_descriptor(root, artifacts["e1_bundle"], "signed E1 bundle", _MAX_SMALL)
     try:
-        bundle = _factorial_bundle_decoder().decode_adaptive_v3_epoch_change_bundle(bundle_raw, issuer_public_key=issuer[:-1])
+        bundle = _factorial_bundle_decoder().decode_epoch_change_bundle(bundle_raw, issuer_public_key=issuer_key)
     except (ValueError, OSError, ImportError) as exc:
         raise ValidationError(f"signed E1 bundle does not independently verify: {exc}") from exc
     e0 = receipt["launch_binding"]["e0_digest"]
-    if bundle.command.predecessor_epoch_digest != e0 or bundle.previous_epoch_digest != e0 or bundle.epoch_number != 1 or bundle.command.successor_epoch_number != 1 or bundle.epoch_digest != bundle.command.successor_epoch_digest:
+    if bundle.command.issuer_id != 1:
+        raise ValidationError("signed E1 bundle issuer ID differs from archived configuration")
+    if (bundle.command.predecessor_epoch_digest != e0 or bundle.previous_epoch_digest != e0 or
+            bundle.epoch_number != 1 or
+            bundle.command.successor_epoch_number != 1 or bundle.epoch_digest != bundle.command.successor_epoch_digest):
         raise ValidationError("signed E1 bundle does not bind the exact E0 predecessor")
-    if (len(bundle.trees) != 7 or tuple(tree.tree_id for tree in bundle.trees) != tuple(range(7)) or
+    if (len(bundle.trees) != 5 or tuple(tree.tree_id for tree in bundle.trees) != tuple(range(5)) or
             bundle.generation_seed != 41719 or bundle.command.activation_delay_blocks != 5):
-        raise ValidationError("signed E1 bundle differs from frozen seven-tree generation")
+        raise ValidationError("signed E1 bundle differs from frozen quorum-five-tree generation")
     for tree in bundle.trees:
         first_leaf = (len(tree.members) - 2) // tree.fanout + 1
         if (tree.fanout != 2 or tree.pipeline_stretch != 2 or
@@ -851,7 +902,7 @@ def _validate_adaptive_causality(root: Path, artifacts: Mapping[str, Any], *,
                                  manager_events: Sequence[Mapping[str, Any]],
                                  actor_events: Sequence[Mapping[str, Any]],
                                  bundle: Any) -> None:
-    """Join scheduled physical omissions to the v3 manager's accepted prefix.
+    """Join scheduled physical omissions to the adaptive-v2 manager's accepted prefix.
 
     The scheduled fault is not controlled by the legacy static injection gate.
     Its native contribution-opportunity event and paired fault log prove the
@@ -899,6 +950,15 @@ def _validate_adaptive_causality(root: Path, artifacts: Mapping[str, Any], *,
             arm["evidence_start_monotonic_ns"] <= anchor_ns):
         raise ValidationError("manager fault-window arm does not precede physical omission")
 
+    def attempt_identity(observation: Mapping[str, Any]) -> tuple[Any, ...]:
+        config = observation.get("configuration")
+        if not isinstance(config, Mapping):
+            return (None,)
+        return (observation.get("reporter_id"), observation.get("observed_replica_id"),
+                config.get("epoch_number"), config.get("tree_id"), config.get("epoch_digest"),
+                observation.get("block_hash"), observation.get("expected_message_type"),
+                observation.get("deadline_duration_us"))
+
     physical: dict[tuple[int, int, str], Mapping[str, Any]] = {}
     for event in actor_events:
         if event["event_type"] != "fault.contribution_opportunity":
@@ -938,9 +998,12 @@ def _validate_adaptive_causality(root: Path, artifacts: Mapping[str, Any], *,
             snapshot.get("evidence_snapshot_id") != bundle.evidence_snapshot_id or
             snapshot["current_cutoff"] != bundle.evidence_cutoff or
             snapshot_event["source_sequence"] <= arm_event["source_sequence"]):
-        raise ValidationError("v3 evidence snapshot does not bind the selected exact prefix")
+        raise ValidationError("adaptive-v2 evidence snapshot does not bind the selected exact prefix")
 
     qualifying: dict[int, set[str]] = {reporter: set() for reporter in (4, 5, 6)}
+    ordinary_candidates: list[Mapping[str, Any]] = []
+    timeout_ids: set[str] = set()
+    timeout_attempts: set[tuple[Any, ...]] = set()
     last_ingestion = 0
     for event in manager_events:
         if event["event_type"] != "evidence.observation_accepted":
@@ -965,6 +1028,11 @@ def _validate_adaptive_causality(root: Path, artifacts: Mapping[str, Any], *,
                 config.get("epoch_number") != 0 or config.get("epoch_digest") != binding["e0_digest"] or
                 observation.get("expected_message_type") != "aggregate_relay"):
             continue
+        # The accepted prefix contains ordinary pre-fault responses on these
+        # paths; retain them to detect contradictory timeout evidence below.
+        if observation.get("outcome") in ("on_time", "late"):
+            ordinary_candidates.append(observation)
+            continue
         if (observation.get("schema_version") != 3 or observation.get("outcome") != "timeout" or
                 observation.get("response_duration_us") != 0 or observation.get("signer_set") != [] or
                 type(observation.get("attempt_start_monotonic_ns")) is not int or
@@ -987,9 +1055,25 @@ def _validate_adaptive_causality(root: Path, artifacts: Mapping[str, Any], *,
             raise ValidationError("accepted timeout lacks its exact native physical omission")
         if block_hash in qualifying[observation["reporter_id"]]:
             raise ValidationError("reporter reuses one physical omission context")
+        timeout_id = _hex64(observation.get("observation_id"), "accepted timeout observation ID")
+        if timeout_id in timeout_ids:
+            raise ValidationError("accepted timeout observation ID is duplicated")
+        timeout_ids.add(timeout_id)
+        timeout_attempts.add(attempt_identity(observation))
         qualifying[observation["reporter_id"]].add(block_hash)
     if any(len(blocks) < 2 for blocks in qualifying.values()):
         raise ValidationError("three internal reporters lack two exact post-arm timeouts each")
+    for observation in ordinary_candidates:
+        config = observation["configuration"]
+        ordinary_key = (config["tree_id"], observation["reporter_id"],
+                        _hex64(observation.get("block_hash"), "ordinary candidate block"))
+        if ordinary_key in physical:
+            raise ValidationError("ordinary candidate contradicts exact physical omission")
+        if observation["outcome"] == "late":
+            raise ValidationError("late candidate conflicts with selected timeout prefix")
+        if (observation.get("observation_id") in timeout_ids or
+                attempt_identity(observation) in timeout_attempts):
+            raise ValidationError("ordinary candidate contradicts timeout evidence")
 
     terminals = [event for event in manager_events
                  if event["event_type"] == "adaptive_v2_session_terminal"]
@@ -1084,6 +1168,9 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
             raise ValidationError("replica source-instance launch binding is malformed")
         source = f"replica-{replica}"
         config = replica_config_raw[replica]
+        if receipt["arm"] == "adaptive_e1":
+            _validate_replica_trust_launch(root, row["argv"], plan["configuration"]["main"],
+                                           plan["configuration"]["replicas"][replica], config, source)
         if _config_option(config, "idx", f"{source} config") != str(replica):
             raise ValidationError(f"{source} config index differs from planned replica")
         if _config_option(config, "structured-event-run-id", f"{source} config") != run_id:

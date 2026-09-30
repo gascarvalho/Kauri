@@ -11,6 +11,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 PATH = ROOT / "n7-path-timeout-quorum" / "sustained_role_validator.py"
+_W19_ISSUER_PUBLIC_KEY = "02" + "0" * 64
+_W19_ISSUER_ID = 1
 spec = importlib.util.spec_from_file_location("n7_sustained_role_validator_test", PATH)
 assert spec and spec.loader
 subject = importlib.util.module_from_spec(spec)
@@ -315,15 +317,279 @@ def test_validator_binds_replica_source_instances_and_observer_to_archived_confi
 
 def test_adaptive_e1_acceptance_has_an_explicit_non_generic_contract() -> None:
     assert subject.ADAPTIVE_E1_REQUIRED_ARTIFACTS == (
-        "canonical signed adaptive-v3 E1 bundle bytes and SHA-256",
+        "canonical signed adaptive-v2 E1 bundle bytes and SHA-256",
         "canonical issuer public-key bytes and SHA-256",
         "independent native bundle decode/signature verification bound to that issuer",
         "decoded E1 predecessor E0 digest, successor E1 digest, and activation height",
-        "decoded all-tree N=7 membership with actor 1 wait-exempt leaf in every tree",
+        "decoded five-tree Q=5/N=7 membership with actor 1 wait-exempt leaf in every tree",
         "all-seven epoch.command_committed raw-event bindings to the decoded E0-to-E1 command",
         "all-seven epoch.activated raw events for that exact E1 digest by anchor plus 20 seconds",
         "seven replica JSONL streams, eight logs, and clean eight-process cleanup through anchor plus 60 seconds",
     )
+
+
+def _adaptive_v2_five_tree_bundle_fixture(*, tree_count: int = 5) -> tuple[dict, dict, dict, SimpleNamespace]:
+    """Return the frozen W19 adaptive-v2 E1 shape without native signing.
+
+    The wire/signature implementation is independently covered by
+    ``factorial_validation``.  This narrow validator test instead spies on
+    decoder selection, so a v3 decoder can never accidentally accept an
+    adaptive-v2 W19 artifact merely because its decoded Python shape happens
+    to look compatible.
+    """
+    e0, e1, payload_digest = "a" * 64, "b" * 64, "c" * 64
+    trees = tuple(
+        SimpleNamespace(tree_id=tree_id, fanout=2, pipeline_stretch=2,
+                        members=(0, 2, 3, 1, 4, 5, 6), wait_exempt=(1,))
+        for tree_id in range(tree_count)
+    )
+    bundle = SimpleNamespace(
+        command=SimpleNamespace(
+            predecessor_epoch_digest=e0,
+            issuer_id=_W19_ISSUER_ID,
+            successor_epoch_number=1,
+            successor_epoch_digest=e1,
+            activation_delay_blocks=5,
+            payload_digest=payload_digest,
+        ),
+        epoch_number=1,
+        epoch_digest=e1,
+        previous_epoch_digest=e0,
+        generation_seed=41719,
+        trees=trees,
+    )
+    artifacts = {
+        "main_config": {"path": "main.conf", "sha256": hashlib.sha256(b"epoch-protocol-mode = adaptive_v2\nepoch-change-issuer-id = 1\nepoch-change-issuer-public-key = 02" + b"0" * 64 + b"\n").hexdigest()},
+        "issuer_public_key": {"path": "issuer.pub", "sha256": hashlib.sha256(_W19_ISSUER_PUBLIC_KEY.encode("ascii") + b"\n").hexdigest()},
+        "e1_bundle": {"path": "e1.bundle", "sha256": hashlib.sha256(b"adaptive-v2-wire").hexdigest()},
+    }
+    receipt = {"launch_binding": {"e0_digest": e0}}
+    streams = {}
+    command = {
+        "command_block_height": 11,
+        "command_block_hash": "d" * 64,
+        "payload_digest": payload_digest,
+        "predecessor_epoch_number": 0,
+        "predecessor_epoch_digest": e0,
+        "successor_epoch_number": 1,
+        "successor_epoch_digest": e1,
+        "activation_delay_blocks": 5,
+        "activation_height": 16,
+    }
+    for replica in range(7):
+        streams[f"replica-{replica}"] = [
+            _event(f"replica-{replica}", 1, 10, "epoch.command_committed", command),
+            _event(f"replica-{replica}", 2, 11, "epoch.activated", {
+                "epoch_number": 1, "tree_id": 0, "epoch_digest": e1,
+                "activation_height": 16,
+            }),
+        ]
+    return artifacts, receipt, streams, bundle
+
+
+def _write_adaptive_v2_bundle_inputs(root: Path, artifacts: dict, *, protocol_mode: str = "adaptive_v2",
+                                     issuer_public_key: str = _W19_ISSUER_PUBLIC_KEY,
+                                     issuer_id: int = _W19_ISSUER_ID) -> None:
+    main_raw = (
+        f"epoch-protocol-mode = {protocol_mode}\n"
+        f"epoch-change-issuer-id = {issuer_id}\n"
+        f"epoch-change-issuer-public-key = {issuer_public_key}\n"
+    ).encode("ascii")
+    artifacts["main_config"] = _write(root, artifacts["main_config"]["path"], main_raw)
+    issuer = _W19_ISSUER_PUBLIC_KEY.encode("ascii") + b"\n"
+    _write(root, artifacts["issuer_public_key"]["path"], issuer)
+    _write(root, artifacts["e1_bundle"]["path"], b"adaptive-v2-wire")
+
+
+def test_w19_adaptive_v2_bundle_uses_v2_decoder_and_exact_five_tree_shape(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts, receipt, streams, bundle = _adaptive_v2_five_tree_bundle_fixture()
+    _write_adaptive_v2_bundle_inputs(tmp_path, artifacts)
+    calls: list[str] = []
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            calls.append("v2")
+            assert payload == b"adaptive-v2-wire"
+            assert issuer_public_key == _W19_ISSUER_PUBLIC_KEY
+            return bundle
+
+        def decode_adaptive_v3_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            calls.append("v3")
+            raise ValueError("adaptive-v3 wire domain is not permitted for W19")
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    verified = subject._validate_adaptive_bundle_and_activation(
+        tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+
+    assert verified is bundle
+    assert calls == ["v2"]
+
+
+def test_w19_adaptive_v2_validator_rejects_v3_wire_without_fallback(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts, receipt, streams, bundle = _adaptive_v2_five_tree_bundle_fixture()
+    _write_adaptive_v2_bundle_inputs(tmp_path, artifacts)
+    calls: list[str] = []
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            calls.append("v2")
+            raise ValueError("epoch-change bundle domain is invalid")
+
+        def decode_adaptive_v3_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            calls.append("v3")
+            return bundle
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    with pytest.raises(subject.ValidationError, match="does not independently verify"):
+        subject._validate_adaptive_bundle_and_activation(
+            tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+    assert calls == ["v2"]
+
+
+def test_w19_adaptive_v2_validator_rejects_archived_v3_protocol_config(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts, receipt, streams, _ = _adaptive_v2_five_tree_bundle_fixture()
+    _write_adaptive_v2_bundle_inputs(tmp_path, artifacts, protocol_mode="adaptive_v3")
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            raise AssertionError("wrong archived protocol configuration must fail before decode")
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    with pytest.raises(subject.ValidationError, match="archived adaptive-v2 protocol mode"):
+        subject._validate_adaptive_bundle_and_activation(
+            tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+
+
+def test_w19_adaptive_v2_validator_binds_main_config_issuer_public_key(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts, receipt, streams, _ = _adaptive_v2_five_tree_bundle_fixture()
+    _write_adaptive_v2_bundle_inputs(
+        tmp_path, artifacts, issuer_public_key="03" + "1" * 64)
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            raise AssertionError("wrong configured issuer key must fail before wire decode")
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    with pytest.raises(subject.ValidationError, match="issuer"):
+        subject._validate_adaptive_bundle_and_activation(
+            tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+
+
+@pytest.mark.parametrize("configured_issuer_id, decoded_issuer_id", [(2, 1), (1, 2)],
+                         ids=["wrong-main-config-id", "wrong-decoded-command-id"])
+def test_w19_adaptive_v2_validator_binds_main_config_and_command_issuer_id(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured_issuer_id: int,
+        decoded_issuer_id: int) -> None:
+    artifacts, receipt, streams, bundle = _adaptive_v2_five_tree_bundle_fixture()
+    _write_adaptive_v2_bundle_inputs(tmp_path, artifacts, issuer_id=configured_issuer_id)
+    bundle.command.issuer_id = decoded_issuer_id
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            return bundle
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    with pytest.raises(subject.ValidationError, match="issuer"):
+        subject._validate_adaptive_bundle_and_activation(
+            tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+
+
+def test_w19_adaptive_v2_validator_rejects_nonfive_tree_bundle(
+        tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    artifacts, receipt, streams, bundle = _adaptive_v2_five_tree_bundle_fixture(tree_count=4)
+    _write_adaptive_v2_bundle_inputs(tmp_path, artifacts)
+
+    class Decoder:
+        def decode_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            return bundle
+
+        def decode_adaptive_v3_epoch_change_bundle(self, payload: bytes, *, issuer_public_key: str):
+            raise AssertionError("W19 must not decode an adaptive-v2 wire as v3")
+
+    monkeypatch.setattr(subject, "_factorial_bundle_decoder", lambda: Decoder())
+    with pytest.raises(subject.ValidationError, match="five-tree generation"):
+        subject._validate_adaptive_bundle_and_activation(
+            tmp_path, artifacts, receipt=receipt, streams=streams, anchor_ns=0)
+
+
+def _replica_trust_launch_fixture(root: Path) -> tuple[list[str], dict[str, str], dict[str, str], bytes]:
+    main_raw = (
+        f"epoch-protocol-mode = adaptive_v2\n"
+        f"epoch-change-issuer-id = {_W19_ISSUER_ID}\n"
+        f"epoch-change-issuer-public-key = {_W19_ISSUER_PUBLIC_KEY}\n"
+    ).encode("ascii")
+    replica_raw = b"idx = 0\nstructured-event-run-id = sustained-run\n"
+    # Receipt artifacts are portable relative copies.  The archived plan keeps
+    # the original absolute paths that must be the argv values.
+    _write(root, "receipt/main.conf", main_raw)
+    _write(root, "receipt/replica-0.conf", replica_raw)
+    main = {"path": str((root / "launch-inputs/main.conf").resolve())}
+    replica = {"path": str((root / "launch-inputs/replica-0.conf").resolve())}
+    argv = [
+        "hotstuff-app", "--conf", str((root / main["path"]).resolve()),
+        "--conf", str((root / replica["path"]).resolve()),
+    ]
+    return argv, main, replica, replica_raw
+
+
+def test_replica_trust_launch_requires_exact_main_then_replica_conf(tmp_path: Path) -> None:
+    argv, main, replica, replica_raw = _replica_trust_launch_fixture(tmp_path)
+    subject._validate_replica_trust_launch(
+        tmp_path, argv, main, replica, replica_raw, "replica-0")
+
+
+@pytest.mark.parametrize("override", [
+    "epoch-protocol-mode = adaptive_v3",
+    "epoch-change-issuer-id = 2",
+    "epoch-change-issuer-public-key = 03" + "1" * 64,
+], ids=["protocol-mode", "issuer-id", "issuer-key"])
+def test_replica_trust_launch_rejects_replica_specific_trust_override(
+        tmp_path: Path, override: str) -> None:
+    argv, main, replica, replica_raw = _replica_trust_launch_fixture(tmp_path)
+    replica_raw += (override + "\n").encode("ascii")
+    with pytest.raises(subject.ValidationError, match="replica"):
+        subject._validate_replica_trust_launch(
+            tmp_path, argv, main, replica, replica_raw, "replica-0")
+
+
+@pytest.mark.parametrize("argv_variant", [
+    lambda argv, main, replica: [*argv, "--conf", "/private/tmp/untrusted-extra.conf"],
+    lambda argv, main, replica: [argv[0], "--conf", argv[4], "--conf", argv[2]],
+    lambda argv, main, replica: [argv[0], f"--conf={argv[2]}", "--conf", argv[4]],
+    lambda argv, main, replica: [argv[0], f"-c{argv[2]}", "--conf", argv[4]],
+    lambda argv, main, replica: [argv[0], f"--con={argv[2]}", "--conf", argv[4]],
+], ids=["extra-conf", "reordered-conf", "equals-conf", "short-conf", "abbreviated-conf"])
+def test_replica_trust_launch_rejects_extra_or_reordered_conf(
+        tmp_path: Path, argv_variant) -> None:
+    argv, main, replica, replica_raw = _replica_trust_launch_fixture(tmp_path)
+    with pytest.raises(subject.ValidationError, match="replica"):
+        subject._validate_replica_trust_launch(
+            tmp_path, argv_variant(argv, main, replica), main, replica,
+            replica_raw, "replica-0")
+
+
+@pytest.mark.parametrize("flag, value", [
+    ("--epoch-protocol-mode", "adaptive_v3"),
+    ("--epoch-change-issuer-id", "2"),
+    ("--epoch-change-issuer-public-key", "03" + "1" * 64),
+], ids=["protocol-mode", "issuer-id", "issuer-key"])
+def test_replica_trust_launch_rejects_direct_cli_trust_override(
+        tmp_path: Path, flag: str, value: str) -> None:
+    argv, main, replica, replica_raw = _replica_trust_launch_fixture(tmp_path)
+    with pytest.raises(subject.ValidationError, match="replica"):
+        subject._validate_replica_trust_launch(
+            tmp_path, [*argv, flag, value], main, replica, replica_raw,
+            "replica-0")
+
+
+def test_native_main_config_parser_rejects_duplicate_effective_assignment() -> None:
+    main_raw = b"epoch-protocol-mode = adaptive_v2\nepoch-protocol-mode=adaptive_v2\n"
+    with pytest.raises(subject.ValidationError, match="main config lacks one exact"):
+        subject._config_option(main_raw, "epoch-protocol-mode", "main config")
 
 
 def test_native_adaptive_v2_activation_envelope_requires_exact_four_fields() -> None:
@@ -560,4 +826,203 @@ def test_adaptive_causality_joins_six_physical_timeouts_to_snapshot(tmp_path: Pa
     with pytest.raises(subject.ValidationError, match="three internal reporters"):
         subject._validate_adaptive_causality(tmp_path, artifacts, receipt=receipt,
                                              manager_events=changed,
+                                             actor_events=physical, bundle=bundle)
+
+
+def test_adaptive_causality_skips_ordinary_candidate_observations_but_binds_timeouts(
+        tmp_path: Path) -> None:
+    artifacts, receipt, manager, physical, bundle = _adaptive_causality_fixture(tmp_path)
+    e0 = receipt["launch_binding"]["e0_digest"]
+    snapshot = json.loads((tmp_path / artifacts["manager_evidence_snapshot"]["path"]).read_text())
+    snapshot["current_cutoff"] = 7
+    snapshot["accepted_prefix_count"] = 7
+    artifacts["manager_evidence_snapshot"] = _write(
+        tmp_path, artifacts["manager_evidence_snapshot"]["path"], _canonical(snapshot))
+    bundle.evidence_cutoff = 7
+
+    def ordinary_observation(*, reporter: int, outcome: str, sequence: int) -> dict:
+        return _event(
+            "adaptive-manager", sequence, sequence + 2,
+            "evidence.observation_accepted", {
+                "ingestion_sequence": sequence - 1,
+                "observation": {
+                    "schema_version": 3,
+                    "observation_id": f"{sequence + 40:064x}",
+                    "reporter_id": reporter,
+                    "observed_replica_id": 1,
+                    "configuration": {"epoch_number": 0, "tree_id": reporter,
+                                      "epoch_digest": e0},
+                    "block_hash": f"{sequence + 80:064x}",
+                    "expected_message_type": "aggregate_relay",
+                    "outcome": outcome,
+                    "response_duration_us": 1 if outcome == "on_time" else 1_000_001,
+                    "signer_set": [1],
+                    # These ordinary observations predate the physical fault.
+                    "attempt_start_monotonic_ns": 1,
+                    "deadline_duration_us": 1_000_000,
+                    "reporter_monotonic_ns": sequence + 3,
+                },
+            })
+
+    arm = manager[0]
+    accepted = [event for event in manager
+                if event["event_type"] == "evidence.observation_accepted"]
+    snapshot_event = next(event for event in manager
+                          if event["event_type"] == "adaptive_v2_evidence_snapshot")
+    terminal = next(event for event in manager
+                    if event["event_type"] == "adaptive_v2_session_terminal")
+    shifted = []
+    for sequence, event in enumerate(accepted, start=3):
+        payload = dict(event["payload"])
+        payload["ingestion_sequence"] += 1
+        shifted.append(dict(event, source_sequence=sequence, payload=payload))
+    manager = [
+        arm,
+        ordinary_observation(reporter=4, outcome="on_time", sequence=2),
+        *shifted,
+        dict(snapshot_event, source_sequence=9, payload=snapshot),
+        dict(terminal, source_sequence=10,
+             payload=dict(terminal["payload"], current_evidence_cutoff=7)),
+    ]
+
+    subject._validate_adaptive_causality(tmp_path, artifacts, receipt=receipt,
+                                         manager_events=manager,
+                                         actor_events=physical, bundle=bundle)
+
+
+def _adaptive_causality_with_conflicting_ordinary_candidate(
+        root: Path, *, outcome: str, same_observation_id: bool,
+        matches_physical_omission: bool = True) -> tuple[dict, dict, list[dict], list[dict], SimpleNamespace]:
+    """Insert an ordinary candidate beside a counted timeout in one prefix."""
+    artifacts, receipt, manager, physical, bundle = _adaptive_causality_fixture(root)
+    snapshot = json.loads((root / artifacts["manager_evidence_snapshot"]["path"]).read_text())
+    snapshot["current_cutoff"] = 7
+    snapshot["accepted_prefix_count"] = 7
+    artifacts["manager_evidence_snapshot"] = _write(
+        root, artifacts["manager_evidence_snapshot"]["path"], _canonical(snapshot))
+    bundle.evidence_cutoff = 7
+
+    arm = manager[0]
+    accepted = [event for event in manager
+                if event["event_type"] == "evidence.observation_accepted"]
+    snapshot_event = next(event for event in manager
+                          if event["event_type"] == "adaptive_v2_evidence_snapshot")
+    terminal = next(event for event in manager
+                    if event["event_type"] == "adaptive_v2_session_terminal")
+    candidate_observation = dict(accepted[0]["payload"]["observation"])
+    if not same_observation_id:
+        candidate_observation["observation_id"] = "f" * 64
+    if not matches_physical_omission:
+        candidate_observation["block_hash"] = "e" * 64
+    candidate_observation.update(
+        outcome=outcome,
+        response_duration_us=1 if outcome == "on_time" else 1_000_001,
+        signer_set=[1],
+    )
+    candidate = _event("adaptive-manager", 2, 4,
+                       "evidence.observation_accepted", {
+                           "ingestion_sequence": 1,
+                           "observation": candidate_observation,
+                       })
+    shifted = []
+    for sequence, event in enumerate(accepted, start=3):
+        payload = dict(event["payload"])
+        payload["ingestion_sequence"] += 1
+        shifted.append(dict(event, source_sequence=sequence, payload=payload))
+    return (
+        artifacts,
+        receipt,
+        [
+            arm,
+            candidate,
+            *shifted,
+            dict(snapshot_event, source_sequence=9, payload=snapshot),
+            dict(terminal, source_sequence=10,
+                 payload=dict(terminal["payload"], current_evidence_cutoff=7)),
+        ],
+        physical,
+        bundle,
+    )
+
+
+@pytest.mark.parametrize("same_observation_id", [True, False],
+                         ids=["same-observation-id", "sibling-attempt"])
+def test_adaptive_causality_rejects_ordinary_candidate_that_contradicts_timeout(
+        tmp_path: Path, same_observation_id: bool) -> None:
+    artifacts, receipt, manager, physical, bundle = (
+        _adaptive_causality_with_conflicting_ordinary_candidate(
+            tmp_path, outcome="on_time", same_observation_id=same_observation_id))
+    with pytest.raises(subject.ValidationError, match="ordinary candidate"):
+        subject._validate_adaptive_causality(tmp_path, artifacts, receipt=receipt,
+                                             manager_events=manager,
+                                             actor_events=physical, bundle=bundle)
+
+
+def test_adaptive_causality_rejects_late_candidate_before_snapshot(tmp_path: Path) -> None:
+    artifacts, receipt, manager, physical, bundle = (
+        _adaptive_causality_with_conflicting_ordinary_candidate(
+            tmp_path, outcome="late", same_observation_id=False,
+            matches_physical_omission=False))
+    with pytest.raises(subject.ValidationError, match="late candidate"):
+        subject._validate_adaptive_causality(tmp_path, artifacts, receipt=receipt,
+                                             manager_events=manager,
+                                             actor_events=physical, bundle=bundle)
+
+
+def test_adaptive_causality_rejects_ordinary_candidate_with_unclaimed_physical_omission(
+        tmp_path: Path) -> None:
+    """An extra valid reporter-4 timeout cannot hide its physical omission.
+
+    Reporter 4 still has two independent counted timeouts (the frozen minimum).
+    The third physical context is represented only by an ordinary ``on_time``
+    observation, modelling a mutation of one of more than two accepted
+    timeouts.  Cardinality alone must therefore not make this pass.
+    """
+    artifacts, receipt, manager, physical, bundle = _adaptive_causality_fixture(tmp_path)
+    e0 = receipt["launch_binding"]["e0_digest"]
+    extra_block = f"{7:064x}"
+    physical.append(_event(
+        "replica-1", 7, 17, "fault.contribution_opportunity", {
+            "actor": 1, "physical_role": "internal",
+            "scheduled_action": "omit_aggregate", "parent_replica": 4,
+            "proposal": {"epoch_number": 0, "tree_id": 4,
+                         "epoch_digest": e0, "block_hash": extra_block},
+        }))
+
+    snapshot = json.loads((tmp_path / artifacts["manager_evidence_snapshot"]["path"]).read_text())
+    snapshot["current_cutoff"] = 7
+    snapshot["accepted_prefix_count"] = 7
+    artifacts["manager_evidence_snapshot"] = _write(
+        tmp_path, artifacts["manager_evidence_snapshot"]["path"], _canonical(snapshot))
+    bundle.evidence_cutoff = 7
+    snapshot_event = next(event for event in manager
+                          if event["event_type"] == "adaptive_v2_evidence_snapshot")
+    terminal = next(event for event in manager
+                    if event["event_type"] == "adaptive_v2_session_terminal")
+    manager = [
+        *manager[:7],
+        _event("adaptive-manager", 8, 1_000_000_040,
+               "evidence.observation_accepted", {
+                   "ingestion_sequence": 7,
+                   "observation": {
+                       "schema_version": 3, "observation_id": f"{17:064x}",
+                       "reporter_id": 4, "observed_replica_id": 1,
+                       "configuration": {"epoch_number": 0, "tree_id": 4,
+                                         "epoch_digest": e0},
+                       "block_hash": extra_block,
+                       "expected_message_type": "aggregate_relay",
+                       "outcome": "on_time", "response_duration_us": 1,
+                       "signer_set": [1], "attempt_start_monotonic_ns": 3,
+                       "deadline_duration_us": 1_000_000,
+                       "reporter_monotonic_ns": 1_000_000_020,
+                   },
+               }),
+        dict(snapshot_event, source_sequence=9, payload=snapshot),
+        dict(terminal, source_sequence=10,
+             payload=dict(terminal["payload"], current_evidence_cutoff=7)),
+    ]
+
+    with pytest.raises(subject.ValidationError, match="ordinary candidate.*physical omission"):
+        subject._validate_adaptive_causality(tmp_path, artifacts, receipt=receipt,
+                                             manager_events=manager,
                                              actor_events=physical, bundle=bundle)
