@@ -44,6 +44,8 @@ MANIFEST_BOUND_RESULT_KIND = "kauri-n7-sustained-role-matched-campaign-result-v2
 RECEIPT_KIND = "kauri-n7-sustained-role-raw-bundle-receipt-v1"
 MANIFEST_KIND = "kauri-n7-sustained-role-serial-campaign-manifest-v1"
 STAGE_RECEIPT_KIND = "kauri-n7-sustained-role-serial-cell-stage-receipt-v1"
+SUCCESS_RECEIPT_KIND = "kauri-n7-sustained-role-campaign-launch-success-v1"
+SUCCESS_RECEIPT_PATH = "runtime/sustained-role-campaign-launch-success-receipt.json"
 NEGATIVE_MARKERS = (
     "runtime/sustained-role-campaign-staging-abort.json",
     "runtime/sustained-role-campaign-launch-abort.json",
@@ -56,7 +58,19 @@ _HEX = frozenset("0123456789abcdef")
 _MAX_SMALL = 256 * 1024
 _MAX_RAW = 16 * 1024 * 1024
 _MAX_EXECUTABLE = 128 * 1024 * 1024
+_MAX_BUILD_PROVENANCE = 1024 * 1024
+_MAX_BUILD_LOG = 16 * 1024 * 1024
 _HERE = Path(__file__).resolve().parent
+_BUILD_RECEIPT_PATH = "exact-build-provenance.json"
+_BUILD_LOG_PATH = "exact-build.log"
+_BUILD_SNAPSHOT_DIR = "build-snapshot"
+_BUILD_BINARY_NAMES = ("hotstuff_app", "adaptation_manager", "hotstuff_keygen",
+                       "hotstuff_tls_keygen", "epoch0_treefile_digest")
+_BUILD_COMMAND = [
+    "cmake", "--build", "build-adaptive", "--clean-first", "--target", "hotstuff-app",
+    "adaptation-manager", "hotstuff-keygen", "hotstuff-tls-keygen",
+    "n7-epoch0-treefile-digest", "-j2",
+]
 
 _MAIN_CONFIG_FIXED = {
     "block-size": "1",
@@ -92,6 +106,7 @@ _REPLICA_ENTRY = re.compile(
     r"(?P<bls>[^,\s]+), (?P<tls>[^,\s]+)$"
 )
 _BOOT_ID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+_SCOPE_UNIT = re.compile(r"^kauri-w19-[A-Za-z0-9._-]+-[0-9a-f]{12}\.scope$")
 
 
 FROZEN_DESIGN: dict[str, Any] = {
@@ -121,6 +136,10 @@ FROZEN_DESIGN: dict[str, Any] = {
     "scheduled_window_binding_policy": (
         "plan and request carry the full prearm attestation; the sealed launch "
         "binding carries the same start and end monotonic timestamps"
+    ),
+    "build_provenance_binding_policy": (
+        "the freeze pins a canonical clean cluster build receipt, its exact source "
+        "revision and host boot identity, and SHA-256 identities for all five launch binaries"
     ),
     "improvement_gate": {
         "required_accepted_pairs": 6,
@@ -155,6 +174,8 @@ FROZEN_DESIGN: dict[str, Any] = {
     "pilot_policy": "excluded-from-campaign-figure-and-claim",
     "claim_scope": "one N=7 same-host fault/tree scenario; no general Byzantine or safety claim",
 }
+FROZEN_DESIGN_V1: dict[str, Any] = deepcopy(FROZEN_DESIGN)
+FROZEN_DESIGN_V1.pop("build_provenance_binding_policy")
 
 
 class CampaignEvaluationError(ValueError):
@@ -273,13 +294,14 @@ def _descriptor(root: Path, value: object, label: str, maximum: int) -> tuple[by
     return raw, expected
 
 
-def frozen_design_sha256() -> str:
-    return _sha(_canonical(FROZEN_DESIGN))
+def frozen_design_sha256(design: Mapping[str, Any] | None = None) -> str:
+    return _sha(_canonical(FROZEN_DESIGN if design is None else design))
 
 
 def build_campaign_freeze(*, campaign_id: str, frozen_utc: str,
                           campaign_approval_reference: str,
-                          repository_revision: str) -> dict[str, Any]:
+                          repository_revision: str,
+                          build_provenance: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Create the immutable pre-live campaign gate; this performs no launch."""
     if not isinstance(campaign_id, str) or not campaign_id.strip():
         _fail("campaign ID is empty")
@@ -287,18 +309,111 @@ def build_campaign_freeze(*, campaign_id: str, frozen_utc: str,
         _fail("campaign approval reference is empty")
     _timestamp(frozen_utc, "campaign freeze timestamp")
     _hex(repository_revision, 40, "campaign repository revision")
+    if build_provenance is not None:
+        _check_build_provenance(build_provenance, repository_revision)
+    design = FROZEN_DESIGN if build_provenance is not None else FROZEN_DESIGN_V1
     freeze: dict[str, Any] = {
-        "schema_version": 1,
+        "schema_version": 2 if build_provenance is not None else 1,
         "kind": FREEZE_KIND,
         "campaign_id": campaign_id,
         "frozen_utc": frozen_utc,
         "campaign_approval_reference": campaign_approval_reference,
         "repository_revision": repository_revision,
-        "design": deepcopy(FROZEN_DESIGN),
-        "design_sha256": frozen_design_sha256(),
+        "design": deepcopy(design),
+        "design_sha256": frozen_design_sha256(design),
     }
+    if build_provenance is not None:
+        freeze["build_provenance"] = deepcopy(dict(build_provenance))
     freeze["freeze_sha256"] = _sha(_canonical(freeze))
     return freeze
+
+
+def _check_build_provenance(value: object, repository_revision: object) -> None:
+    """Validate the compact identity copied from an external clean-build receipt."""
+    required = {"raw_sha256", "repository_revision", "repository_branch", "host_identity",
+                "binary_sha256"}
+    if not isinstance(value, Mapping) or set(value) != required:
+        _fail("campaign build provenance schema drifted")
+    if (value.get("repository_revision") != repository_revision or
+            value.get("repository_branch") != "feature/adaptive-epoch-throughput"):
+        _fail("campaign build provenance is not a clean pinned proteina02 build")
+    _hex(value.get("raw_sha256"), 64, "campaign build provenance raw SHA-256")
+    identity = value.get("host_identity")
+    if (not isinstance(identity, Mapping) or set(identity) != {"hostname", "linux_boot_id"} or
+            identity.get("hostname") != "proteina02" or not isinstance(identity.get("linux_boot_id"), str) or
+            _BOOT_ID.fullmatch(identity["linux_boot_id"]) is None):
+        _fail("campaign build provenance Linux boot ID is invalid")
+    binaries = value.get("binary_sha256")
+    expected_binaries = {"hotstuff_app", "adaptation_manager", "hotstuff_keygen",
+                         "hotstuff_tls_keygen", "epoch0_treefile_digest"}
+    if not isinstance(binaries, Mapping) or set(binaries) != expected_binaries:
+        _fail("campaign build provenance binary set drifted")
+    for name, digest in binaries.items():
+        _hex(digest, 64, f"campaign build provenance {name} SHA-256")
+
+
+def _verify_campaign_build_archive(root: Path, freeze: Mapping[str, Any]) -> None:
+    """Reopen every archived build input before issuing a manifest-bound verdict."""
+    provenance = freeze.get("build_provenance")
+    if not isinstance(provenance, Mapping):
+        _fail("campaign build provenance is unavailable for final evaluation")
+    raw = _read(_safe_child(root, _BUILD_RECEIPT_PATH, "campaign build provenance"),
+                "campaign build provenance", _MAX_BUILD_PROVENANCE)
+    if _sha(raw) != provenance.get("raw_sha256"):
+        _fail("campaign build provenance receipt differs from freeze pin")
+    receipt = _strict_json(raw, "campaign build provenance", canonical=True)
+    required = {"schema_version", "kind", "repository_revision", "origin_revision",
+                "repository_branch", "repository_clean_after_build", "host", "linux_boot_id",
+                "build_exit_code", "build_command", "build_log_path", "build_log_sha256",
+                "build_type", "cmake_version", "cxx_compiler", "cxx_compiler_version",
+                "recorded_utc", "submodule_status", "binaries"}
+    if (set(receipt) != required or receipt.get("schema_version") != 1 or
+            receipt.get("kind") != "kauri-w19-cluster-build-provenance-v1" or
+            receipt.get("repository_revision") != freeze["repository_revision"] or
+            receipt.get("origin_revision") != freeze["repository_revision"] or
+            receipt.get("repository_branch") != provenance.get("repository_branch") or
+            receipt.get("repository_clean_after_build") is not True or
+            receipt.get("host") != provenance["host_identity"]["hostname"] or
+            receipt.get("linux_boot_id") != provenance["host_identity"]["linux_boot_id"] or
+            receipt.get("build_exit_code") != 0 or not isinstance(receipt.get("build_log_path"), str) or
+            not Path(receipt["build_log_path"]).is_absolute()):
+        _fail("campaign archived build receipt schema or identity drifted")
+    if (receipt.get("build_command") != _BUILD_COMMAND or
+            not all(isinstance(receipt.get(key), str) and receipt[key] for key in
+                    ("build_type", "cmake_version", "cxx_compiler", "cxx_compiler_version")) or
+            not isinstance(receipt.get("submodule_status"), list) or len(receipt["submodule_status"]) != 2 or
+            any(not isinstance(item, str) for item in receipt["submodule_status"])):
+        _fail("campaign archived build toolchain metadata is invalid")
+    if _timestamp(receipt.get("recorded_utc"), "campaign archived build timestamp") > _timestamp(
+            freeze["frozen_utc"], "campaign freeze timestamp"):
+        _fail("campaign archived build was recorded after the campaign freeze")
+    _hex(receipt.get("build_log_sha256"), 64, "campaign archived build log SHA-256")
+    log = _read(_safe_child(root, _BUILD_LOG_PATH, "campaign archived build log"),
+                "campaign archived build log", _MAX_BUILD_LOG)
+    if _sha(log) != receipt["build_log_sha256"]:
+        _fail("campaign archived build log differs from receipt")
+    binaries = receipt.get("binaries")
+    if not isinstance(binaries, Mapping) or set(binaries) != set(_BUILD_BINARY_NAMES):
+        _fail("campaign archived build binary set drifted")
+    for name in _BUILD_BINARY_NAMES:
+        descriptor = binaries[name]
+        if (not isinstance(descriptor, Mapping) or set(descriptor) != {"path", "sha256", "size_bytes"} or
+                not isinstance(descriptor.get("path"), str) or not Path(descriptor["path"]).is_absolute() or
+                type(descriptor.get("size_bytes")) is not int or descriptor["size_bytes"] <= 0):
+            _fail(f"campaign archived build descriptor drifted: {name}")
+        expected_sha = _hex(descriptor["sha256"], 64, f"campaign archived {name} SHA-256")
+        if expected_sha != provenance["binary_sha256"][name]:
+            _fail(f"campaign archived build SHA-256 differs from freeze: {name}")
+        snapshot = _safe_child(root, f"{_BUILD_SNAPSHOT_DIR}/{name}", f"campaign archived {name}")
+        try:
+            mode = snapshot.stat().st_mode
+        except OSError as exc:
+            raise CampaignEvaluationError(f"campaign archived build snapshot is unavailable: {name}") from exc
+        if (snapshot.is_symlink() or not stat.S_ISREG(mode) or not os.access(snapshot, os.X_OK) or
+                snapshot.stat().st_size != descriptor["size_bytes"]):
+            _fail(f"campaign archived build snapshot is invalid: {name}")
+        if _sha(_read(snapshot, f"campaign archived {name}", _MAX_EXECUTABLE)) != expected_sha:
+            _fail(f"campaign archived build snapshot differs from receipt: {name}")
 
 
 def _timestamp(value: object, label: str) -> datetime:
@@ -319,7 +434,15 @@ def _check_freeze(freeze: Mapping[str, Any]) -> datetime:
         "campaign_approval_reference", "repository_revision", "design",
         "design_sha256", "freeze_sha256",
     }
-    if set(freeze) != required or freeze.get("schema_version") != 1 or freeze.get("kind") != FREEZE_KIND:
+    schema_version = freeze.get("schema_version")
+    if schema_version == 2:
+        required = required | {"build_provenance"}
+        expected_design = FROZEN_DESIGN
+    elif schema_version == 1:
+        expected_design = FROZEN_DESIGN_V1
+    else:
+        expected_design = None
+    if set(freeze) != required or schema_version not in {1, 2} or freeze.get("kind") != FREEZE_KIND:
         _fail("campaign freeze schema drifted")
     if not isinstance(freeze.get("campaign_id"), str) or not freeze["campaign_id"].strip():
         _fail("campaign freeze ID is invalid")
@@ -327,7 +450,9 @@ def _check_freeze(freeze: Mapping[str, Any]) -> datetime:
             not freeze["campaign_approval_reference"].strip()):
         _fail("campaign approval reference is invalid")
     _hex(freeze.get("repository_revision"), 40, "campaign repository revision")
-    if freeze.get("design") != FROZEN_DESIGN or freeze.get("design_sha256") != frozen_design_sha256():
+    if schema_version == 2:
+        _check_build_provenance(freeze.get("build_provenance"), freeze["repository_revision"])
+    if freeze.get("design") != expected_design or freeze.get("design_sha256") != frozen_design_sha256(expected_design):
         _fail("campaign design differs from the prospective frozen gate")
     semantic = {key: value for key, value in freeze.items() if key != "freeze_sha256"}
     if freeze.get("freeze_sha256") != _sha(_canonical(semantic)):
@@ -416,7 +541,13 @@ def _stage_receipt(root: Path, record: Mapping[str, Any], expected: Mapping[str,
                 "host_identity", "clock", "scheduled_window", "hard_timeout_seconds",
                 "no_retry", "authorization_request_sha256", "claim_eligible",
                 "figure_eligible", "stage_receipt_sha256"}
-    if set(receipt) != required or receipt.get("schema_version") != 1 or receipt.get("kind") != STAGE_RECEIPT_KIND:
+    if freeze.get("schema_version") == 2:
+        required |= {"build_provenance_raw_sha256", "build_provenance_binary_sha256"}
+        expected_schema = 2
+    else:
+        expected_schema = 1
+    if (set(receipt) != required or receipt.get("schema_version") != expected_schema or
+            receipt.get("kind") != STAGE_RECEIPT_KIND):
         _fail(f"cell {expected['ordinal']} stage receipt schema drifted")
     semantic = {key: value for key, value in receipt.items() if key != "stage_receipt_sha256"}
     if receipt.get("stage_receipt_sha256") != _sha(_canonical(semantic)):
@@ -431,6 +562,11 @@ def _stage_receipt(root: Path, record: Mapping[str, Any], expected: Mapping[str,
     }
     if any(receipt.get(key) != value for key, value in required_values.items()):
         _fail(f"cell {expected['ordinal']} stage receipt is not bound to the frozen manifest")
+    if expected_schema == 2:
+        provenance = freeze["build_provenance"]
+        if (receipt.get("build_provenance_raw_sha256") != provenance["raw_sha256"] or
+                receipt.get("build_provenance_binary_sha256") != provenance["binary_sha256"]):
+            _fail(f"cell {expected['ordinal']} stage receipt build provenance differs from campaign freeze")
     if (receipt.get("state") != "MATERIALIZED_NO_LAUNCH_EXTERNAL_EXACT_APPROVAL_REQUIRED" or
             not isinstance(receipt.get("scheduled_window"), Mapping) or
             type(receipt["scheduled_window"].get("start_monotonic_ns")) is not int or
@@ -448,6 +584,8 @@ def _stage_receipt(root: Path, record: Mapping[str, Any], expected: Mapping[str,
         _fail(f"cell {expected['ordinal']} stage receipt host identity is invalid")
     if required_host_identity is not None and identity != required_host_identity:
         _fail(f"cell {expected['ordinal']} stage receipt is from a different host or Linux boot")
+    if expected_schema == 2 and identity != freeze["build_provenance"]["host_identity"]:
+        _fail(f"cell {expected['ordinal']} stage receipt host or Linux boot differs from frozen build")
     return receipt["authorization_request_sha256"]
 
 
@@ -457,6 +595,74 @@ def _reject_negative_markers(root: Path, *, ordinal: int) -> None:
         path = _safe_child(root, relative, f"cell {ordinal} negative marker")
         if path.exists() or path.is_symlink():
             _fail(f"cell {ordinal} has a sealed negative marker: {relative}")
+
+
+def _wrapper_success_receipt(root: Path, record: Mapping[str, Any], expected: Mapping[str, Any],
+                             manifest: Mapping[str, Any], freeze: Mapping[str, Any],
+                             replay_result: Mapping[str, Any]) -> None:
+    """Bind a final cell record to the wrapper's scope-clean/replay success proof."""
+    if record.get("success_receipt_path") != SUCCESS_RECEIPT_PATH:
+        _fail(f"cell {expected['ordinal']} wrapper success receipt path is not canonical")
+    path = _safe_child(root, SUCCESS_RECEIPT_PATH,
+                       f"cell {expected['ordinal']} wrapper success receipt")
+    raw = _read(path, f"cell {expected['ordinal']} wrapper success receipt", _MAX_SMALL)
+    if _sha(raw) != _hex(record.get("success_receipt_sha256"), 64,
+                         f"cell {expected['ordinal']} wrapper success receipt SHA-256"):
+        _fail(f"cell {expected['ordinal']} wrapper success receipt differs from its record pin")
+    success = _strict_json(raw, f"cell {expected['ordinal']} wrapper success receipt", canonical=True)
+    required = {"schema_version", "kind", "state", "manifest_sha256", "freeze_sha256",
+                "ordinal", "pair_index", "arm", "run_id", "raw_receipt_path",
+                "raw_receipt_sha256", "stage_receipt_path", "stage_receipt_sha256",
+                "authorization_sha256", "scope_unit", "supervisor_exit_code", "scope", "immediate_replay_sha256", "no_retry",
+                "claim_eligible", "figure_eligible"}
+    if set(success) != required or success.get("schema_version") != 1 or success.get("kind") != SUCCESS_RECEIPT_KIND:
+        _fail(f"cell {expected['ordinal']} wrapper success receipt schema drifted")
+    required_values = {
+        "state": "SUCCEEDED_SCOPE_CLEAN_REPLAY_ACCEPTED",
+        "manifest_sha256": manifest["manifest_sha256"], "freeze_sha256": freeze["freeze_sha256"],
+        "ordinal": expected["ordinal"], "pair_index": expected["pair_index"],
+        "arm": expected["arm"], "run_id": expected["run_id"],
+        "raw_receipt_path": record["receipt_path"], "raw_receipt_sha256": record["receipt_sha256"],
+        "stage_receipt_path": record["stage_receipt_path"], "stage_receipt_sha256": record["stage_receipt_sha256"],
+        "no_retry": True, "claim_eligible": False, "figure_eligible": False,
+    }
+    if any(success.get(key) != value for key, value in required_values.items()):
+        _fail(f"cell {expected['ordinal']} wrapper success receipt is not bound to the campaign cell")
+    expected_scope_prefix = f"kauri-w19-{expected['run_id']}-"
+    if (not isinstance(success.get("scope_unit"), str) or _SCOPE_UNIT.fullmatch(success["scope_unit"]) is None or
+            not success["scope_unit"].startswith(expected_scope_prefix) or success.get("supervisor_exit_code") != 0):
+        _fail(f"cell {expected['ordinal']} wrapper supervisor proof is invalid")
+    scope = success.get("scope")
+    if (not isinstance(scope, Mapping) or set(scope) != {"terminal_properties", "terminal_properties_sha256", "cgroup_population"} or
+            not isinstance(scope.get("terminal_properties"), str) or not scope["terminal_properties"] or
+            scope.get("terminal_properties_sha256") != _sha(scope["terminal_properties"].encode("utf-8")) or
+            scope.get("cgroup_population") not in {"zero", "collected"}):
+        _fail(f"cell {expected['ordinal']} wrapper scope-clean proof is invalid")
+    properties: dict[str, str] = {}
+    for line in scope["terminal_properties"].splitlines():
+        if line.count("=") != 1:
+            _fail(f"cell {expected['ordinal']} wrapper scope properties are malformed")
+        key, value = line.split("=", 1)
+        if key in properties:
+            _fail(f"cell {expected['ordinal']} wrapper scope properties are duplicated")
+        properties[key] = value
+    if set(properties) != {"ActiveState", "SubState", "Result", "ControlGroup"}:
+        _fail(f"cell {expected['ordinal']} wrapper scope properties are incomplete")
+    terminal = (properties.get("ActiveState") == "inactive" or
+                (properties.get("ActiveState") == "failed" and properties.get("Result") == "timeout"))
+    control_group = properties.get("ControlGroup")
+    if (not terminal or (scope["cgroup_population"] == "collected" and control_group != "") or
+            (scope["cgroup_population"] == "zero" and (not isinstance(control_group, str) or not control_group.startswith("/")))):
+        _fail(f"cell {expected['ordinal']} wrapper scope terminal state is invalid")
+    approval_sha = _descriptor(
+        root, _strict_json(_read(_safe_child(root, record["receipt_path"], f"cell {expected['ordinal']} raw receipt"),
+                                f"cell {expected['ordinal']} raw receipt", _MAX_SMALL),
+                           f"cell {expected['ordinal']} raw receipt", canonical=True)["artifacts"].get("approved_authorization"),
+        f"cell {expected['ordinal']} approved authorization", _MAX_SMALL)[1]
+    if success.get("authorization_sha256") != approval_sha:
+        _fail(f"cell {expected['ordinal']} wrapper success approval differs from sealed raw bundle")
+    if success.get("immediate_replay_sha256") != _sha(_canonical(dict(replay_result))):
+        _fail(f"cell {expected['ordinal']} wrapper success replay digest differs from independent replay")
 
 
 _VALIDATOR_MODULE: ModuleType | None = None
@@ -1123,20 +1329,24 @@ def evaluate_manifest_bound_campaign(
     to the immutable manifest root, ordered cell identity, and staged target
     host evidence before replaying the existing independent raw validator.
     """
-    _check_freeze(freeze)
+    frozen_at = _check_freeze(freeze)
+    if freeze.get("schema_version") != 2:
+        _fail("legacy campaign freeze cannot produce a manifest-bound result")
     if not isinstance(manifest, Mapping):
         _fail("campaign manifest is not an object")
     expected_cells = _check_campaign_manifest(freeze, manifest)
     root = _reject_lexical_symlink_ancestors(Path(campaign_root), "campaign root").resolve()
     if not root.is_dir():
         _fail("campaign root is not a regular directory")
+    _verify_campaign_build_archive(root, freeze)
     if isinstance(cells, (str, bytes, Mapping)) or len(cells) != len(expected_cells):
         _fail("manifest-bound campaign requires exactly twelve ordered cells")
     raw_records: list[dict[str, Any]] = []
     boot_ids: set[str] = set()
     for expected, record in zip(expected_cells, cells):
         required = {"pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256",
-                    "stage_receipt_path", "stage_receipt_sha256"}
+                    "stage_receipt_path", "stage_receipt_sha256", "success_receipt_path",
+                    "success_receipt_sha256"}
         if not isinstance(record, Mapping) or set(record) != required:
             _fail(f"cell {expected['ordinal']} manifest-bound record schema drifted")
         if (record.get("pair_index"), record.get("ordinal"), record.get("arm")) != (
@@ -1178,6 +1388,17 @@ def evaluate_manifest_bound_campaign(
             f"cell {expected['ordinal']} authorization request", _MAX_SMALL)
         if request_sha != staged_request_sha:
             _fail(f"cell {expected['ordinal']} raw receipt request differs from staged request")
+        replay_result = _one_cell(
+            {key: record[key] for key in ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")},
+            expected_pair=expected["pair_index"], expected_ordinal=expected["ordinal"],
+            expected_arm=expected["arm"], freeze=freeze, frozen_at=frozen_at)
+        executable_identity = replay_result.get("identity", {}).get("executable_sha256")
+        frozen_binaries = freeze["build_provenance"]["binary_sha256"]
+        if (not isinstance(executable_identity, Mapping) or
+                executable_identity.get("hotstuff_app") != frozen_binaries["hotstuff_app"] or
+                executable_identity.get("adaptation_manager") != frozen_binaries["adaptation_manager"]):
+            _fail(f"cell {expected['ordinal']} executable bytes differ from frozen build provenance")
+        _wrapper_success_receipt(expected_root, record, expected, manifest, freeze, replay_result)
         raw_records.append({key: record[key] for key in
                             ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")})
     if len(boot_ids) != 1:

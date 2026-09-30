@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -15,6 +16,8 @@ assert SPEC is not None and SPEC.loader is not None
 subject = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = subject
 SPEC.loader.exec_module(subject)
+REAL_VERIFY_FROZEN_BUILD = subject._verify_frozen_build_provenance
+REAL_POST_MATERIALIZATION_BUILD = subject._post_materialization_build_binding
 
 
 def _canonical(value: object) -> bytes:
@@ -25,6 +28,12 @@ def _freeze() -> dict[str, object]:
     return subject.evaluator.build_campaign_freeze(
         campaign_id="w19-serial", frozen_utc="2026-09-30T12:00:00Z",
         campaign_approval_reference="user-approval-ref", repository_revision="a" * 40,
+        build_provenance={
+            "raw_sha256": "a" * 64, "repository_revision": "a" * 40,
+            "repository_branch": "feature/adaptive-epoch-throughput",
+            "host_identity": {"hostname": "proteina02", "linux_boot_id": "12345678-1234-1234-1234-123456789abc"},
+            "binary_sha256": {name: "a" * 64 for name in subject._BUILD_BINARY_NAMES},
+        },
     )
 
 
@@ -55,6 +64,20 @@ def _local_linux_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     })
     monkeypatch.setattr(subject, "_raw_clock", lambda: 90_000_000_000)
     monkeypatch.setattr(subject.local, "prepare_production_dry_run", _prepare)
+    monkeypatch.setattr(subject.evaluator, "_wrapper_success_receipt", lambda *_args, **_kwargs: None)
+    def verify(root: Path, freeze: dict[str, object], *args: object, **kwargs: object) -> dict[str, object]:
+        if freeze["campaign_id"] == "w19-serial-v6" or (root / subject.BUILD_PROVENANCE_NAME).is_file():
+            return REAL_VERIFY_FROZEN_BUILD(root, freeze, *args, **kwargs)
+        return dict(freeze["build_provenance"])
+    monkeypatch.setattr(subject, "_verify_frozen_build_provenance", verify)
+    def post(root: Path, *, campaign_root: Path, freeze: dict[str, object], **kwargs: object) -> None:
+        if freeze["campaign_id"] == "w19-serial-v6":
+            REAL_POST_MATERIALIZATION_BUILD(root, campaign_root=campaign_root,
+                                            freeze=freeze, **kwargs)
+        elif (campaign_root / subject.BUILD_PROVENANCE_NAME).is_file():
+            REAL_POST_MATERIALIZATION_BUILD(root, campaign_root=campaign_root,
+                                            freeze=freeze, **kwargs)
+    monkeypatch.setattr(subject, "_post_materialization_build_binding", post)
 
 
 def _prepare(root: Path, **kwargs: object) -> dict[str, object]:
@@ -66,6 +89,19 @@ def _prepare(root: Path, **kwargs: object) -> dict[str, object]:
               "attestation": {"must_be_written": "after_prearm_all_seven_e0_common_commit_before_scheduled_start",
                               "is_not": "an_arm_or_gate"}}
     plan = {"schema_version": 1, "repository_revision": "a" * 40, "scheduled_window": window}
+    if all(name in kwargs for name in ("app_binary", "manager_binary", "e0_helper_binary")):
+        archives = root / "materialization-binaries"; archives.mkdir()
+        mapped = {"app_binary": "hotstuff-app", "manager_binary": "adaptation-manager",
+                  "e0_helper_binary": "e0-identity-helper"}
+        digests = {}
+        for source_name, archive_name in mapped.items():
+            source = Path(str(kwargs[source_name])); payload = source.read_bytes()
+            target = archives / archive_name; target.write_bytes(payload); target.chmod(0o700)
+            digests[source_name] = __import__("hashlib").sha256(payload).hexdigest()
+        plan["commands"] = {
+            "manager": {"executable_sha256": digests["manager_binary"]},
+            "replicas": [{"executable_sha256": digests["app_binary"]} for _ in range(7)],
+        }
     plan["plan_sha256"] = __import__("hashlib").sha256(_canonical(plan)).hexdigest()
     request = {
         "schema_version": 1, "kind": "request", "execution_plan_sha256": plan["plan_sha256"], "arm": kwargs["arm"],
@@ -88,6 +124,50 @@ def _stub_prior_provenance(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(subject.evaluator, "_descriptor", lambda *_args: (b"{}\n", "a" * 64))
 
 
+def _v6_build_receipt(root: Path) -> tuple[bytes, dict[str, object], dict[str, Path]]:
+    binaries: dict[str, dict[str, object]] = {}
+    paths: dict[str, Path] = {}
+    for receipt_name, prepare_name in subject._BUILD_PREPARE_NAMES.items():
+        path = root / f"build-{receipt_name}"
+        payload = receipt_name.encode("ascii")
+        path.write_bytes(payload); path.chmod(0o700)
+        binaries[receipt_name] = {"path": str(path.resolve()),
+                                  "sha256": hashlib.sha256(payload).hexdigest(),
+                                  "size_bytes": len(payload)}
+        paths[prepare_name] = path
+    log = root / "build.log"; log.write_bytes(b"clean build\n")
+    receipt = {
+        "schema_version": 1, "kind": "kauri-w19-cluster-build-provenance-v1",
+        "repository_revision": "a" * 40, "origin_revision": "a" * 40,
+        "repository_branch": "feature/adaptive-epoch-throughput",
+        "repository_clean_after_build": True, "host": "proteina02",
+        "linux_boot_id": "12345678-1234-1234-1234-123456789abc",
+        "build_exit_code": 0, "build_command": list(subject._BUILD_COMMAND),
+        "build_type": "RelWithDebInfo", "cmake_version": "3.30.0",
+        "cxx_compiler": "clang++", "cxx_compiler_version": "18.0.0",
+        "recorded_utc": "2026-09-30T22:00:00Z", "submodule_status": ["", ""],
+        "build_log_path": str(log.resolve()),
+        "build_log_sha256": hashlib.sha256(log.read_bytes()).hexdigest(), "binaries": binaries,
+    }
+    raw = _canonical(receipt)
+    return raw, subject.build_provenance_binding(raw, repository_revision="a" * 40,
+                                                  target_host="proteina02"), paths
+
+
+def _v6_freeze_and_manifest(root: Path) -> tuple[dict[str, object], dict[str, object], dict[str, Path]]:
+    raw, binding, paths = _v6_build_receipt(root)
+    (root / subject.BUILD_PROVENANCE_NAME).write_bytes(raw)
+    subject.archive_w19_build_inputs(root, raw, repository_revision="a" * 40,
+                                     target_host="proteina02")
+    freeze = subject.evaluator.build_campaign_freeze(
+        campaign_id="w19-serial-v6", frozen_utc="2026-09-30T22:00:00Z",
+        campaign_approval_reference="user-approval-ref", repository_revision="a" * 40,
+        build_provenance=binding)
+    snapshots = {prepare: root / subject.BUILD_SNAPSHOT_DIRECTORY / receipt
+                 for receipt, prepare in subject._BUILD_PREPARE_NAMES.items()}
+    return freeze, _manifest(freeze), snapshots
+
+
 def test_materialization_returns_fresh_request_but_never_launches(tmp_path: Path) -> None:
     freeze = _freeze(); manifest = _manifest(freeze)
     stage = subject.materialize_next_cell(
@@ -105,6 +185,99 @@ def test_materialization_returns_fresh_request_but_never_launches(tmp_path: Path
     assert sealed["manifest_sha256"] == manifest["manifest_sha256"]
     assert sealed["host_identity"]["hostname"] == "proteina02"
     assert stage["stage_receipt"]["path"] == "runtime/sustained-role-campaign-stage-receipt.json"
+
+
+def test_v6_stage_embeds_frozen_build_binding_after_live_byte_check(tmp_path: Path) -> None:
+    freeze, manifest, paths = _v6_freeze_and_manifest(tmp_path)
+    stage = subject.materialize_next_cell(
+        manifest, freeze, ordinal=1, campaign_root=tmp_path,
+        window_start_monotonic_ns=140_000_000_000,
+        window_end_monotonic_ns=210_000_000_000, prepare_kwargs=paths,
+        prior_validated_cells=(), build_provenance=freeze["build_provenance"])
+    sealed = json.loads((tmp_path / "cells/cell-01" / subject.STAGE_RECEIPT).read_text())
+    assert sealed["schema_version"] == 2
+    assert sealed["build_provenance_raw_sha256"] == freeze["build_provenance"]["raw_sha256"]
+    assert sealed["build_provenance_binary_sha256"] == freeze["build_provenance"]["binary_sha256"]
+    assert stage["launch_permitted"] is False
+
+
+def test_v6_live_binary_drift_rejects_before_creating_cell(tmp_path: Path) -> None:
+    freeze, manifest, paths = _v6_freeze_and_manifest(tmp_path)
+    paths["app_binary"].write_bytes(b"drifted")
+    with pytest.raises(subject.CampaignOperatorError, match="live frozen build binary drifted"):
+        subject.materialize_next_cell(
+            manifest, freeze, ordinal=1, campaign_root=tmp_path,
+            window_start_monotonic_ns=140_000_000_000,
+            window_end_monotonic_ns=210_000_000_000, prepare_kwargs=paths,
+            prior_validated_cells=(), build_provenance=freeze["build_provenance"])
+    assert not (tmp_path / "cells").exists()
+
+
+def test_v6_snapshot_mutation_during_prepare_seals_abort_without_stage_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    freeze, manifest, paths = _v6_freeze_and_manifest(tmp_path)
+    def mutate(root: Path, **kwargs: object) -> dict[str, object]:
+        result = _prepare(root, **kwargs)
+        Path(str(kwargs["app_binary"])).write_bytes(b"mutated-during-prepare")
+        return result
+    monkeypatch.setattr(subject.local, "prepare_production_dry_run", mutate)
+    with pytest.raises(subject.CampaignOperatorError, match="frozen build"):
+        subject.materialize_next_cell(
+            manifest, freeze, ordinal=1, campaign_root=tmp_path,
+            window_start_monotonic_ns=140_000_000_000,
+            window_end_monotonic_ns=210_000_000_000, prepare_kwargs=paths,
+            prior_validated_cells=(), build_provenance=freeze["build_provenance"])
+    root = tmp_path / "cells/cell-01/runtime"
+    assert (root / "sustained-role-campaign-staging-abort.json").is_file()
+    assert not (root / "sustained-role-campaign-stage-receipt.json").exists()
+
+
+def test_v6_receipt_removal_during_prepare_seals_abort_without_stage_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    freeze, manifest, paths = _v6_freeze_and_manifest(tmp_path)
+    def remove_receipt(root: Path, **kwargs: object) -> dict[str, object]:
+        result = _prepare(root, **kwargs)
+        (tmp_path / subject.BUILD_PROVENANCE_NAME).unlink()
+        return result
+    monkeypatch.setattr(subject.local, "prepare_production_dry_run", remove_receipt)
+    with pytest.raises(subject.CampaignOperatorError, match="provenance"):
+        subject.materialize_next_cell(
+            manifest, freeze, ordinal=1, campaign_root=tmp_path,
+            window_start_monotonic_ns=140_000_000_000,
+            window_end_monotonic_ns=210_000_000_000, prepare_kwargs=paths,
+            prior_validated_cells=(), build_provenance=freeze["build_provenance"])
+    root = tmp_path / "cells/cell-01/runtime"
+    assert (root / "sustained-role-campaign-staging-abort.json").is_file()
+    assert not (root / "sustained-role-campaign-stage-receipt.json").exists()
+
+
+def test_v6_second_cell_requires_prior_wrapper_success_receipt_pin(tmp_path: Path) -> None:
+    freeze, manifest, paths = _v6_freeze_and_manifest(tmp_path)
+    legacy_prior = {"pair_index": 1, "ordinal": 1, "arm": "fixed_e0",
+                    "root": str((tmp_path / "cells/cell-01").resolve()),
+                    "receipt_path": "raw.json", "receipt_sha256": "a" * 64,
+                    "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64}
+    with pytest.raises(subject.CampaignOperatorError, match="prior validation record"):
+        subject.materialize_next_cell(
+            manifest, freeze, ordinal=2, campaign_root=tmp_path,
+            window_start_monotonic_ns=140_000_000_000,
+            window_end_monotonic_ns=210_000_000_000, prepare_kwargs=paths,
+            prior_validated_cells=(legacy_prior,), build_provenance=freeze["build_provenance"])
+    assert not (tmp_path / "cells").exists()
+
+
+def test_legacy_v1_freeze_is_read_only_before_cell_creation(tmp_path: Path) -> None:
+    freeze = subject.evaluator.build_campaign_freeze(
+        campaign_id="legacy", frozen_utc="2026-09-30T12:00:00Z",
+        campaign_approval_reference="historical", repository_revision="a" * 40)
+    with pytest.raises(subject.CampaignOperatorError, match="read-only"):
+        subject.materialize_next_cell(
+            _manifest(freeze), freeze, ordinal=1, campaign_root=tmp_path,
+            window_start_monotonic_ns=140_000_000_000,
+            window_end_monotonic_ns=210_000_000_000, prepare_kwargs={}, prior_validated_cells=())
+    assert not (tmp_path / "cells").exists()
 
 
 def test_materialization_with_only_29_seconds_left_seals_staging_abort(
@@ -183,7 +356,8 @@ def test_second_cell_calls_the_builtin_independent_validator(
         prior_validated_cells=({"pair_index": 1, "ordinal": 1, "arm": "fixed_e0",
                                 "root": str(prior_root.resolve()), "receipt_path": "fixed-receipt.json",
                                 "receipt_sha256": __import__("hashlib").sha256(receipt.read_bytes()).hexdigest(),
-                                "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64},),
+                                "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64,
+                                "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64},),
     )
     assert stage["ordinal"] == 2
     assert calls == [(prior_root.resolve(), Path("fixed-receipt.json"))]
@@ -211,7 +385,8 @@ def test_new_window_must_follow_previous_accepted_window(
             prior_validated_cells=({"pair_index": 1, "ordinal": 1, "arm": "fixed_e0",
                                     "root": str(prior_root.resolve()), "receipt_path": "fixed-receipt.json",
                                     "receipt_sha256": __import__("hashlib").sha256(receipt.read_bytes()).hexdigest(),
-                                    "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64},),
+                                    "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64,
+                                    "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64},),
         )
     assert not (tmp_path / "cells/cell-02").exists()
 
@@ -237,7 +412,8 @@ def test_cell1_launch_record_binds_real_stage_and_request_before_cell2_materiali
               "receipt_path": raw_path.name,
               "receipt_sha256": __import__("hashlib").sha256(raw_path.read_bytes()).hexdigest(),
               "stage_receipt_path": first["stage_receipt"]["path"],
-              "stage_receipt_sha256": first["stage_receipt"]["sha256"]}
+              "stage_receipt_sha256": first["stage_receipt"]["sha256"],
+              "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64}
 
     def accepted(_record: object, **_kwargs: object) -> dict[str, object]:
         return {"identity": {"fixture": "same"},
@@ -273,7 +449,8 @@ def test_changed_linux_boot_rejects_prior_cell_before_staging_next(
               "receipt_path": receipt.name,
               "receipt_sha256": __import__("hashlib").sha256(receipt.read_bytes()).hexdigest(),
               "stage_receipt_path": first["stage_receipt"]["path"],
-              "stage_receipt_sha256": first["stage_receipt"]["sha256"]}
+              "stage_receipt_sha256": first["stage_receipt"]["sha256"],
+              "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64}
     monkeypatch.setattr(subject, "_host_boot_identity", lambda: {
         "hostname": "proteina02", "linux_boot_id": "12345678-1234-1234-1234-123456789abd",
     })
@@ -300,7 +477,8 @@ def test_outer_abort_blocks_progress_even_when_prior_raw_receipt_exists(
     record = {"pair_index": 1, "ordinal": 1, "arm": "fixed_e0", "root": str(prior_root.resolve()),
               "receipt_path": receipt.name,
               "receipt_sha256": __import__("hashlib").sha256(receipt.read_bytes()).hexdigest(),
-              "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64}
+              "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64,
+              "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64}
     monkeypatch.setattr(subject.evaluator, "_one_cell", lambda *_args, **_kwargs: pytest.fail(
         "raw validation must not run after a sealed abort"))
     with pytest.raises(subject.CampaignOperatorError, match="negative marker"):
@@ -328,7 +506,8 @@ def test_prior_cells_must_match_identity_and_not_overlap_before_staging(
         records.append({"pair_index": (ordinal + 1) // 2, "ordinal": ordinal, "arm": arm,
                         "root": str(root.resolve()), "receipt_path": "receipt.json",
                         "receipt_sha256": __import__("hashlib").sha256(receipt.read_bytes()).hexdigest(),
-                        "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64})
+                        "stage_receipt_path": "runtime/stage.json", "stage_receipt_sha256": "a" * 64,
+                        "success_receipt_path": "runtime/success.json", "success_receipt_sha256": "a" * 64})
 
     def accepted(record: dict[str, object], **_kwargs: object) -> dict[str, object]:
         ordinal = int(record["ordinal"])

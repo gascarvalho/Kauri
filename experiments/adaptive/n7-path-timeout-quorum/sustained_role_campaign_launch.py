@@ -48,6 +48,7 @@ def _load(name: str, filename: str):
 operator = _load("w19_campaign_operator_for_launch", "sustained_role_campaign_operator.py")
 evaluator = _load("w19_campaign_evaluator_for_launch", "sustained_role_campaign_evaluator.py")
 fixed = _load("w19_fixed_launcher_for_campaign", "sustained_role_fixed_e0_launcher.py")
+SUCCESS_PATH = Path(evaluator.SUCCESS_RECEIPT_PATH)
 
 
 def _canonical(value: object) -> bytes:
@@ -88,6 +89,8 @@ def verify_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, c
                     ordinal: int, authorization: Path, git_runner: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
     """Validate every pre-spawn binding; this function has no side effects."""
     frozen, cells = operator.validate_manifest(manifest, freeze)
+    if frozen.get("schema_version") != 2:
+        raise CampaignLaunchError("legacy campaign freeze is read-only and cannot launch a cell")
     if type(ordinal) is not int or ordinal not in range(1, len(cells) + 1):
         raise CampaignLaunchError("ordinal is outside the frozen campaign")
     _git_clean_pinned(frozen["repository_revision"], git_runner)
@@ -95,10 +98,14 @@ def verify_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, c
     root = operator._reject_lexical_symlink_ancestors(Path(campaign_root), "campaign root")
     if not root.is_dir():
         raise CampaignLaunchError("campaign root is unavailable")
+    try:
+        evaluator._verify_campaign_build_archive(root, frozen)
+    except Exception as exc:
+        raise CampaignLaunchError("campaign archived build inputs are unavailable or drifted") from exc
     run_root = operator._lexical_child(root, cell["run_root"], "manifest cell")
     if not run_root.is_dir():
         raise CampaignLaunchError("materialized cell root is unavailable")
-    reuse_markers = (*evaluator.NEGATIVE_MARKERS, *RECEIPTS.values(),
+    reuse_markers = (*evaluator.NEGATIVE_MARKERS, *RECEIPTS.values(), str(SUCCESS_PATH),
                      "runtime/sustained-role-fixed-e0-launch-authorization.json",
                      "runtime/sustained-role-adaptive-e1-launch-authorization.json")
     if any((run_root / name).exists() or (run_root / name).is_symlink() for name in reuse_markers):
@@ -196,7 +203,7 @@ def _cgroup_empty(control_group: str) -> bool:
 
 def _scope_empty(unit: str, runner: Callable[..., Any], *, monotonic: Callable[[], float] = time.monotonic,
                  sleep: Callable[[float], None] = time.sleep,
-                 cgroup_empty: Callable[[str], bool] = _cgroup_empty) -> str:
+                 cgroup_empty: Callable[[str], bool] = _cgroup_empty) -> dict[str, Any]:
     """Wait for terminal scope state *and* an empty scope cgroup.
 
     ``ControlGroup=`` names a cgroup even after it is empty, so it is not
@@ -219,13 +226,13 @@ def _scope_empty(unit: str, runner: Callable[..., Any], *, monotonic: Callable[[
         if completed.returncode == 0 and terminal:
             group_line = next((line for line in last.splitlines() if line.startswith("ControlGroup=")), None)
             if group_line == "ControlGroup=":
-                return last
+                return {"terminal_properties": last, "cgroup_population": "collected"}
             group = group_line.split("=", 1)[1] if group_line is not None else None
             if not group:
                 sleep(0.05)
                 continue
             if cgroup_empty(group):
-                return last
+                return {"terminal_properties": last, "cgroup_population": "zero"}
         if monotonic() >= deadline:
             raise CampaignLaunchError("transient scope did not become inactive")
         sleep(0.05)
@@ -263,6 +270,47 @@ def _scope_diagnostics(completed: Any, unit: str) -> dict[str, Any]:
             "stderr_tail_escaped": escaped_tail}
 
 
+def _seal_success(root: Path, *, cell: Mapping[str, Any], freeze: Mapping[str, Any],
+                  manifest: Mapping[str, Any], raw_receipt_path: Path, raw_receipt_sha256: str,
+                  stage_receipt_path: str, stage_receipt_sha256: str,
+                  authorization_sha256: str, scope_unit: str, supervisor_exit_code: int,
+                  scope_proof: Mapping[str, Any],
+                  replay_result: Mapping[str, Any]) -> tuple[str, str]:
+    """Seal the wrapper's post-scope, post-replay success proof exactly once."""
+    terminal = scope_proof.get("terminal_properties")
+    population = scope_proof.get("cgroup_population")
+    if (not isinstance(terminal, str) or not isinstance(scope_unit, str) or supervisor_exit_code != 0 or
+            population not in {"zero", "collected"} or
+            not isinstance(replay_result, Mapping)):
+        raise CampaignLaunchError("scope or immediate replay proof is malformed")
+    payload = {
+        "schema_version": 1, "kind": evaluator.SUCCESS_RECEIPT_KIND,
+        "state": "SUCCEEDED_SCOPE_CLEAN_REPLAY_ACCEPTED",
+        "manifest_sha256": manifest.get("manifest_sha256"), "freeze_sha256": freeze.get("freeze_sha256"),
+        "ordinal": cell["ordinal"], "pair_index": cell["pair_index"], "arm": cell["arm"],
+        "run_id": cell["run_id"], "raw_receipt_path": raw_receipt_path.name,
+        "raw_receipt_sha256": raw_receipt_sha256,
+        "stage_receipt_path": stage_receipt_path, "stage_receipt_sha256": stage_receipt_sha256,
+        "authorization_sha256": authorization_sha256,
+        "scope_unit": scope_unit, "supervisor_exit_code": supervisor_exit_code,
+        "scope": {"terminal_properties": terminal,
+                  "terminal_properties_sha256": hashlib.sha256(terminal.encode("utf-8")).hexdigest(),
+                  "cgroup_population": population},
+        "immediate_replay_sha256": hashlib.sha256(_canonical(dict(replay_result))).hexdigest(),
+        "no_retry": True, "claim_eligible": False, "figure_eligible": False,
+    }
+    raw = _canonical(payload)
+    path = root / SUCCESS_PATH
+    try:
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+    except OSError as exc:
+        raise CampaignLaunchError("cannot seal immutable wrapper success receipt") from exc
+    return str(SUCCESS_PATH), hashlib.sha256(raw).hexdigest()
+
+
 def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, campaign_root: Path,
                      ordinal: int, authorization: Path, runner: Callable[..., Any] = subprocess.run,
                      git_runner: Callable[..., Any] = subprocess.run) -> dict[str, Any]:
@@ -287,7 +335,7 @@ def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, 
                     diagnostics=diagnostics)
         raise CampaignLaunchError("systemd did not confirm the exact transient scope; no retry")
     try:
-        scope_status = _scope_empty(unit, runner)
+        scope_proof = _scope_empty(unit, runner)
     except BaseException as exc:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_SCOPE_STATUS_UNVERIFIED",
                     detail="scope cleanup could not be verified; process state requires manual verification",
@@ -296,7 +344,7 @@ def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, 
     receipt_path = root / RECEIPTS[cell["arm"]]
     if completed.returncode != 0 or receipt_path.is_symlink() or not receipt_path.is_file():
         _seal_abort(root, cell=cell, detail=("scoped launcher failed or lacked raw receipt; " +
-                                               scope_status.replace("\n", "; ")[:300]),
+                                               str(scope_proof.get("terminal_properties", "")).replace("\n", "; ")[:300]),
                     diagnostics=diagnostics)
         raise CampaignLaunchError("scope failed or launcher did not seal its raw receipt; no retry")
     raw = receipt_path.read_bytes()
@@ -307,14 +355,30 @@ def execute_one_cell(freeze: Mapping[str, Any], manifest: Mapping[str, Any], *, 
               "stage_receipt_sha256": prepared["stage_receipt_sha256"]}
     # One-arm replay immediately follows launch.  It remains component-only.
     try:
-        evaluator._one_cell({key: record[key] for key in ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")},
-                            expected_pair=cell["pair_index"], expected_ordinal=cell["ordinal"],
-                            expected_arm=cell["arm"], freeze=freeze, frozen_at=evaluator._check_freeze(freeze))
+        replay_result = evaluator._one_cell(
+            {key: record[key] for key in ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")},
+            expected_pair=cell["pair_index"], expected_ordinal=cell["ordinal"],
+            expected_arm=cell["arm"], freeze=freeze, frozen_at=evaluator._check_freeze(freeze))
     except BaseException as exc:
         _seal_abort(root, cell=cell, state="ABORTED_NO_RETRY_VALIDATION_REJECTED_SCOPE_CLEAN",
                     detail="independent immediate per-cell replay rejected the sealed raw bundle",
                     diagnostics=diagnostics)
         raise CampaignLaunchError("independent per-cell replay rejected the raw bundle; no retry") from exc
+    try:
+        success_path, success_sha256 = _seal_success(
+            root, cell=cell, freeze=freeze, manifest=manifest, raw_receipt_path=receipt_path,
+            raw_receipt_sha256=record["receipt_sha256"], stage_receipt_path=prepared["stage_receipt_path"],
+            stage_receipt_sha256=prepared["stage_receipt_sha256"],
+            authorization_sha256=prepared["authorization_sha256"], scope_unit=f"{unit}.scope",
+            supervisor_exit_code=completed.returncode, scope_proof=scope_proof,
+            replay_result=replay_result)
+    except BaseException as exc:
+        _seal_abort(root, cell=cell,
+                    detail="scope and replay completed but immutable wrapper success receipt could not be sealed",
+                    diagnostics=diagnostics)
+        raise CampaignLaunchError("cannot seal wrapper success receipt; no retry") from exc
+    record["success_receipt_path"] = success_path
+    record["success_receipt_sha256"] = success_sha256
     return record
 
 

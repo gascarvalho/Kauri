@@ -19,6 +19,13 @@ subject = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = subject
 SPEC.loader.exec_module(subject)
 
+OPERATOR_MODULE = ROOT / "n7-path-timeout-quorum" / "sustained_role_campaign_operator.py"
+OPERATOR_SPEC = importlib.util.spec_from_file_location("n7_sustained_role_campaign_operator_for_evaluator", OPERATOR_MODULE)
+assert OPERATOR_SPEC is not None and OPERATOR_SPEC.loader is not None
+operator = importlib.util.module_from_spec(OPERATOR_SPEC)
+sys.modules[OPERATOR_SPEC.name] = operator
+OPERATOR_SPEC.loader.exec_module(operator)
+
 
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
@@ -209,8 +216,8 @@ def _cell(tmp_path: Path, *, ordinal: int, pair_index: int, arm: str, count: int
         root, "config/main.conf",
         _main_config(root, ordinal=ordinal, override=config_override),
     )
-    app = _descriptor(root, "inputs/hotstuff-app", {"binary": "app"})
-    manager = _descriptor(root, "inputs/adaptation-manager", {"binary": "manager"})
+    app = _raw_descriptor(root, "inputs/hotstuff-app", _BUILD_BINARIES["hotstuff_app"])
+    manager = _raw_descriptor(root, "inputs/adaptation-manager", _BUILD_BINARIES["adaptation_manager"])
     scheduled_window = {"start_monotonic_ns": start,
                         "end_monotonic_ns": start + 70_000_000_000}
     full_window = {
@@ -261,12 +268,82 @@ def _cell(tmp_path: Path, *, ordinal: int, pair_index: int, arm: str, count: int
             "receipt_sha256": hashlib.sha256(raw).hexdigest()}
 
 
+_BUILD_LOG = b"W19 clean build log fixture\n"
+_BUILD_BINARIES = {
+    "hotstuff_app": b"#!/bin/sh\n# app\n",
+    "adaptation_manager": b"#!/bin/sh\n# manager\n",
+    "hotstuff_keygen": b"#!/bin/sh\n# keygen\n",
+    "hotstuff_tls_keygen": b"#!/bin/sh\n# tls keygen\n",
+    "epoch0_treefile_digest": b"#!/bin/sh\n# digest\n",
+}
+
+
+def _build_receipt(*, recorded_utc: str = "2026-09-29T22:00:00Z") -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "kind": "kauri-w19-cluster-build-provenance-v1",
+        "repository_revision": "1" * 40,
+        "origin_revision": "1" * 40,
+        "repository_branch": "feature/adaptive-epoch-throughput",
+        "repository_clean_after_build": True,
+        "host": "proteina02",
+        "linux_boot_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "build_exit_code": 0,
+        "build_command": [
+            "cmake", "--build", "build-adaptive", "--clean-first", "--target", "hotstuff-app",
+            "adaptation-manager", "hotstuff-keygen", "hotstuff-tls-keygen",
+            "n7-epoch0-treefile-digest", "-j2",
+        ],
+        "build_log_path": "/remote/exact-build.log",
+        "build_log_sha256": hashlib.sha256(_BUILD_LOG).hexdigest(),
+        "build_type": "RelWithDebInfo",
+        "cmake_version": "3.30.0",
+        "cxx_compiler": "clang++",
+        "cxx_compiler_version": "17.0.0",
+        "recorded_utc": recorded_utc,
+        "submodule_status": ["", ""],
+        "binaries": {
+            name: {"path": f"/remote/{name}", "sha256": hashlib.sha256(raw).hexdigest(),
+                   "size_bytes": len(raw)}
+            for name, raw in _BUILD_BINARIES.items()
+        },
+    }
+
+
+def _build_provenance(receipt: dict[str, Any] | None = None) -> dict[str, Any]:
+    raw = _canonical(_build_receipt() if receipt is None else receipt)
+    return {
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "repository_revision": "1" * 40,
+        "repository_branch": "feature/adaptive-epoch-throughput",
+        "host_identity": {
+            "hostname": "proteina02",
+            "linux_boot_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        },
+        "binary_sha256": {
+            name: hashlib.sha256(raw).hexdigest() for name, raw in _BUILD_BINARIES.items()
+        },
+    }
+
+
+def _write_build_archive(root: Path, *, receipt: dict[str, Any] | None = None) -> None:
+    (root / "exact-build-provenance.json").write_bytes(_canonical(_build_receipt() if receipt is None else receipt))
+    (root / "exact-build.log").write_bytes(_BUILD_LOG)
+    snapshots = root / "build-snapshot"
+    snapshots.mkdir()
+    for name, raw in _BUILD_BINARIES.items():
+        path = snapshots / name
+        path.write_bytes(raw)
+        path.chmod(0o700)
+
+
 def _freeze() -> dict[str, Any]:
     return subject.build_campaign_freeze(
         campaign_id="w19-six-pair-v1",
         frozen_utc="2026-09-30T00:00:00Z",
         campaign_approval_reference="W19 campaign approval",
         repository_revision="1" * 40,
+        build_provenance=_build_provenance(),
     )
 
 
@@ -294,7 +371,8 @@ def test_executable_bound_accepts_debug_binary_without_relaxing_raw_bound(tmp_pa
         subject._descriptor(tmp_path, descriptor, "raw event stream", subject._MAX_RAW)
 
 
-def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
+def _manifest_bound_campaign(tmp_path: Path, *, freeze: dict[str, Any] | None = None,
+                             build_receipt: dict[str, Any] | None = None) -> tuple[dict[str, Any], Path, list[dict[str, Any]]]:
     """Build a complete synthetic v2 fixture with stage receipts.
 
     The stage receipt is intentionally separate from the raw bundle: a raw
@@ -303,7 +381,8 @@ def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list
     """
     campaign_root = tmp_path / "campaign"
     cells = _campaign(campaign_root / "cells")
-    freeze = _freeze()
+    freeze = _freeze() if freeze is None else freeze
+    _write_build_archive(campaign_root, receipt=build_receipt)
     manifest_cells: list[dict[str, Any]] = []
     for cell in cells:
         root = Path(cell["root"])
@@ -325,7 +404,7 @@ def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list
         root = Path(cell["root"])
         raw_receipt = json.loads((root / cell["receipt_path"]).read_text(encoding="ascii"))
         stage = {
-            "schema_version": 1, "kind": subject.STAGE_RECEIPT_KIND,
+            "schema_version": 2, "kind": subject.STAGE_RECEIPT_KIND,
             "state": "MATERIALIZED_NO_LAUNCH_EXTERNAL_EXACT_APPROVAL_REQUIRED",
             "manifest_sha256": manifest["manifest_sha256"], "freeze_sha256": freeze["freeze_sha256"],
             "ordinal": expected["ordinal"], "pair_index": expected["pair_index"], "arm": expected["arm"],
@@ -336,6 +415,8 @@ def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list
             "scheduled_window": {"start_monotonic_ns": 1, "end_monotonic_ns": 2},
             "hard_timeout_seconds": 210, "no_retry": True,
             "authorization_request_sha256": raw_receipt["artifacts"]["authorization_request"]["sha256"],
+            "build_provenance_raw_sha256": freeze["build_provenance"]["raw_sha256"],
+            "build_provenance_binary_sha256": freeze["build_provenance"]["binary_sha256"],
             "claim_eligible": False, "figure_eligible": False,
         }
         stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
@@ -345,6 +426,39 @@ def _manifest_bound_campaign(tmp_path: Path) -> tuple[dict[str, Any], Path, list
         stage_path.write_bytes(stage_raw)
         cell["stage_receipt_path"] = "runtime/stage-receipt.json"
         cell["stage_receipt_sha256"] = hashlib.sha256(stage_raw).hexdigest()
+        replay = subject._one_cell(
+            {key: cell[key] for key in ("pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256")},
+            expected_pair=expected["pair_index"], expected_ordinal=expected["ordinal"],
+            expected_arm=expected["arm"], freeze=freeze, frozen_at=subject._check_freeze(freeze))
+        terminal = "ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n"
+        success = {
+            "schema_version": 1,
+            "kind": "kauri-n7-sustained-role-campaign-launch-success-v1",
+            "state": "SUCCEEDED_SCOPE_CLEAN_REPLAY_ACCEPTED",
+            "manifest_sha256": manifest["manifest_sha256"],
+            "freeze_sha256": freeze["freeze_sha256"],
+            "ordinal": expected["ordinal"], "pair_index": expected["pair_index"],
+            "arm": expected["arm"], "run_id": expected["run_id"],
+            "raw_receipt_path": cell["receipt_path"],
+            "raw_receipt_sha256": cell["receipt_sha256"],
+            "stage_receipt_path": cell["stage_receipt_path"],
+            "stage_receipt_sha256": cell["stage_receipt_sha256"],
+            "authorization_sha256": raw_receipt["artifacts"]["approved_authorization"]["sha256"],
+            "scope_unit": f"kauri-w19-{expected['run_id']}-deadbeefcafe.scope",
+            "supervisor_exit_code": 0,
+            "scope": {
+                "terminal_properties": terminal,
+                "terminal_properties_sha256": hashlib.sha256(terminal.encode()).hexdigest(),
+                "cgroup_population": "collected",
+            },
+            "immediate_replay_sha256": hashlib.sha256(_canonical(replay)).hexdigest(),
+            "no_retry": True, "claim_eligible": False, "figure_eligible": False,
+        }
+        success_path = root / "runtime/sustained-role-campaign-launch-success-receipt.json"
+        success_raw = _canonical(success)
+        success_path.write_bytes(success_raw)
+        cell["success_receipt_path"] = "runtime/sustained-role-campaign-launch-success-receipt.json"
+        cell["success_receipt_sha256"] = hashlib.sha256(success_raw).hexdigest()
     return manifest, campaign_root, cells
 
 
@@ -412,6 +526,153 @@ def test_manifest_bound_campaign_pins_all_roots_host_and_no_claim_state(tmp_path
     assert result["figure_eligible"] is False
 
 
+def test_producer_build_receipt_binding_survives_freeze_to_final_evaluation(tmp_path: Path) -> None:
+    raw = _canonical(_build_receipt())
+    # Use the producer's parser and compact binding function, then make the
+    # evaluator consume that exact full receipt through the final archive gate.
+    producer_receipt = operator._build_receipt(raw, repository_revision="1" * 40,
+                                               target_host="proteina02")
+    binding = operator.build_provenance_binding(raw, repository_revision="1" * 40,
+                                                target_host="proteina02")
+    assert producer_receipt["recorded_utc"] == "2026-09-29T22:00:00Z"
+    freeze = subject.build_campaign_freeze(
+        campaign_id="w19-producer-compatible", frozen_utc="2026-09-30T00:00:00Z",
+        campaign_approval_reference="W19 campaign approval", repository_revision="1" * 40,
+        build_provenance=binding)
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path, freeze=freeze)
+    result = subject.evaluate_manifest_bound_campaign(freeze, manifest, campaign_root, cells)
+    assert result["manifest_sha256"] == manifest["manifest_sha256"]
+
+
+def test_manifest_bound_campaign_rejects_build_recorded_after_freeze(tmp_path: Path) -> None:
+    late_receipt = _build_receipt(recorded_utc="2026-10-01T00:00:00Z")
+    freeze = subject.build_campaign_freeze(
+        campaign_id="w19-late-build", frozen_utc="2026-09-30T00:00:00Z",
+        campaign_approval_reference="W19 campaign approval", repository_revision="1" * 40,
+        build_provenance=_build_provenance(late_receipt))
+    manifest, campaign_root, cells = _manifest_bound_campaign(
+        tmp_path, freeze=freeze, build_receipt=late_receipt)
+    with pytest.raises(subject.CampaignEvaluationError, match="recorded after the campaign freeze"):
+        subject.evaluate_manifest_bound_campaign(freeze, manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_missing_wrapper_success_receipt(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    (Path(cells[0]["root"]) / cells[0]["success_receipt_path"]).unlink()
+    with pytest.raises(subject.CampaignEvaluationError, match="wrapper success receipt"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_redirected_wrapper_success_receipt(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    canonical = root / cells[0]["success_receipt_path"]
+    redirected = root / "runtime/copied-success.json"
+    redirected.write_bytes(canonical.read_bytes())
+    canonical.unlink()
+    cells[0]["success_receipt_path"] = "runtime/copied-success.json"
+    cells[0]["success_receipt_sha256"] = hashlib.sha256(redirected.read_bytes()).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="path is not canonical"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+@pytest.mark.parametrize("mutate", ["duplicate-properties", "supervisor-exit"])
+def test_manifest_bound_campaign_rejects_tampered_wrapper_supervisor_proof(
+    tmp_path: Path, mutate: str,
+) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    path = root / cells[0]["success_receipt_path"]
+    success = json.loads(path.read_text(encoding="ascii"))
+    if mutate == "duplicate-properties":
+        terminal = "ActiveState=active\nActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n"
+        success["scope"]["terminal_properties"] = terminal
+        success["scope"]["terminal_properties_sha256"] = hashlib.sha256(terminal.encode()).hexdigest()
+    else:
+        success["supervisor_exit_code"] = 1
+    raw = _canonical(success)
+    path.write_bytes(raw)
+    cells[0]["success_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="wrapper (scope properties are duplicated|supervisor proof is invalid)"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_legacy_freeze(tmp_path: Path) -> None:
+    legacy = subject.build_campaign_freeze(
+        campaign_id="legacy", frozen_utc="2026-09-30T00:00:00Z",
+        campaign_approval_reference="W19 campaign approval", repository_revision="1" * 40)
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    with pytest.raises(subject.CampaignEvaluationError, match="legacy campaign freeze"):
+        subject.evaluate_manifest_bound_campaign(legacy, manifest, campaign_root, cells)
+
+
+@pytest.mark.parametrize("relative", [
+    "exact-build-provenance.json", "exact-build.log", "build-snapshot/hotstuff_app",
+])
+def test_manifest_bound_campaign_rejects_tampered_archived_build_input(
+    tmp_path: Path, relative: str,
+) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    (campaign_root / relative).write_bytes(b"tampered archived input\n")
+    with pytest.raises(subject.CampaignEvaluationError, match="campaign (build provenance receipt|archived build)"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+@pytest.mark.parametrize("mutate", ["missing", "binary-drift"])
+def test_manifest_bound_campaign_rejects_v2_stage_build_provenance_drift(
+    tmp_path: Path, mutate: str,
+) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    stage_path = root / cells[0]["stage_receipt_path"]
+    stage = json.loads(stage_path.read_text(encoding="ascii"))
+    if mutate == "missing":
+        stage.pop("build_provenance_raw_sha256")
+    else:
+        stage["build_provenance_binary_sha256"]["hotstuff_app"] = "9" * 64
+    stage.pop("stage_receipt_sha256")
+    stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+    raw = _canonical(stage)
+    stage_path.write_bytes(raw)
+    cells[0]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="stage receipt (schema drifted|build provenance differs)"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_stage_boot_different_from_frozen_build(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    stage_path = root / cells[0]["stage_receipt_path"]
+    stage = json.loads(stage_path.read_text(encoding="ascii"))
+    stage["host_identity"]["linux_boot_id"] = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    stage.pop("stage_receipt_sha256")
+    stage["stage_receipt_sha256"] = hashlib.sha256(_canonical(stage)).hexdigest()
+    raw = _canonical(stage)
+    stage_path.write_bytes(raw)
+    cells[0]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="differs from frozen build"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
+def test_manifest_bound_campaign_rejects_self_consistent_cell_binary_drift(tmp_path: Path) -> None:
+    manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
+    root = Path(cells[0]["root"])
+    receipt_path = root / cells[0]["receipt_path"]
+    receipt = json.loads(receipt_path.read_text(encoding="ascii"))
+    app = receipt["artifacts"]["executables"]["hotstuff_app"]
+    changed = b"#!/bin/sh\n# alternate app bytes\n"
+    app_path = root / app["path"]
+    app_path.write_bytes(changed)
+    app["sha256"] = hashlib.sha256(changed).hexdigest()
+    receipt.pop("receipt_sha256")
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical(receipt)).hexdigest()
+    raw = _canonical(receipt)
+    receipt_path.write_bytes(raw)
+    cells[0]["receipt_sha256"] = hashlib.sha256(raw).hexdigest()
+    with pytest.raises(subject.CampaignEvaluationError, match="executable bytes differ from frozen build"):
+        subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
+
+
 def test_manifest_bound_campaign_rejects_post_hoc_root_substitution(tmp_path: Path) -> None:
     manifest, campaign_root, cells = _manifest_bound_campaign(tmp_path)
     cells[0]["root"] = cells[1]["root"]
@@ -440,7 +701,7 @@ def test_manifest_bound_campaign_rejects_cross_boot_raw_clock(tmp_path: Path) ->
     raw = _canonical(stage)
     stage_path.write_bytes(raw)
     cells[1]["stage_receipt_sha256"] = hashlib.sha256(raw).hexdigest()
-    with pytest.raises(subject.CampaignEvaluationError, match="more than one Linux boot"):
+    with pytest.raises(subject.CampaignEvaluationError, match="differs from frozen build|wrapper success receipt|more than one Linux boot"):
         subject.evaluate_manifest_bound_campaign(_freeze(), manifest, campaign_root, cells)
 
 

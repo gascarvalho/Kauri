@@ -18,6 +18,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import sys
 import time
@@ -41,6 +42,22 @@ STAGING_ABORT_KIND = "kauri-n7-sustained-role-serial-cell-staging-abort-v1"
 STAGING_ABORT = Path("runtime/sustained-role-campaign-staging-abort.json")
 STAGE_RECEIPT_KIND = "kauri-n7-sustained-role-serial-cell-stage-receipt-v1"
 STAGE_RECEIPT = Path("runtime/sustained-role-campaign-stage-receipt.json")
+BUILD_PROVENANCE_NAME = "exact-build-provenance.json"
+_MAX_BUILD_PROVENANCE_BYTES = 1024 * 1024
+_MAX_BUILD_LOG_BYTES = 16 * 1024 * 1024
+BUILD_SNAPSHOT_DIRECTORY = Path("build-snapshot")
+BUILD_LOG_NAME = "exact-build.log"
+_BUILD_RECEIPT_KIND = "kauri-w19-cluster-build-provenance-v1"
+_BUILD_COMMAND = ("cmake", "--build", "build-adaptive", "--clean-first", "--target",
+                  "hotstuff-app", "adaptation-manager", "hotstuff-keygen",
+                  "hotstuff-tls-keygen", "n7-epoch0-treefile-digest", "-j2")
+_BUILD_BINARY_NAMES = ("hotstuff_app", "adaptation_manager", "hotstuff_keygen",
+                       "hotstuff_tls_keygen", "epoch0_treefile_digest")
+_BUILD_PREPARE_NAMES = {
+    "hotstuff_app": "app_binary", "adaptation_manager": "manager_binary",
+    "hotstuff_keygen": "keygen_binary", "hotstuff_tls_keygen": "tls_keygen_binary",
+    "epoch0_treefile_digest": "e0_helper_binary",
+}
 _ALLOWED_PREPARE_KWARGS = frozenset({
     "peer_port", "client_port", "manager_port", "app_binary", "manager_binary",
     "keygen_binary", "tls_keygen_binary", "e0_helper_binary",
@@ -110,6 +127,208 @@ def _hex(value: object, label: str) -> str:
     if not isinstance(value, str) or len(value) != 64 or any(item not in _HEX for item in value):
         raise CampaignOperatorError(f"{label} is not a lower-case SHA-256")
     return value
+
+
+def _build_receipt(raw: bytes, *, repository_revision: str,
+                  target_host: str) -> dict[str, Any]:
+    """Validate the cluster's canonical W19 clean-build receipt schema."""
+    try:
+        receipt = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise CampaignOperatorError("clean-build provenance is unreadable") from exc
+    if raw != _canonical(receipt):
+        raise CampaignOperatorError("clean-build provenance is not canonical JSON")
+    required = {"schema_version", "kind", "repository_revision", "origin_revision",
+                "repository_branch", "repository_clean_after_build", "host",
+                "linux_boot_id", "build_exit_code", "build_command", "build_log_path",
+                "build_log_sha256", "build_type", "cmake_version", "cxx_compiler",
+                "cxx_compiler_version", "recorded_utc", "submodule_status", "binaries"}
+    if (not isinstance(receipt, dict) or set(receipt) != required or
+            receipt.get("schema_version") != 1 or receipt.get("kind") != _BUILD_RECEIPT_KIND):
+        raise CampaignOperatorError("clean-build provenance schema drifted")
+    if (receipt.get("repository_revision") != repository_revision or
+            receipt.get("origin_revision") != repository_revision or
+            receipt.get("repository_branch") != "feature/adaptive-epoch-throughput" or
+            receipt.get("repository_clean_after_build") is not True or
+            receipt.get("host") != target_host or receipt.get("build_exit_code") != 0):
+        raise CampaignOperatorError("clean-build provenance is not exact clean target build")
+    if not isinstance(receipt.get("build_log_path"), str) or not Path(receipt["build_log_path"]).is_absolute():
+        raise CampaignOperatorError("clean-build provenance log path is invalid")
+    _hex(receipt.get("build_log_sha256"), "clean-build log SHA-256")
+    if (receipt.get("build_command") != list(_BUILD_COMMAND) or
+            not all(isinstance(receipt.get(key), str) and receipt[key] for key in
+                    ("build_type", "cmake_version", "cxx_compiler", "cxx_compiler_version")) or
+            not isinstance(receipt.get("submodule_status"), list) or len(receipt["submodule_status"]) != 2 or
+            any(not isinstance(item, str) for item in receipt["submodule_status"])):
+        raise CampaignOperatorError("clean-build provenance toolchain metadata is invalid")
+    _utc(receipt.get("recorded_utc"), "clean-build provenance timestamp")
+    boot_id = receipt.get("linux_boot_id")
+    if not isinstance(boot_id, str) or re.fullmatch(
+            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", boot_id) is None:
+        raise CampaignOperatorError("clean-build provenance Linux boot ID is invalid")
+    binaries = receipt.get("binaries")
+    if not isinstance(binaries, dict) or set(binaries) != set(_BUILD_BINARY_NAMES):
+        raise CampaignOperatorError("clean-build provenance binary membership drifted")
+    for name in _BUILD_BINARY_NAMES:
+        descriptor = binaries[name]
+        if not isinstance(descriptor, dict) or set(descriptor) != {"path", "sha256", "size_bytes"}:
+            raise CampaignOperatorError(f"clean-build provenance binary descriptor drifted: {name}")
+        if (not isinstance(descriptor["path"], str) or not Path(descriptor["path"]).is_absolute() or
+                type(descriptor["size_bytes"]) is not int or descriptor["size_bytes"] <= 0):
+            raise CampaignOperatorError(f"clean-build provenance binary path or size is invalid: {name}")
+        _hex(descriptor["sha256"], f"clean-build provenance binary SHA-256: {name}")
+    return receipt
+
+
+def read_w19_build_provenance(path: Path, *, repository_revision: str,
+                              target_host: str) -> bytes:
+    """Read one bounded, non-symlinked external W19 build receipt."""
+    candidate = Path(path)
+    try:
+        if candidate.is_symlink() or not candidate.is_file() or candidate.stat().st_size > _MAX_BUILD_PROVENANCE_BYTES:
+            raise CampaignOperatorError("clean-build provenance is not a bounded regular file")
+        raw = candidate.read_bytes()
+    except OSError as exc:
+        raise CampaignOperatorError("clean-build provenance cannot be read") from exc
+    _build_receipt(raw, repository_revision=repository_revision, target_host=target_host)
+    return raw
+
+
+def build_provenance_binding(raw: bytes, *, repository_revision: str,
+                             target_host: str) -> dict[str, Any]:
+    receipt = _build_receipt(raw, repository_revision=repository_revision, target_host=target_host)
+    return {
+        "raw_sha256": hashlib.sha256(raw).hexdigest(),
+        "repository_revision": repository_revision,
+        "repository_branch": receipt["repository_branch"],
+        "host_identity": {"hostname": receipt["host"], "linux_boot_id": receipt["linux_boot_id"]},
+        "binary_sha256": {name: receipt["binaries"][name]["sha256"] for name in _BUILD_BINARY_NAMES},
+    }
+
+
+def _copy_exact_source(source: Path, destination: Path, *, expected_sha256: str,
+                       maximum_bytes: int, executable: bool, label: str) -> Path:
+    """Make one O_EXCL snapshot and accept it only if its bytes match the receipt."""
+    try:
+        if source.is_symlink() or not source.is_file() or source.stat().st_size > maximum_bytes:
+            raise CampaignOperatorError(f"clean-build {label} is not a bounded regular file")
+        descriptor = os.open(destination, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o700 if executable else 0o600)
+        with source.open("rb") as incoming, os.fdopen(descriptor, "wb") as outgoing:
+            shutil.copyfileobj(incoming, outgoing)
+            outgoing.flush(); os.fsync(outgoing.fileno())
+        if hashlib.sha256(destination.read_bytes()).hexdigest() != expected_sha256:
+            raise CampaignOperatorError(f"clean-build {label} bytes differ from receipt")
+        if executable:
+            destination.chmod(0o700)
+        return destination
+    except OSError as exc:
+        raise CampaignOperatorError(f"cannot snapshot clean-build {label}") from exc
+
+
+def archive_w19_build_inputs(root: Path, raw: bytes, *, repository_revision: str,
+                             target_host: str) -> None:
+    """Archive the verified build log and all five immutable launch snapshots."""
+    receipt = _build_receipt(raw, repository_revision=repository_revision, target_host=target_host)
+    snapshots = root / BUILD_SNAPSHOT_DIRECTORY
+    if snapshots.exists() or snapshots.is_symlink():
+        raise CampaignOperatorError("clean-build snapshot directory already exists")
+    try:
+        snapshots.mkdir(mode=0o700)
+    except OSError as exc:
+        raise CampaignOperatorError("cannot create clean-build snapshot directory") from exc
+    _copy_exact_source(Path(receipt["build_log_path"]), root / BUILD_LOG_NAME,
+                       expected_sha256=receipt["build_log_sha256"], maximum_bytes=_MAX_BUILD_LOG_BYTES,
+                       executable=False, label="log")
+    for name in _BUILD_BINARY_NAMES:
+        descriptor = receipt["binaries"][name]
+        _copy_exact_source(Path(descriptor["path"]), snapshots / name,
+                           expected_sha256=descriptor["sha256"], maximum_bytes=128 * 1024 * 1024,
+                           executable=True, label=f"binary {name}")
+
+
+def _verify_frozen_build_provenance(root: Path, freeze: Mapping[str, Any],
+                                    host_identity: Mapping[str, str],
+                                    prepare_kwargs: Mapping[str, Any],
+                                    supplied: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    frozen = freeze.get("build_provenance")
+    if frozen is None:
+        if supplied is not None:
+            raise CampaignOperatorError("v1 campaign cannot accept v6 build provenance")
+        return None
+    if not isinstance(frozen, Mapping) or supplied != frozen:
+        raise CampaignOperatorError("staging build provenance differs from the campaign freeze")
+    if frozen.get("repository_revision") != freeze.get("repository_revision"):
+        raise CampaignOperatorError("frozen build provenance revision differs from campaign")
+    identity = frozen.get("host_identity")
+    if not isinstance(identity, Mapping) or dict(identity) != dict(host_identity):
+        raise CampaignOperatorError("live host or Linux boot differs from frozen build provenance")
+    receipt_path = _lexical_child(root, BUILD_PROVENANCE_NAME, "frozen build provenance")
+    raw = read_w19_build_provenance(receipt_path, repository_revision=str(freeze["repository_revision"]),
+                                    target_host=str(identity.get("hostname")))
+    binding = build_provenance_binding(raw, repository_revision=str(freeze["repository_revision"]),
+                                       target_host=str(identity.get("hostname")))
+    if binding != dict(frozen):
+        raise CampaignOperatorError("frozen build provenance copy differs from campaign pin")
+    receipt = _build_receipt(raw, repository_revision=str(freeze["repository_revision"]),
+                             target_host=str(identity.get("hostname")))
+    archived_log = _lexical_child(root, BUILD_LOG_NAME, "frozen build log")
+    try:
+        if (archived_log.is_symlink() or not archived_log.is_file() or
+                archived_log.stat().st_size > _MAX_BUILD_LOG_BYTES or
+                hashlib.sha256(archived_log.read_bytes()).hexdigest() != receipt["build_log_sha256"]):
+            raise ValueError("log drift")
+    except (OSError, ValueError) as exc:
+        raise CampaignOperatorError("frozen build log differs from receipt") from exc
+    for receipt_name, prepare_name in _BUILD_PREPARE_NAMES.items():
+        supplied_path = prepare_kwargs.get(prepare_name)
+        descriptor = receipt["binaries"][receipt_name]
+        if not isinstance(supplied_path, Path):
+            raise CampaignOperatorError(f"staging lacks frozen build binary: {receipt_name}")
+        try:
+            expected = _lexical_child(root, str(BUILD_SNAPSHOT_DIRECTORY / receipt_name),
+                                      f"frozen build snapshot {receipt_name}").resolve(strict=True)
+            actual = supplied_path.resolve(strict=True)
+            if expected != actual or expected.is_symlink() or not expected.is_file() or not os.access(expected, os.X_OK):
+                raise ValueError("path drift")
+            if expected.stat().st_size != descriptor["size_bytes"] or hashlib.sha256(expected.read_bytes()).hexdigest() != descriptor["sha256"]:
+                raise ValueError("byte drift")
+        except (OSError, ValueError) as exc:
+            raise CampaignOperatorError(f"live frozen build binary drifted: {receipt_name}") from exc
+    return binding
+
+
+def _post_materialization_build_binding(root: Path, *, campaign_root: Path,
+                                        freeze: Mapping[str, Any],
+                                        host_identity: Mapping[str, str],
+                                        prepare_kwargs: Mapping[str, Any],
+                                        build_provenance: Mapping[str, Any]) -> None:
+    """Catch snapshot mutation during producer copies or key-generator execution."""
+    _verify_frozen_build_provenance(campaign_root, freeze, host_identity,
+                                    prepare_kwargs, build_provenance)
+    expected = build_provenance["binary_sha256"]
+    archives = {
+        "hotstuff_app": root / "materialization-binaries/hotstuff-app",
+        "adaptation_manager": root / "materialization-binaries/adaptation-manager",
+        "epoch0_treefile_digest": root / "materialization-binaries/e0-identity-helper",
+    }
+    for name, path in archives.items():
+        try:
+            if (path.is_symlink() or not path.is_file() or not os.access(path, os.X_OK) or
+                    hashlib.sha256(path.read_bytes()).hexdigest() != expected[name]):
+                raise ValueError("archive drift")
+        except (OSError, ValueError) as exc:
+            raise CampaignOperatorError(f"materialized launch archive differs from frozen build: {name}") from exc
+    plan_path = root / "runtime/sustained-role-execution-plan.json"
+    try:
+        plan = json.loads(plan_path.read_bytes())
+        manager = plan["commands"]["manager"]
+        replicas = plan["commands"]["replicas"]
+        if (manager.get("executable_sha256") != expected["adaptation_manager"] or
+                not isinstance(replicas, list) or len(replicas) != 7 or
+                any(row.get("executable_sha256") != expected["hotstuff_app"] for row in replicas)):
+            raise ValueError("plan executable drift")
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        raise CampaignOperatorError("materialized execution plan differs from frozen build") from exc
 
 
 def _utc(value: object, label: str) -> None:
@@ -184,12 +403,13 @@ def _post_materialization_failure(root: Path, *, manifest: Mapping[str, Any], fr
 
 def _seal_stage_receipt(root: Path, *, manifest: Mapping[str, Any], freeze: Mapping[str, Any],
                         cell: Mapping[str, Any], host_identity: Mapping[str, str],
-                        request_sha256: str, scheduled_window: Mapping[str, int]) -> tuple[str, str]:
+                        request_sha256: str, scheduled_window: Mapping[str, int],
+                        build_provenance: Mapping[str, Any] | None = None) -> tuple[str, str]:
     path = root / STAGE_RECEIPT
     if path.exists() or path.is_symlink():
         raise CampaignOperatorError("operator stage receipt already exists")
     payload: dict[str, Any] = {
-        "schema_version": 1, "kind": STAGE_RECEIPT_KIND,
+        "schema_version": 2 if build_provenance is not None else 1, "kind": STAGE_RECEIPT_KIND,
         "state": "MATERIALIZED_NO_LAUNCH_EXTERNAL_EXACT_APPROVAL_REQUIRED",
         "manifest_sha256": manifest["manifest_sha256"], "freeze_sha256": freeze["freeze_sha256"],
         "ordinal": cell["ordinal"], "pair_index": cell["pair_index"], "arm": cell["arm"],
@@ -199,6 +419,9 @@ def _seal_stage_receipt(root: Path, *, manifest: Mapping[str, Any], freeze: Mapp
         "no_retry": True, "authorization_request_sha256": request_sha256,
         "claim_eligible": False, "figure_eligible": False,
     }
+    if build_provenance is not None:
+        payload["build_provenance_raw_sha256"] = build_provenance["raw_sha256"]
+        payload["build_provenance_binary_sha256"] = dict(build_provenance["binary_sha256"])
     payload["stage_receipt_sha256"] = _sha(payload)
     raw = _canonical(payload)
     try:
@@ -281,6 +504,7 @@ def materialize_next_cell(
     window_end_monotonic_ns: int,
     prepare_kwargs: Mapping[str, Any],
     prior_validated_cells: Sequence[Mapping[str, Any]],
+    build_provenance: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Materialize one absent cell and return its exact external-approval gate.
 
@@ -295,6 +519,8 @@ def materialize_next_cell(
         frozen_at = evaluator._check_freeze(frozen)
     except Exception as exc:
         raise CampaignOperatorError("campaign freeze is invalid") from exc
+    if frozen.get("schema_version") != 2:
+        raise CampaignOperatorError("legacy campaign freeze is read-only and cannot stage a new cell")
     if type(ordinal) is not int or ordinal not in range(1, len(cells) + 1):
         raise CampaignOperatorError("cell ordinal is outside the fixed campaign")
     if isinstance(prior_validated_cells, (str, bytes, Mapping)) or len(prior_validated_cells) != ordinal - 1:
@@ -306,13 +532,21 @@ def materialize_next_cell(
     host_identity = _host_boot_identity()
     if host_identity["hostname"] != cell["target_host"]:
         raise CampaignOperatorError("local hostname differs from the frozen campaign target host")
+    # This verification intentionally precedes the output parent/cell mkdir:
+    # a stale boot, copied receipt, or live binary drift cannot consume a cell.
+    verified_build_provenance = _verify_frozen_build_provenance(
+        root, frozen, host_identity, prepare_kwargs, build_provenance)
     prior_accepted: list[Mapping[str, Any]] = []
+    v2_freeze = frozen.get("schema_version") == 2
     for previous_ordinal, previous in enumerate(prior_validated_cells, start=1):
         if not isinstance(previous, Mapping):
             raise CampaignOperatorError("prior cell validation record is not an object")
         expected = cells[previous_ordinal - 1]
-        if set(previous) != {"pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256",
-                             "stage_receipt_path", "stage_receipt_sha256"} or (
+        required_prior = {"pair_index", "ordinal", "arm", "root", "receipt_path", "receipt_sha256",
+                          "stage_receipt_path", "stage_receipt_sha256"}
+        if v2_freeze:
+            required_prior |= {"success_receipt_path", "success_receipt_sha256"}
+        if set(previous) != required_prior or (
                 previous.get("ordinal"), previous.get("arm")) != (expected["ordinal"], expected["arm"]):
             raise CampaignOperatorError("prior validation record is not bound to the frozen schedule")
         if previous.get("pair_index") != expected["pair_index"]:
@@ -351,6 +585,9 @@ def materialize_next_cell(
             accepted = evaluator._one_cell(
                 record, expected_pair=expected["pair_index"], expected_ordinal=expected["ordinal"],
                 expected_arm=expected["arm"], freeze=frozen, frozen_at=frozen_at)
+            if v2_freeze:
+                evaluator._wrapper_success_receipt(
+                    prior_root, previous, expected, manifest, frozen, accepted)
             if (not isinstance(accepted, Mapping) or not isinstance(accepted.get("identity"), Mapping) or
                     not isinstance(accepted.get("scheduled_window"), Mapping)):
                 raise ValueError("prior cell lacks campaign comparability identity")
@@ -465,12 +702,20 @@ def materialize_next_cell(
     if plan.get("repository_revision") != frozen["repository_revision"]:
         _post_materialization_failure(output, manifest=manifest, freeze=frozen, cell=cell,
                                       detail="materialized plan revision differs from the campaign freeze")
+    try:
+        _post_materialization_build_binding(
+            output, campaign_root=root, freeze=frozen, host_identity=host_identity,
+            prepare_kwargs=prepare_kwargs, build_provenance=verified_build_provenance)
+    except CampaignOperatorError as exc:
+        _post_materialization_failure(output, manifest=manifest, freeze=frozen, cell=cell,
+                                      detail=str(exc))
     stage_window = {"start_monotonic_ns": window_start_monotonic_ns,
                     "end_monotonic_ns": window_end_monotonic_ns}
     try:
         stage_path, stage_sha256 = _seal_stage_receipt(
             output, manifest=manifest, freeze=frozen, cell=cell, host_identity=host_identity,
-            request_sha256=request_sha256, scheduled_window=stage_window)
+            request_sha256=request_sha256, scheduled_window=stage_window,
+            build_provenance=verified_build_provenance)
     except CampaignOperatorError as exc:
         _post_materialization_failure(output, manifest=manifest, freeze=frozen, cell=cell, detail=str(exc))
     return {

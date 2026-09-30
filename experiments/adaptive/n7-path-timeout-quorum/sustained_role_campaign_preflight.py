@@ -28,6 +28,7 @@ HERE = Path(__file__).resolve().parent
 KAURI = HERE.parents[2]
 FREEZE_NAME = "campaign-freeze.json"
 MANIFEST_NAME = "campaign-manifest.json"
+BUILD_PROVENANCE_NAME = "exact-build-provenance.json"
 _CAMPAIGN_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
 _CELL_WINDOW_NS = 70_000_000_000
 _STAGE_LEAD_NS = 90_000_000_000
@@ -153,8 +154,34 @@ def _manifest(freeze: Mapping[str, Any], *, target_host: str, prepared_utc: str)
     return manifest
 
 
+def _build_provenance_binding(path: Path, *, repository_revision: str,
+                              target_host: str) -> tuple[bytes, dict[str, Any]]:
+    """Read the externally sealed clean-build receipt before creating v6 inputs."""
+    try:
+        raw = operator.read_w19_build_provenance(
+            path, repository_revision=repository_revision, target_host=target_host)
+        binding = operator.build_provenance_binding(
+            raw, repository_revision=repository_revision, target_host=target_host)
+    except Exception as exc:
+        raise CampaignPreflightError("clean-build provenance receipt is invalid") from exc
+    return raw, binding
+
+
+def _receipt_not_after_freeze(raw: bytes, *, frozen_utc: str) -> None:
+    """A build attestation cannot be produced after the campaign it freezes."""
+    try:
+        receipt = json.loads(raw)
+        recorded = datetime.fromisoformat(str(receipt["recorded_utc"]).replace("Z", "+00:00"))
+        frozen = datetime.fromisoformat(frozen_utc.replace("Z", "+00:00"))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CampaignPreflightError("clean-build provenance timestamp is invalid") from exc
+    if recorded.tzinfo != timezone.utc or frozen.tzinfo != timezone.utc or recorded > frozen:
+        raise CampaignPreflightError("clean-build provenance timestamp is later than campaign freeze")
+
+
 def create_campaign(*, campaign_root: Path, campaign_id: str, approval_reference: str,
-                    repository_revision: str, target_host: str, frozen_utc: str | None = None) -> dict[str, Any]:
+                    repository_revision: str, target_host: str, build_provenance_path: Path,
+                    frozen_utc: str | None = None) -> dict[str, Any]:
     """Create a root plus the only two immutable pre-launch documents."""
     root = _safe_root(campaign_root, "campaign root")
     if root.exists():
@@ -163,11 +190,15 @@ def create_campaign(*, campaign_root: Path, campaign_id: str, approval_reference
     if not isinstance(approval_reference, str) or not approval_reference.strip():
         raise CampaignPreflightError("campaign approval reference is empty")
     frozen_utc = frozen_utc or _utc_now()
+    provenance_raw, provenance_binding = _build_provenance_binding(
+        build_provenance_path, repository_revision=repository_revision,
+        target_host=target_host)
+    _receipt_not_after_freeze(provenance_raw, frozen_utc=frozen_utc)
     try:
         freeze = evaluator.build_campaign_freeze(
             campaign_id=campaign_id, frozen_utc=frozen_utc,
             campaign_approval_reference=approval_reference,
-            repository_revision=repository_revision,
+            repository_revision=repository_revision, build_provenance=provenance_binding,
         )
     except Exception as exc:
         raise CampaignPreflightError("campaign freeze inputs are invalid") from exc
@@ -178,6 +209,10 @@ def create_campaign(*, campaign_root: Path, campaign_id: str, approval_reference
     except OSError as exc:
         raise CampaignPreflightError("cannot create exclusive campaign root") from exc
     try:
+        _write_new(root / BUILD_PROVENANCE_NAME, provenance_raw)
+        operator.archive_w19_build_inputs(
+            root, provenance_raw, repository_revision=repository_revision,
+            target_host=target_host)
         _write_new(root / FREEZE_NAME, _canonical(freeze))
         _write_new(root / MANIFEST_NAME, _canonical(manifest))
     except Exception:
@@ -249,6 +284,8 @@ def stage_campaign_cell(*, campaign_root: Path, ordinal: int, prior_records: Pat
     manifest = _read_canonical(root / MANIFEST_NAME, "campaign manifest")
     if not isinstance(freeze, Mapping) or not isinstance(manifest, Mapping):
         raise CampaignPreflightError("frozen campaign documents are not objects")
+    if freeze.get("schema_version") != 2:
+        raise CampaignPreflightError("legacy campaign freeze is read-only and cannot stage a new cell")
     try:
         operator.validate_manifest(manifest, freeze)
     except Exception as exc:
@@ -256,18 +293,21 @@ def stage_campaign_cell(*, campaign_root: Path, ordinal: int, prior_records: Pat
     _git_clean_pinned(freeze["repository_revision"])
     records = _prior_records(prior_records, ordinal)
     ports = _port_bases(ordinal, peer_port, client_port, manager_port)
-    defaults = {
-        "app_binary": KAURI / "build-adaptive/examples/hotstuff-app",
-        "manager_binary": KAURI / "build-adaptive/examples/adaptation-manager",
-        "keygen_binary": KAURI / "build-adaptive/hotstuff-keygen",
-        "tls_keygen_binary": KAURI / "build-adaptive/hotstuff-tls-keygen",
-        "e0_helper_binary": KAURI / "build-adaptive/examples/n7-epoch0-treefile-digest",
-    }
     supplied = {"app_binary": app_binary, "manager_binary": manager_binary,
                 "keygen_binary": keygen_binary, "tls_keygen_binary": tls_keygen_binary,
                 "e0_helper_binary": e0_helper_binary}
-    binaries = {key: _binary(value if value is not None else defaults[key], key.replace("_", " "))
-                for key, value in supplied.items()}
+    build_provenance = freeze.get("build_provenance")
+    snapshots = {
+        "app_binary": root / operator.BUILD_SNAPSHOT_DIRECTORY / "hotstuff_app",
+        "manager_binary": root / operator.BUILD_SNAPSHOT_DIRECTORY / "adaptation_manager",
+        "keygen_binary": root / operator.BUILD_SNAPSHOT_DIRECTORY / "hotstuff_keygen",
+        "tls_keygen_binary": root / operator.BUILD_SNAPSHOT_DIRECTORY / "hotstuff_tls_keygen",
+        "e0_helper_binary": root / operator.BUILD_SNAPSHOT_DIRECTORY / "epoch0_treefile_digest",
+    }
+    binaries = {key: _binary(path, key.replace("_", " ")) for key, path in snapshots.items()}
+    for key, value in supplied.items():
+        if value is not None and _binary(value, key.replace("_", " ")) != binaries[key]:
+            raise CampaignPreflightError("fresh v6 staging only permits its frozen build snapshots")
     try:
         now = raw_clock(time.CLOCK_MONOTONIC_RAW)
     except Exception as exc:
@@ -279,6 +319,7 @@ def stage_campaign_cell(*, campaign_root: Path, ordinal: int, prior_records: Pat
         manifest, freeze, ordinal=ordinal, campaign_root=root,
         window_start_monotonic_ns=start, window_end_monotonic_ns=start + _CELL_WINDOW_NS,
         prepare_kwargs={**ports, **binaries}, prior_validated_cells=records,
+        build_provenance=build_provenance,
     )
     if not isinstance(result, Mapping) or result.get("launch_permitted") is not False:
         raise CampaignPreflightError("operator returned an invalid pre-launch state")
@@ -295,6 +336,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     freeze.add_argument("--repository-revision", required=True)
     freeze.add_argument("--target-host", required=True)
     freeze.add_argument("--frozen-utc")
+    freeze.add_argument("--build-provenance", type=Path, required=True,
+                        help="canonical W19 clean-build receipt required for a fresh v6 freeze")
     stage = commands.add_parser("stage", help="materialize one fresh cell without launch")
     stage.add_argument("--campaign-root", type=Path, required=True)
     stage.add_argument("--ordinal", type=int, required=True)
@@ -312,7 +355,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = create_campaign(campaign_root=args.campaign_root, campaign_id=args.campaign_id,
                                      approval_reference=args.approval_reference,
                                      repository_revision=args.repository_revision,
-                                     target_host=args.target_host, frozen_utc=args.frozen_utc)
+                                     target_host=args.target_host, frozen_utc=args.frozen_utc,
+                                     build_provenance_path=args.build_provenance)
         else:
             result = stage_campaign_cell(
                 campaign_root=args.campaign_root, ordinal=args.ordinal, prior_records=args.prior_records,
