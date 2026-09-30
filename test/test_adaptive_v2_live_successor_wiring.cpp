@@ -767,3 +767,39 @@ TEST_CASE(
         CHECK(manager_peer < global_configure);
     }
 }
+
+TEST_CASE(
+    "adaptive v2 command diagnostics expose bounded proposal stages",
+    "[we19][adaptive-v2][live-successor][diagnostics]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto beat = function_body(implementation, "void HotStuffBase::beat(");
+    const auto local_hook = function_body(
+        implementation,
+        "void HotStuffBase::on_local_proposal_processed(");
+
+    REQUIRE_FALSE(beat.empty());
+    REQUIRE_FALSE(local_hook.empty());
+    const auto gate = beat.find("if ((inbox_snapshot.state !=");
+    const auto snapshot = beat.find(
+        "KAURI_ADAPTIVE_V2_COMMAND stage=inbox_snapshot");
+    REQUIRE(gate != std::string::npos);
+    REQUIRE(snapshot != std::string::npos);
+    CHECK(gate < snapshot);
+    CHECK(contains_all(
+        beat.substr(gate, snapshot - gate),
+        {"inbox_snapshot.material != nullptr",
+         "AdaptiveV2CommandInboxState::reserved",
+         "stage=inbox_gate"}));
+    CHECK(contains_all(
+        beat.substr(snapshot),
+        {"AdaptiveV2CommandInboxState::available", "material=1",
+         "stage=precondition", "stage=active_tree", "stage=history",
+         "stage=prepare"}));
+    CHECK(contains_all(
+        local_hook,
+        {"stage=mark_proposed", "outcome=rejected", "outcome=marked",
+         "stage=release", "outcome=%s", "released ? \"released\" : \"rejected\""}));
+    CHECK(implementation.find("KAURI_ADAPTIVE_V3_COMMAND stage=inbox_snapshot") ==
+          std::string::npos);
+}
