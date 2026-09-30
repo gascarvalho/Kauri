@@ -8723,22 +8723,54 @@ namespace hotstuff
             !adaptive_v2_epoch_change_bundle_limits.has_value() ||
             epoch_change_verifier == nullptr || exact_epochs == nullptr ||
             adaptive_epoch_runtime == nullptr)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V2_BUNDLE stage=precondition "
+                "outcome=rejected replica=%u",
+                static_cast<unsigned>(get_id()));
             return;
+        }
 
         const auto peer = conn->get_peer_id();
         if (!authorize_manager_peer(peer))
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V2_BUNDLE stage=peer_binding "
+                "outcome=rejected replica=%u authorized=0",
+                static_cast<unsigned>(get_id()));
             return;
+        }
         const auto pinned_connection = pn.get_peer_conn(peer);
         const auto *certificate = conn->get_peer_cert();
-        if (pinned_connection == nullptr || pinned_connection != conn ||
-            certificate == nullptr || PeerId(*certificate) != peer)
+        const bool certificate_match =
+            pinned_connection != nullptr && pinned_connection == conn &&
+            certificate != nullptr && PeerId(*certificate) == peer;
+        if (!certificate_match)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V2_BUNDLE stage=peer_binding "
+                "outcome=rejected replica=%u authorized=1 pinned=%u "
+                "same_connection=%u certificate=%u certificate_match=%u",
+                static_cast<unsigned>(get_id()),
+                pinned_connection == nullptr ? 0U : 1U,
+                pinned_connection == conn ? 1U : 0U,
+                certificate == nullptr ? 0U : 1U,
+                certificate_match ? 1U : 0U);
             return;
+        }
 
         const auto decoded = decode_adaptive_v2_epoch_change_bundle(
             static_cast<bytearray_t>(message.serialized),
             *adaptive_v2_epoch_change_bundle_limits);
         if (!decoded)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V2_BUNDLE stage=decode "
+                "outcome=rejected replica=%u error=%u",
+                static_cast<unsigned>(get_id()),
+                static_cast<unsigned>(decoded.error));
             return;
+        }
 
         const auto active_configuration =
             adaptive_epoch_runtime->activation.active_effect().configuration;
@@ -8747,7 +8779,15 @@ namespace hotstuff
         if (active_epoch == nullptr ||
             active_epoch->epoch_digest() !=
                 active_configuration.epoch_digest)
+        {
+            HOTSTUFF_LOG_INFO(
+                "KAURI_ADAPTIVE_V2_BUNDLE stage=active_epoch "
+                "outcome=rejected replica=%u epoch=%u tree=%u",
+                static_cast<unsigned>(get_id()),
+                active_configuration.epoch_number,
+                active_configuration.tree_id);
             return;
+        }
 
         auto &command_inbox = *adaptive_v2_command_inbox;
         const auto result = command_inbox.ingest(
@@ -8755,6 +8795,23 @@ namespace hotstuff
             *active_epoch,
             *epoch_change_verifier,
             *exact_epochs);
+        HOTSTUFF_LOG_INFO(
+            "KAURI_ADAPTIVE_V2_BUNDLE stage=inbox outcome=observed "
+            "replica=%u disposition=%u has_material=%u "
+            "initial_present=%u initial=%u staging_present=%u staging=%u "
+            "final_present=%u final=%u",
+            static_cast<unsigned>(get_id()),
+            static_cast<unsigned>(result.disposition),
+            result.material == nullptr ? 0U : 1U,
+            result.initial_validation.has_value() ? 1U : 0U,
+            result.initial_validation.has_value()
+                ? static_cast<unsigned>(*result.initial_validation) : 0U,
+            result.definition_staging.has_value() ? 1U : 0U,
+            result.definition_staging.has_value()
+                ? static_cast<unsigned>(*result.definition_staging) : 0U,
+            result.final_validation.has_value() ? 1U : 0U,
+            result.final_validation.has_value()
+                ? static_cast<unsigned>(*result.final_validation) : 0U);
         if (result.disposition ==
                 AdaptiveV2CommandIngestDisposition::internal_failure)
         {

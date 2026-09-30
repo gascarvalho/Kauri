@@ -333,7 +333,7 @@ TEST_CASE(
              "authorize_manager_peer",
              "pn.get_peer_conn(",
              "conn->get_peer_cert()",
-             "pinned_connection != conn",
+             "pinned_connection == conn",
              "PeerId(*certificate)",
              "decode_adaptive_v2_epoch_change_bundle",
              ".ingest("}));
@@ -360,6 +360,43 @@ TEST_CASE(
         CHECK(arguments[2].find("epoch_change_verifier") !=
               std::string::npos);
         CHECK(arguments[3].find("exact_epochs") != std::string::npos);
+    }
+}
+
+TEST_CASE(
+    "adaptive-v2 manager bundle ingress diagnostics preserve gate dispositions",
+    "[we08][adaptive-v2][live-successor][manager-ingress][diagnostics]")
+{
+    const auto implementation = source("src/hotstuff.cpp");
+    const auto handler = function_body(
+        implementation,
+        "void HotStuffBase::adaptive_v2_epoch_change_bundle_handler(");
+    REQUIRE_FALSE(handler.empty());
+
+    SECTION("every ingress gate records a bounded stage disposition")
+    {
+        CHECK(contains_in_order(
+            handler,
+            {"stage=precondition", "outcome=rejected", "stage=peer_binding",
+             "outcome=rejected", "stage=decode", "outcome=rejected",
+             "stage=active_epoch", "outcome=rejected", "stage=inbox",
+             "outcome=observed"}));
+        CHECK(contains_all(
+            handler,
+            {"authorized=0", "authorized=1", "pinned=%u", "same_connection=%u",
+             "certificate=%u", "certificate_match=%u", "disposition=%u",
+             "has_material=%u", "initial_present=%u", "initial=%u",
+             "staging_present=%u", "staging=%u", "final_present=%u",
+             "final=%u"}));
+    }
+
+    SECTION("authorization and exact connection pin remain before decoding")
+    {
+        CHECK(contains_in_order(
+            handler,
+            {"authorize_manager_peer(peer)", "pn.get_peer_conn(peer)",
+             "pinned_connection == conn", "PeerId(*certificate) == peer",
+             "decode_adaptive_v2_epoch_change_bundle"}));
     }
 }
 
