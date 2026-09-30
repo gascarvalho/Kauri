@@ -211,6 +211,35 @@ def _option(argv: Sequence[str], option: str) -> str:
     return argv[index + 1]
 
 
+def _first_omission_tree(plan: Mapping[str, Any]) -> int | None:
+    """Read the optional v1-compatible actor phase gate from frozen argv."""
+    replicas = plan.get("commands", {}).get("replicas", [])
+    if not isinstance(replicas, list) or len(replicas) != 7 or not isinstance(replicas[1], Mapping):
+        raise LaunchError("plan lacks actor-1 replica command")
+    argv = replicas[1].get("argv")
+    if not isinstance(argv, list):
+        raise LaunchError("actor-1 replica argv is malformed")
+    option = "--experiment-byzantine-first-omission-tree"
+    if option not in argv:
+        tree = None
+    else:
+        if argv.count(option) != 1:
+            raise LaunchError("actor-1 first-omission tree option is ambiguous")
+        index = argv.index(option)
+        if index + 1 >= len(argv) or not isinstance(argv[index + 1], str) or not argv[index + 1].isdigit():
+            raise LaunchError("actor-1 first-omission tree option is malformed")
+        tree = int(argv[index + 1])
+        if tree != 4 or argv[index + 1] != str(tree):
+            raise LaunchError("actor-1 first-omission tree differs from frozen tree 4")
+    native = plan.get("native_fault_schedule")
+    values = native.get("values") if isinstance(native, Mapping) else None
+    fault = values.get("fault") if isinstance(values, Mapping) else None
+    declared = fault.get("first_omission_tree") if isinstance(fault, Mapping) else None
+    if declared != tree:
+        raise LaunchError("actor-1 first-omission tree differs from frozen profile")
+    return tree
+
+
 def _scheduled_manager(plan: Mapping[str, Any], *, e0_digest: str) -> tuple[str, ...]:
     commands = plan.get("commands")
     schedule = plan.get("scheduled_window")
@@ -356,7 +385,7 @@ def _persist_cleanup(root: Path, receipt: Mapping[str, Any]) -> None:
     _write_once(path, receipt)
 
 
-def _physical_anchor_and_coverage(root: Path) -> dict[str, Any]:
+def _physical_anchor_and_coverage(root: Path, *, first_omission_tree: int | None = None) -> dict[str, Any]:
     """Bind both arms to the same actor-1 internal aggregate opportunity."""
     raw = (root / "raw/replica-1.jsonl").read_bytes()
     anchor: dict[str, Any] | None = None
@@ -366,6 +395,15 @@ def _physical_anchor_and_coverage(root: Path) -> dict[str, Any]:
         except json.JSONDecodeError as exc:
             raise LaunchError("replica-1 raw stream is not JSONL") from exc
         payload = event.get("payload") if isinstance(event, Mapping) else None
+        proposal = payload.get("proposal") if isinstance(payload, Mapping) else None
+        if (first_omission_tree is not None and event.get("event_type") == "fault.contribution_opportunity" and
+                isinstance(payload, Mapping) and payload.get("actor") == 1):
+            if not (payload.get("fault_mode") == "role_scoped_persistent_selected_omission_v1" and
+                    payload.get("physical_role") == "internal" and
+                    payload.get("scheduled_action") == "omit_aggregate" and
+                    isinstance(proposal, Mapping) and proposal.get("epoch_number") == 0 and
+                    proposal.get("tree_id") == first_omission_tree):
+                raise LaunchError("first actor-1 physical omission does not bind frozen tree 4 internal aggregate")
         if (event.get("event_type") == "fault.contribution_opportunity" and isinstance(payload, Mapping)
                 and payload.get("actor") == 1
                 and payload.get("fault_mode") == "role_scoped_persistent_selected_omission_v1"
@@ -460,6 +498,7 @@ def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
         _verify_approved_launch_inputs(root, plan)
         e0_digest, e0_path = _source_e0(root)
         e0_helper = _e0_identity_helper(root, e0_path)
+        first_omission_tree = _first_omission_tree(plan)
         manager = _scheduled_manager(plan, e0_digest=e0_digest)
         replicas = plan.get("commands", {}).get("replicas", [])
         if not isinstance(replicas, list) or len(replicas) != 7:
@@ -508,7 +547,7 @@ def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
             "e0_identity_helper": _archive_input(root, e0_helper, "e0-identity-helper"),
         }
         replica_config_archives = [_archive_input(root, Path(row["path"]), f"replica-{i}.conf") for i, row in enumerate(plan["configuration"]["replicas"])]
-        anchor = _physical_anchor_and_coverage(root)
+        anchor = _physical_anchor_and_coverage(root, first_omission_tree=first_omission_tree)
         artifacts: dict[str, Any] = {
             "profile": _descriptor(root, archived["profile"]), "epoch0_tree": _descriptor(root, archived["epoch0_tree"]),
             "main_config": _descriptor(root, archived["main_config"]), "execution_plan": _descriptor(root, root / PLAN),
@@ -523,8 +562,10 @@ def execute_fixed_e0_pilot(run_directory: Path, authorization_path: Path, *,
             "replica_configs": [_descriptor(root, path) for path in replica_config_archives],
             "executables": {"hotstuff_app": _descriptor(root, archived["hotstuff_app"]), "adaptation_manager": _descriptor(root, archived["adaptation_manager"])},
         }
-        receipt = {"schema_version": 1, "kind": KIND, "state": "SEALED_RAW_BUNDLE_NO_CLAIM", "arm": "fixed_e0", "run_id": _option(manager, "--structured-event-run-id"), "plan_sha256": plan["plan_sha256"], "anchor": anchor, "horizon": {"clock": "CLOCK_MONOTONIC_RAW", "duration_ns": 60_000_000_000, "late_offset_ns": 20_000_000_000}, "artifacts": artifacts,
-                   "launch_binding": {"request_sha256": _sha(request_bytes), "approval_sha256": _sha(_canonical(approval)), "e0_digest": e0_digest, "scheduled_window": {"start_monotonic_ns": start, "end_monotonic_ns": end}, "manager_argv_sha256": _sha(_canonical({"argv": list(manager)})), "manager_executable_sha256": plan["commands"]["manager"]["executable_sha256"], "replica_argv_sha256": [row["sha256"] for row in plan["commands"]["replicas"]], "replica_executable_sha256": plan["commands"]["replicas"][0]["executable_sha256"], "native_profile_sha256": plan["native_fault_schedule"]["descriptor"]["sha256"], "selection_profile_sha256": plan["manager_selection_policy"]["descriptor"]["sha256"], "exit_codes": exit_codes}}
+        binding = {"request_sha256": _sha(request_bytes), "approval_sha256": _sha(_canonical(approval)), "e0_digest": e0_digest, "scheduled_window": {"start_monotonic_ns": start, "end_monotonic_ns": end}, "manager_argv_sha256": _sha(_canonical({"argv": list(manager)})), "manager_executable_sha256": plan["commands"]["manager"]["executable_sha256"], "replica_argv_sha256": [row["sha256"] for row in plan["commands"]["replicas"]], "replica_executable_sha256": plan["commands"]["replicas"][0]["executable_sha256"], "native_profile_sha256": plan["native_fault_schedule"]["descriptor"]["sha256"], "selection_profile_sha256": plan["manager_selection_policy"]["descriptor"]["sha256"], "exit_codes": exit_codes}
+        if first_omission_tree is not None:
+            binding["first_omission_tree"] = first_omission_tree
+        receipt = {"schema_version": 1, "kind": KIND, "state": "SEALED_RAW_BUNDLE_NO_CLAIM", "arm": "fixed_e0", "run_id": _option(manager, "--structured-event-run-id"), "plan_sha256": plan["plan_sha256"], "anchor": anchor, "horizon": {"clock": "CLOCK_MONOTONIC_RAW", "duration_ns": 60_000_000_000, "late_offset_ns": 20_000_000_000}, "artifacts": artifacts, "launch_binding": binding}
         receipt["receipt_sha256"] = _sha(_canonical(receipt)); _write_once(root / RECEIPT, receipt)
         return {"status": "SEALED_RAW_BUNDLE_NO_CLAIM", "receipt_sha256": receipt["receipt_sha256"]}
     except BaseException as exc:

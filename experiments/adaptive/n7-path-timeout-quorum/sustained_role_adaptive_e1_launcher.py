@@ -86,9 +86,19 @@ def _safe_child(root: Path, raw: str, label: str) -> Path:
     return path
 
 
-def _first_anchor(streams: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping[str, Any] | None:
+def _first_anchor(streams: Mapping[str, Sequence[Mapping[str, Any]]], *,
+                  first_omission_tree: int | None = None) -> Mapping[str, Any] | None:
     for event in streams.get("replica-1", ()):
         payload = event.get("payload") if isinstance(event, Mapping) else None
+        proposal = payload.get("proposal") if isinstance(payload, Mapping) else None
+        if (first_omission_tree is not None and event.get("event_type") == "fault.contribution_opportunity" and
+                isinstance(payload, Mapping) and payload.get("actor") == 1):
+            if not (payload.get("fault_mode") == "role_scoped_persistent_selected_omission_v1" and
+                    payload.get("physical_role") == "internal" and
+                    payload.get("scheduled_action") == "omit_aggregate" and
+                    isinstance(proposal, Mapping) and proposal.get("epoch_number") == 0 and
+                    proposal.get("tree_id") == first_omission_tree):
+                raise LaunchError("first actor-1 physical omission does not bind frozen tree 4 internal aggregate")
         if (event.get("event_type") == "fault.contribution_opportunity" and isinstance(payload, Mapping)
                 and payload.get("actor") == 1 and payload.get("fault_mode") == "role_scoped_persistent_selected_omission_v1"
                 and payload.get("physical_role") == "internal" and payload.get("scheduled_action") == "omit_aggregate"
@@ -97,7 +107,7 @@ def _first_anchor(streams: Mapping[str, Sequence[Mapping[str, Any]]]) -> Mapping
     return None
 
 
-def _sealed_anchor_and_coverage(root: Path) -> dict[str, Any]:
+def _sealed_anchor_and_coverage(root: Path, *, first_omission_tree: int | None = None) -> dict[str, Any]:
     """Hash the identical native internal-aggregate event used to arm E1."""
     raw = (root / "raw/replica-1.jsonl").read_bytes()
     anchor: dict[str, Any] | None = None
@@ -106,7 +116,7 @@ def _sealed_anchor_and_coverage(root: Path) -> dict[str, Any]:
             event = json.loads(line)
         except json.JSONDecodeError as exc:
             raise LaunchError("replica-1 raw stream is not JSONL") from exc
-        selected = _first_anchor({"replica-1": (event,)})
+        selected = _first_anchor({"replica-1": (event,)}, first_omission_tree=first_omission_tree)
         if selected is not None:
             anchor = {"source_id": "replica-1", "source_sequence": event.get("source_sequence"), "line_sha256": _sha(line), "monotonic_ns": event.get("source_monotonic_ns")}
             break
@@ -393,6 +403,7 @@ def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
             kind=AUTH_KIND, archive_path=APPROVAL,
         )
         fixed._verify_approved_launch_inputs(root, plan)
+        first_omission_tree = fixed._first_omission_tree(plan)
         manager = _adaptive_manager(plan)
         bundle = _safe_child(root, _option(manager, "--bundle-output"), "E1 bundle output")
         if bundle.exists() or bundle.is_symlink():
@@ -446,7 +457,8 @@ def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
         anchor = None
         while raw_clock() < end:
             if monotonic() >= deadline: raise LaunchError("hard timeout expired before raw horizon")
-            streams = event_streams(root); anchor = anchor or _first_anchor(streams)
+            streams = event_streams(root); anchor = anchor or _first_anchor(
+                streams, first_omission_tree=first_omission_tree)
             if anchor is not None and not _all_seven_e1_activated(streams, deadline_ns=anchor["source_monotonic_ns"] + _E1_DEADLINE_NS):
                 if raw_clock() > anchor["source_monotonic_ns"] + _E1_DEADLINE_NS: raise LaunchError("all-seven E1 activation missed anchor-plus-20-second deadline")
             sleep(.05)
@@ -460,11 +472,14 @@ def execute_adaptive_e1_pilot(run_directory: Path, authorization_path: Path, *,
         archived = {"profile": fixed._archive_input(root, HERE / "sustained_role_profile.py", "sustained-role-profile.py"), "epoch0_tree": fixed._archive_input(root, Path(plan["epoch0"]["tree"]["path"]), "epoch0.tree"), "main_config": fixed._archive_input(root, Path(plan["configuration"]["main"]["path"]), "main.conf"), "hotstuff_app": fixed._archive_input(root, Path(replicas[0]["argv"][0]), "hotstuff-app"), "adaptation_manager": fixed._archive_input(root, Path(manager[0]), "adaptation-manager"), "e0_identity_helper": fixed._archive_input(root, e0_helper, "e0-identity-helper"), "bundle": bundle, "issuer": issuer}
         replica_configs = [fixed._archive_input(root, Path(row["path"]), f"replica-{i}.conf") for i, row in enumerate(plan["configuration"]["replicas"])]
         if not arm_path.is_file() or arm_path.is_symlink(): raise LaunchError("native manager did not seal its fault-window arm")
-        sealed_anchor = _sealed_anchor_and_coverage(root)
+        sealed_anchor = _sealed_anchor_and_coverage(root, first_omission_tree=first_omission_tree)
         if sealed_anchor["source_sequence"] != anchor["source_sequence"] or sealed_anchor["monotonic_ns"] != anchor["source_monotonic_ns"]:
             raise LaunchError("sealed raw anchor differs from the E1 activation anchor")
         artifacts = {"profile": fixed._descriptor(root, archived["profile"]), "epoch0_tree": fixed._descriptor(root, archived["epoch0_tree"]), "main_config": fixed._descriptor(root, archived["main_config"]), "execution_plan": fixed._descriptor(root, root / PLAN), "authorization_request": fixed._descriptor(root, root / REQUEST), "approved_authorization": fixed._descriptor(root, root / APPROVAL), "e0_identity_receipt": fixed._descriptor(root, root / "runtime/e0-identity-receipt.json"), "e0_identity_helper": fixed._descriptor(root, archived["e0_identity_helper"]), "finalization_receipt": fixed._descriptor(root, root / FINALIZATION), "fault_window_attestation": fixed._descriptor(root, root / ATTESTATION), "manager_events": fixed._descriptor(root, root / "raw/adaptive-manager.jsonl"), "manager_log": fixed._descriptor(root, root / "logs/adaptive-manager.log"), "cleanup": fixed._descriptor(root, root / CLEANUP), "replica_events": [fixed._descriptor(root, root / f"raw/replica-{i}.jsonl") for i in range(7)], "replica_logs": [fixed._descriptor(root, root / f"logs/replica-{i}.log") for i in range(7)], "replica_configs": [fixed._descriptor(root, item) for item in replica_configs], "executables": {"hotstuff_app": fixed._descriptor(root, archived["hotstuff_app"]), "adaptation_manager": fixed._descriptor(root, archived["adaptation_manager"])}, "transition_request": fixed._descriptor(root, request_path), "issuer_public_key": fixed._descriptor(root, archived["issuer"]), "e1_bundle": fixed._descriptor(root, archived["bundle"]), "manager_evidence_snapshot": fixed._descriptor(root, evidence_snapshot), "manager_fault_window_arm": fixed._descriptor(root, arm_path)}
-        receipt = {"schema_version": 1, "kind": KIND, "state": "SEALED_RAW_BUNDLE_NO_CLAIM", "arm": "adaptive_e1", "run_id": _option(manager, "--structured-event-run-id"), "plan_sha256": plan["plan_sha256"], "anchor": sealed_anchor, "horizon": {"clock": "CLOCK_MONOTONIC_RAW", "duration_ns": _HORIZON_NS, "late_offset_ns": _E1_DEADLINE_NS}, "artifacts": artifacts, "launch_binding": {"request_sha256": _sha(request_bytes), "approval_sha256": _sha(_canonical(approval)), "e0_digest": e0_digest, "scheduled_window": {"start_monotonic_ns": start, "end_monotonic_ns": end}, "manager_argv_sha256": _sha(_canonical({"argv": list(manager)})), "manager_executable_sha256": plan["commands"]["manager"]["executable_sha256"], "replica_argv_sha256": [row["sha256"] for row in replicas], "replica_executable_sha256": replicas[0]["executable_sha256"], "native_profile_sha256": plan["native_fault_schedule"]["descriptor"]["sha256"], "selection_profile_sha256": plan["manager_selection_policy"]["descriptor"]["sha256"], "exit_codes": exits}}
+        binding = {"request_sha256": _sha(request_bytes), "approval_sha256": _sha(_canonical(approval)), "e0_digest": e0_digest, "scheduled_window": {"start_monotonic_ns": start, "end_monotonic_ns": end}, "manager_argv_sha256": _sha(_canonical({"argv": list(manager)})), "manager_executable_sha256": plan["commands"]["manager"]["executable_sha256"], "replica_argv_sha256": [row["sha256"] for row in replicas], "replica_executable_sha256": replicas[0]["executable_sha256"], "native_profile_sha256": plan["native_fault_schedule"]["descriptor"]["sha256"], "selection_profile_sha256": plan["manager_selection_policy"]["descriptor"]["sha256"], "exit_codes": exits}
+        if first_omission_tree is not None:
+            binding["first_omission_tree"] = first_omission_tree
+        receipt = {"schema_version": 1, "kind": KIND, "state": "SEALED_RAW_BUNDLE_NO_CLAIM", "arm": "adaptive_e1", "run_id": _option(manager, "--structured-event-run-id"), "plan_sha256": plan["plan_sha256"], "anchor": sealed_anchor, "horizon": {"clock": "CLOCK_MONOTONIC_RAW", "duration_ns": _HORIZON_NS, "late_offset_ns": _E1_DEADLINE_NS}, "artifacts": artifacts, "launch_binding": binding}
         receipt["receipt_sha256"] = _sha(_canonical(receipt)); fixed._write_once(root / RECEIPT, receipt)
         return {"status": "SEALED_RAW_BUNDLE_NO_CLAIM", "receipt_sha256": receipt["receipt_sha256"]}
     except BaseException as exc:

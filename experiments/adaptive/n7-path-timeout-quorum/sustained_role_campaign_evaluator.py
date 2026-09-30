@@ -630,12 +630,14 @@ def _fault_schedule_invariants(plan: Mapping[str, Any], *, label: str) -> dict[s
         "window_start_monotonic_ns", "window_end_monotonic_ns", "common_horizon_ns",
         "minimum_post_start_anchor_slack_ns", "argv_overlay",
     }
+    phase_field = "first_omission_tree"
     if (not isinstance(values, Mapping) or set(values) != expected_values or
             values.get("schema_version") != 1 or
             values.get("profile_id") != "n7-role-scoped-persistent-selected-omission-v1" or
             values.get("status") != "PREFLIGHT_ONLY_NO_EXECUTION" or
             protocol != {"replica_ids": list(range(7)), "fault_threshold": 2, "quorum": 5} or
-            not isinstance(fault, Mapping) or set(fault) != expected_fault):
+            not isinstance(fault, Mapping) or
+            set(fault) not in (expected_fault, expected_fault | {phase_field})):
         _fail(f"{label} native fault schedule schema drifted")
     start, end = fault.get("window_start_monotonic_ns"), fault.get("window_end_monotonic_ns")
     fixed = {
@@ -652,6 +654,9 @@ def _fault_schedule_invariants(plan: Mapping[str, Any], *, label: str) -> dict[s
     if (type(start) is not int or type(end) is not int or end <= start or
             any(fault.get(key) != value for key, value in fixed.items())):
         _fail(f"{label} native fault policy differs from frozen W19")
+    first_omission_tree = fault.get(phase_field)
+    if first_omission_tree is not None and first_omission_tree != 4:
+        _fail(f"{label} first omission tree differs from frozen tree 4")
     expected_overlay = [
         "--experiment-byzantine-mode", fixed["native_mode"],
         "--experiment-byzantine-window", values["profile_id"],
@@ -661,9 +666,12 @@ def _fault_schedule_invariants(plan: Mapping[str, Any], *, label: str) -> dict[s
         "--experiment-byzantine-max-omissions-per-proposal", "1",
         "--experiment-rotating-omission-context-limit", "100000",
     ]
+    if first_omission_tree is not None:
+        expected_overlay.extend(("--experiment-byzantine-first-omission-tree", "4"))
     if fault.get("argv_overlay") != expected_overlay:
         _fail(f"{label} native fault argv differs from its declared window")
-    return {**fixed, "fault_schedule_duration_ns": end - start}
+    return {**fixed, "first_omission_tree": first_omission_tree,
+            "fault_schedule_duration_ns": end - start}
 
 
 def _one_cell(record: Mapping[str, Any], *, expected_pair: int, expected_ordinal: int,

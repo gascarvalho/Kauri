@@ -75,6 +75,10 @@ struct ExperimentRotatingOmissionOptions final
     std::size_t maximum_contexts{0};
     std::vector<ReplicaID> responsive_degraded_actor_ids;
     std::size_t responsive_omission_period{0};
+    // Optional experiment-only phase latch. The role-scoped persistent mode
+    // forwards until an inside-window Epoch-0 contribution reaches this tree,
+    // then retains its normal omission behavior across subsequent roles.
+    std::optional<std::uint32_t> first_omission_tree;
 };
 
 struct ExperimentOmissionMarker final

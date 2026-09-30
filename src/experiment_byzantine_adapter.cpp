@@ -503,6 +503,12 @@ struct ExperimentByzantineAdapter::State
                  scheduled.expected_actor_count != 1))
                 throw std::invalid_argument(
                     "role-scoped persistent omission requires exactly one hard actor");
+            if (scheduled.first_omission_tree.has_value() &&
+                (scheduled.mode != kRoleScopedPersistentOmissionMode ||
+                 *scheduled.first_omission_tree != 4 ||
+                 *scheduled.first_omission_tree >= scheduled.replica_count))
+                throw std::invalid_argument(
+                    "first omission tree requires frozen in-range role-scoped persistent tree 4");
             std::sort(
                 scheduled.responsive_degraded_actor_ids.begin(),
                 scheduled.responsive_degraded_actor_ids.end());
@@ -643,8 +649,24 @@ struct ExperimentByzantineAdapter::State
             scheduled.mode == kRoleScopedPersistentOmissionMode)
         {
             decision.cohort = local_actor_cohort();
+            bool phase_latch_allows_omission = true;
+            if (scheduled.mode == kRoleScopedPersistentOmissionMode &&
+                scheduled.first_omission_tree.has_value() &&
+                !first_omission_tree_reached)
+            {
+                phase_latch_allows_omission =
+                    inside_window &&
+                    decision.cohort == ExperimentOmissionCohort::hard &&
+                    role != ExperimentReplicaRole::root &&
+                    context.proposal.configuration.epoch_number == 0 &&
+                    context.proposal.configuration.tree_id ==
+                        *scheduled.first_omission_tree;
+                if (phase_latch_allows_omission)
+                    first_omission_tree_reached = true;
+            }
             decision.auditable =
-                inside_window && role != ExperimentReplicaRole::root &&
+                inside_window && phase_latch_allows_omission &&
+                role != ExperimentReplicaRole::root &&
                 decision.cohort != ExperimentOmissionCohort::none;
             if (decision.auditable)
             {
@@ -1047,6 +1069,7 @@ struct ExperimentByzantineAdapter::State
         responsive_epoch_role_contribution_ordinals;
     std::size_t scheduled_fault_threshold{0};
     bool scheduled_capacity_marker_emitted{false};
+    bool first_omission_tree_reached{false};
 };
 
 ExperimentByzantineAdapter::ExperimentByzantineAdapter(

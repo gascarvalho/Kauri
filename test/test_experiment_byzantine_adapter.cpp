@@ -1884,6 +1884,88 @@ TEST_CASE(
 }
 
 TEST_CASE(
+    "role-scoped first-omission tree gates E0 onset then persists across roles",
+    "[adaptive-v2][experiment][byzantine][persistent][role-scoped][phase]")
+{
+    ExperimentByzantineAdapter legacy(
+        role_scoped_single_hard_options(1));
+    auto phased = role_scoped_single_hard_options(1);
+    phased.rotating_omission->first_omission_tree = 4;
+    ExperimentByzantineAdapter adapter(std::move(phased));
+    const auto epoch_zero_digest = digest("role-scoped-phased-e0");
+    const auto epoch_one_digest = digest("role-scoped-phased-e1");
+    const auto e0 = [&epoch_zero_digest](
+                        const std::string &label, std::uint32_t tree_id)
+    {
+        return context(
+            label,
+            ConfigurationId{0, tree_id, epoch_zero_digest},
+            "factorial-window-1");
+    };
+    const auto e1 = [&epoch_one_digest](
+                        const std::string &label, std::uint32_t tree_id)
+    {
+        return context(
+            label,
+            ConfigurationId{1, tree_id, epoch_one_digest},
+            "factorial-window-1");
+    };
+
+    CHECK(legacy.consume_outbound_aggregate(
+        e0("phase-legacy-tree-5", 5),
+        ExperimentReplicaRole::internal, 100));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        e0("phase-before-window-tree-4", 4),
+        ExperimentReplicaRole::internal, 99));
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        e0("phase-inside-window-tree-5", 5),
+        ExperimentReplicaRole::internal, 100));
+    CHECK(adapter.consume_outbound_direct_vote(
+              e1("phase-future-e1-tree-4", 4),
+              ExperimentReplicaRole::leaf, 101) ==
+          ExperimentDirectVoteDisposition::forward);
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        e0("phase-root-tree-4", 4), ExperimentReplicaRole::root, 102));
+
+    CHECK(adapter.consume_outbound_aggregate(
+        e0("phase-latch-tree-4", 4),
+        ExperimentReplicaRole::internal, 103));
+    CHECK(adapter.consume_outbound_aggregate(
+        e0("phase-persist-tree-5", 5),
+        ExperimentReplicaRole::internal, 104));
+    CHECK(adapter.consume_outbound_direct_vote(
+              e1("phase-persist-e1-leaf", 2),
+              ExperimentReplicaRole::leaf, 105) ==
+          ExperimentDirectVoteDisposition::omit_first);
+    CHECK_FALSE(adapter.consume_outbound_aggregate(
+        e0("phase-after-window", 4),
+        ExperimentReplicaRole::internal, 200));
+}
+
+TEST_CASE(
+    "first-omission tree is limited to the role-scoped persistent mode",
+    "[adaptive-v2][experiment][byzantine][persistent][role-scoped][phase]")
+{
+    auto wrong_mode = persistent_omission_options(1);
+    wrong_mode.rotating_omission->first_omission_tree = 4;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(std::move(wrong_mode)),
+        std::invalid_argument);
+
+    auto wrong_tree = role_scoped_single_hard_options(1);
+    wrong_tree.rotating_omission->first_omission_tree = 3;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(std::move(wrong_tree)),
+        std::invalid_argument);
+
+    auto outside_membership = role_scoped_single_hard_options(1);
+    outside_membership.rotating_omission->first_omission_tree = 7;
+    CHECK_THROWS_AS(
+        ExperimentByzantineAdapter(std::move(outside_membership)),
+        std::invalid_argument);
+}
+
+TEST_CASE(
     "tiered responsive-degraded cohort query is diagnostic-only",
     "[adaptive-v2][experiment][byzantine][tiered][cohort-query]")
 {
@@ -2740,6 +2822,10 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         declarations.find(
+            "opt_experiment_byzantine_first_omission_tree") !=
+        std::string::npos);
+    CHECK(
+        declarations.find(
             "opt_experiment_byzantine_max_omissions_per_proposal") !=
         std::string::npos);
     CHECK(
@@ -2816,6 +2902,10 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         application.find(
+            "\"experiment-byzantine-first-omission-tree\"") !=
+        std::string::npos);
+    CHECK(
+        application.find(
             "\"experiment-byzantine-max-omissions-per-proposal\"") !=
         std::string::npos);
     CHECK(
@@ -2864,6 +2954,17 @@ TEST_CASE(
         std::string::npos);
     CHECK(
         parser.find("raw_responsive_degraded_omission_actors") !=
+        std::string::npos);
+    CHECK(
+        parser.find("raw_first_omission_tree") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "raw_first_omission_tree != \"4\"") !=
+        std::string::npos);
+    CHECK(
+        parser.find(
+            "options.rotating_omission->first_omission_tree = 4") !=
         std::string::npos);
     CHECK(
         parser.find("responsive_omission_period") !=

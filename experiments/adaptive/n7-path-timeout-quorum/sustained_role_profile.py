@@ -22,6 +22,9 @@ COMMON_HORIZON_NS = 60_000_000_000
 MINIMUM_POST_START_ANCHOR_SLACK_NS = 10_000_000_000
 CONTEXT_LIMIT = 100_000
 MAX_OMISSIONS_PER_PROPOSAL = 1
+# Optional v1-compatible phase gate: when present, actor 1 must first see an
+# in-window selected opportunity on this tree before any scheduled omission.
+FIRST_OMISSION_TREE = 4
 PATH_TIMEOUT_SELECTION_PROFILE_ID = "n7-path-local-timeout-quorum-v4"
 PATH_TIMEOUT_SELECTION_PROFILE_SHA256 = "3e2b2af834279168199db31bd5ee47e0abdef480d1d5327a17cbcc1b57efc244"
 PATH_TIMEOUT_ARM_DOMAIN = "kauri-focused-fault-window-arm-v4"
@@ -258,7 +261,8 @@ def _positive_uint64(value: object, label: str) -> int:
 
 
 def argv_overlay(*, window_start_monotonic_ns: int,
-                 window_end_monotonic_ns: int) -> tuple[str, ...]:
+                 window_end_monotonic_ns: int,
+                 first_omission_tree: int | None = None) -> tuple[str, ...]:
     """Return the exact native scheduled-fault options for actor 1.
 
     The mode is deliberately configuration-independent: Epoch-1 leaf
@@ -273,7 +277,7 @@ def argv_overlay(*, window_start_monotonic_ns: int,
         raise SustainedRoleProfileError(
             "fault window must cover a positive post-start anchor allowance plus the 60-second common horizon"
         )
-    return (
+    overlay = (
         "--experiment-byzantine-mode", NATIVE_MODE,
         "--experiment-byzantine-window", PROFILE_ID,
         "--experiment-rotating-omission-actors", str(ACTOR_ID),
@@ -283,14 +287,21 @@ def argv_overlay(*, window_start_monotonic_ns: int,
         str(MAX_OMISSIONS_PER_PROPOSAL),
         "--experiment-rotating-omission-context-limit", str(CONTEXT_LIMIT),
     )
+    if first_omission_tree is None:
+        return overlay
+    if type(first_omission_tree) is not int or first_omission_tree != FIRST_OMISSION_TREE:
+        raise SustainedRoleProfileError("first omission tree must be frozen tree 4 or absent")
+    return overlay + ("--experiment-byzantine-first-omission-tree", str(first_omission_tree))
 
 
 def preflight(*, window_start_monotonic_ns: int,
-              window_end_monotonic_ns: int) -> dict[str, Any]:
+              window_end_monotonic_ns: int,
+              first_omission_tree: int | None = None) -> dict[str, Any]:
     """Describe one bounded prospective input without authorizing execution."""
     overlay = argv_overlay(
         window_start_monotonic_ns=window_start_monotonic_ns,
         window_end_monotonic_ns=window_end_monotonic_ns,
+        first_omission_tree=first_omission_tree,
     )
     return {
         "schema_version": 1,
@@ -318,6 +329,7 @@ def preflight(*, window_start_monotonic_ns: int,
             "window_end_monotonic_ns": window_end_monotonic_ns,
             "common_horizon_ns": COMMON_HORIZON_NS,
             "minimum_post_start_anchor_slack_ns": MINIMUM_POST_START_ANCHOR_SLACK_NS,
+            "first_omission_tree": first_omission_tree,
             "argv_overlay": list(overlay),
         },
     }

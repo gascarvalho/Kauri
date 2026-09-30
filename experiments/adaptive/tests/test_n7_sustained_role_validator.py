@@ -188,6 +188,59 @@ def test_validator_accepts_exact_fixed_e0_raw_replay_with_bounded_receipt(tmp_pa
     assert verdict["commit_metric"]["counts"] == {"common_completed_commits": 1}
 
 
+def test_validator_rejects_phase_gated_anchor_outside_tree_four(tmp_path: Path) -> None:
+    receipt_path = _accepted_fixed_bundle(tmp_path)
+    receipt = json.loads(receipt_path.read_text())
+    plan_descriptor = receipt["artifacts"]["execution_plan"]
+    plan = json.loads((tmp_path / plan_descriptor["path"]).read_text())
+    actor = plan["commands"]["replicas"][1]
+    actor["argv"].extend(["--experiment-byzantine-first-omission-tree", "4"])
+    actor["sha256"] = hashlib.sha256(
+        _canonical({"schema_version": 1, "argv": actor["argv"]})).hexdigest()
+    plan.pop("plan_sha256")
+    plan["plan_sha256"] = hashlib.sha256(_canonical(plan)).hexdigest()
+    receipt["plan_sha256"] = plan["plan_sha256"]
+    receipt["artifacts"]["execution_plan"] = _write(
+        tmp_path, plan_descriptor["path"], _canonical(plan))
+    request_descriptor = receipt["artifacts"]["authorization_request"]
+    request = json.loads((tmp_path / request_descriptor["path"]).read_text())
+    request["execution_plan_sha256"] = plan["plan_sha256"]
+    receipt["artifacts"]["authorization_request"] = _write(
+        tmp_path, request_descriptor["path"], _canonical(request))
+    approval_descriptor = receipt["artifacts"]["approved_authorization"]
+    approval = json.loads((tmp_path / approval_descriptor["path"]).read_text())
+    approval["request_sha256"] = receipt["artifacts"]["authorization_request"]["sha256"]
+    approval["plan_sha256"] = plan["plan_sha256"]
+    receipt["artifacts"]["approved_authorization"] = _write(
+        tmp_path, approval_descriptor["path"], _canonical(approval))
+    binding = receipt["launch_binding"]
+    binding["request_sha256"] = receipt["artifacts"]["authorization_request"]["sha256"]
+    binding["approval_sha256"] = receipt["artifacts"]["approved_authorization"]["sha256"]
+    binding["replica_argv_sha256"][1] = actor["sha256"]
+    binding["first_omission_tree"] = 4
+    finalization_descriptor = receipt["artifacts"]["finalization_receipt"]
+    finalization = json.loads((tmp_path / finalization_descriptor["path"]).read_text())
+    finalization["plan_sha256"] = plan["plan_sha256"]
+    finalization["authorization_sha256"] = receipt["artifacts"]["approved_authorization"]["sha256"]
+    receipt["artifacts"]["finalization_receipt"] = _write(
+        tmp_path, finalization_descriptor["path"], _canonical(finalization))
+    events_descriptor = receipt["artifacts"]["replica_events"][1]
+    events = [json.loads(line) for line in (tmp_path / events_descriptor["path"]).read_text().splitlines()]
+    opportunity = next(event for event in events if event["event_type"] == "fault.contribution_opportunity")
+    opportunity["payload"]["proposal"]["tree_id"] = 3
+    raw_events = _jsonl(events)
+    receipt["artifacts"]["replica_events"][1] = _write(
+        tmp_path, events_descriptor["path"], raw_events)
+    receipt["anchor"]["line_sha256"] = hashlib.sha256(
+        _jsonl([opportunity]).rstrip(b"\n")).hexdigest()
+    receipt["receipt_sha256"] = hashlib.sha256(_canonical({
+        key: value for key, value in receipt.items() if key != "receipt_sha256"
+    })).hexdigest()
+    receipt_path.write_bytes(_canonical(receipt))
+    with pytest.raises(subject.ValidationError, match="frozen first-omission tree"):
+        subject.validate_raw_bundle(tmp_path, receipt_path.name)
+
+
 def test_source_derived_digest_matches_the_native_n7_epoch_zero_fixture() -> None:
     tree = (ROOT / "n7-path-timeout-quorum" / "epoch0.tree").read_bytes()
     assert subject._source_adaptive_v2_epoch_zero_digest(tree) == (

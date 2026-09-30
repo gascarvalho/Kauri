@@ -297,6 +297,7 @@ parse_experiment_byzantine_options(
     int responsive_omission_period,
     const std::string &raw_window_start_monotonic_ns,
     const std::string &raw_window_end_monotonic_ns,
+    const std::string &raw_first_omission_tree,
     int max_omissions_per_proposal,
     int maximum_rotating_contexts,
     const std::string &raw_response_evidence_duplicate_probe,
@@ -314,6 +315,7 @@ parse_experiment_byzantine_options(
         responsive_omission_period != 0 ||
         !raw_window_start_monotonic_ns.empty() ||
         !raw_window_end_monotonic_ns.empty() ||
+        !raw_first_omission_tree.empty() ||
         max_omissions_per_proposal != 0 ||
         maximum_rotating_contexts != 0 ||
         !raw_response_evidence_duplicate_probe.empty();
@@ -368,6 +370,12 @@ parse_experiment_byzantine_options(
             "select exactly one experiment Byzantine fault mode");
     if (scheduled_mode)
     {
+        if (!raw_first_omission_tree.empty() &&
+            (fault_mode !=
+                 "role_scoped_persistent_selected_omission_v1" ||
+             raw_first_omission_tree != "4"))
+            throw HotStuffError(
+                "first omission tree requires role-scoped mode and tree 4");
         if (fault_mode != "rotating_intermittent_omission_v1" &&
             fault_mode != "persistent_selected_omission_v1" &&
             fault_mode != "role_scoped_persistent_selected_omission_v1" &&
@@ -574,6 +582,8 @@ parse_experiment_byzantine_options(
                 tiered_mode
                     ? static_cast<std::size_t>(responsive_omission_period)
                     : std::size_t{0}};
+        if (!raw_first_omission_tree.empty())
+            options.rotating_omission->first_omission_tree = 4;
         return options;
     }
 
@@ -1149,6 +1159,8 @@ int main(int argc, char **argv)
         Config::OptValStr::create("");
     auto opt_experiment_byzantine_window_end_monotonic_ns =
         Config::OptValStr::create("");
+    auto opt_experiment_byzantine_first_omission_tree =
+        Config::OptValStr::create("");
     auto opt_experiment_byzantine_max_omissions_per_proposal =
         Config::OptValInt::create(0);
     auto opt_experiment_rotating_omission_context_limit =
@@ -1454,6 +1466,12 @@ int main(int argc, char **argv)
         -1,
         "exclusive scheduled omission window end on CLOCK_MONOTONIC_RAW");
     config.add_opt(
+        "experiment-byzantine-first-omission-tree",
+        opt_experiment_byzantine_first_omission_tree,
+        Config::SET_VAL,
+        -1,
+        "optional role-scoped first omission phase, exact E0 tree 4");
+    config.add_opt(
         "experiment-byzantine-max-omissions-per-proposal",
         opt_experiment_byzantine_max_omissions_per_proposal,
         Config::SET_VAL,
@@ -1616,6 +1634,7 @@ int main(int argc, char **argv)
             opt_experiment_responsive_omission_period->get(),
             opt_experiment_byzantine_window_start_monotonic_ns->get(),
             opt_experiment_byzantine_window_end_monotonic_ns->get(),
+            opt_experiment_byzantine_first_omission_tree->get(),
             opt_experiment_byzantine_max_omissions_per_proposal->get(),
             opt_experiment_rotating_omission_context_limit->get(),
             opt_experiment_response_evidence_duplicate_probe->get(),

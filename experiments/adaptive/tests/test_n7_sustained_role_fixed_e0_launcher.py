@@ -26,6 +26,45 @@ def test_scheduled_manager_binds_source_e0_identity_and_rejects_legacy_control()
         subject._scheduled_manager(plan, e0_digest="b" * 64)
 
 
+def test_first_omission_tree_is_bound_across_actor_argv_and_frozen_profile():
+    option = "--experiment-byzantine-first-omission-tree"
+    plan = {
+        "commands": {"replicas": [
+            {"argv": ["app"]} if replica != 1 else {"argv": ["app", option, "4"]}
+            for replica in range(7)
+        ]},
+        "native_fault_schedule": {"values": {"fault": {"first_omission_tree": 4}}},
+    }
+    assert subject._first_omission_tree(plan) == 4
+    plan["native_fault_schedule"]["values"]["fault"]["first_omission_tree"] = 3
+    with pytest.raises(subject.LaunchError, match="differs from frozen profile"):
+        subject._first_omission_tree(plan)
+    plan["commands"]["replicas"][1]["argv"][-1] = "3"
+    with pytest.raises(subject.LaunchError, match="frozen tree 4"):
+        subject._first_omission_tree(plan)
+
+
+def test_phase_gated_fixed_anchor_rejects_first_physical_omission_outside_tree_four(
+        tmp_path: Path):
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    event = {
+        "event_type": "fault.contribution_opportunity", "source_sequence": 1,
+        "source_monotonic_ns": 10,
+        "payload": {"actor": 1,
+                    "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                    "physical_role": "internal", "scheduled_action": "omit_aggregate",
+                    "proposal": {"tree_id": 3}},
+    }
+    for source in (f"replica-{replica}" for replica in range(7)):
+        rows = [event, {"source_monotonic_ns": 60_000_000_010}] if source == "replica-1" else [
+            {"source_monotonic_ns": 60_000_000_010}]
+        (root / "raw" / f"{source}.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in rows))
+    with pytest.raises(subject.LaunchError, match="first actor-1 physical omission does not bind frozen tree 4 internal aggregate"):
+        subject._physical_anchor_and_coverage(root, first_omission_tree=4)
+
+
 def test_plan_digest_matches_sustained_role_producer_convention():
     plan = {"schema_version": 1, "kind": "kauri-n7-sustained-role-execution-plan-v1"}
     plan["plan_sha256"] = hashlib.sha256(_canon(plan)).hexdigest()

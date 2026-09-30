@@ -36,6 +36,59 @@ def test_anchor_is_only_native_actor_one_internal_aggregate_omission():
     assert subject._first_anchor(streams)["source_sequence"] == 4
 
 
+def test_phase_gated_adaptive_anchor_rejects_earlier_wrong_tree():
+    streams = {"replica-1": [
+        {"event_type": "fault.contribution_opportunity", "source_sequence": 1,
+         "source_monotonic_ns": 10,
+         "payload": {"actor": 1,
+                     "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                     "physical_role": "internal", "scheduled_action": "omit_aggregate",
+                     "proposal": {"epoch_number": 0, "tree_id": 3}}},
+        {"event_type": "fault.contribution_opportunity", "source_sequence": 2,
+         "source_monotonic_ns": 11,
+         "payload": {"actor": 1,
+                     "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                     "physical_role": "internal", "scheduled_action": "omit_aggregate",
+                     "proposal": {"epoch_number": 0, "tree_id": 4}}},
+    ]}
+    with pytest.raises(subject.LaunchError, match="first actor-1 physical omission does not bind frozen tree 4 internal aggregate"):
+        subject._first_anchor(streams, first_omission_tree=4)
+
+
+def test_phase_gated_adaptive_anchor_rejects_earlier_direct_vote():
+    streams = {"replica-1": [
+        {"event_type": "fault.contribution_opportunity", "source_sequence": 1,
+         "source_monotonic_ns": 10,
+         "payload": {"actor": 1,
+                     "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                     "physical_role": "leaf", "scheduled_action": "omit_direct_vote",
+                     "proposal": {"epoch_number": 0, "tree_id": 4}}},
+    ]}
+    with pytest.raises(subject.LaunchError, match="first actor-1 physical omission does not bind frozen tree 4 internal aggregate"):
+        subject._first_anchor(streams, first_omission_tree=4)
+
+
+def test_phase_gated_adaptive_sealed_anchor_rejects_only_pre_tree_four_omission(
+        tmp_path: Path):
+    root = tmp_path / "run"
+    (root / "raw").mkdir(parents=True)
+    opportunity = {
+        "event_type": "fault.contribution_opportunity", "source_sequence": 1,
+        "source_monotonic_ns": 10,
+        "payload": {"actor": 1,
+                    "fault_mode": "role_scoped_persistent_selected_omission_v1",
+                    "physical_role": "internal", "scheduled_action": "omit_aggregate",
+                    "proposal": {"tree_id": 3}},
+    }
+    for source in ("adaptive-manager", *[f"replica-{replica}" for replica in range(7)]):
+        rows = [opportunity, {"source_monotonic_ns": 60_000_000_010}] if source == "replica-1" else [
+            {"source_monotonic_ns": 60_000_000_010}]
+        (root / "raw" / f"{source}.jsonl").write_text(
+            "".join(__import__("json").dumps(row) + "\n" for row in rows))
+    with pytest.raises(subject.LaunchError, match="first actor-1 physical omission does not bind frozen tree 4 internal aggregate"):
+        subject._sealed_anchor_and_coverage(root, first_omission_tree=4)
+
+
 def test_all_seven_native_v2_e1_activations_are_deadline_bound():
     streams = {f"replica-{i}": [{"event_type": "epoch.activated", "source_monotonic_ns": 20,
                                    "payload": {"epoch_number": 1, "tree_id": 0,

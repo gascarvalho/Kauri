@@ -273,7 +273,8 @@ def _check_receipt(receipt: Mapping[str, Any]) -> None:
         "replica_executable_sha256", "native_profile_sha256", "selection_profile_sha256",
         "exit_codes",
     }
-    if not isinstance(binding, Mapping) or set(binding) != expected_binding:
+    optional_binding = {"first_omission_tree"}
+    if not isinstance(binding, Mapping) or set(binding) not in (expected_binding, expected_binding | optional_binding):
         raise ValidationError("receipt launch binding has schema drift")
     for key in ("request_sha256", "approval_sha256", "e0_digest", "manager_argv_sha256",
                 "manager_executable_sha256", "replica_executable_sha256", "native_profile_sha256",
@@ -282,6 +283,8 @@ def _check_receipt(receipt: Mapping[str, Any]) -> None:
     if (not isinstance(binding["replica_argv_sha256"], list) or len(binding["replica_argv_sha256"]) != 7 or
             any(_hex64(value, "receipt replica argv") != value for value in binding["replica_argv_sha256"])):
         raise ValidationError("receipt replica argv binding is invalid")
+    if "first_omission_tree" in binding and binding["first_omission_tree"] != 4:
+        raise ValidationError("receipt first-omission tree differs from frozen tree 4")
     window = binding["scheduled_window"]
     if (not isinstance(window, Mapping) or set(window) != {"start_monotonic_ns", "end_monotonic_ns"} or
             type(window["start_monotonic_ns"]) is not int or type(window["end_monotonic_ns"]) is not int or
@@ -512,6 +515,26 @@ def _validate_archived_launch_binding(plan: Mapping[str, Any], artifacts: Mappin
     if (replica_hashes != binding["replica_argv_sha256"] or
             any(row["executable_sha256"] != binding["replica_executable_sha256"] for row in replicas)):
         raise ValidationError("replica receipt launch binding differs from archived plan")
+    actor_argv = replicas[1]["argv"]
+    gate_option = "--experiment-byzantine-first-omission-tree"
+    if gate_option not in actor_argv:
+        first_omission_tree = None
+    else:
+        if actor_argv.count(gate_option) != 1:
+            raise ValidationError("actor-1 first-omission tree option is ambiguous")
+        gate_index = actor_argv.index(gate_option)
+        if (gate_index + 1 >= len(actor_argv) or not isinstance(actor_argv[gate_index + 1], str) or
+                not actor_argv[gate_index + 1].isdigit()):
+            raise ValidationError("actor-1 first-omission tree option is malformed")
+        first_omission_tree = int(actor_argv[gate_index + 1])
+        if first_omission_tree != 4 or actor_argv[gate_index + 1] != str(first_omission_tree):
+            raise ValidationError("actor-1 first-omission tree differs from frozen tree 4")
+    native_values = native.get("values")
+    native_fault = native_values.get("fault") if isinstance(native_values, Mapping) else None
+    if isinstance(native_fault, Mapping) and native_fault.get("first_omission_tree") != first_omission_tree:
+        raise ValidationError("actor-1 first-omission tree differs from archived profile")
+    if binding.get("first_omission_tree") != first_omission_tree:
+        raise ValidationError("receipt first-omission tree differs from archived actor argv")
     expected_descriptors = (
         (epoch0.get("tree"), artifacts["epoch0_tree"], "Epoch-0 tree"),
         (configuration.get("main"), artifacts["main_config"], "main config"),
@@ -1166,14 +1189,36 @@ def validate_raw_bundle(root: Path, receipt_path: Path) -> dict[str, Any]:
             not isinstance(proposal, Mapping) or proposal.get("epoch_number") != 0 or
             proposal.get("epoch_digest") != receipt["launch_binding"]["e0_digest"]):
         raise ValidationError("receipt anchor is not the scheduled actor-1 role-scoped fault")
+    first_omission_tree = receipt["launch_binding"].get("first_omission_tree")
+    if first_omission_tree is not None and proposal.get("tree_id") != first_omission_tree:
+        raise ValidationError("receipt anchor does not bind the frozen first-omission tree")
+    if first_omission_tree is not None:
+        first_actor_opportunity = next((item for item in streams["replica-1"]
+                                        if item["event_type"] == "fault.contribution_opportunity" and
+                                        isinstance(item.get("payload"), Mapping) and
+                                        item["payload"].get("actor") == 1), None)
+        first_payload = (first_actor_opportunity.get("payload")
+                         if isinstance(first_actor_opportunity, Mapping) else None)
+        first_proposal = (first_payload.get("proposal")
+                          if isinstance(first_payload, Mapping) else None)
+        if not (isinstance(first_payload, Mapping) and
+                first_payload.get("fault_mode") == "role_scoped_persistent_selected_omission_v1" and
+                first_payload.get("physical_role") == "internal" and
+                first_payload.get("scheduled_action") == "omit_aggregate" and
+                isinstance(first_proposal, Mapping) and first_proposal.get("epoch_number") == 0 and
+                first_proposal.get("tree_id") == first_omission_tree):
+            raise ValidationError("first actor-1 physical omission does not bind frozen tree 4 internal aggregate")
     first_anchor = next((item for item in streams["replica-1"]
                          if item["event_type"] == "fault.contribution_opportunity" and
                          isinstance(item.get("payload"), Mapping) and
                          item["payload"].get("actor") == 1 and
                          item["payload"].get("physical_role") == "internal" and
-                         item["payload"].get("scheduled_action") == "omit_aggregate"), None)
+                         item["payload"].get("scheduled_action") == "omit_aggregate" and
+                         (first_omission_tree is None or
+                          isinstance(item["payload"].get("proposal"), Mapping) and
+                          item["payload"]["proposal"].get("tree_id") == first_omission_tree)), None)
     if first_anchor is None or first_anchor["source_sequence"] != anchor["source_sequence"]:
-        raise ValidationError("receipt anchor is not the first E0 internal aggregate omission")
+        raise ValidationError("receipt anchor is not the first selected E0 internal aggregate omission")
     if any(not stream or stream[-1]["source_monotonic_ns"] < anchor["monotonic_ns"] + _HORIZON_NS for stream in streams.values()):
         raise ValidationError("replica streams do not cover the common horizon")
     opportunities = [_opportunity_identity(item) for item in streams["replica-1"] if item["event_type"] == "fault.contribution_opportunity"]

@@ -79,9 +79,35 @@ def _main_config(root: Path, *, ordinal: int,
     return ("\n".join(lines) + "\n").encode("ascii")
 
 
-def _native_fault_schedule(start: int) -> dict[str, Any]:
+def _native_fault_schedule(start: int, *, first_omission_tree: int | None = None) -> dict[str, Any]:
     end = start + 70_000_000_000
     profile_id = "n7-role-scoped-persistent-selected-omission-v1"
+    fault = {
+        "native_mode": "role_scoped_persistent_selected_omission_v1",
+        "actor_id": 1,
+        "hard_actor_count": 1,
+        "responsive_degraded_actor_count": 0,
+        "responsive_omission_period": 0,
+        "max_omissions_per_proposal": 1,
+        "context_limit": 100_000,
+        "window_start_monotonic_ns": start,
+        "window_end_monotonic_ns": end,
+        "common_horizon_ns": 60_000_000_000,
+        "minimum_post_start_anchor_slack_ns": 10_000_000_000,
+        "argv_overlay": [
+            "--experiment-byzantine-mode", "role_scoped_persistent_selected_omission_v1",
+            "--experiment-byzantine-window", profile_id,
+            "--experiment-rotating-omission-actors", "1",
+            "--experiment-byzantine-window-start-monotonic-ns", str(start),
+            "--experiment-byzantine-window-end-monotonic-ns", str(end),
+            "--experiment-byzantine-max-omissions-per-proposal", "1",
+            "--experiment-rotating-omission-context-limit", "100000",
+        ],
+    }
+    if first_omission_tree is not None:
+        fault["first_omission_tree"] = first_omission_tree
+        fault["argv_overlay"].extend(
+            ["--experiment-byzantine-first-omission-tree", str(first_omission_tree)])
     return {
         "descriptor": {"path": "sustained_role_profile.py", "sha256": "unused-in-test"},
         "values": {
@@ -90,28 +116,7 @@ def _native_fault_schedule(start: int) -> dict[str, Any]:
             "status": "PREFLIGHT_ONLY_NO_EXECUTION",
             "claim_boundary": "synthetic no-launch fixture",
             "protocol": {"replica_ids": list(range(7)), "fault_threshold": 2, "quorum": 5},
-            "fault": {
-                "native_mode": "role_scoped_persistent_selected_omission_v1",
-                "actor_id": 1,
-                "hard_actor_count": 1,
-                "responsive_degraded_actor_count": 0,
-                "responsive_omission_period": 0,
-                "max_omissions_per_proposal": 1,
-                "context_limit": 100_000,
-                "window_start_monotonic_ns": start,
-                "window_end_monotonic_ns": end,
-                "common_horizon_ns": 60_000_000_000,
-                "minimum_post_start_anchor_slack_ns": 10_000_000_000,
-                "argv_overlay": [
-                    "--experiment-byzantine-mode", "role_scoped_persistent_selected_omission_v1",
-                    "--experiment-byzantine-window", profile_id,
-                    "--experiment-rotating-omission-actors", "1",
-                    "--experiment-byzantine-window-start-monotonic-ns", str(start),
-                    "--experiment-byzantine-window-end-monotonic-ns", str(end),
-                    "--experiment-byzantine-max-omissions-per-proposal", "1",
-                    "--experiment-rotating-omission-context-limit", "100000",
-                ],
-            },
+            "fault": fault,
         },
     }
 
@@ -268,6 +273,25 @@ def _campaign(tmp_path: Path, *, fixed_counts: list[int] | None = None,
                                count=(fixed_counts if arm == subject.FIXED_ARM else adaptive_counts)[pair_index - 1],
                                start=ordinal * 100_000_000_000))
     return cells
+
+
+def test_fault_schedule_accepts_legacy_absence_and_binds_phase_gate_tree_four() -> None:
+    legacy = subject._fault_schedule_invariants(
+        {"native_fault_schedule": _native_fault_schedule(10)}, label="legacy")
+    gated = subject._fault_schedule_invariants(
+        {"native_fault_schedule": _native_fault_schedule(10, first_omission_tree=4)}, label="gated")
+    assert legacy["first_omission_tree"] is None
+    assert gated["first_omission_tree"] == 4
+
+
+def test_fault_schedule_rejects_foreign_phase_gate_or_argv_mismatch() -> None:
+    foreign = _native_fault_schedule(10, first_omission_tree=3)
+    with pytest.raises(subject.CampaignEvaluationError, match="frozen tree 4"):
+        subject._fault_schedule_invariants({"native_fault_schedule": foreign}, label="foreign")
+    mismatch = _native_fault_schedule(10, first_omission_tree=4)
+    mismatch["values"]["fault"]["argv_overlay"][-1] = "3"
+    with pytest.raises(subject.CampaignEvaluationError, match="native fault argv"):
+        subject._fault_schedule_invariants({"native_fault_schedule": mismatch}, label="mismatch")
 
 
 @pytest.fixture(autouse=True)

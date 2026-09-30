@@ -289,6 +289,7 @@ def prepare_dry_run(
     replica_commands: Sequence[Sequence[str]],
     window_start_monotonic_ns: int,
     window_end_monotonic_ns: int,
+    first_omission_tree: int | None = profile.FIRST_OMISSION_TREE,
     hard_timeout_seconds: int = 180,
     repository_snapshot: Callable[[Path], object] = base.verify_repository_state,
     native_mode_revision_check: Callable[[str], bool] = _native_mode_revision_present,
@@ -336,6 +337,7 @@ def prepare_dry_run(
     overlay = profile.argv_overlay(
         window_start_monotonic_ns=window_start_monotonic_ns,
         window_end_monotonic_ns=window_end_monotonic_ns,
+        first_omission_tree=first_omission_tree,
     )
     forbidden = {
         "--experiment-omit-outbound-aggregate",
@@ -371,6 +373,7 @@ def prepare_dry_run(
     preflight = profile.preflight(
         window_start_monotonic_ns=window_start_monotonic_ns,
         window_end_monotonic_ns=window_end_monotonic_ns,
+        first_omission_tree=first_omission_tree,
     )
     profile_descriptor = _descriptor(HERE / "sustained_role_profile.py", "sustained-role profile")
     selection_profile_descriptor = _descriptor(
