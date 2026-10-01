@@ -88,6 +88,9 @@ N7_PATH_TIMEOUT_QUORUM_PROFILE_ID = (
 N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID = (
     "n7-path-local-timeout-quorum-v4"
 )
+N7_SUSTAINED_ROLE_V8_PROFILE_ID = (
+    "n7-sustained-role-proposal-boundary-v8"
+)
 PAIRED_PROFILE_ARMS = {
     PAIRED_ADAPTIVE_PROFILE_ID: "adaptive",
     PAIRED_CONTROL_PROFILE_ID: "control",
@@ -797,6 +800,7 @@ def _profile_throughput_windows(
             N7_THREE_REPORTER_OMISSION_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID,
+            N7_SUSTAINED_ROLE_V8_PROFILE_ID,
         }
         else (
             (
@@ -820,6 +824,7 @@ def _profile_throughput_windows(
             N7_THREE_REPORTER_OMISSION_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_PROFILE_ID,
             N7_PATH_TIMEOUT_QUORUM_V4_PROFILE_ID,
+            N7_SUSTAINED_ROLE_V8_PROFILE_ID,
             RECURRING_PROFILE_ID,
             PAIRED_ADAPTIVE_PROFILE_ID,
             PAIRED_CONTROL_PROFILE_ID,

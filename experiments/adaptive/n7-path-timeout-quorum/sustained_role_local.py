@@ -637,6 +637,7 @@ def materialize_runtime_inputs(
     keygen_binary: Path,
     tls_keygen_binary: Path,
     e0_helper_binary: Path,
+    materialization_profile: Mapping[str, Any] | None = None,
 ) -> Mapping[str, Any]:
     """Materialize one W19 no-launch input set below an already-owned root.
 
@@ -657,20 +658,37 @@ def materialize_runtime_inputs(
     for port in (peer_port, client_port, manager_port):
         if type(port) is not int or port <= 1024 or port > 65535:
             raise SustainedRoleProducerError("materialization ports are invalid")
+    writer_profile = _base_materialization_profile()
+    v8_materialization = materialization_profile is not None
+    if v8_materialization:
+        v8_profile = _load("n7_sustained_role_v8_profile", HERE / "sustained_role_v8_profile.py")
+        try:
+            v8_profile.validate_materialization_profile(materialization_profile)
+        except v8_profile.V8ProfileError as exc:
+            raise SustainedRoleProducerError(
+                "materialization profile is not the exact frozen v8 profile") from exc
+        writer_profile = dict(materialization_profile)
     config = root / "config"
     config.mkdir(mode=0o700)
     try:
         # The commands and E0 receipt must never point back to a mutable build
-        # directory.  Key generators are preparation-only and are not later
-        # replayed, so only launch-time binaries are retained here.
+        # directory.  v7 retains its historic preparation-only generator
+        # behavior byte-for-byte.  The v8 materialization profile additionally
+        # snapshots both generators *before* invoking them, so the generated
+        # identities are bound to the same in-root binary closure as the
+        # launch-time programs.
         app = _archive_executable_for_materialization(root, app, "hotstuff-app")
         manager_binary = _archive_executable_for_materialization(root, manager_binary, "adaptation-manager")
         helper = _archive_executable_for_materialization(root, helper, "e0-identity-helper")
+        if v8_materialization:
+            keygen = _archive_executable_for_materialization(root, keygen, "hotstuff-keygen")
+            tls_keygen = _archive_executable_for_materialization(
+                root, tls_keygen, "hotstuff-tls-keygen")
         bls, tls, issuer = base.generate_identities(keygen, tls_keygen, config)
         source_instances = {"adaptive-manager": f"{run_id}-manager"}
         source_instances.update({f"replica-{replica}": f"{run_id}-replica-{replica}" for replica in range(7)})
         main, replicas, manager, commands, _artifacts = base.write_runtime_inputs(
-            root, _base_materialization_profile(), bls, tls, issuer,
+            root, writer_profile, bls, tls, issuer,
             peer_port=peer_port, client_port=client_port, manager_port=manager_port,
             run_id=run_id, source_instances=source_instances, app_binary=app,
             manager_binary=manager_binary, manager_extra_args=(),
