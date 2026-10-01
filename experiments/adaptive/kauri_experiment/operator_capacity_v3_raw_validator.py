@@ -18,6 +18,7 @@ from typing import Any, Callable, Mapping
 from . import operator_capacity_consumption_audit as consumption_audit
 from . import operator_capacity_native_replay as native_replay
 from . import operator_capacity_v3_backend as backend
+from . import operator_capacity_v3_baseline_replay as baseline_replay
 from .operator_capacity_preflight import _EXPECTED_QUOTA_PROFILE
 
 
@@ -403,7 +404,7 @@ def validate_operator_capacity_v3_raw(
         manager_raw = _read(root / "raw/manager-events.jsonl", "manager event stream")
         if _sha(manager_raw) != authority["event_stream_sha256"]["manager"]:
             raise RawValidationError("manager stream differs from authority pin")
-        _stream_events(root / "raw/manager-events.jsonl", kind="adaptation_manager",
+        manager_events = _stream_events(root / "raw/manager-events.jsonl", kind="adaptation_manager",
                        source_id="adaptive-manager", run_id=run_id)
         streams: dict[int, list[dict[str, Any]]] = {}
         for replica in range(N):
@@ -420,6 +421,10 @@ def validate_operator_capacity_v3_raw(
             successor_bundle=root / "transitions/e0-to-e1-operator-capacity/successor.bundle", consumption_record=root / "raw/consumption.json",
             stage_a_verifier_receipt=root / str(authority["stage_a_verifier_receipt"]),
             stage_b_verifier_receipt=root / str(authority["stage_b_verifier_receipt"]), pins=pins)
+        baseline = baseline_replay.replay_operator_capacity_baseline(
+            manager_events, consumption_record=_json(
+                _read(root / "raw/consumption.json", "consumption record"), "consumption record"),
+            manager_argv=manager_argv)
         recomputed = independently_recompute_verifiers(root, authority)
         if (not isinstance(recomputed, Mapping) or set(recomputed) != {"stage_a_receipt_sha256", "stage_b_receipt_sha256"} or
                 recomputed["stage_a_receipt_sha256"] != _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt")) or
@@ -440,6 +445,7 @@ def validate_operator_capacity_v3_raw(
                 "workload_boundary": "all-31 common committed-block cadence under a pinned replica-local synthetic drive; transaction_count is a nonempty-slot invariant, not TPS or unique transactions",
                 "synthetic_workload": workload,
                 "public_identity_fingerprint": public_identity_fingerprint,
-                "consumption_chain": chain}
-    except (RawValidationError, consumption_audit.ConsumptionAuditError, native_replay.NativeReplayError, KeyError, TypeError) as exc:
+                "consumption_chain": chain, "baseline_replay": baseline}
+    except (RawValidationError, consumption_audit.ConsumptionAuditError, native_replay.NativeReplayError,
+            baseline_replay.BaselineReplayError, KeyError, TypeError) as exc:
         return _failure("RAW_CONTRACT_INCOMPLETE", str(exc))

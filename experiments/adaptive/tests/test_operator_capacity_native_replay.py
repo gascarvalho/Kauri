@@ -90,6 +90,13 @@ def test_censors_incomplete_right_boundary_without_inflating_throughput() -> Non
     assert _replay(streams) == ()
 
 
+@pytest.mark.parametrize("replica", [0, 1])
+def test_censors_commit_with_a_peer_witness_before_the_common_window(replica: int) -> None:
+    streams = _streams()
+    streams[replica][1]["source_monotonic_ns"] = 129
+    assert _replay(streams) == ()
+
+
 def test_empty_pipeline_block_is_valid_but_unscored() -> None:
     streams = _streams()
     for events in streams.values():

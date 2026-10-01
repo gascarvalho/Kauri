@@ -78,8 +78,8 @@ def replay_post_e1_common_commits(
 
     The half-open interval is fixed by the caller's *predeclared* measurement
     contract, never inferred from the observed commit rate.  A designated
-    commit must occur inside it and all peer witnesses must arrive before its
-    end. In-flight commits at the right boundary are censored, not counted.
+    commit and all local/peer witnesses must occur inside it. In-flight
+    commits at either boundary are censored, not counted.
     Completion is the latest of the 31 source timestamps.
     """
     if set(streams) != REPLICAS or designated_replica not in REPLICAS:
@@ -200,6 +200,8 @@ def replay_post_e1_common_commits(
         if any(peer_metadata != metadata for replica, (_when, peer_metadata) in peers.items()
                if replica != designated_replica):
             raise NativeReplayError("peer commit metadata conflicts with designated commit")
+        if any(not start <= peers[replica][0] < end for replica in REPLICAS):
+            continue
         completion = max(designated_ns, *(peers[replica][0] for replica in REPLICAS if replica != designated_replica))
         if completion >= end:
             continue
