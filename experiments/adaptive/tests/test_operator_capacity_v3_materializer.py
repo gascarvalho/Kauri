@@ -143,9 +143,19 @@ def test_materializes_canonical_all_live_v3_input_without_execution(tmp_path: Pa
     assert manifest["verdict"] == "MATERIALIZED_NO_EXECUTION"
     assert manifest["claim_eligible"] is False and len(replicas) == 31
     assert manager.count("--activation-readiness-member") == 31
+    assert manager[manager.index("--activation-readiness-release-count") + 1] == "31"
+    assert manager[manager.index("--activation-readiness-maximum-delivery-attempts") + 1] == "1"
+    assert manager[manager.index("--activation-readiness-retry-interval-ticks") + 1] == "30000"
     assert "--protocol-mode" in manager and manager[manager.index("--protocol-mode") + 1] == "adaptive_v3"
     assert "--experiment-byzantine-mode" not in manager
     assert all("--experiment-byzantine-mode" not in argv for argv in replicas)
+    assert "experiment-exact-timeout-attempt-evidence-v3 = true" in (
+        tmp_path / "out/config/hotstuff.gen.conf").read_text().splitlines()
+    readiness = [line.split(" = ", 1)[1] for line in
+                 (tmp_path / "out/config/hotstuff.gen.conf").read_text().splitlines()
+                 if line.startswith("activation-readiness-member = ")]
+    assert readiness == [f"{replica},{key['pub']}" for replica, key in
+                         enumerate(values["identities"]["bls"])]
     lines = (tmp_path / "out/config/epoch0.tree").read_text().splitlines()
     assert len(lines) == 21 and all(line.startswith("fan:5 pipe:2 ") for line in lines)
     assert {int(line.split()[2]) for line in lines} == set(range(6))

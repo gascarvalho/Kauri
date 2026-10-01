@@ -17,8 +17,49 @@ from kauri_experiment import operator_capacity_v3_local_runner as subject
 from kauri_experiment.operator_capacity_preflight import _EXPECTED_QUOTA_PROFILE
 
 
+def _native_success_terminal() -> dict[str, object]:
+    identity = {"predecessor_boundary_configuration": {"epoch_number": 0},
+                "successor_configuration": {"epoch_number": 1, "tree_id": 0, "epoch_digest": "b" * 64},
+                "activation_delay_blocks": 5, "command_block_height": 21,
+                "activation_height": 26}
+    return {"run_id": "native-run", "source_kind": "adaptation_manager",
+            "event_type": "adaptive_v3.readiness_terminal",
+            "payload": {"terminal_reason": 1, "terminal_cycle_ordinal": 0,
+                        "disposition": "session_terminal", "required_release_count": 31,
+                        "observed_signers": list(range(31)), "terminal_bundle_digest": "a" * 64,
+                        "identity": identity, "terminal_identity": identity}}
+
+
+def test_success_gate_accepts_native_v3_all_live_terminal(tmp_path: Path) -> None:
+    (tmp_path / "raw").mkdir()
+    (tmp_path / "raw/manager-events.jsonl").write_text(json.dumps(_native_success_terminal()) + "\n")
+    assert subject._manager_success_terminal(tmp_path, "native-run")
+
+
+@pytest.mark.parametrize("mode", ["duplicate", "retry_exhausted", "partial_release", "wrong_epoch", "legacy"])
+def test_success_gate_rejects_non_native_or_incomplete_terminal(tmp_path: Path, mode: str) -> None:
+    event = _native_success_terminal()
+    if mode == "retry_exhausted":
+        event["payload"]["terminal_reason"] = 4
+    elif mode == "partial_release":
+        event["payload"]["required_release_count"] = 21
+        event["payload"]["observed_signers"] = list(range(21))
+    elif mode == "wrong_epoch":
+        event["payload"]["identity"]["successor_configuration"]["epoch_number"] = 2
+    elif mode == "legacy":
+        event["event_type"] = "adaptive_v2_session_terminal"
+        event["payload"] = {"outcome": "advanced", "reason": "successor_converged", "successor_epoch_number": 1}
+    (tmp_path / "raw").mkdir()
+    raw = json.dumps(event) + "\n"
+    (tmp_path / "raw/manager-events.jsonl").write_text(raw * (2 if mode == "duplicate" else 1))
+    assert not subject._manager_success_terminal(tmp_path, "native-run")
+
+
 def _canonical(value: object) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("ascii") + b"\n"
+
+
+_MAIN_CONFIG = b"block-size = 1\nfan-out = 5\nasync_blocks = 2\npiped_latency = 1\nbase-timeout = 2.0\nprop-delay = 0.1\naggregation-timeout = 0.5\nleader-progress-timeout = 5.0\nleader-activation-grace = 1.0\ntree-switch-period = 2\n"
 
 
 def _write(path: Path, value: object) -> bytes:
@@ -34,22 +75,74 @@ def _fixture(tmp_path: Path) -> tuple[Path, list[str], list[list[str]], Path, Pa
     artifacts = {}
     for relative in ("config/epoch0.tree", "config/stage-a-envelope.wire", "config/hotstuff.gen.conf", *[f"config/replica-{i}.conf" for i in range(31)]):
         path = root / relative
-        path.write_bytes(relative.encode())
+        replica = int(relative.split("-")[-1].split(".")[0]) if relative.startswith("config/replica-") else None
+        path.write_bytes(_MAIN_CONFIG if relative == "config/hotstuff.gen.conf" else (f"privkey = key\ntls-privkey = tls-key\ntls-cert = {replica:064x}\nidx = {replica}\n".encode("ascii") if replica is not None else relative.encode("ascii")))
         artifacts[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     transition = {"policy_intent": "performance_optimization", "evidence_window_rule": "fresh_exact_predecessor_after_common_commit", "transition_artifact_id": "e0-to-e1-operator-capacity", "bundle_path": "transitions/e0-to-e1-operator-capacity/successor.bundle", "evidence_snapshot_path": "transitions/e0-to-e1-operator-capacity/evidence-snapshot.json", "predecessor_epoch_number": 0, "successor_epoch_number": 1, "minimum_predecessor_residency_ms": 0, "minimum_post_baseline_observation_ms": 0, "apply_shape_selection": False, "policy_parameters": {}}
     binaries = {}
     for name in stage_a.REQUIRED_BINARIES:
         path = tmp_path / f"binary-{name}"
-        path.write_bytes(name.encode("ascii"))
+        if name == "identity_parity_verifier":
+            path.write_text("""#!/usr/bin/env python3
+import hashlib,json,sys
+args=sys.argv
+bundle=open(args[args.index('--identity-bundle')+1],'rb').read()
+source=args[args.index('--source-revision')+1]
+fingerprint=args[args.index('--expected-public-fingerprint')+1]
+output=args[args.index('--output')+1]
+receipt={'schema_version':1,'kind':'kauri-operator-capacity-native-identity-parity-receipt-v1','verdict':'NATIVE_IDENTITY_PARITY_VERIFIED_NO_EXECUTION','source_revision':source,'identity_bundle_sha256':hashlib.sha256(bundle).hexdigest(),'public_identity_fingerprint':fingerprint,'bls_replicas':31,'tls_identities':32}
+open(output,'w').write(json.dumps(receipt,sort_keys=True,separators=(',',':'))+'\\n')
+""", encoding="ascii")
+            path.chmod(0o700)
+        else:
+            path.write_bytes(name.encode("ascii"))
         binaries[name] = path
     binary_sha = {name: hashlib.sha256(path.read_bytes()).hexdigest() for name, path in binaries.items()}
     plan_binary_sha = {name: binary_sha[name] for name in ("adaptation_manager", "hotstuff_app", "identity_parity_verifier")}
     approval = tmp_path / "tool-approval.json"
     _write(approval, {"schema_version": 1, "kind": "kauri-n31-operator-capacity-tool-identity-approval-v1", "verdict": "EXTERNAL_TOOL_IDENTITY_APPROVED", "revision": "a" * 40, "approval_ref": "external-test", "approved_at_utc": "2026-09-29T00:00:00Z", "binary_sha256": binary_sha})
-    manager = [str(binaries["adaptation_manager"]), "--protocol-mode", "adaptive_v3", "--transition-request", json.dumps(transition, sort_keys=True, separators=(",", ":")), "--structured-event-output", str(root / "raw/manager-events.jsonl"), "--operator-capacity-stage-b-authorization-output", str(root / "raw/stage-b-authorization.wire"), "--operator-capacity-consumption-output", str(root / "raw/consumption.json"), "--bundle-output", str(root / "transitions/e0-to-e1-operator-capacity/successor.bundle"), "--epoch-zero-tree-file", str(root / "config/epoch0.tree"), "--operator-capacity-stage-a-envelope", str(root / "config/stage-a-envelope.wire"), "--operator-capacity-stage-a-wire-sha256", hashlib.sha256((root / "config/stage-a-envelope.wire").read_bytes()).hexdigest(), "--operator-capacity-label-issuer-id", "7", "--operator-capacity-label-issuer-reference", "test", "--operator-capacity-label-issuer-public-key-hex", "a" * 66, "--operator-capacity-label-issuer-public-key-fingerprint", "b" * 64, "--operator-capacity-approved-capacity-digest", "c" * 64]
-    replicas = [[str(binaries["hotstuff_app"]), "--structured-event-output", str(root / f"raw/replica-{i}.jsonl"), "--structured-event-commit-observer-id", "replica-0"] for i in range(31)]
+    manager = [str(binaries["adaptation_manager"]), "--protocol-mode", "adaptive_v3", "--listen", "127.0.0.1:20000",
+               "--tls-privkey", "d" * 64, "--tls-cert", "e" * 64, "--issuer-id", "1",
+               "--issuer-private-key", "f" * 64, "--activation-delay-blocks", "5",
+               "--convergence-deadline-seconds", "30", "--tree-fanout", "5", "--pipeline-stretch", "2",
+               "--shape-candidate-fanouts", "5", "--shape-deterministic-seed", "1",
+               "--transition-request", json.dumps(transition, sort_keys=True, separators=(",", ":")),
+               "--bundle-output", str(root / "transitions/e0-to-e1-operator-capacity/successor.bundle"),
+               "--epoch-zero-tree-file", str(root / "config/epoch0.tree"), "--structured-event-run-id", "test-run",
+               "--structured-event-source-instance", "test-source", "--structured-event-output", str(root / "raw/manager-events.jsonl"),
+               "--activation-readiness-release-count", "31", "--activation-readiness-maximum-delivery-attempts", "1",
+               "--activation-readiness-retry-interval-ticks", "30000", "--operator-capacity-stage-a-envelope", str(root / "config/stage-a-envelope.wire"),
+               "--operator-capacity-stage-a-wire-sha256", hashlib.sha256((root / "config/stage-a-envelope.wire").read_bytes()).hexdigest(),
+               "--operator-capacity-label-issuer-id", "7", "--operator-capacity-label-issuer-reference", "test",
+               "--operator-capacity-label-issuer-public-key-hex", "a" * 66,
+               "--operator-capacity-label-issuer-public-key-fingerprint", "b" * 64,
+               "--operator-capacity-approved-capacity-digest", "c" * 64,
+               "--operator-capacity-hard-deadline-ns", "1000000000",
+               "--operator-capacity-stage-b-authorization-output", str(root / "raw/stage-b-authorization.wire"),
+               "--operator-capacity-consumption-output", str(root / "raw/consumption.json"),
+               "--operator-capacity-stage-b-issuer-reference", "test-stage-b"]
+    for replica in range(31):
+        manager.extend(("--replica", f"{replica},127.0.0.1:{21000 + replica},{replica:064x}",
+                        "--activation-readiness-member", f"{replica},{replica + 31:064x}"))
+    replicas = [[str(binaries["hotstuff_app"]), "--conf", str(root / "config/hotstuff.gen.conf"), "--conf", str(root / f"config/replica-{i}.conf"),
+                 "--structured-event-run-id", "test-run", "--structured-event-source-instance", f"test-source-replica-{i}",
+                 "--structured-event-output", str(root / f"raw/replica-{i}.jsonl"), "--structured-event-commit-observer-id", "replica-0",
+                 "--structured-event-commit-observer-instance", "test-source-replica-0"] for i in range(31)]
+    main = _MAIN_CONFIG + f"nworker = 2\nrepnworker = 2\npace-maker = dummy\nproposer = 0\nclient-ip = 127.0.0.1\ntree-generation = file\ntree-generation-fpath = {root / 'config/epoch0.tree'}\nepoch-protocol-mode = adaptive_v3\nepoch-change-issuer-id = 1\nepoch-change-issuer-public-key = 02abcd\nepoch-change-minimum-activation-delay = 5\nepoch-change-maximum-activation-delay = 5\nepoch-change-maximum-block-extra-bytes = 4096\nepoch-change-maximum-ancestry-blocks = 128\nepoch-manager-address = 127.0.0.1:20000\nepoch-manager-tls-cert = {'e' * 64}\nmax-rep-msg = 4194304\n".encode("ascii") + b"".join(f"replica = 127.0.0.1:{21000 + replica};{22000 + replica}, {replica + 31:064x}, {replica + 62:064x}\n".encode("ascii") for replica in range(31))
+    main += b"".join(f"activation-readiness-member = {replica},{replica + 31:064x}\n".encode("ascii")
+                     for replica in range(31))
+    main += b"experiment-exact-timeout-attempt-evidence-v3 = true\n"
+    (root / "config/hotstuff.gen.conf").write_bytes(main); artifacts["config/hotstuff.gen.conf"] = hashlib.sha256(main).hexdigest()
+    bls = [f"{replica + 31:064x}" for replica in range(31)]
+    tls = [(f"{replica:064x}", f"{replica + 62:064x}") for replica in range(31)] + [("e" * 64, "d" * 64)]
+    public_fingerprint = backend._public_identity_fingerprint(bls, tls, "02abcd")
+    bundle_sha = hashlib.sha256(backend._identity_bundle_bytes(bls=bls, bls_secrets=["key"] * 31, tls=tls, tls_secrets=["tls-key"] * 31 + ["d" * 64], issuer_public_key="02abcd", issuer_secret="f" * 64)).hexdigest()
+    receipt = {"schema_version": 1, "kind": "kauri-operator-capacity-native-identity-parity-receipt-v1", "verdict": "NATIVE_IDENTITY_PARITY_VERIFIED_NO_EXECUTION", "source_revision": "a" * 40, "identity_bundle_sha256": bundle_sha, "public_identity_fingerprint": public_fingerprint, "bls_replicas": 31, "tls_identities": 32}
+    projection = {"schema_version": 1, "kind": "kauri-operator-capacity-materialized-public-identity-v1", "bls_public_keys": bls, "replica_tls": [{"certificate": certificate, "common_name": common_name} for certificate, common_name in tls[:-1]], "manager_tls": {"certificate": tls[-1][0], "common_name": tls[-1][1]}, "issuer_public_key": "02abcd"}
+    for relative, value in (("config/identity-parity-receipt.json", receipt), ("config/identity-public-projection.json", projection)):
+        path = root / relative; path.write_bytes(_canonical(value)); artifacts[relative] = hashlib.sha256(path.read_bytes()).hexdigest()
     verifier_arguments = ["--epoch0-tree-file", str(root / "config/epoch0.tree"), "--stage-a-envelope-wire", str(root / "config/stage-a-envelope.wire"), "--issuer-id", "7", "--issuer-reference", "test", "--issuer-public-key-hex", "a" * 66, "--issuer-public-key-fingerprint", "b" * 64, "--approved-capacity-digest", "c" * 64, "--arm", "fast_priority_treatment", "--source-revision", "a" * 40]
-    manifest = {"schema_version": 1, "kind": "kauri-n31-operator-capacity-v3-materialization-v1", "verdict": "MATERIALIZED_NO_EXECUTION", "claim_eligible": False, "figure_eligible": False, "arm": "treatment", "stage_a_native_arm": "fast_priority_treatment", "protocol": {"N": 31, "Q": 21, "tree_count": 21}, "slow_root_ids": list(range(6)), "revision": "a" * 40, "epoch0_tree": {"sha256": artifacts["config/epoch0.tree"], "topology_digest": "c" * 64}, "binary_sha256": plan_binary_sha, "artifact_sha256": artifacts, "manager_argv_sha256": backend._argv_digest(manager), "replica_argv_sha256": [backend._argv_digest(row) for row in replicas], "stage_a_envelope_sha256": artifacts["config/stage-a-envelope.wire"], "stage_a_verifier_receipt_sha256": "1" * 64, "stage_a_verifier_arguments": verifier_arguments, "identity_parity_receipt_sha256": "2" * 64, "tool_identity_approval_receipt_sha256": hashlib.sha256(approval.read_bytes()).hexdigest(), "stage_b_authorization_output": "raw/stage-b-authorization.wire", "consumption_output": "raw/consumption.json", "bundle_output": "transitions/e0-to-e1-operator-capacity/successor.bundle"}
+    manifest = {"schema_version": 1, "kind": "kauri-n31-operator-capacity-v3-materialization-v1", "verdict": "MATERIALIZED_NO_EXECUTION", "claim_eligible": False, "figure_eligible": False, "arm": "treatment", "stage_a_native_arm": "fast_priority_treatment", "protocol": {"N": 31, "Q": 21, "tree_count": 21}, "slow_root_ids": list(range(6)), "revision": "a" * 40, "epoch0_tree": {"sha256": artifacts["config/epoch0.tree"], "topology_digest": "c" * 64}, "binary_sha256": plan_binary_sha, "artifact_sha256": artifacts, "manager_argv_sha256": backend._argv_digest(manager), "replica_argv_sha256": [backend._argv_digest(row) for row in replicas], "synthetic_workload": {"kind": "replica-local-synthetic-v1", "source_revision": "a" * 40, "hotstuff_app_sha256": plan_binary_sha["hotstuff_app"], "main_config_sha256": artifacts["config/hotstuff.gen.conf"], "block_size": 1, "initial_beat_delay_ms": 10000, "beat_interval_ms": 50, "transaction_count_per_block": 1, "post_e1_window_ns": 30 * 1_000_000_000}, "stage_a_envelope_sha256": artifacts["config/stage-a-envelope.wire"], "stage_a_verifier_receipt_sha256": "1" * 64, "stage_a_verifier_arguments": verifier_arguments, "identity_parity_receipt_sha256": artifacts["config/identity-parity-receipt.json"], "public_identity_fingerprint": public_fingerprint, "tool_identity_approval_receipt_sha256": hashlib.sha256(approval.read_bytes()).hexdigest(), "stage_b_authorization_output": "raw/stage-b-authorization.wire", "consumption_output": "raw/consumption.json", "bundle_output": "transitions/e0-to-e1-operator-capacity/successor.bundle"}
     _write(root / "materialization-manifest.json", manifest)
     quota = tmp_path / "quota.json"
     quota.write_bytes(_canonical(_EXPECTED_QUOTA_PROFILE))
@@ -164,6 +257,35 @@ def test_execution_rejects_dirty_or_wrong_revision_before_lifecycle(tmp_path: Pa
     with pytest.raises(subject.OperatorCapacityV3LocalRunnerError, match="clean worktree"):
         subject.execute_excluded_local_shakedown(materialization_root=root, manager_argv=manager, replica_argv=replicas, quota_profile=quota, authorization_request=request, authorization_receipt=receipt, tool_identity_approval_path=approval, execute=True, timeout_s=1200, current_revision=lambda: "b" * 40, worktree_clean=lambda: False, lifecycle_factory=lambda: lifecycle, pre_spawn_authority=authority, quota_contract=_contract())
     assert lifecycle.calls == [] and not (root / "logs").exists()
+
+
+def test_pre_spawn_rejects_changed_synthetic_main_config(tmp_path: Path) -> None:
+    root, _manager, _replicas, _quota, _approval, _binaries = _fixture(tmp_path)
+    config = root / "config/hotstuff.gen.conf"
+    config.write_bytes(config.read_bytes() + b" async_blocks=200\n")
+    with pytest.raises(subject.OperatorCapacityV3LocalRunnerError, match="synthetic workload configuration changed"):
+        subject._verify_synthetic_config_before_spawn(root, _manager)
+
+
+def test_factory_config_mutation_reaches_zero_replica_starts(tmp_path: Path) -> None:
+    root, manager, replicas, quota, approval, _binaries = _fixture(tmp_path)
+    authority = _authority(tmp_path, root, quota, approval, _binaries)
+    _bind_materialization_to_authority(root, authority)
+    _plan, request, receipt = _authorized(root, manager, replicas, quota)
+    lifecycle = _FakeLifecycle()
+    def factory() -> _FakeLifecycle:
+        config = root / "config/hotstuff.gen.conf"
+        config.write_bytes(config.read_bytes() + b" async_blocks=200\n")
+        return lifecycle
+    result = subject.execute_excluded_local_shakedown(
+        materialization_root=root, manager_argv=manager, replica_argv=replicas,
+        quota_profile=quota, authorization_request=request, authorization_receipt=receipt,
+        tool_identity_approval_path=approval, execute=True, timeout_s=1200,
+        current_revision=lambda: "a" * 40, worktree_clean=lambda: True,
+        lifecycle_factory=factory, pre_spawn_authority=authority, quota_contract=_contract(),
+        native_verifier_run=_native_verifier_copying_retained_receipt(authority))
+    assert result["verdict"] == "ABORTED"
+    assert not any(call.startswith("replica-") or call == "manager" for call in lifecycle.calls)
 
 
 def test_valid_authority_reaches_fake_lifecycle_and_mutated_binary_cannot(tmp_path: Path) -> None:
@@ -350,14 +472,12 @@ def test_e1_measurement_window_rejects_legacy_nested_activation_or_nonreplica_so
 
 def test_manager_success_terminal_requires_run_bound_e1_success(tmp_path: Path) -> None:
     raw = tmp_path / "raw"; raw.mkdir()
-    terminal = {"run_id": "run-1", "source_kind": "adaptation_manager",
-                "event_type": "adaptive_v2_session_terminal",
-                "payload": {"outcome": "advanced", "reason": "successor_converged",
-                            "successor_epoch_number": 1}}
+    terminal = _native_success_terminal()
+    terminal["run_id"] = "run-1"
     (raw / "manager-events.jsonl").write_text(json.dumps(terminal) + "\n", encoding="ascii")
     assert subject._manager_success_terminal(tmp_path, "run-1") is True
     assert subject._manager_success_terminal(tmp_path, "other-run") is False
-    terminal["payload"]["successor_epoch_number"] = 2
+    terminal["payload"]["identity"]["successor_configuration"]["epoch_number"] = 2
     (raw / "manager-events.jsonl").write_text(json.dumps(terminal) + "\n", encoding="ascii")
     assert subject._manager_success_terminal(tmp_path, "run-1") is False
 

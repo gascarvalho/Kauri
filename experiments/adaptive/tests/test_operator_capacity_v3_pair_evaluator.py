@@ -32,6 +32,11 @@ def _arm(tmp_path: Path, name: str, *, count: int = 12, window_ns: int = subject
     artifacts = {
         "materialization_manifest_sha256": ("materialization-manifest.json", {
             "artifact": "manifest", "arm": name, "binary_sha256": {"app": binary_sha},
+            "public_identity_fingerprint": "a" * 64,
+            "synthetic_workload": {"kind": "replica-local-synthetic-v1", "source_revision": "a" * 40,
+                                   "hotstuff_app_sha256": binary_sha, "main_config_sha256": ("1" if name == "sham" else "2") * 64,
+                                   "block_size": 1, "initial_beat_delay_ms": 10000, "beat_interval_ms": 50,
+                                   "transaction_count_per_block": 1, "post_e1_window_ns": subject.WINDOW_NS},
         }),
         "runner_receipt_sha256": ("runtime/local-shakedown-receipt.json", {"artifact": "receipt", "arm": name}),
         "cpu_quota_frozen_contract_sha256": ("runtime/frozen-cpu-quota-contract.json", {
@@ -63,12 +68,17 @@ def _arm(tmp_path: Path, name: str, *, count: int = 12, window_ns: int = subject
     authority_raw = _write(authority_path, authority)
     start = 1_000_000_000
     commits = [{"height": item + 1, "block_hash": f"{item + 1:064x}",
-                "designated_ns": start + item, "completion_ns": start + item + 1}
+                "designated_ns": start + item, "completion_ns": start + item + 1, "transaction_count": 1}
                for item in range(count)]
     raw = {"schema_version": 1, "kind": subject._RAW_KIND, "verdict": "COMPLETE_NO_CLAIM",
            "claim_eligible": False, "figure_eligible": False,
            "complete_common_commit_count": count, "common_commits": commits,
            "measurement_window": {"start_monotonic_ns": start, "end_monotonic_ns": start + window_ns},
+           "synthetic_workload": {"kind": "replica-local-synthetic-v1", "source_revision": "a" * 40,
+                                  "hotstuff_app_sha256": binary_sha, "main_config_sha256": ("1" if name == "sham" else "2") * 64,
+                                  "block_size": 1, "initial_beat_delay_ms": 10000, "beat_interval_ms": 50,
+                                  "transaction_count_per_block": 1, "post_e1_window_ns": subject.WINDOW_NS},
+           "public_identity_fingerprint": "a" * 64,
            "consumption_chain": {"arm": name,
                                  "stage_a_wire_sha256": ("1" if name == "sham" else "2") * 64,
                                  "stage_b_authorization_wire_sha256": "3" * 64}}
@@ -115,6 +125,43 @@ def test_complete_pair_exposes_frozen_ratio_but_never_a_claim(tmp_path: Path) ->
     assert result["claim_eligible"] is False
     assert result["figure_eligible"] is False
     assert result["campaign_eligible"] is False
+
+
+def test_pair_rejects_synthetic_workload_identity_drift(tmp_path: Path) -> None:
+    sham_root, sham_raw, sham_authority = _arm(tmp_path, "sham")
+    treatment_root, treatment_raw, treatment_authority = _arm(tmp_path, "treatment")
+    raw = json.loads(treatment_raw.read_text(encoding="ascii"))
+    raw["synthetic_workload"]["beat_interval_ms"] = 51
+    _write(treatment_raw, raw)
+    manifest = _manifest(sham_raw, sham_authority, treatment_raw, treatment_authority)
+    with pytest.raises(subject.PairEvaluationError, match="synthetic workload identity and horizon"):
+        subject.evaluate_matched_pair(
+            manifest, sham_root=sham_root, treatment_root=treatment_root,
+            sham_raw_validation=sham_raw, treatment_raw_validation=treatment_raw,
+            sham_authority=sham_authority, treatment_authority=treatment_authority,
+            revalidate=_revalidator((sham_raw, sham_authority), (treatment_raw, treatment_authority)),
+        )
+
+
+def test_pair_accepts_distinct_per_arm_config_hashes_with_same_drive(tmp_path: Path) -> None:
+    result = _evaluate(tmp_path)
+    assert result["verdict"] == "PAIR_COMPLETE_DESCRIPTIVE_ONLY"
+
+
+def test_pair_rejects_distinct_materialized_public_identity_projection(tmp_path: Path) -> None:
+    sham_root, sham_raw, sham_authority = _arm(tmp_path, "sham")
+    treatment_root, treatment_raw, treatment_authority = _arm(tmp_path, "treatment")
+    raw = json.loads(treatment_raw.read_text(encoding="ascii"))
+    raw["public_identity_fingerprint"] = "b" * 64
+    _write(treatment_raw, raw)
+    with pytest.raises(subject.PairEvaluationError, match="validator-derived public identity projection"):
+        subject.evaluate_matched_pair(
+            _manifest(sham_raw, sham_authority, treatment_raw, treatment_authority),
+            sham_root=sham_root, treatment_root=treatment_root,
+            sham_raw_validation=sham_raw, treatment_raw_validation=treatment_raw,
+            sham_authority=sham_authority, treatment_authority=treatment_authority,
+            revalidate=_revalidator((sham_raw, sham_authority), (treatment_raw, treatment_authority)),
+        )
 
 
 def test_pair_rejects_raw_artifact_drift_after_external_pin(tmp_path: Path) -> None:
@@ -186,7 +233,8 @@ def test_pair_requires_independent_recomputation_to_match_persisted_result(tmp_p
     forged["complete_common_commit_count"] += 1
     forged["common_commits"].append({"height": 99, "block_hash": "f" * 64,
                                       "designated_ns": 1_000_000_100,
-                                      "completion_ns": 1_000_000_101})
+                                      "completion_ns": 1_000_000_101,
+                                      "transaction_count": 1})
     _write(treatment_raw, forged)
     with pytest.raises(subject.PairEvaluationError, match="independent recomputation"):
         subject.evaluate_matched_pair(

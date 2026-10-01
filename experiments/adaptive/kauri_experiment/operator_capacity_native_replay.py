@@ -40,6 +40,7 @@ class CommonCommit:
     block_hash: str
     designated_ns: int
     completion_ns: int
+    transaction_count: int
 
 
 def _hex64(value: object, label: str) -> str:
@@ -202,7 +203,13 @@ def replay_post_e1_common_commits(
         completion = max(designated_ns, *(peers[replica][0] for replica in REPLICAS if replica != designated_replica))
         if completion >= end:
             continue
-        accepted.append(CommonCommit(height, block_hash, designated_ns, completion))
+        if metadata[1] == 0:
+            # Empty pipeline padding is valid protocol traffic.  It cannot
+            # contribute to the predeclared one-command commit metric.
+            continue
+        if metadata[1] != 1:
+            raise NativeReplayError("counted E1 common commit does not contain exactly one synthetic command")
+        accepted.append(CommonCommit(height, block_hash, designated_ns, completion, metadata[1]))
     accepted.sort(key=lambda item: item.height)
     if any(later.height <= earlier.height or later.completion_ns < earlier.completion_ns
            for earlier, later in zip(accepted, accepted[1:])):

@@ -17,6 +17,7 @@ from typing import Any, Callable, Mapping
 
 from . import operator_capacity_consumption_audit as consumption_audit
 from . import operator_capacity_native_replay as native_replay
+from . import operator_capacity_v3_backend as backend
 from .operator_capacity_preflight import _EXPECTED_QUOTA_PROFILE
 
 
@@ -112,6 +113,40 @@ def _failure(code: str, detail: str) -> dict[str, object]:
             "claim_eligible": False, "figure_eligible": False,
             "failure_code": code, "detail": detail,
             "complete_common_commit_count": 0}
+
+
+def _validate_materialized_identity_for_raw(
+    *, root: Path, manager_argv: list[str], manifest: Mapping[str, object],
+) -> str:
+    """Run the same identity gate on the honest raw-validation path."""
+    try:
+        value = backend.validate_materialized_public_identity(
+            root=root, manager_argv=manager_argv,
+            receipt_sha256=manifest.get("identity_parity_receipt_sha256"),
+            expected_fingerprint=manifest.get("public_identity_fingerprint"),
+            source_revision=manifest.get("revision"))
+    except backend.OperatorCapacityV3BackendError as exc:
+        raise RawValidationError(str(exc)) from exc
+    return value
+
+
+def _validate_retained_manager_argv_for_raw(
+    *, root: Path, manager_argv: list[str], manifest: Mapping[str, object],
+) -> None:
+    """Bind the post-run argv to the frozen grammar before replaying raw data."""
+    try:
+        backend.validate_materialized_manager_argv(
+            root=root, manager_argv=manager_argv,
+            expected_sha256=manifest.get("manager_argv_sha256"))
+    except backend.OperatorCapacityV3BackendError as exc:
+        raise RawValidationError(str(exc)) from exc
+
+
+def _validate_materialized_workload_for_raw(manifest: Mapping[str, object]) -> dict[str, object]:
+    try:
+        return backend.validate_materialized_synthetic_workload(manifest)
+    except backend.OperatorCapacityV3BackendError as exc:
+        raise RawValidationError(str(exc)) from exc
 
 
 def _authority(root: Path, receipt_raw: bytes, authority_path: Path | None) -> dict[str, Any]:
@@ -319,6 +354,31 @@ def validate_operator_capacity_v3_raw(
         manifest = _json(manifest_raw, "materialization manifest")
         if manifest.get("verdict") != "MATERIALIZED_NO_EXECUTION" or manifest.get("protocol") != {"N": 31, "Q": 21, "tree_count": 21}:
             raise RawValidationError("materialization manifest is not frozen W18 N31")
+        workload = _validate_materialized_workload_for_raw(manifest)
+        artifacts = manifest.get("artifact_sha256")
+        if not isinstance(artifacts, dict):
+            raise RawValidationError("materialization artifacts are absent")
+        required_config = {"config/hotstuff.gen.conf", *(f"config/replica-{replica}.conf" for replica in range(N))}
+        if not required_config.issubset(artifacts) or any(
+                _sha(_read(root / relative, f"materialized {relative}")) != artifacts[relative]
+                for relative in required_config):
+            raise RawValidationError("effective synthetic workload configuration differs from manifest")
+        try:
+            try:
+                manager_argv = json.loads(_read(root / "runtime/manager-argv.json", "retained manager argv").decode("ascii"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RawValidationError("retained manager argv is invalid") from exc
+            if not isinstance(manager_argv, list) or not all(isinstance(value, str) for value in manager_argv):
+                raise RawValidationError("retained manager argv is invalid")
+            _validate_retained_manager_argv_for_raw(
+                root=root, manager_argv=manager_argv, manifest=manifest)
+            backend.validate_synthetic_main_config(
+                _read(root / "config/hotstuff.gen.conf", "materialized main config"), root=root,
+                manager_argv=manager_argv)
+            public_identity_fingerprint = _validate_materialized_identity_for_raw(
+                root=root, manager_argv=manager_argv, manifest=manifest)
+        except backend.OperatorCapacityV3BackendError as exc:
+            raise RawValidationError(str(exc)) from exc
         if (_sha(_read(root / "config/stage-a-envelope.wire", "Stage-A envelope"))
                 != manifest.get("stage_a_envelope_sha256") or
                 _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt"))
@@ -367,6 +427,8 @@ def validate_operator_capacity_v3_raw(
             raise RawValidationError("independent native verifier recomputation differs from retained receipts")
         commits = native_replay.replay_post_e1_common_commits(streams, run_id=run_id,
             epoch1_digest=epoch1_digest, window_start_ns=start, window_end_ns=end)
+        if any(commit.transaction_count != 1 for commit in commits):
+            raise RawValidationError("counted E1 commits do not retain one synthetic command each")
         _validate_cpu(root, authority, start=start, end=end)
         cleanup = receipt["cleanup"]
         if not isinstance(cleanup, dict) or cleanup.get("stop_quota_monitor") != "completed" or cleanup.get("terminate_manager_and_replicas") != "completed" or not isinstance(cleanup.get("terminate_owned_replica_scopes"), dict) or not isinstance(cleanup.get("verify_scope_cleanup"), dict) or cleanup["terminate_owned_replica_scopes"].get("complete") is not True or cleanup["verify_scope_cleanup"].get("complete") is not True or len(cleanup["terminate_owned_replica_scopes"].get("units", [])) != N or len(cleanup["verify_scope_cleanup"].get("units", [])) != N:
@@ -375,6 +437,9 @@ def validate_operator_capacity_v3_raw(
                 "claim_eligible": False, "figure_eligible": False, "automatic_retries": 0,
                 "complete_common_commit_count": len(commits), "common_commits": [item.__dict__ for item in commits],
                 "measurement_window": {"start_monotonic_ns": start, "end_monotonic_ns": end},
+                "workload_boundary": "all-31 common committed-block cadence under a pinned replica-local synthetic drive; transaction_count is a nonempty-slot invariant, not TPS or unique transactions",
+                "synthetic_workload": workload,
+                "public_identity_fingerprint": public_identity_fingerprint,
                 "consumption_chain": chain}
     except (RawValidationError, consumption_audit.ConsumptionAuditError, native_replay.NativeReplayError, KeyError, TypeError) as exc:
         return _failure("RAW_CONTRACT_INCOMPLETE", str(exc))

@@ -90,6 +90,24 @@ def test_censors_incomplete_right_boundary_without_inflating_throughput() -> Non
     assert _replay(streams) == ()
 
 
+def test_empty_pipeline_block_is_valid_but_unscored() -> None:
+    streams = _streams()
+    for events in streams.values():
+        events[1]["payload"]["transaction_count"] = 0
+    streams[0][2]["payload"]["transaction_count"] = 0
+    assert _replay(streams) == ()
+
+
+@pytest.mark.parametrize("count", [2])
+def test_rejects_counted_e1_commit_without_exactly_one_synthetic_command(count: int) -> None:
+    streams = _streams()
+    for events in streams.values():
+        events[1]["payload"]["transaction_count"] = count
+    streams[0][2]["payload"]["transaction_count"] = count
+    with pytest.raises(NativeReplayError, match="exactly one synthetic command"):
+        _replay(streams)
+
+
 def test_rejects_conflicting_commit_hash_and_identity() -> None:
     streams = _streams()
     streams[30][1]["payload"]["block_hash"] = "e" * 64

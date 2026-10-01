@@ -74,7 +74,8 @@ def build_execution_request(plan: Mapping[str, object], *, materialization_root:
         "schema_version", "kind", "verdict", "claim_eligible", "figure_eligible",
         "launch_permitted", "materialization_manifest_sha256", "arm", "revision", "epoch0_tree",
         "automatic_retries", "binary_sha256", "quota_ownership", "stage_a", "stage_b",
-        "cleanup_contract", "native_policy_order_repaired", "execution_blocker",
+        "cleanup_contract", "native_policy_order_repaired", "execution_blocker", "synthetic_workload", "post_e1_window_ns",
+        "public_identity_fingerprint",
     }
     if set(plan) != expected or plan.get("verdict") != "BACKEND_PLAN_REVIEW_REQUIRED_NO_EXECUTION":
         _fail("backend plan is not the current no-launch W18 plan")
@@ -83,6 +84,10 @@ def build_execution_request(plan: Mapping[str, object], *, materialization_root:
     if (plan.get("native_policy_order_repaired") is not True or
             plan.get("execution_blocker") != "EXTERNAL_AUTHORIZATION_AND_PRESPAWN_AUTHORITY_REQUIRED"):
         _fail("backend plan does not record the repaired native admission and runner boundary")
+    workload = plan.get("synthetic_workload")
+    if (not isinstance(workload, dict) or plan.get("post_e1_window_ns") != _POST_E1_WINDOW_NS or
+            workload.get("post_e1_window_ns") != _POST_E1_WINDOW_NS):
+        _fail("backend plan does not bind the frozen synthetic W18 horizon")
     root = Path(materialization_root).resolve()
     return _canonical({
         "schema_version": 1, "kind": _KIND, "backend_plan_sha256": _sha(_canonical(dict(plan))),
@@ -90,6 +95,8 @@ def build_execution_request(plan: Mapping[str, object], *, materialization_root:
         "revision": plan["revision"], "arm": plan["arm"], "hard_timeout_s": timeout_s,
         "automatic_retries": 0, "environment": "local-only", "cluster_execution": False,
         "claim_eligible": False, "figure_eligible": False,
+        "synthetic_workload": workload, "post_e1_window_ns": _POST_E1_WINDOW_NS,
+        "public_identity_fingerprint": plan["public_identity_fingerprint"],
     })
 
 
@@ -216,6 +223,16 @@ def verify_pre_spawn_authority(
     verify_tool_identity_before_spawn(
         Path(str(authority["tool_approval"])), plan=plan,
         manager_argv=manager_argv, replica_argv=replica_argv)
+    stage_a_plan = plan.get("stage_a")
+    if not isinstance(stage_a_plan, Mapping):
+        _fail("backend plan lacks the native identity-parity receipt pin")
+    backend.rerun_materialized_native_identity_parity(
+        root=root, manager_argv=manager_argv,
+        receipt_sha256=str(stage_a_plan.get("identity_parity_receipt_sha256")),
+        expected_fingerprint=str(plan.get("public_identity_fingerprint")),
+        source_revision=str(plan.get("revision")),
+        verifier_binary=Path(str(binaries["identity_parity_verifier"])),
+    )
 
 
 def verify_w18_cpu_contract(contract: cpu_quota.CpuQuotaContract) -> None:
@@ -254,6 +271,36 @@ def _verify_fresh_runtime(root: Path) -> tuple[Path, Path]:
     if logs.exists() or runtime.exists():
         _fail("local execution output directories must be fresh; retries and resume are forbidden")
     return logs, runtime
+
+
+def _verify_synthetic_config_before_spawn(root: Path, manager_argv: Sequence[str]) -> None:
+    """Rehash the effective synthetic-drive configuration at the spawn edge."""
+    manifest = _json_bytes(_regular(root / "materialization-manifest.json", "materialization manifest"),
+                           "materialization manifest")
+    artifacts = manifest.get("artifact_sha256")
+    workload = manifest.get("synthetic_workload")
+    if not isinstance(artifacts, dict) or not isinstance(workload, dict):
+        _fail("materialization lacks a synthetic workload artifact binding")
+    required = {"config/hotstuff.gen.conf", *(f"config/replica-{replica}.conf" for replica in range(31))}
+    if not required.issubset(artifacts):
+        _fail("materialization artifact binding lacks effective replica configuration")
+    for relative in required:
+        if _sha(_regular(root / relative, f"materialized {relative}")) != artifacts[relative]:
+            _fail("materialized synthetic workload configuration changed before spawn")
+    backend.validate_synthetic_main_config(_regular(root / "config/hotstuff.gen.conf", "materialized main config"),
+                                           root=root, manager_argv=manager_argv)
+    fingerprint = manifest.get("public_identity_fingerprint")
+    receipt_sha256 = manifest.get("identity_parity_receipt_sha256")
+    if not isinstance(fingerprint, str) or not isinstance(receipt_sha256, str):
+        _fail("materialization lacks a public identity projection")
+    backend.validate_materialized_public_identity(
+        root=root, manager_argv=manager_argv, receipt_sha256=receipt_sha256,
+        expected_fingerprint=fingerprint, source_revision=str(manifest.get("revision")))
+    if (workload.get("kind") != "replica-local-synthetic-v1" or
+            workload.get("main_config_sha256") != artifacts["config/hotstuff.gen.conf"] or
+            workload.get("block_size") != 1 or workload.get("transaction_count_per_block") != 1 or
+            workload.get("post_e1_window_ns") != _POST_E1_WINDOW_NS):
+        _fail("materialized synthetic workload contract changed before spawn")
 
 
 def _e1_measurement_window(root: Path) -> dict[str, object] | None:
@@ -327,14 +374,29 @@ def _manager_success_terminal(root: Path, run_id: str) -> bool:
     if not path.is_file() or path.is_symlink():
         return False
     try:
-        events = (json.loads(line) for line in path.read_text(encoding="ascii").splitlines())
-        return any(isinstance(event, dict) and event.get("run_id") == run_id and
-                   event.get("source_kind") == "adaptation_manager" and
-                   event.get("event_type") == "adaptive_v2_session_terminal" and
-                   isinstance(event.get("payload"), dict) and
-                   event["payload"].get("outcome") == "advanced" and
-                   event["payload"].get("reason") == "successor_converged" and
-                   event["payload"].get("successor_epoch_number") == 1 for event in events)
+        events = [json.loads(line) for line in path.read_text(encoding="ascii").splitlines()]
+        terminals = [event for event in events if isinstance(event, dict) and
+                     event.get("event_type") in {"adaptive_v3.readiness_terminal", "adaptive_v2_session_terminal"}]
+        if len(terminals) != 1:
+            return False
+        event = terminals[0]
+        payload = event.get("payload")
+        if (event.get("run_id") != run_id or event.get("source_kind") != "adaptation_manager" or
+                event.get("event_type") != "adaptive_v3.readiness_terminal" or not isinstance(payload, dict)):
+            return False
+        identity = payload.get("terminal_identity")
+        if not isinstance(identity, dict) or payload.get("identity") != identity:
+            return False
+        successor = identity.get("successor_configuration")
+        predecessor = identity.get("predecessor_boundary_configuration")
+        digest = payload.get("terminal_bundle_digest")
+        return (payload.get("terminal_reason") == 1 and payload.get("terminal_cycle_ordinal") == 0 and
+                payload.get("disposition") == "session_terminal" and payload.get("required_release_count") == 31 and
+                payload.get("observed_signers") == list(range(31)) and
+                isinstance(digest, str) and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest) and
+                isinstance(predecessor, dict) and predecessor.get("epoch_number") == 0 and
+                isinstance(successor, dict) and successor.get("epoch_number") == 1 and successor.get("tree_id") == 0 and
+                identity.get("activation_delay_blocks") == 5)
     except (OSError, json.JSONDecodeError):
         return False
 
@@ -368,6 +430,7 @@ def verify_execution_admission(
     verify_w18_cpu_contract(quota_contract)
     if current_revision() != plan["revision"] or not worktree_clean():
         _fail("local execution requires a clean worktree at the pinned materialization revision")
+    _verify_synthetic_config_before_spawn(root, manager_argv)
     _verify_fresh_runtime(root)
     return tool_approval
 
@@ -669,8 +732,14 @@ def execute_excluded_local_shakedown(
         # invoked only after this runner has atomically claimed fresh runtime
         # paths and retained both authorization documents.
         lifecycle = lifecycle_factory()
+        # The factory is external to the admission check. Revalidate after it
+        # returns so it cannot alter the effective drive before any process.
+        _verify_synthetic_config_before_spawn(root, manager_argv)
         for replica_id, argv in enumerate(replica_argv):
             lifecycle.start_replica(replica_id, argv, logs / f"replica-{replica_id}.log")
+        # Replica setup is also external code; do not start the manager until
+        # the exact same effective configuration remains pinned.
+        _verify_synthetic_config_before_spawn(root, manager_argv)
         lifecycle.start_manager(manager_argv, logs / "manager.log")
         e1_measurement_window = lifecycle.await_e1_measurement_window(deadline)
         manager_terminal_verified = lifecycle.manager_success_terminal_verified()

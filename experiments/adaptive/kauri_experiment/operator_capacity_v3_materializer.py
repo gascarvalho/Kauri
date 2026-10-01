@@ -45,6 +45,8 @@ _IDENTITY_PARITY_RECEIPT_KEYS = frozenset({
     "bls_replicas", "tls_identities",
 })
 _IDENTITY_APPROVAL_KIND = "kauri-n31-operator-capacity-tool-identity-approval-v1"
+_SYNTHETIC_WORKLOAD = "replica-local-synthetic-v1"
+_POST_E1_WINDOW_NS = 30 * 1_000_000_000
 
 
 def _fail(message: str) -> None:
@@ -185,10 +187,46 @@ def _identity_public_fingerprint(bls: Sequence[Mapping[str, str]], tls: Sequence
     return _sha(("\n".join(rows) + "\n").encode("ascii"))
 
 
+def _materialized_public_identity_fingerprint(
+    bls: Sequence[Mapping[str, str]], tls: Sequence[Mapping[str, str]], issuer: Mapping[str, str],
+) -> str:
+    """Fingerprint only public fields present in the materialized runtime seam.
+
+    The native parity receipt also covers the manager TLS common name.  That
+    field has no native configuration or manager-argv consumer, so it remains
+    receipt-bound rather than being misrepresented as an active binding.
+    """
+    rows = ["kauri-operator-capacity-materialized-identity-public-v1"]
+    rows.extend(f"bls:{index}:{row['pub']}" for index, row in enumerate(bls))
+    rows.extend(f"tls:{index}:{row['crt']}:{row['cid']}" for index, row in enumerate(tls[:-1]))
+    rows.append(f"manager-tls:{tls[-1]['crt']}")
+    rows.append(f"issuer:{issuer['pub']}")
+    return _sha(("\n".join(rows) + "\n").encode("ascii"))
+
+
+def _identity_public_projection(
+    bls: Sequence[Mapping[str, str]], tls: Sequence[Mapping[str, str]], issuer: Mapping[str, str],
+) -> bytes:
+    """Persist the public fields needed to reconstruct the native receipt.
+
+    This is not a new authority: the archived native parity receipt below is
+    the independent expected fingerprint.  The projection only makes its
+    public, indexed inputs available to the later no-launch audit.
+    """
+    return _canonical_json({
+        "schema_version": 1,
+        "kind": "kauri-operator-capacity-materialized-public-identity-v1",
+        "bls_public_keys": [row["pub"] for row in bls],
+        "replica_tls": [{"certificate": row["crt"], "common_name": row["cid"]} for row in tls[:-1]],
+        "manager_tls": {"certificate": tls[-1]["crt"], "common_name": tls[-1]["cid"]},
+        "issuer_public_key": issuer["pub"],
+    })
+
+
 def _identity_parity_receipt(value: Mapping[str, object], *, bls: Sequence[Mapping[str, str]],
                              tls: Sequence[Mapping[str, str]], issuer: Mapping[str, str],
                              source_revision: str, verifier_binary: Path,
-                             verifier_sha256: str) -> str:
+                             verifier_sha256: str) -> tuple[str, bytes]:
     if set(value) != {"path", "sha256"}:
         _fail("native identity-parity receipt binding schema differs")
     path = Path(str(value["path"]))
@@ -231,7 +269,7 @@ def _identity_parity_receipt(value: Mapping[str, object], *, bls: Sequence[Mappi
             _fail("native identity-parity receipt differs from fresh verifier output")
     if _sha(_regular(verifier_binary, "pinned native identity-parity verifier", maximum_bytes=512 * 1024 * 1024)) != verifier_sha256:
         _fail("native identity-parity verifier changed during verification")
-    return expected_sha
+    return expected_sha, raw
 
 
 def _identity_verifier_approval(value: Mapping[str, object], *, verifier_binary: Path,
@@ -389,7 +427,7 @@ def materialize_operator_capacity_v3(
         manager_binary=manager_binary, app_binary=app_binary,
         source_revision=source_revision)
     bls, tls, issuer = _identities(identities); stage = _stage_a(stage_a)
-    identity_receipt_sha = _identity_parity_receipt(
+    identity_receipt_sha, identity_receipt_raw = _identity_parity_receipt(
         identity_parity_receipt, bls=bls, tls=tls, issuer=issuer,
         source_revision=source_revision, verifier_binary=verifier_binary,
         verifier_sha256=verifier_sha)
@@ -412,6 +450,10 @@ def materialize_operator_capacity_v3(
     # manifest and rechecked at the runner's spawn edge.
     stage_envelope = root / "config/stage-a-envelope.wire"
     _write_new(stage_envelope, _regular(Path(stage["envelope_path"]), "Stage-A envelope", maximum_bytes=32 * 1024))
+    identity_receipt = root / "config/identity-parity-receipt.json"
+    identity_projection = root / "config/identity-public-projection.json"
+    _write_new(identity_receipt, identity_receipt_raw, mode=0o644)
+    _write_new(identity_projection, _identity_public_projection(bls, tls, issuer), mode=0o644)
     main = root / "config/hotstuff.gen.conf"
     main_lines = [
         "block-size = 1", "fan-out = 5", "async_blocks = 2", "piped_latency = 1",
@@ -420,6 +462,7 @@ def materialize_operator_capacity_v3(
         "leader-progress-timeout = 5.0", "leader-activation-grace = 1.0",
         "client-ip = 127.0.0.1", "tree-generation = file", f"tree-generation-fpath = {tree}",
         "tree-switch-period = 2", "epoch-protocol-mode = adaptive_v3",
+        "experiment-exact-timeout-attempt-evidence-v3 = true",
         "epoch-change-issuer-id = 1", f"epoch-change-issuer-public-key = {issuer['pub']}",
         "epoch-change-minimum-activation-delay = 5", "epoch-change-maximum-activation-delay = 5",
         "epoch-change-maximum-block-extra-bytes = 4096", "epoch-change-maximum-ancestry-blocks = 128",
@@ -428,6 +471,7 @@ def materialize_operator_capacity_v3(
     ]
     for replica in range(N):
         main_lines.append(f"replica = 127.0.0.1:{ports['peer_base'] + replica};{ports['client_base'] + replica}, {bls[replica]['pub']}, {tls[replica]['cid']}")
+        main_lines.append(f"activation-readiness-member = {replica},{bls[replica]['pub']}")
     _write_new(main, ("\n".join(main_lines) + "\n").encode("ascii"))
     replica_paths: list[Path] = []
     for replica in range(N):
@@ -457,7 +501,7 @@ def materialize_operator_capacity_v3(
                     "--shape-candidate-fanouts", "5", "--shape-deterministic-seed", "1", "--transition-request", transition,
                     "--bundle-output", str(bundle), "--epoch-zero-tree-file", str(tree), "--structured-event-run-id", run_id,
                     "--structured-event-source-instance", source_instance, "--structured-event-output", str(manager_events),
-                    "--activation-readiness-release-count", str(Q), "--activation-readiness-maximum-delivery-attempts", "1", "--activation-readiness-retry-interval-ticks", "1",
+                    "--activation-readiness-release-count", str(N), "--activation-readiness-maximum-delivery-attempts", "1", "--activation-readiness-retry-interval-ticks", "30000",
                     "--operator-capacity-stage-a-envelope", str(stage_envelope), "--operator-capacity-stage-a-wire-sha256", stage["envelope_sha256"],
                     "--operator-capacity-label-issuer-id", stage["label_issuer_id"], "--operator-capacity-label-issuer-reference", stage["label_issuer_reference"],
                     "--operator-capacity-label-issuer-public-key-hex", stage["label_issuer_public_key_hex"], "--operator-capacity-label-issuer-public-key-fingerprint", stage["label_issuer_public_key_fingerprint"],
@@ -470,16 +514,28 @@ def materialize_operator_capacity_v3(
     replica_argv = [[str(app_binary), "--conf", str(main), "--conf", str(path), "--structured-event-run-id", run_id,
                      "--structured-event-source-instance", f"{source_instance}-replica-{replica}", "--structured-event-output", str(root / f"raw/replica-{replica}.jsonl"),
                      "--structured-event-commit-observer-id", "replica-0", "--structured-event-commit-observer-instance", observer_instance] for replica, path in enumerate(replica_paths)]
-    artifacts = {str(path.relative_to(root)): _sha(_regular(path, str(path))) for path in (tree, stage_envelope, main, *replica_paths)}
+    artifacts = {str(path.relative_to(root)): _sha(_regular(path, str(path))) for path in (tree, stage_envelope, identity_receipt, identity_projection, main, *replica_paths)}
+    synthetic_workload = {"kind": _SYNTHETIC_WORKLOAD, "source_revision": source_revision,
+                          "hotstuff_app_sha256": app_sha,
+                          "main_config_sha256": artifacts["config/hotstuff.gen.conf"],
+                          "block_size": 1, "initial_beat_delay_ms": 10_000,
+                          "beat_interval_ms": 50, "transaction_count_per_block": 1,
+                          "post_e1_window_ns": _POST_E1_WINDOW_NS}
     manifest = {"schema_version": 1, "kind": "kauri-n31-operator-capacity-v3-materialization-v1", "verdict": "MATERIALIZED_NO_EXECUTION", "claim_eligible": False, "figure_eligible": False,
                 "arm": arm, "stage_a_native_arm": _ARMS[arm], "protocol": {"N": N, "Q": Q, "tree_count": TREE_COUNT}, "slow_root_ids": list(SLOW_ROOTS),
                 "revision": source_revision, "epoch0_tree": {"sha256": _sha(tree_raw), "topology_digest": tree_binding["topology_digest"]},
                 "binary_sha256": {"adaptation_manager": manager_sha, "hotstuff_app": app_sha,
                                   "identity_parity_verifier": verifier_sha}, "artifact_sha256": artifacts,
                 "manager_argv_sha256": _sha(_canonical_json(manager_argv)), "replica_argv_sha256": [_sha(_canonical_json(argv)) for argv in replica_argv],
+                "synthetic_workload": synthetic_workload,
                 "stage_a_envelope_sha256": stage["envelope_sha256"], "stage_a_verifier_receipt_sha256": stage_a_receipt_sha,
                 "stage_a_verifier_arguments": verifier_arguments,
                 "identity_parity_receipt_sha256": identity_receipt_sha,
+                # This public projection is later recomputed from the exact
+                # materialized config files and argv.  It deliberately says
+                # nothing about whether the native parser consumed private
+                # key bytes; that needs native loaded-config evidence.
+                "public_identity_fingerprint": _identity_public_fingerprint(bls, tls, issuer),
                 "tool_identity_approval_receipt_sha256": approval_sha,
                 "stage_b_authorization_output": str(stage_b.relative_to(root)), "consumption_output": str(consumption.relative_to(root)), "bundle_output": str(bundle.relative_to(root))}
     _write_new(root / "materialization-manifest.json", _canonical_json(manifest), mode=0o644)

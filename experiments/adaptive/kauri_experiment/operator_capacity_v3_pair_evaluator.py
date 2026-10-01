@@ -224,17 +224,26 @@ def _arm(
             type(window["start_monotonic_ns"]) is not int or type(window["end_monotonic_ns"]) is not int or
             window["end_monotonic_ns"] - window["start_monotonic_ns"] != WINDOW_NS):
         _fail(f"{arm_name} raw validation lacks an exact 30-second E1 window")
+    workload = raw.get("synthetic_workload")
+    if (not isinstance(workload, Mapping) or workload.get("kind") != "replica-local-synthetic-v1" or
+            workload.get("block_size") != 1 or workload.get("transaction_count_per_block") != 1 or
+            workload.get("post_e1_window_ns") != WINDOW_NS):
+        _fail(f"{arm_name} raw validation lacks the frozen synthetic workload identity")
+    public_identity = raw.get("public_identity_fingerprint")
+    if not isinstance(public_identity, str) or len(public_identity) != 64 or any(char not in "0123456789abcdef" for char in public_identity):
+        _fail(f"{arm_name} raw validation lacks validator-derived public identity")
     count = raw.get("complete_common_commit_count")
     commits = raw.get("common_commits")
     if type(count) is not int or count < 0 or not isinstance(commits, list) or len(commits) != count:
         _fail(f"{arm_name} raw validation commit count does not bind its common commits")
     for item in commits:
-        if not isinstance(item, Mapping) or set(item) != {"height", "block_hash", "designated_ns", "completion_ns"}:
+        if not isinstance(item, Mapping) or set(item) != {"height", "block_hash", "designated_ns", "completion_ns", "transaction_count"}:
             _fail(f"{arm_name} common commit schema differs")
         if (type(item["height"]) is not int or item["height"] <= 0 or
                 type(item["designated_ns"]) is not int or type(item["completion_ns"]) is not int or
                 not window["start_monotonic_ns"] <= item["designated_ns"] < window["end_monotonic_ns"] or
-                not item["designated_ns"] <= item["completion_ns"] < window["end_monotonic_ns"]):
+                not item["designated_ns"] <= item["completion_ns"] < window["end_monotonic_ns"] or
+                item["transaction_count"] != 1):
             _fail(f"{arm_name} common commit lies outside its E1 window")
         _hex64(item["block_hash"], f"{arm_name} common commit hash")
     chain = raw.get("consumption_chain")
@@ -256,7 +265,18 @@ def _arm(
             "raw_validation_sha256": _sha(raw_bytes), "authority_sha256": _sha(authority_bytes),
             "artifacts": artifacts, "stage_a_wire_sha256": chain.get("stage_a_wire_sha256"),
             "stage_b_authorization_wire_sha256": chain.get("stage_b_authorization_wire_sha256"),
-            "frozen_cpu_identity": _frozen_cpu_identity(root)}
+            "frozen_cpu_identity": _frozen_cpu_identity(root), "synthetic_workload": dict(workload),
+            "public_identity_fingerprint": public_identity}
+
+
+def _synthetic_workload_semantics(workload: Mapping[str, Any]) -> dict[str, Any]:
+    """Compare the drive, leaving per-arm materialized config hashes local."""
+    fields = {"kind", "source_revision", "hotstuff_app_sha256", "block_size",
+              "initial_beat_delay_ms", "beat_interval_ms", "transaction_count_per_block",
+              "post_e1_window_ns"}
+    if not fields.issubset(workload):
+        _fail("raw synthetic workload semantics are incomplete")
+    return {field: workload[field] for field in fields}
 
 
 def evaluate_matched_pair(
@@ -312,6 +332,11 @@ def evaluate_matched_pair(
     treatment_manifest, _ = _document(Path(treatment_root) / "materialization-manifest.json", "treatment materialization manifest")
     if sham_manifest.get("binary_sha256") != treatment_manifest.get("binary_sha256"):
         _fail("arms do not share exact materialized binary identity")
+    if sham["public_identity_fingerprint"] != treatment["public_identity_fingerprint"]:
+        _fail("arms do not share exact validator-derived public identity projection")
+    if (_synthetic_workload_semantics(sham["synthetic_workload"]) !=
+            _synthetic_workload_semantics(treatment["synthetic_workload"])):
+        _fail("arms do not share exact synthetic workload identity and horizon")
     if treatment["count"] < 0 or sham["count"] <= 0:
         _fail("sham common-commit denominator is not positive")
     meets = treatment["count"] * denominator >= sham["count"] * numerator
