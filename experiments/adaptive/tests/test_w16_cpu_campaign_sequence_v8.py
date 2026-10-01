@@ -30,11 +30,11 @@ def _freeze(tmp_path: Path) -> tuple[Path, dict[str, object]]:
     timeout.chmod(0o755)
     freeze = {
         "schema_version": 3, "kind": "kauri-w16-cpu-repeat-freeze-v8-neutral-v1",
-        "campaign_id": "w16-cpu-repeat-v8-test", "revision": "a" * 40,
+        "campaign_id": "w16-cpu-repeat-v8-20260927-8dd8ba38", "revision": "a" * 40,
         "host": "proteina02", "booking_id": "1hfblbqhgpne9en0k05jaq83t0",
         "repository_root": str(repository),
-        "output_parent": str(repository / "results" / "w16-cpu-repeat-v8-test"),
-        "evidence_dir": str(repository / "build-adaptive" / "w16-cpu-repeat-v8-test"),
+        "output_parent": str(repository / "results" / "w16-cpu-repeat-v8-20260927-8dd8ba38"),
+        "evidence_dir": str(repository / "build-adaptive" / "w16-cpu-repeat-v8-20260927-8dd8ba38"),
         "timeout_path": str(timeout),
         "timeout_sha256": hashlib.sha256(timeout.read_bytes()).hexdigest(),
         "block_orders": ["forward", "reverse", "forward", "reverse", "forward", "reverse"],

@@ -30,6 +30,10 @@ _EXECUTION_APPROVAL_KIND = "kauri-w16-cpu-repeat-execution-approval-v1"
 _RECEIPT_SCHEMA = "kauri-n31-static-e0-local-executor-v3"
 _ORDERS = ("forward", "reverse", "forward", "reverse", "forward", "reverse")
 _BINARIES = {"app", "keygen", "tls_keygen", "native_digest"}
+_BOOKING_ID_BY_CAMPAIGN = {
+    "w16-cpu-repeat-v8-20260927-8dd8ba38": "1hfblbqhgpne9en0k05jaq83t0",
+    "w16-cpu-repeat-v8-20261002-replication": "9ju0eqk272j7ofgtkvii0rag68",
+}
 _FREEZE_KEYS = {"schema_version", "kind", "campaign_id", "revision", "host", "booking_id", "repository_root", "output_parent", "evidence_dir", "timeout_path", "timeout_sha256", "block_orders", "replica_count", "quorum", "fanout", "tree_count", "authoritative_observer", "slow_replica_ids", "slow_quota_percent", "other_quota_percent", "complete_cycles", "hard_timeout_s", "external_timeout_s", "automatic_retries", "positive_blocks_required", "positive_per_order_required", "adjusted_gain_numerator", "adjusted_gain_denominator", "pilot_excluded", "authorization_schema_version", "authorization_kind", "executor_receipt_schema", "cell_validator_version", "process_cleanup_required"}
 _MANIFEST_KEYS = {"schema_version", "kind", "campaign_id", "revision", "campaign_freeze_sha256", "approval_ref", "output_parent", "evidence_dir", "cells"}
 _CELL_KEYS = {"ordinal", "block_index", "block_order", "cell_label", "block_cell_ordinal", "output_root", "preflight_path", "preflight_sha256", "authorization_path", "authorization_sha256", "hard_timeout_s", "external_timeout_s", "automatic_retries"}
@@ -111,8 +115,9 @@ def _validate_freeze_or_raise(freeze: Mapping[str, object]) -> dict[str, object]
     campaign_id = freeze.get("campaign_id")
     fixed = (
         type(freeze.get("schema_version")) is int and freeze.get("schema_version") == 3 and freeze.get("kind") == _FREEZE_KIND
-        and isinstance(campaign_id, str) and re.fullmatch(r"w16-cpu-repeat-v8-[a-z0-9][a-z0-9-]*", campaign_id)
-        and _digest(freeze.get("revision"), 40) and freeze.get("host") == "proteina02" and freeze.get("booking_id") == "1hfblbqhgpne9en0k05jaq83t0"
+        and isinstance(campaign_id, str) and campaign_id in _BOOKING_ID_BY_CAMPAIGN
+        and freeze.get("booking_id") == _BOOKING_ID_BY_CAMPAIGN[campaign_id]
+        and _digest(freeze.get("revision"), 40) and freeze.get("host") == "proteina02"
         and freeze.get("block_orders") == list(_ORDERS) and freeze.get("replica_count") == 31 and freeze.get("quorum") == 21 and freeze.get("fanout") == 5 and freeze.get("tree_count") == 21 and freeze.get("authoritative_observer") == 27
         and freeze.get("slow_replica_ids") == list(range(6)) and freeze.get("slow_quota_percent") == 25 and freeze.get("other_quota_percent") == 100 and freeze.get("complete_cycles") == 5
         and freeze.get("hard_timeout_s") == 480 and freeze.get("external_timeout_s") == 720 and freeze.get("automatic_retries") == 0 and freeze.get("positive_blocks_required") == 5 and freeze.get("positive_per_order_required") == 2
