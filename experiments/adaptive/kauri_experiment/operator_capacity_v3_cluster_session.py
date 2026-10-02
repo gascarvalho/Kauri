@@ -26,6 +26,7 @@ def design():
         "shared_inputs_per_block": ["31 BLS keys", "32 TLS identities", "epoch issuer", "label issuer", "capacity snapshot"],
         "snapshot_validity_seconds": 1800, "hard_scope_seconds": 300, "wrapper_timeout_seconds": 315,
         "replica_cfs_quota_period_usec": cluster.REPLICA_CFS_PERIOD_US,
+        "booking_policy": "each cell within one exact event; campaign across verified adjacent exclusive events",
         "baseline_decision_deadline_seconds": 240, "convergence_seconds": 30,
         "readiness_required": 31, "readiness_delivery_attempts": 1, "activation_delay_blocks": 5,
         "metric": "all31 same-window one-command common committed blocks",
@@ -45,9 +46,13 @@ def run_cell(session, *, ordinal, cell, shared, repo, build_receipt, booking_id,
     regime, arm = cell
     run_id = session.name + "-" + name
     root = session / ("pilots" if pilot else "cells") / name
+    frozen, _ = cluster.read(session / "freeze.json")
+    admission = cluster.admit_cell_booking(frozen["booking_ids"])
+    booking_id = admission["booking_id"]
     arguments = prepare.prepare(root, shared_path=shared, private=session / "inputs" / name,
         run_id=run_id, arm=arm, regime=regime, repo=repo, build_receipt=build_receipt,
         booking_id=booking_id, approval_reference=reference)
+    cluster.write(root / "runtime/session-booking-admission.json", admission)
     cluster.execute(**arguments)
     terminal_sha = cluster.sha((root / validation.TERMINAL).read_bytes())
     result = validation.replay(root, expected_terminal_sha256=terminal_sha)
@@ -68,11 +73,17 @@ def evaluate(session):
     if (frozen["design"] != design() or cluster.sha(build_raw) != frozen["build_receipt_sha256"] or
             frozen["repository_revision"] != build["repository_revision"]):
         raise cluster.ClusterError("W18 prospective design/build freeze changed")
+    coverage = cluster.booking_coverage(frozen["booking_stdout"],
+        datetime.fromisoformat(frozen["booking_observed_utc"]), reserve_s=9500)
+    if (coverage != frozen["booking_coverage"] or
+            frozen["booking_ids"] != [row[0] for row in coverage["booking_rows"]]):
+        raise cluster.ClusterError("frozen reservation coverage changed")
     pilots, _ = cluster.read(session / "accepted-excluded-pilots.json")
     if len(pilots["pilots"]) != 4:
         raise cluster.ClusterError("W18 requires four accepted excluded pilots")
     for item, cell in zip(pilots["pilots"], (HS, HT, OS, OT)):
         proof = validation.replay(Path(item["root"]), expected_terminal_sha256=item["terminal_sha256"])
+        verify_cell_booking(Path(item["root"]), frozen["booking_ids"])
         if (proof["physical_regime"], proof["arm"]) != cell:
             raise cluster.ClusterError("excluded pilot differs from frozen arm/regime")
     rows = []; totals = {HS: 0, HT: 0, OS: 0, OT: 0}; orders = {"sham,treatment": 0, "treatment,sham": 0}
@@ -82,6 +93,7 @@ def evaluate(session):
             ordinal = (block_number - 1) * 4 + j + 1
             item, _ = cluster.read(session / "cell-" / f"c{ordinal:02d}.json")
             result = validation.replay(Path(item["root"]), expected_terminal_sha256=item["terminal_sha256"])
+            verify_cell_booking(Path(item["root"]), frozen["booking_ids"])
             if (result["repository_revision"] != frozen["repository_revision"] or
                     (result["physical_regime"], result["arm"]) != cell or
                     result["complete_common_commit_count"] != item["count"] or
@@ -114,17 +126,34 @@ def evaluate(session):
         "external_client_throughput": False}
 
 
+def verify_cell_booking(root, allowed_ids):
+    admission, _ = cluster.read(root / "runtime/session-booking-admission.json")
+    request, _ = cluster.read(root / "runtime/cluster-request.json")
+    if (admission["booking_id"] not in allowed_ids or
+            admission["booking_id"] != request["booking_id"] or
+            admission["preparation_and_cell_reserve_seconds"] != 420 or
+            admission["waited_before_admission_seconds"] < 0):
+        raise cluster.ClusterError("cell reservation differs from its frozen admission")
+    cluster.booking_row(admission["booking_stdout"], admission["booking_id"],
+        datetime.fromisoformat(admission["observed_utc"]), reserve_s=420)
+
+
 def run(session, *, repo, build_receipt, booking_id, reference):
     if session.exists() or session != session.resolve() or not reference:
         raise cluster.ClusterError("W18 session must be a fresh canonical authorized root")
     build, build_raw = cluster.read(build_receipt)
     cluster.require_no_owned_native()
+    booking_stdout = cluster.booking_listing()
+    booking_observed = datetime.now(timezone.utc)
+    coverage = cluster.booking_coverage(booking_stdout, booking_observed, reserve_s=9500)
     session.mkdir(mode=0o700)
     for name in ("pilots", "cells", "inputs", "shared", "pilot-", "cell-"):
         (session / name).mkdir(mode=0o700)
     frozen = {"design": design(), "build_receipt_path": str(build_receipt),
         "build_receipt_sha256": cluster.sha(build_raw), "repository_revision": build["repository_revision"],
         "booking_id": booking_id, "approval_reference": reference,
+        "booking_stdout": booking_stdout, "booking_observed_utc": booking_observed.isoformat(),
+        "booking_coverage": coverage, "booking_ids": [row[0] for row in coverage["booking_rows"]],
         "frozen_before_first_pilot_utc": datetime.now(timezone.utc).isoformat()}
     cluster.write(session / "freeze.json", frozen)
     try:

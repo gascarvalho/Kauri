@@ -82,6 +82,70 @@ def booking_row(stdout, booking_id, observed_utc, *, reserve_s=360):
     return selected[0]
 
 
+def booking_listing():
+    return subprocess.check_output(["gsd_manager", "-N", "proteina02", "booking", "ls",
+        "-u", "gascarvalho", "-m", "exclusive", "-s", "2026-10-02 09:30",
+        "-e", "2026-10-03 00:00", "-n", "100"], text=True, timeout=25)
+
+
+def authorized_booking_rows(stdout):
+    rows = []
+    seen = set()
+    for line in stdout.splitlines():
+        if not line.startswith("|"):
+            continue
+        row = [field.strip() for field in line.split("|")[1:-1]]
+        if not row or row[0] not in BOOKINGS:
+            continue
+        if (len(row) != 7 or row[:4] != [row[0], "proteina02", "gascarvalho", "EXCLUSIVE"] or
+                tuple(row[5:]) != BOOKINGS[row[0]] or row[0] in seen):
+            raise ClusterError("authorized reservation identity, ownership or bounds changed")
+        seen.add(row[0])
+        start, end = [datetime.strptime(value, "%Y-%m-%d %H:%M").replace(
+            tzinfo=ZoneInfo("Europe/Lisbon")) for value in row[5:]]
+        rows.append((start, end, row))
+    return sorted(rows, key=lambda item: item[0])
+
+
+def booking_coverage(stdout, observed_utc, *, reserve_s):
+    rows = authorized_booking_rows(stdout)
+    active = [i for i, (start, end, _) in enumerate(rows) if start <= observed_utc < end]
+    if len(active) != 1 or reserve_s <= 0:
+        raise ClusterError("no exact active reservation for campaign admission")
+    index = active[0]
+    chain = [rows[index][2]]
+    end = rows[index][1]
+    while (end - observed_utc).total_seconds() < reserve_s:
+        index += 1
+        if index >= len(rows) or rows[index][0] != end:
+            raise ClusterError("authorized exclusive reservations do not cover the fixed reserve")
+        end = rows[index][1]
+        chain.append(rows[index][2])
+    return {"booking_rows": chain, "fixed_reserve_seconds": reserve_s,
+            "coverage_until_utc": end.astimezone(timezone.utc).isoformat()}
+
+
+def admit_cell_booking(allowed_ids):
+    started = time.monotonic()
+    while True:
+        stdout = booking_listing()
+        now = datetime.now(timezone.utc)
+        rows = [item for item in authorized_booking_rows(stdout) if item[2][0] in allowed_ids]
+        active = [item for item in rows if item[0] <= now < item[1]]
+        if len(active) != 1:
+            raise ClusterError("cell has no exact frozen active reservation")
+        start, end, row = active[0]
+        # Reserve preparation time before the unchanged 360s cell/cleanup gate.
+        if (end - now).total_seconds() >= 420:
+            booking_row(stdout, row[0], now, reserve_s=420)
+            return {"booking_id": row[0], "booking_stdout": stdout,
+                    "observed_utc": now.isoformat(), "preparation_and_cell_reserve_seconds": 420,
+                    "waited_before_admission_seconds": time.monotonic() - started}
+        if not any(next_start == end for next_start, _, _ in rows):
+            raise ClusterError("cell cannot fit and has no frozen adjacent reservation")
+        time.sleep(min(30, max(0.1, (end - now).total_seconds())))
+
+
 def repository_state(repo, revision):
     for arguments, expected in ((["rev-parse", "HEAD"], revision),
             (["branch", "--show-current"], "feature/adaptive-epoch-throughput"),

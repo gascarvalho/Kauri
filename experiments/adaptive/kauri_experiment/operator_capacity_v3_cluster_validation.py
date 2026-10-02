@@ -83,6 +83,12 @@ def _cluster_chain(root):
         raise cluster.ClusterError("native build log, dependency closure or complete tool map differs")
     cluster.booking_row(observed["booking_stdout"], request["booking_id"],
         datetime.fromisoformat(observed["observed_utc"]))
+    booking_observed = datetime.fromisoformat(build["booking_observed_utc"])
+    if cluster.booking_coverage(build["booking_stdout"], booking_observed,
+            reserve_s=11500) != build["booking_coverage"]:
+        raise cluster.ClusterError("build did not retain full campaign reservation coverage")
+    cluster.booking_row(build["booking_stdout"], build["booking_id"], booking_observed,
+                        reserve_s=2020)
     if observed["booking_row"] != cluster.booking_row(observed["booking_stdout"],
             request["booking_id"], datetime.fromisoformat(observed["observed_utc"])):
         raise cluster.ClusterError("retained exact booking row differs")

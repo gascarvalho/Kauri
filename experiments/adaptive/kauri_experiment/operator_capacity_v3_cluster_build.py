@@ -43,9 +43,11 @@ def build(repo, destination, revision, booking_id):
         raise cluster.ClusterError("wrong W18 native build host")
     cluster.repository_state(repo, revision)
     cluster.require_no_owned_native()
-    booking = subprocess.check_output(["gsd_manager", "-N", "proteina02", "booking", "ls",
-        "-c", "-u", "gascarvalho", "-m", "exclusive"], text=True, timeout=25)
-    cluster.booking_row(booking, booking_id, datetime.now(timezone.utc), reserve_s=11500)
+    booking = cluster.booking_listing()
+    booking_observed = datetime.now(timezone.utc)
+    coverage = cluster.booking_coverage(booking, booking_observed, reserve_s=11500)
+    # The campaign spans verified events; this bounded build stays within one.
+    cluster.booking_row(booking, booking_id, booking_observed, reserve_s=2020)
     destination.mkdir(mode=0o700)
     deps = dependency_tree()
     cluster.write(destination / "dependencies-before.json", deps)
@@ -89,7 +91,8 @@ def build(repo, destination, revision, booking_id):
         "binaries": binaries, "cmake_version": out(["cmake", "--version"]).splitlines()[0],
         "cxx_compiler": compiler, "cxx_version": out([compiler, "--version"]).splitlines()[0],
         "submodule_status": out(["git", "submodule", "status"]), "booking_stdout": booking,
-        "booking_id": booking_id, "recorded_utc": datetime.now(timezone.utc).isoformat()}
+        "booking_id": booking_id, "booking_observed_utc": booking_observed.isoformat(),
+        "booking_coverage": coverage, "recorded_utc": datetime.now(timezone.utc).isoformat()}
     cluster.write(destination / "build-provenance.json", receipt)
     return receipt
 
