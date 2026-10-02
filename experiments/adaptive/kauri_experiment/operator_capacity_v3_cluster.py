@@ -35,6 +35,7 @@ REQUEST_KIND = "kauri-w18-cluster-arm-request-v1"
 APPROVAL_KIND = "kauri-w18-cluster-arm-approval-v1"
 RECEIPT_KIND = "kauri-w18-cluster-arm-receipt-v1"
 TIMEOUT_S = 300
+REPLICA_CFS_PERIOD_US = 20_000
 
 
 class ClusterError(ValueError):
@@ -120,6 +121,7 @@ def build_request(plan, *, root, run_id, build_receipt, booking_id):
             "booking_id": booking_id, "booking_bounds": list(BOOKINGS[booking_id]),
             "physical_regime": plan["cluster_physical_regime"], "arm": plan["arm"],
             "quota_profile_sha256": plan["cluster_quota_sha256"],
+            "replica_cfs_quota_period_usec": REPLICA_CFS_PERIOD_US,
             "hard_timeout_s": TIMEOUT_S, "kill_grace_s": 15, "automatic_retries": 0,
             "claim_eligible": False, "figure_eligible": False}
 
@@ -210,7 +212,8 @@ class ClusterLifecycle(physical.CpuQuotaLocalLifecycle):
                 raise ClusterError("replica spawn does not have exact CPU scope grammar")
             index = command.index("--")
             command[index:index] = ["--property=RuntimeMaxSec=300s",
-                "--property=KillMode=control-group", "--property=SendSIGKILL=yes"]
+                "--property=KillMode=control-group", "--property=SendSIGKILL=yes",
+                "--property=CPUQuotaPeriodSec=20ms"]
             return base_spawn(registry, **{**kwargs, "command": tuple(command)})
 
         self._quota._base_spawn = bounded_spawn
@@ -221,8 +224,29 @@ class ClusterLifecycle(physical.CpuQuotaLocalLifecycle):
         raw = subprocess.check_output(["systemctl", "--user", "show", unit, "-p", "RuntimeMaxUSec"], text=True, timeout=10)
         if raw.strip() not in {"RuntimeMaxUSec=5min", "RuntimeMaxUSec=300s"}:
             raise ClusterError("replica scope does not retain fixed 300-second limit")
+        period_raw = subprocess.check_output(["systemctl", "--user", "show", unit,
+            "-p", "CPUQuotaPeriodUSec", "-p", "ControlGroup"], text=True, timeout=10)
+        properties = dict(line.split("=", 1) for line in period_raw.splitlines() if "=" in line)
+        if (properties.get("CPUQuotaPeriodUSec") != "20ms" or
+                not properties.get("ControlGroup", "").endswith("/" + unit)):
+            raise ClusterError("replica scope lacks the prospectively fixed CFS period")
+        cpu_max = (Path("/sys/fs/cgroup") / properties["ControlGroup"].lstrip("/") / "cpu.max").read_text()
+        if (int(cpu_max.split()[1]) != REPLICA_CFS_PERIOD_US or
+                cpu_quota.parse_cpu_max(cpu_max) !=
+                self._quota.contract.assignments[replica_id].cpu_quota_percent * 10_000):
+            raise ClusterError("replica CFS period or exact quota budget differs")
         write(self._root / "runtime" / f"cluster-replica-{replica_id}-scope-limit.json",
-              {"unit": unit, "raw_properties": raw, "hard_timeout_s": TIMEOUT_S})
+              {"unit": unit, "raw_properties": raw, "hard_timeout_s": TIMEOUT_S,
+               "quota_period_properties": period_raw, "quota_period_usec": REPLICA_CFS_PERIOD_US,
+               "cpu_max": cpu_max})
+
+
+def quota_calibration_command(plan, *, run_id, cohort):
+    from .cpu_quota_calibration import calibration_scope_command
+    command, unit = calibration_scope_command(plan, run_id=run_id, cohort=cohort)
+    args = list(command)
+    args.insert(args.index("--"), "--property=CPUQuotaPeriodSec=20ms")
+    return tuple(args), unit
 
 
 def execute_child(root, *, request_path, approval_path, approval_sha, build_receipt,

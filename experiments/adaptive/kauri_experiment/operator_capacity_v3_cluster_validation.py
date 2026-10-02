@@ -104,6 +104,15 @@ def _cluster_chain(root):
                 limit["hard_timeout_s"] != 300 or limit["raw_properties"].strip()
                 not in {"RuntimeMaxUSec=5min", "RuntimeMaxUSec=300s"}):
             raise cluster.ClusterError("replica scope lacked unchanged 300-second ceiling")
+        period = dict(line.split("=", 1) for line in
+                      limit["quota_period_properties"].splitlines() if "=" in line)
+        expected_quota = 25 if request["physical_regime"] == "heterogeneous" and i < 6 else 100
+        if (limit["quota_period_usec"] != cluster.REPLICA_CFS_PERIOD_US or
+                period.get("CPUQuotaPeriodUSec") != "20ms" or
+                int(limit["cpu_max"].split()[1]) != cluster.REPLICA_CFS_PERIOD_US or
+                cpu_quota.parse_cpu_max(limit["cpu_max"]) != expected_quota * 10_000 or
+                not period.get("ControlGroup", "").endswith("/" + limit["unit"])):
+            raise cluster.ClusterError("replica CFS period, quota or owned cgroup differs")
     tool, tool_raw = cluster.read(root / "runtime/tool-identity-approval.json")
     manifest, _ = cluster.read(root / "materialization-manifest.json")
     if cluster.sha(tool_raw) != manifest["tool_identity_approval_receipt_sha256"]:

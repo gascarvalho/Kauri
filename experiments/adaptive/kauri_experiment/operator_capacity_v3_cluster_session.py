@@ -25,6 +25,7 @@ def design():
         "matched_schedule": [[list(x) for x in block] for block in SCHEDULE],
         "shared_inputs_per_block": ["31 BLS keys", "32 TLS identities", "epoch issuer", "label issuer", "capacity snapshot"],
         "snapshot_validity_seconds": 1800, "hard_scope_seconds": 300, "wrapper_timeout_seconds": 315,
+        "replica_cfs_quota_period_usec": cluster.REPLICA_CFS_PERIOD_US,
         "baseline_decision_deadline_seconds": 240, "convergence_seconds": 30,
         "readiness_required": 31, "readiness_delivery_attempts": 1, "activation_delay_blocks": 5,
         "metric": "all31 same-window one-command common committed blocks",
@@ -128,7 +129,7 @@ def run(session, *, repo, build_receipt, booking_id, reference):
     cluster.write(session / "freeze.json", frozen)
     try:
         receipt = calibration.run_calibration(calibration.CalibrationPlan(), output_root=session / "calibration",
-            run_id=session.name + "-calibration")
+            run_id=session.name + "-calibration", command_builder=cluster.quota_calibration_command)
         if receipt.get("verdict") != "PASS":
             raise cluster.ClusterError("physical CPU quota service calibration rejected")
         pilots = [run_cell(session, ordinal=i + 1, cell=cell, shared=session / "shared/pilots.json",
