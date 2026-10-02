@@ -64,6 +64,8 @@ def _cluster_chain(root):
             receipt["manager_exit_code"] not in (None, 0) or
             type(receipt["manager_exit_code_after_cleanup"]) is not int or
             receipt["manager_success_terminal_verified"] is not True or
+            receipt["fresh_native_stage_a_receipt_sha256"] != cluster.sha(authority._read(
+                root / "runtime/fresh-native-stage-a-receipt.json", "fresh native Stage A")) or
             receipt["claim_eligible"] is not False or receipt["figure_eligible"] is not False):
         raise cluster.ClusterError("cluster child lacks a successful sealed no-retry receipt")
     if (build["kind"] != "kauri-w18-cluster-build-provenance-v1" or

@@ -55,6 +55,27 @@ def _json_bytes(raw: bytes, label: str) -> dict[str, object]:
     return value
 
 
+def _native_json_bytes(raw: bytes, label: str) -> dict[str, object]:
+    """Decode framed native receipts without imposing Python field ordering."""
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            if key in result:
+                _fail(f"{label} repeats JSON field {key}")
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(raw.decode("ascii"), object_pairs_hook=pairs,
+                           parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        _fail(f"{label} is not strict ASCII JSON")
+        raise AssertionError from exc
+    if not isinstance(value, dict) or not raw.endswith(b"\n"):
+        _fail(f"{label} is not a framed native JSON object")
+    return value
+
+
 def _regular(path: Path, label: str) -> bytes:
     candidate = Path(path)
     if candidate.is_symlink() or not candidate.is_file():
@@ -183,7 +204,7 @@ def verify_pre_spawn_authority(
             Path(str(authority["envelope"])).resolve() != root / "config/stage-a-envelope.wire"):
         _fail("pre-spawn Stage-A authority does not name the exact materialized inputs")
     native_raw = _regular(Path(str(authority["native_receipt"])), "native Stage-A receipt")
-    native = _json_bytes(native_raw, "native Stage-A receipt")
+    native = _native_json_bytes(native_raw, "native Stage-A receipt")
     expected_native_fields = {
         "schema_version", "kind", "verdict", "envelope_wire_sha256",
         "envelope_canonical_digest", "approved_capacity_digest", "issuer_id",
@@ -643,14 +664,15 @@ def _rerun_native_stage_a_verifier(
         raise AssertionError from exc
     if getattr(invoked, "returncode", None) != 0:
         _fail("pinned native Stage-A verifier rejected the exact launch inputs")
-    retained = _json_bytes(_regular(Path(str(authority["native_receipt"])), "native Stage-A receipt"), "native Stage-A receipt")
-    fresh = _json_bytes(_regular(output, "fresh native Stage-A receipt"), "fresh native Stage-A receipt")
+    retained = _native_json_bytes(_regular(Path(str(authority["native_receipt"])), "native Stage-A receipt"), "native Stage-A receipt")
+    fresh_raw = _regular(output, "fresh native Stage-A receipt")
+    fresh = _native_json_bytes(fresh_raw, "fresh native Stage-A receipt")
     if (set(fresh) != set(retained) or
             any(fresh.get(key) != value for key, value in retained.items() if key != "verification_monotonic_raw_ns") or
             not isinstance(fresh.get("verification_monotonic_raw_ns"), int) or
             fresh["verification_monotonic_raw_ns"] <= 0):
         _fail("fresh native Stage-A verifier output differs from the retained authority receipt")
-    return _sha(_canonical(fresh))
+    return _sha(fresh_raw)
 
 
 def execute_excluded_local_shakedown(
