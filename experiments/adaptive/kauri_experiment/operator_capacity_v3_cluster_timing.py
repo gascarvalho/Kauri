@@ -3,9 +3,9 @@ import json
 
 
 def expected_profile():
-    return {"kind": "kauri-w18-cluster-aggregation-1s-leader-5s-v1",
-            "schema_version": 1, "aggregation_per_remaining_level_ms": 1000,
-            "leader_progress_timeout_ms": 5000, "leader_activation_grace_ms": 1000}
+    return {"kind": "kauri-w18-cluster-aggregation-1s-leader-10s-v2",
+            "schema_version": 2, "aggregation_per_remaining_level_ms": 1000,
+            "leader_progress_timeout_ms": 10000, "leader_activation_grace_ms": 1000}
 
 
 def aggregation_seconds(profile=None):
@@ -15,3 +15,9 @@ def aggregation_seconds(profile=None):
     if canonical(profile) != canonical(expected_profile()):
         raise ValueError("cluster aggregation timing differs from the approved exact profile")
     return 1.0
+
+
+def leader_progress_seconds(profile=None):
+    # Validate the same exact profile before selecting either native timer.
+    aggregation_seconds(profile)
+    return 5.0 if profile is None else 10.0

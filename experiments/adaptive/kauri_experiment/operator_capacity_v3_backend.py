@@ -123,6 +123,7 @@ def validate_synthetic_main_config(raw: bytes, *, root: Path, manager_argv: Sequ
     expected_config = dict(_SYNTHETIC_CONFIG)
     try:
         expected_config["aggregation-timeout"] = f"{timing.aggregation_seconds(cluster_timing_profile):.1f}"
+        expected_config["leader-progress-timeout"] = f"{timing.leader_progress_seconds(cluster_timing_profile):.1f}"
     except (ValueError, TypeError) as exc:
         _fail(str(exc))
     if any(parsed.get(key) != value for key, value in expected_config.items()):
