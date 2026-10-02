@@ -23,6 +23,7 @@ from . import cpu_quota
 from . import operator_capacity_v3_authority as authority
 from . import operator_capacity_v3_backend as backend
 from . import operator_capacity_v3_cluster_profiles as profiles
+from . import operator_capacity_v3_cluster_timing as timing
 from . import operator_capacity_v3_local_runner as physical
 
 
@@ -172,7 +173,8 @@ def require_no_owned_native():
 
 
 def build_request(plan, *, root, run_id, build_receipt, booking_id):
-    if (plan.get("cluster_physical_regime") not in {"heterogeneous", "homogeneous"} or
+    if (plan.get("cluster_timing_profile") != timing.expected_profile() or
+            plan.get("cluster_physical_regime") not in {"heterogeneous", "homogeneous"} or
             plan.get("verdict") != "BACKEND_PLAN_REVIEW_REQUIRED_NO_EXECUTION" or
             plan.get("automatic_retries") != 0 or plan.get("launch_permitted") is not False or
             root != root.resolve() or booking_id not in BOOKINGS or
@@ -186,6 +188,7 @@ def build_request(plan, *, root, run_id, build_receipt, booking_id):
             "physical_regime": plan["cluster_physical_regime"], "arm": plan["arm"],
             "quota_profile_sha256": plan["cluster_quota_sha256"],
             "replica_cfs_quota_period_usec": REPLICA_CFS_PERIOD_US,
+            "cluster_timing_profile": plan["cluster_timing_profile"],
             "hard_timeout_s": TIMEOUT_S, "kill_grace_s": 15, "automatic_retries": 0,
             "claim_eligible": False, "figure_eligible": False}
 

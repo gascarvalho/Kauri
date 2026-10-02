@@ -15,6 +15,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 from .operator_capacity_stage_a_preflight import REQUIRED_BINARIES
+from . import operator_capacity_v3_cluster_timing as timing
 
 
 class OperatorCapacityV3MaterializerError(ValueError):
@@ -398,9 +399,11 @@ def materialize_operator_capacity_v3(
     tool_identity_approval: Mapping[str, object], epoch0_tree: Mapping[str, object], stage_a: Mapping[str, object],
     stage_a_verifier_receipt: Mapping[str, object], source_revision: str,
     stage_b_issuer_reference: str, hard_deadline_ns: int,
+    cluster_timing_profile: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Write a fresh v3 all-live input set and return actual argv only in memory."""
     root = Path(root)
+    aggregation_seconds = timing.aggregation_seconds(cluster_timing_profile)
     if root.exists() or root.is_symlink() or arm not in _ARMS:
         _fail("materialization root must be fresh and arm predeclared")
     if (not isinstance(run_id, str) or not run_id or len(run_id) > 128 or
@@ -458,7 +461,7 @@ def materialize_operator_capacity_v3(
     main_lines = [
         "block-size = 1", "fan-out = 5", "async_blocks = 2", "piped_latency = 1",
         "nworker = 2", "repnworker = 2", "pace-maker = dummy", "proposer = 0",
-        "base-timeout = 2.0", "prop-delay = 0.1", "aggregation-timeout = 0.5",
+        "base-timeout = 2.0", "prop-delay = 0.1", f"aggregation-timeout = {aggregation_seconds:.1f}",
         "leader-progress-timeout = 5.0", "leader-activation-grace = 1.0",
         "client-ip = 127.0.0.1", "tree-generation = file", f"tree-generation-fpath = {tree}",
         "tree-switch-period = 2", "epoch-protocol-mode = adaptive_v3",
@@ -538,5 +541,7 @@ def materialize_operator_capacity_v3(
                 "public_identity_fingerprint": _identity_public_fingerprint(bls, tls, issuer),
                 "tool_identity_approval_receipt_sha256": approval_sha,
                 "stage_b_authorization_output": str(stage_b.relative_to(root)), "consumption_output": str(consumption.relative_to(root)), "bundle_output": str(bundle.relative_to(root))}
+    if cluster_timing_profile is not None:
+        manifest["cluster_timing_profile"] = dict(cluster_timing_profile)
     _write_new(root / "materialization-manifest.json", _canonical_json(manifest), mode=0o644)
     return {"manifest": manifest, "manager_argv": tuple(manager_argv), "replica_argv": tuple(tuple(argv) for argv in replica_argv)}

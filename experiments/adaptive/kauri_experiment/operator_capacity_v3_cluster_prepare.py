@@ -10,6 +10,7 @@ import subprocess
 from . import operator_capacity_v3_cluster as cluster
 from . import operator_capacity_v3_backend as backend
 from . import operator_capacity_v3_materializer as mat
+from . import operator_capacity_v3_cluster_timing as timing
 from . import factorial_validation as fv
 
 
@@ -97,7 +98,8 @@ def prepare(root, *, shared_path, private, run_id, arm, regime, repo, build_rece
             "label_issuer_id": 73, "label_issuer_reference": reference, "label_issuer_public_key_hex": shared["label"]["pub"],
             "label_issuer_public_key_fingerprint": fingerprint, "approved_capacity_digest": capacity},
         stage_a_verifier_receipt={"path": private / "stage-a-verified.json", "sha256": sha_path(private / "stage-a-verified.json")},
-        source_revision=revision, stage_b_issuer_reference="w18-cluster-epoch-manager", hard_deadline_ns=240_000_000_000)
+        source_revision=revision, stage_b_issuer_reference="w18-cluster-epoch-manager", hard_deadline_ns=240_000_000_000,
+        cluster_timing_profile=timing.expected_profile())
     cluster.write(root / "private-argv.json", {"manager": list(result["manager_argv"]),
         "replicas": [list(command) for command in result["replica_argv"]]})
     quota_name = ("n31-static-resource-cpu-sham-quota-v1.json" if regime == "heterogeneous"

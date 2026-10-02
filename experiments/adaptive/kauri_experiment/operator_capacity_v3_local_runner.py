@@ -309,7 +309,8 @@ def _verify_synthetic_config_before_spawn(root: Path, manager_argv: Sequence[str
         if _sha(_regular(root / relative, f"materialized {relative}")) != artifacts[relative]:
             _fail("materialized synthetic workload configuration changed before spawn")
     backend.validate_synthetic_main_config(_regular(root / "config/hotstuff.gen.conf", "materialized main config"),
-                                           root=root, manager_argv=manager_argv)
+                                           root=root, manager_argv=manager_argv,
+                                           cluster_timing_profile=manifest.get("cluster_timing_profile"))
     fingerprint = manifest.get("public_identity_fingerprint")
     receipt_sha256 = manifest.get("identity_parity_receipt_sha256")
     if not isinstance(fingerprint, str) or not isinstance(receipt_sha256, str):

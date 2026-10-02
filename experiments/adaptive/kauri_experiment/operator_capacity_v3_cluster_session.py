@@ -6,6 +6,7 @@ import subprocess
 from . import operator_capacity_v3_cluster as cluster
 from . import operator_capacity_v3_cluster_prepare as prepare
 from . import operator_capacity_v3_cluster_validation as validation
+from . import operator_capacity_v3_cluster_timing as timing
 from . import cpu_quota_calibration as calibration
 
 
@@ -26,6 +27,7 @@ def design():
         "shared_inputs_per_block": ["31 BLS keys", "32 TLS identities", "epoch issuer", "label issuer", "capacity snapshot"],
         "snapshot_validity_seconds": 1800, "hard_scope_seconds": 300, "wrapper_timeout_seconds": 315,
         "replica_cfs_quota_period_usec": cluster.REPLICA_CFS_PERIOD_US,
+        "cluster_timing_profile": timing.expected_profile(),
         "booking_policy": "each cell within one exact event; campaign across verified adjacent exclusive events",
         "baseline_decision_deadline_seconds": 240, "convergence_seconds": 30,
         "readiness_required": 31, "readiness_delivery_attempts": 1, "activation_delay_blocks": 5,

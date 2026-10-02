@@ -17,6 +17,7 @@ import tempfile
 from typing import Any, Mapping, Sequence
 
 from .operator_capacity_preflight import _validate_quota_profile_bytes
+from . import operator_capacity_v3_cluster_timing as timing
 
 
 N = 31
@@ -85,7 +86,8 @@ def _validate_readiness_rows(replicas: Sequence[str], readiness: Sequence[str],
         _fail("materialized adaptive-v3 readiness membership differs from exact N31 keys")
 
 
-def validate_synthetic_main_config(raw: bytes, *, root: Path, manager_argv: Sequence[str]) -> dict[str, str]:
+def validate_synthetic_main_config(raw: bytes, *, root: Path, manager_argv: Sequence[str],
+                                   cluster_timing_profile=None) -> dict[str, str]:
     """Parse singleton options as Salticidae does: trim around ``=``.
 
     ``replica`` and ``activation-readiness-member`` are indexed repeatable
@@ -118,7 +120,12 @@ def validate_synthetic_main_config(raw: bytes, *, root: Path, manager_argv: Sequ
     allowed = set(_SYNTHETIC_CONFIG) | {"tree-generation-fpath", "epoch-manager-address", "epoch-manager-tls-cert", "epoch-change-issuer-public-key"}
     if set(parsed) != allowed:
         _fail("materialized main config contains unpinned native options")
-    if any(parsed.get(key) != value for key, value in _SYNTHETIC_CONFIG.items()):
+    expected_config = dict(_SYNTHETIC_CONFIG)
+    try:
+        expected_config["aggregation-timeout"] = f"{timing.aggregation_seconds(cluster_timing_profile):.1f}"
+    except (ValueError, TypeError) as exc:
+        _fail(str(exc))
+    if any(parsed.get(key) != value for key, value in expected_config.items()):
         _fail("materialized main config does not pin the frozen synthetic cadence")
     if parsed.get("tree-generation-fpath") != str(Path(root).resolve() / "config/epoch0.tree"):
         _fail("materialized main config tree path is not the pinned E0 artifact")
@@ -638,6 +645,15 @@ def _prepare_backend(
         "tool_identity_approval_receipt_sha256", "stage_a_verifier_arguments",
         "stage_b_authorization_output", "consumption_output", "bundle_output",
     }
+    cluster_timing_profile = manifest.get("cluster_timing_profile")
+    if "cluster_timing_profile" in manifest:
+        required.add("cluster_timing_profile")
+        if cluster_physical_regime is None or cluster_timing_profile is None:
+            _fail("cluster timing cannot enter the legacy local backend")
+        try:
+            timing.aggregation_seconds(cluster_timing_profile)
+        except (ValueError, TypeError) as exc:
+            _fail(str(exc))
     if set(manifest) != required:
         _fail("materialization manifest schema differs")
     if (manifest["schema_version"] != 1 or manifest["kind"] != _MANIFEST_KIND or
@@ -682,7 +698,8 @@ def _prepare_backend(
         root=root, manager_argv=manager_argv,
         expected_sha256=manifest["manager_argv_sha256"])
     validate_synthetic_main_config(_read_regular(root / "config/hotstuff.gen.conf", "materialized main config"),
-                                   root=root, manager_argv=manager_argv)
+                                   root=root, manager_argv=manager_argv,
+                                   cluster_timing_profile=cluster_timing_profile)
     public_identity_fingerprint = validate_materialized_public_identity(
         root=root, manager_argv=manager_argv,
         receipt_sha256=manifest["identity_parity_receipt_sha256"],
@@ -787,6 +804,8 @@ def _prepare_backend(
         # separate cluster admission must bind booking/build/scope authority.
         result["cluster_physical_regime"] = cluster_physical_regime
         result["cluster_quota_sha256"] = _sha(quota_raw)
+        if cluster_timing_profile is not None:
+            result["cluster_timing_profile"] = dict(cluster_timing_profile)
     return result
 
 

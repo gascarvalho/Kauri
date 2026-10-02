@@ -396,7 +396,8 @@ def _validate_evidence(root, *, receipt, authority, independently_recompute_veri
             root=root, manager_argv=manager_argv, manifest=manifest)
         backend.validate_synthetic_main_config(
             _read(root / "config/hotstuff.gen.conf", "materialized main config"), root=root,
-            manager_argv=manager_argv)
+            manager_argv=manager_argv,
+            cluster_timing_profile=manifest.get("cluster_timing_profile"))
         public_identity_fingerprint = _validate_materialized_identity_for_raw(
             root=root, manager_argv=manager_argv, manifest=manifest)
     except backend.OperatorCapacityV3BackendError as exc:
