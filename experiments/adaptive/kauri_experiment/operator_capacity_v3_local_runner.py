@@ -495,7 +495,7 @@ class CpuQuotaLocalLifecycle:
         # This outer deadline is an independent Python monotonic timeout.  It
         # is never compared with the persisted CLOCK_MONOTONIC_RAW evidence
         # anchor below.
-        run_id = _value(self._manager.args if isinstance(self._manager.args, (tuple, list)) else (), "--structured-event-run-id")
+        run_id = backend._value(self._manager.args if isinstance(self._manager.args, (tuple, list)) else (), "--structured-event-run-id")
         while time.monotonic() < deadline_monotonic:
             if any(record.process.poll() is not None for record in self._registry.records):
                 _fail("a replica exited before the E1 measurement window completed")
@@ -526,7 +526,7 @@ class CpuQuotaLocalLifecycle:
     def manager_success_terminal_verified(self) -> bool:
         if self._manager is None:
             _fail("manager was not launched")
-        run_id = _value(
+        run_id = backend._value(
             self._manager.args if isinstance(self._manager.args, (tuple, list)) else (),
             "--structured-event-run-id",
         )
