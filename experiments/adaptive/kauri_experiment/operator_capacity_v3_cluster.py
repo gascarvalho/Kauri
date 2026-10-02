@@ -200,11 +200,24 @@ def scope_empty(unit):
 class ClusterLifecycle(physical.CpuQuotaLocalLifecycle):
     """Reuse physical quota bookkeeping with independent cluster scope limits."""
 
+    def __init__(self, **arguments):
+        super().__init__(**arguments)
+        base_spawn = self._quota._base_spawn
+
+        def bounded_spawn(registry, **kwargs):
+            command = list(kwargs["command"])
+            if command[0] != "systemd-run" or command.count("--") != 1:
+                raise ClusterError("replica spawn does not have exact CPU scope grammar")
+            index = command.index("--")
+            command[index:index] = ["--property=RuntimeMaxSec=300s",
+                "--property=KillMode=control-group", "--property=SendSIGKILL=yes"]
+            return base_spawn(registry, **{**kwargs, "command": tuple(command)})
+
+        self._quota._base_spawn = bounded_spawn
+
     def start_replica(self, replica_id, argv, log):
         super().start_replica(replica_id, argv, log)
         unit = cpu_quota._unit_name(self._quota.run_id, replica_id)
-        subprocess.run(["systemctl", "--user", "set-property", unit, "RuntimeMaxSec=300s",
-                        "KillMode=control-group", "SendSIGKILL=yes"], check=True, capture_output=True, timeout=10)
         raw = subprocess.check_output(["systemctl", "--user", "show", unit, "-p", "RuntimeMaxUSec"], text=True, timeout=10)
         if raw.strip() not in {"RuntimeMaxUSec=5min", "RuntimeMaxUSec=300s"}:
             raise ClusterError("replica scope does not retain fixed 300-second limit")
