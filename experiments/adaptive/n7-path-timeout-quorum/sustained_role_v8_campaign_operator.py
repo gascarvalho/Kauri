@@ -333,25 +333,43 @@ def _one_command_driver_metric(*, replay: Mapping[str, Any], expected_identity: 
         payload = event.get("payload")
         proof = payload.get("decision_proof") if isinstance(payload, Mapping) else None
         timestamp = event.get("source_monotonic_ns")
-        if (event.get("event_type") == "block.committed" and type(timestamp) is int and
+        if not (event.get("event_type") == "block.committed" and type(timestamp) is int and
                 start_ns <= timestamp < end_ns and isinstance(proof, Mapping) and
                 proof.get("epoch_number") == 1 and
                 proof.get("epoch_digest") == expected_identity.get("successor_epoch_digest")):
-            if payload.get("transaction_count") != 1:
-                raise V8SlotError("counted E1 authority is not a one-command synthetic-driver block")
-            authoritative.add((payload["block_height"], payload["block_hash"]))
+            continue
+        count = payload.get("transaction_count")
+        if type(count) is not int or count not in (0, 1):
+            raise V8SlotError("E1 authority differs from the frozen one-command workload")
+        if count == 0:
+            # Valid empty pipeline padding is unscored in the primary replay.
+            continue
+        key = payload["block_height"], payload["block_hash"]
+        complete = True
+        for replica, events in replica_events.items():
+            witnesses = [candidate for candidate in events
+                         if candidate.get("event_type") == "block.commit_observed" and
+                         isinstance(candidate.get("payload"), Mapping) and
+                         candidate["payload"].get("block_height") == key[0] and
+                         candidate["payload"].get("block_hash") == key[1] and
+                         type(candidate.get("source_monotonic_ns")) is int and
+                         start_ns <= candidate["source_monotonic_ns"] < end_ns]
+            if len(witnesses) > 1:
+                raise V8SlotError("common one-command witness is duplicated")
+            if not witnesses:
+                complete = False
+                continue
+            witness = witnesses[0]["payload"]
+            if (witness.get("transaction_count") != 1 or
+                    witness.get("parent_hash") != payload.get("parent_hash")):
+                raise V8SlotError(f"replica-{replica} common witness metadata differs")
+        # The frozen metric censors incomplete blocks at either boundary.
+        if complete:
+            if payload.get("designated_observer") is not True or key in authoritative:
+                raise V8SlotError("common one-command authority is duplicated or mislabeled")
+            authoritative.add(key)
     if len(authoritative) != replay.get("common_e1_committed_blocks"):
         raise V8SlotError("one-command authority count differs from the replayed common metric")
-    for replica, events in replica_events.items():
-        for height, block_hash in authoritative:
-            witnesses = [event for event in events
-                         if event.get("event_type") == "block.commit_observed" and
-                         isinstance(event.get("payload"), Mapping) and
-                         event["payload"].get("block_height") == height and
-                         event["payload"].get("block_hash") == block_hash]
-            if len(witnesses) != 1 or witnesses[0]["payload"].get("transaction_count") != 1:
-                raise V8SlotError(
-                    f"replica-{replica} does not bind the common metric to one command")
 
 
 def _component_replay(root: Path, receipt: Mapping[str, Any]) -> dict[str, Any]:
