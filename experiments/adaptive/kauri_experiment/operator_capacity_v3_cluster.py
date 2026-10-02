@@ -239,7 +239,7 @@ def execute_child(root, *, request_path, approval_path, approval_sha, build_rece
     if request_raw != canonical(request):
         raise ClusterError("cluster request differs from current exact materialized plan")
     approved = verify_approval(request, approval_path, approval_sha)
-    if physical._value(manager, "--structured-event-run-id") != request["run_id"]:
+    if backend._value(manager, "--structured-event-run-id") != request["run_id"]:
         raise ClusterError("cluster manager run ID differs from request")
     observed = collect_authority(repo=repo, revision=request["revision"],
         build_receipt=build_receipt, booking_id=request["booking_id"], plan=plan)
