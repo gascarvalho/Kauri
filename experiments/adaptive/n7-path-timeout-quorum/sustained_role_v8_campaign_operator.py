@@ -83,12 +83,21 @@ def _sha(raw: bytes) -> str:
     return hashlib.sha256(raw).hexdigest()
 
 
-def _strict(raw: bytes, label: str) -> dict[str, Any]:
+def _strict(raw: bytes, label: str, *, canonical: bool = True) -> dict[str, Any]:
+    def pairs(items):
+        value = {}
+        for key, item in items:
+            if key in value:
+                raise V8SlotError(f"{label} repeats a JSON key")
+            value[key] = item
+        return value
     try:
-        value = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise V8SlotError(f"{label} is not JSON") from exc
-    if not isinstance(value, dict) or raw != _canonical(value):
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs,
+                           parse_constant=lambda value: (_ for _ in ()).throw(ValueError(value)))
+        encoded = _canonical(value)
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise V8SlotError(f"{label} is not strict JSON") from exc
+    if not isinstance(value, dict) or (canonical and raw != encoded):
         raise V8SlotError(f"{label} is not canonical JSON")
     return value
 
@@ -130,9 +139,13 @@ def _descriptor(root: Path, value: object, label: str, *,
 
 
 def _events(raw: bytes, label: str) -> list[dict[str, Any]]:
+    # Native event writers retain their own field order. Their original
+    # bytes remain SHA-bound; only operator-owned receipts are canonical JSON.
+    if not raw.endswith(b"\n"):
+        raise V8SlotError(f"{label} has incomplete JSONL framing")
     events: list[dict[str, Any]] = []
     for line in raw.splitlines():
-        event = _strict(line + b"\n", label)
+        event = _strict(line + b"\n", label, canonical=False)
         if type(event.get("source_monotonic_ns")) is not int or event["source_monotonic_ns"] < 0:
             raise V8SlotError(f"{label} contains an invalid raw clock")
         events.append(event)
