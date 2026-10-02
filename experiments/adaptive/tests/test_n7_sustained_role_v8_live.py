@@ -49,16 +49,16 @@ def test_private_identity_mutation_cannot_spawn(tmp_path):
 
 
 def table():
-    return "| id | machine | user | mode | duration | start | end |\n| " + subject.BOOKING + " | proteina02 | gascarvalho | EXCLUSIVE | 2 hours | 2026-10-02 00:00 | 2026-10-02 02:00 |\n"
+    return "| id | machine | user | mode | duration | start | end |\n| " + subject.BOOKING + " | proteina02 | gascarvalho | EXCLUSIVE | 7 hours | 2026-10-02 09:30 | 2026-10-02 17:00 |\n"
 
 
 def test_exact_current_booking_uses_lisbon_not_utc_dates():
-    row = subject.booking_row(table(), now=datetime(2026, 10, 1, 23, 10, tzinfo=timezone.utc))
+    row = subject.booking_row(table(), now=datetime(2026, 10, 2, 8, 40, tzinfo=timezone.utc))
     assert row[0] == subject.BOOKING
 
 
-@pytest.mark.parametrize("now", [datetime(2026, 10, 1, 22, 59, tzinfo=timezone.utc),
-                                 datetime(2026, 10, 2, 0, 59, tzinfo=timezone.utc)])
+@pytest.mark.parametrize("now", [datetime(2026, 10, 2, 8, 29, tzinfo=timezone.utc),
+                                 datetime(2026, 10, 2, 15, 59, tzinfo=timezone.utc)])
 def test_booking_rejects_inactive_or_insufficient_reserve(now):
     with pytest.raises(subject.LiveError, match="inactive"):
         subject.booking_row(table(), now=now)
@@ -66,7 +66,7 @@ def test_booking_rejects_inactive_or_insufficient_reserve(now):
 
 def test_wrong_event_is_not_booking_capacity():
     with pytest.raises(subject.LiveError, match="absent"):
-        subject.booking_row(table().replace(subject.BOOKING, "other"), now=datetime(2026, 10, 1, 23, 10, tzinfo=timezone.utc))
+        subject.booking_row(table().replace(subject.BOOKING, "other"), now=datetime(2026, 10, 2, 8, 40, tzinfo=timezone.utc))
 
 
 def lifecycle():

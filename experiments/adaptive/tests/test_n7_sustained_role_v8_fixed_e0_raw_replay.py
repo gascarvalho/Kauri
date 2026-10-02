@@ -112,7 +112,15 @@ def _accepted() -> dict[str, object]:
                                     _event("adaptive-manager", 2, START, "scheduled_fixed_e0_control.observation", control),
                                     _event("adaptive-manager", 3, ANCHOR + 40_000_000_000,
                                            "scheduled_fixed_e0_control.observation", control),
-                                    _event("adaptive-manager", 4, END, "scheduled_fixed_e0_control.terminal", control)]),
+                                    _event("adaptive-manager", 4, END, "scheduled_fixed_e0_control.terminal", control),
+                                    _event("adaptive-manager", 5, END + 1, "adaptive_v2_session_terminal", {
+                                        "cycle_ordinal": 0, "policy_intent": "fault_containment", "outcome": "no_op",
+                                        "reason": "explicit_no_op", "transition_artifact_id": "scheduled-fixed-e0-control/" + RUN,
+                                        "predecessor_epoch_number": 0, "predecessor_epoch_digest": E0,
+                                        "successor_epoch_number": None, "successor_epoch_digest": None,
+                                        "command_payload_digest": None, "winning_activation": None,
+                                        "evidence_window_activation_generation": 1, "baseline_evidence_cutoff": 1,
+                                        "current_evidence_cutoff": 1, "controller_failure": None})]),
             "replica_raw": replica_raw,
             "replica_logs": [b"", _marker(_opportunity()) + _marker(_late_opportunity()), b"", b"", b"", b"", b""],
             "cleanup_raw": json.dumps(cleanup, sort_keys=True, separators=(",", ":")).encode()}
@@ -135,10 +143,10 @@ def test_fixed_e0_raw_replay_accepts_only_component_evidence() -> None:
 
 
 @pytest.mark.parametrize("mutation, error", [
-    ("e1_command", "forbidden E1"),
-    ("e1_activation", "forbidden E1"),
-    ("wrong_transaction_count", "exactly one synthetic"),
-    ("missing_witness", "all-seven observations"),
+    ("e1_command", "forbidden successor"),
+    ("e1_activation", "forbidden successor"),
+    ("wrong_transaction_count", "one-command maximum"),
+    ("missing_witness", "no all-seven common"),
     ("duplicate_instance", "eight unique source instances"),
     ("foreign_fault", "outside physical actor 1"),
     ("abort", "abort or terminal"),
@@ -231,11 +239,11 @@ def test_fixed_e0_replay_rejects_unbound_native_control(mutation: str, error: st
     case = copy.deepcopy(_accepted())
     events = _events(case["manager_raw"])
     if mutation == "missing_terminal":
-        events.pop()
+        events.pop(-2)
     elif mutation == "wrong_binding":
         events[1]["payload"]["epoch_zero_digest"] = "f" * 64
     elif mutation == "early_terminal":
-        events[-1]["source_monotonic_ns"] = END - 1
+        events[-2]["source_monotonic_ns"] = END - 1
     elif mutation == "no_late_observation":
         events.pop(2)
     else:

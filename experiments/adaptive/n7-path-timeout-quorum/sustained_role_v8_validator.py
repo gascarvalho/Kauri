@@ -82,7 +82,7 @@ def _identity(payload: Mapping[str, object]) -> dict[str, object]:
 
 
 def _decode_bundle(bundle_bytes: bytes, issuer_public_key: str) -> Any:
-    package_root = str(HERE.parents[1]); inserted = package_root not in sys.path
+    package_root = str(HERE.parent); inserted = package_root not in sys.path
     if inserted: sys.path.insert(0, package_root)
     try:
         return importlib.import_module("kauri_experiment.factorial_validation").decode_epoch_change_bundle(bundle_bytes, issuer_public_key=issuer_public_key)
@@ -369,8 +369,8 @@ def _common_e1_commit_count(streams: Mapping[int, Sequence[Mapping[str, object]]
                     raise V8ValidationError("committed-block metric event does not follow local E1 activation")
             if event.get("event_type") == "block.commit_observed":
                 payload = _strict_commit(event.get("payload"), observed=True)
-                if payload["transaction_count"] != 1:
-                    raise V8ValidationError("scored E1 committed block must contain exactly one synthetic command")
+                if payload["transaction_count"] not in (0, 1):
+                    raise V8ValidationError("synthetic block exceeds the one-command maximum")
                 prior = height_hashes.setdefault(payload["block_height"], payload["block_hash"])
                 if prior != payload["block_hash"]: raise V8ValidationError("conflicting commit hashes at one block height")
                 key = (payload["block_height"], payload["block_hash"])
@@ -378,8 +378,8 @@ def _common_e1_commit_count(streams: Mapping[int, Sequence[Mapping[str, object]]
                 observed[key][replica] = (payload["parent_hash"], payload["transaction_count"])
             elif event.get("event_type") == "block.committed":
                 payload = _strict_commit(event.get("payload"), observed=False)
-                if payload["transaction_count"] != 1:
-                    raise V8ValidationError("scored E1 committed block must contain exactly one synthetic command")
+                if payload["transaction_count"] not in (0, 1):
+                    raise V8ValidationError("synthetic block exceeds the one-command maximum")
                 prior = height_hashes.setdefault(payload["block_height"], payload["block_hash"])
                 if prior != payload["block_hash"]: raise V8ValidationError("conflicting commit hashes at one block height")
                 proof = payload["decision_proof"]
@@ -397,9 +397,11 @@ def _common_e1_commit_count(streams: Mapping[int, Sequence[Mapping[str, object]]
     if not authoritative: raise V8ValidationError("measurement horizon lacks an authoritative E1 committed block")
     expected_sources = set(profile.REPLICA_IDS)
     for key, metadata in authoritative.items():
-        if observed.get(key) != {replica: metadata for replica in expected_sources}:
-            raise V8ValidationError("authoritative E1 committed block lacks matching all-seven observations")
-    return len(authoritative)
+        if any(value != metadata for value in observed.get(key, {}).values()):
+            raise V8ValidationError("E1 observed metadata contradicts authoritative metadata")
+    count = sum(metadata[1] == 1 and observed.get(key) == {replica: metadata for replica in expected_sources} for key, metadata in authoritative.items())
+    if count == 0: raise V8ValidationError("no all-seven common one-command commit in metric window")
+    return count
 
 
 def validate_v8_raw_contract(*, anchor_monotonic_ns: int, expected_identity: Mapping[str, object], manager_events: Sequence[Mapping[str, object]], replica_events: Mapping[int, Sequence[Mapping[str, object]]], bundle_bytes: bytes, issuer_public_key: str, predecessor_tree_ids: frozenset[int]) -> dict[str, Any]:

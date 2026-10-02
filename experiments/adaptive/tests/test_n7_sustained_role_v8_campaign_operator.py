@@ -382,8 +382,8 @@ def test_public_operator_runs_component_replay_but_never_issues_a_verdict(tmp_pa
 @pytest.mark.parametrize(("mutation", "error"), [
     ("source_instance", "source instance"), ("late_digest", "active signed E1"),
     ("cleanup", "process closure"), ("validator", "immediate fixed replay"),
-    ("fifth_binary", "five-binary"), ("zero_command", "exactly one synthetic command"),
-    ("multi_command", "exactly one synthetic command"),
+    ("fifth_binary", "five-binary"), ("zero_command", "no all-seven common"),
+    ("multi_command", "one-command maximum"),
 ])
 def test_component_replay_rejects_cross_layer_mutations(
     tmp_path: Path, mutation: str, error: str,

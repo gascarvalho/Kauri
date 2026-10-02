@@ -32,7 +32,7 @@ LIVE = "runtime/sustained-role-v8-live-authority.json"
 STARTED = "runtime/sustained-role-v8-live-child-started.json"
 FIXED_APPROVAL = "runtime/sustained-role-v8-fixed-launch-authorization.json"
 FIXED_INTENT = "runtime/sustained-role-v8-fixed-launch-intent.json"
-BOOKING = "upr8cd04tupkphnhp0k8kar9ug"
+BOOKING = "32usk1i80tieqq3e8jterd8as4"
 
 
 class LiveError(ValueError):
@@ -102,7 +102,7 @@ def booking_row(text, *, now):
     row = matches[0]
     start, end = [datetime.strptime(value, "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo("Europe/Lisbon"))
                   for value in row[5:7]]
-    if (row[5:7] != ["2026-10-02 00:00", "2026-10-02 02:00"] or
+    if (row[5:7] != ["2026-10-02 09:30", "2026-10-02 17:00"] or
             not start <= now < end or (end - now).total_seconds() < 260):
         raise LiveError("booking is inactive or lacks cell/cleanup reserve")
     return row

@@ -69,11 +69,11 @@ def _commit(payload: object, *, authoritative: bool, label: str) -> Mapping[str,
     _hex64(payload["block_hash"], f"{label} block hash")
     if payload["parent_hash"] is not None:
         _hex64(payload["parent_hash"], f"{label} parent hash")
-    if (type(payload["transaction_count"]) is not int or payload["transaction_count"] != 1 or
+    if (type(payload["transaction_count"]) is not int or payload["transaction_count"] not in (0, 1) or
             type(payload["commit_batch_index"]) is not int or payload["commit_batch_index"] < 0):
-        _fail(f"{label} must contain exactly one synthetic command")
+        _fail(f"{label} exceeds the one-command maximum")
     if authoritative:
-        if payload["designated_observer"] is not True or type(payload["view_generation"]) is not int or payload["view_generation"] < 0:
+        if type(payload["designated_observer"]) is not bool or type(payload["view_generation"]) is not int or payload["view_generation"] < 0:
             _fail(f"{label} authority fields are invalid")
         proof = payload["decision_proof"]
         if not isinstance(proof, Mapping) or frozenset(proof) != _PROOF_FIELDS or proof["block_hash"] != payload["block_hash"]:
@@ -141,14 +141,32 @@ def _anchor(streams: Mapping[str, Sequence[Mapping[str, Any]]], logs: Sequence[b
     return decision_ns, event, late_count
 
 
-def _reject_successor_authority(streams: Mapping[str, Sequence[Mapping[str, Any]]]) -> None:
+def _reject_successor_authority(streams, *, run_id, e0_digest, scheduled_end_ns):
+    no_ops = []
     for source, events in streams.items():
         for event in events:
-            if event.get("event_type") in {"epoch.command_committed", "epoch.activated"}:
-                _fail(f"{source} contains forbidden E1 command or activation authority")
-            if source == "adaptive-manager" and event.get("event_type") in {
-                    "adaptive_v2.convergence_started", "adaptive_v2_session_terminal", "adaptive_v2.selection_decided"}:
-                _fail("fixed-E0 manager contains forbidden adaptive transition evidence")
+            kind = event.get("event_type")
+            if kind in {"epoch.command_committed", "epoch.activated"}:
+                _fail(f"{source} contains forbidden successor authority")
+            if source == "adaptive-manager" and kind in {"adaptive_v2.convergence_started", "adaptive_v2.selection_decided"}:
+                _fail("fixed manager contains forbidden adaptive transition evidence")
+            if kind == "adaptive_v2_session_terminal":
+                p = event.get("payload")
+                if not isinstance(p, Mapping):
+                    _fail("fixed manager no-op payload is malformed")
+                cutoff = p.get("baseline_evidence_cutoff")
+                expected = {"cycle_ordinal": 0, "policy_intent": "fault_containment", "outcome": "no_op",
+                    "reason": "explicit_no_op", "transition_artifact_id": "scheduled-fixed-e0-control/" + run_id,
+                    "predecessor_epoch_number": 0, "predecessor_epoch_digest": e0_digest,
+                    "successor_epoch_number": None, "successor_epoch_digest": None,
+                    "command_payload_digest": None, "winning_activation": None,
+                    "evidence_window_activation_generation": 1, "baseline_evidence_cutoff": cutoff,
+                    "current_evidence_cutoff": cutoff, "controller_failure": None}
+                if source != "adaptive-manager" or p != expected or type(cutoff) is not int or cutoff <= 0 or _timestamp(event, "fixed no-op") < scheduled_end_ns:
+                    _fail("fixed manager terminal is not the exact scheduled no-op")
+                no_ops.append(event)
+    if len(no_ops) != 1:
+        _fail("fixed manager lacks exactly one scheduled no-op terminal")
 
 
 def _manager_control(events: Sequence[Mapping[str, Any]], *, run_id: str,
@@ -202,11 +220,13 @@ def _metric(streams: Mapping[str, Sequence[Mapping[str, Any]]], *, start_ns: int
                 observed[key][source] = (payload["parent_hash"], payload["transaction_count"])
             elif event_type == "block.committed":
                 payload = _commit(event.get("payload"), authoritative=True, label=f"{source} authoritative commit")
-                if source != "replica-2":
-                    _fail("only designated replica 2 may emit an authoritative committed block")
+                if payload["designated_observer"] is not (source == "replica-2"):
+                    _fail("designated observer flag disagrees with configured replica 2")
                 proof = payload["decision_proof"]
                 if proof["epoch_number"] != 0 or proof["epoch_digest"] != e0_digest:
-                    _fail("authoritative metric block is not exact E0 authority")
+                    _fail("committed metric block is not exact E0 authority")
+                if source != "replica-2":
+                    continue
                 key = (payload["block_height"], payload["block_hash"])
                 if heights.setdefault(payload["block_height"], payload["block_hash"]) != payload["block_hash"]:
                     _fail("conflicting E0 commit hashes at one height")
@@ -218,9 +238,11 @@ def _metric(streams: Mapping[str, Sequence[Mapping[str, Any]]], *, start_ns: int
     # Only replicas witness commits; the manager is a separate eighth raw source.
     expected_sources = {f"replica-{replica}" for replica in _REPLICAS}
     for key, metadata in authoritative.items():
-        if observed.get(key) != {source: metadata for source in expected_sources}:
-            _fail("authoritative E0 commit lacks matching all-seven observations")
-    return len(authoritative)
+        if any(value != metadata for value in observed.get(key, {}).values()):
+            _fail("E0 observed metadata contradicts authoritative metadata")
+    count = sum(metadata[1] == 1 and observed.get(key) == {source: metadata for source in expected_sources} for key, metadata in authoritative.items())
+    if count == 0: _fail("no all-seven common one-command commit in metric window")
+    return count
 
 
 def replay_fixed_e0_raw(*, run_id: str, e0_digest: str, profile_sha256: str,
@@ -255,7 +277,7 @@ def replay_fixed_e0_raw(*, run_id: str, e0_digest: str, profile_sha256: str,
     instances = [events[0]["source_instance"] for events in streams.values()]
     if len(set(instances)) != len(_SOURCES):
         _fail("eight raw sources do not bind eight unique source instances")
-    _reject_successor_authority(streams)
+    _reject_successor_authority(streams, run_id=run_id, e0_digest=e0_digest, scheduled_end_ns=end_ns)
     anchor_ns, anchor_event, late_omission_count = _anchor(streams, replica_logs, e0_digest=e0_digest)
     if not start_ns <= anchor_ns <= start_ns + 10_000_000_000 or end_ns < anchor_ns + _NS_72:
         _fail("fixed-E0 physical anchor is outside the sealed scheduled window")

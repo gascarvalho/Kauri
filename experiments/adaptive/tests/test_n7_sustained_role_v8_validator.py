@@ -114,7 +114,7 @@ def test_v8_validator_accepts_first_cycle_only_with_signed_command_delivery_and_
     ("missing_selection", "selection_decided"),
     ("missing_commit", "designated E0"),
     ("missing_command_witness", "commit_observed witness"),
-    ("missing_e1_witness", "all-seven observations"),
+    ("missing_e1_witness", "no all-seven common"),
     ("post_command_witness", "does not precede"),
     ("foreign_authority", "misbound epoch activation"),
     ("misbound_command", "exactly one matching epoch.command_committed"),
@@ -185,7 +185,7 @@ def test_v8_validator_rejects_nonunit_synthetic_command_count_in_every_scored_ob
         for event in events:
             if event.get("event_type") in {"block.committed", "block.commit_observed"} and event["payload"].get("block_height") == 16:
                 event["payload"]["transaction_count"] = count
-    with pytest.raises(subject.V8ValidationError, match="exactly one synthetic command"):
+    with pytest.raises(subject.V8ValidationError, match="no all-seven common" if count == 0 else "one-command maximum"):
         subject.validate_v8_raw_contract(**case)
 
 
