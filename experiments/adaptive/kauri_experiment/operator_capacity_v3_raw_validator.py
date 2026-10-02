@@ -53,7 +53,13 @@ def _read(path: Path, label: str, maximum: int = 8 * 1024 * 1024) -> bytes:
             if not chunk:
                 raise RawValidationError(f"{label} changed during read")
             raw += chunk
-        if os.read(fd, 1) or os.fstat(fd) != before:
+        after = os.fstat(fd)
+        stable_identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_nlink,
+            value.st_uid, value.st_gid, value.st_size, value.st_mtime_ns,
+            value.st_ctime_ns,
+        )
+        if os.read(fd, 1) or stable_identity(after) != stable_identity(before):
             raise RawValidationError(f"{label} changed during read")
         return raw
     finally:
