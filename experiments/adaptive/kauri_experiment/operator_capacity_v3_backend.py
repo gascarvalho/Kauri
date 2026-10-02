@@ -611,9 +611,11 @@ def validate_materialized_synthetic_workload(manifest: Mapping[str, object]) -> 
     return dict(workload)
 
 
-def prepare_no_launch_backend(
+def _prepare_backend(
     *, materialization_root: Path, manager_argv: Sequence[str],
     replica_argv: Sequence[Sequence[str]], quota_profile: Path,
+    cluster_physical_regime: str | None = None,
+    require_fresh_outputs: bool = True,
 ) -> dict[str, object]:
     """Audit one frozen arm and return a non-executable process/cleanup plan.
 
@@ -722,18 +724,23 @@ def prepare_no_launch_backend(
         _fail("persisted native Stage-A verifier invocation differs from the executable plan")
     raw = root / "raw"
     transition = root / "transitions/e0-to-e1-operator-capacity"
-    if not raw.is_dir() or not transition.is_dir() or any(raw.iterdir()) or any(transition.iterdir()):
+    if (not raw.is_dir() or not transition.is_dir() or
+            (require_fresh_outputs and (any(raw.iterdir()) or any(transition.iterdir())))):
         _fail("materialization raw and transition outputs must be fresh before backend planning")
     quota_raw = _read_regular(Path(quota_profile), "frozen CPU quota profile", 64 * 1024)
     try:
-        _validate_quota_profile_bytes(quota_raw)
+        if cluster_physical_regime is None:
+            _validate_quota_profile_bytes(quota_raw)
+        else:
+            from .operator_capacity_v3_cluster_profiles import validate_quota_bytes
+            validate_quota_bytes(quota_raw, cluster_physical_regime)
     except Exception as exc:
         _fail("quota profile differs from frozen W18 N31 ownership contract")
         raise AssertionError from exc
     policy = _transition_policy(manager_argv)
     if policy != "performance_optimization":
         _fail("W18 operator-capacity materialization requires optimization-first policy")
-    return {
+    result = {
         "schema_version": 1,
         "kind": "kauri-n31-operator-capacity-v3-no-launch-backend-plan-v1",
         "verdict": "BACKEND_PLAN_REVIEW_REQUIRED_NO_EXECUTION",
@@ -775,6 +782,30 @@ def prepare_no_launch_backend(
         # complete Stage-A authority chain at the process-spawn edge.
         "execution_blocker": "EXTERNAL_AUTHORIZATION_AND_PRESPAWN_AUTHORITY_REQUIRED",
     }
+    if cluster_physical_regime is not None:
+        # The local-only request builder rejects this additional field. A
+        # separate cluster admission must bind booking/build/scope authority.
+        result["cluster_physical_regime"] = cluster_physical_regime
+        result["cluster_quota_sha256"] = _sha(quota_raw)
+    return result
+
+
+def prepare_no_launch_backend(*, materialization_root, manager_argv, replica_argv,
+                              quota_profile, cluster_physical_regime=None):
+    """Pre-spawn audit: fresh raw/transition paths are always mandatory."""
+    return _prepare_backend(materialization_root=materialization_root, manager_argv=manager_argv,
+        replica_argv=replica_argv, quota_profile=quota_profile,
+        cluster_physical_regime=cluster_physical_regime, require_fresh_outputs=True)
+
+
+def inspect_retained_cluster_backend(*, materialization_root, manager_argv, replica_argv,
+                                     quota_profile, cluster_physical_regime):
+    """Offline reconstruction only; the separate cluster receipt closes execution."""
+    if cluster_physical_regime not in {"heterogeneous", "homogeneous"}:
+        _fail("retained backend inspection requires an explicit physical regime")
+    return _prepare_backend(materialization_root=materialization_root, manager_argv=manager_argv,
+        replica_argv=replica_argv, quota_profile=quota_profile,
+        cluster_physical_regime=cluster_physical_regime, require_fresh_outputs=False)
 
 
 def execution_not_implemented() -> None:

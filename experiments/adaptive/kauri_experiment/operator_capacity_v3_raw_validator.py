@@ -187,7 +187,8 @@ def _authority(root: Path, receipt_raw: bytes, authority_path: Path | None) -> d
     return value
 
 
-def _validate_cpu(root: Path, authority: Mapping[str, Any], *, start: int, end: int) -> None:
+def _validate_cpu(root: Path, authority: Mapping[str, Any], *, start: int, end: int,
+                  cluster_physical_regime: str | None = None) -> None:
     frozen_raw = _read(root / "runtime/frozen-cpu-quota-contract.json", "frozen CPU quota contract")
     contract_raw = _read(root / "runtime/cpu-quota-contract.json", "CPU quota contract")
     launch_raw = _read(root / "runtime/cpu-quota-launch.json", "CPU quota launch")
@@ -202,9 +203,13 @@ def _validate_cpu(root: Path, authority: Mapping[str, Any], *, start: int, end: 
     frozen_contract = _json(frozen_raw, "frozen CPU quota contract")
     contract = _json(contract_raw, "CPU quota contract")
     launch = _json(launch_raw, "CPU quota launch")
-    if frozen_contract != contract:
+    if _canonical(frozen_contract) != _canonical(contract):
         raise RawValidationError("runtime CPU quota contract differs semantically from frozen input")
-    if contract != _EXPECTED_QUOTA_PROFILE:
+    expected = _EXPECTED_QUOTA_PROFILE
+    if cluster_physical_regime is not None:
+        from .operator_capacity_v3_cluster_profiles import expected_quota_profile
+        expected = expected_quota_profile(cluster_physical_regime)
+    if _canonical(contract) != _canonical(expected):
         raise RawValidationError("CPU quota contract differs from frozen W18 profile")
     assignments = contract.get("assignments")
     if (set(contract) != {"schema_version", "contract_id", "enabled", "figure_eligible",
@@ -214,13 +219,13 @@ def _validate_cpu(root: Path, authority: Mapping[str, Any], *, start: int, end: 
             contract["figure_eligible"] is not False or contract["manager_visibility"] != "none" or
             contract["launcher"] != "systemd-user-scope-cpu-quota-v1" or
             contract["sampling_interval_ms"] != 1000 or
-            contract["contract_id"] != "n31-static-resource-cpu-sham-quota-v1" or
-            contract["base_profile_id"] != "n31-static-resource-cpu-sham-v1" or
+            contract["contract_id"] != expected["contract_id"] or
+            contract["base_profile_id"] != expected["base_profile_id"] or
             not isinstance(assignments, list) or len(assignments) != N):
         raise RawValidationError("CPU quota contract is not the frozen 31-replica profile")
     for replica, assignment in enumerate(assignments):
-        expected_class = "slow" if replica < 6 else "fast"
-        expected_percent = 25 if replica < 6 else 100
+        expected_class = expected["assignments"][replica]["capacity_class"]
+        expected_percent = expected["assignments"][replica]["cpu_quota_percent"]
         if (not isinstance(assignment, dict) or
                 assignment != {"replica_id": replica, "capacity_class": expected_class,
                                "cpu_quota_percent": expected_percent}):
@@ -243,7 +248,7 @@ def _validate_cpu(root: Path, authority: Mapping[str, Any], *, start: int, end: 
             raise RawValidationError("CPU launch row schema drifted")
         replica = row["replica_id"]
         if (type(replica) is not int or replica not in range(N) or replica in launched or
-                row["cpu_quota_percent"] != (25 if replica < 6 else 100) or
+                row["cpu_quota_percent"] != expected["assignments"][replica]["cpu_quota_percent"] or
                 row["cpu_quota_per_second_usec"] != row["cpu_quota_percent"] * 10_000 or
                 row["active_state"] != "active" or row["sub_state"] not in {"running", "start"} or
                 not isinstance(row["unit"], str) or not row["unit"] or
@@ -349,103 +354,111 @@ def validate_operator_capacity_v3_raw(
         authority = _authority(root, receipt_raw, authority_path)
         if independently_recompute_verifiers is None:
             raise RawValidationError("independent Stage-A and Stage-B verifier recomputation was not supplied")
-        manifest_raw = _read(root / "materialization-manifest.json", "materialization manifest", 256 * 1024)
-        if _sha(manifest_raw) != authority["materialization_manifest_sha256"]:
-            raise RawValidationError("materialization manifest differs from authority pin")
-        manifest = _json(manifest_raw, "materialization manifest")
-        if manifest.get("verdict") != "MATERIALIZED_NO_EXECUTION" or manifest.get("protocol") != {"N": 31, "Q": 21, "tree_count": 21}:
-            raise RawValidationError("materialization manifest is not frozen W18 N31")
-        workload = _validate_materialized_workload_for_raw(manifest)
-        artifacts = manifest.get("artifact_sha256")
-        if not isinstance(artifacts, dict):
-            raise RawValidationError("materialization artifacts are absent")
-        required_config = {"config/hotstuff.gen.conf", *(f"config/replica-{replica}.conf" for replica in range(N))}
-        if not required_config.issubset(artifacts) or any(
-                _sha(_read(root / relative, f"materialized {relative}")) != artifacts[relative]
-                for relative in required_config):
-            raise RawValidationError("effective synthetic workload configuration differs from manifest")
-        try:
-            try:
-                manager_argv = json.loads(_read(root / "runtime/manager-argv.json", "retained manager argv").decode("ascii"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise RawValidationError("retained manager argv is invalid") from exc
-            if not isinstance(manager_argv, list) or not all(isinstance(value, str) for value in manager_argv):
-                raise RawValidationError("retained manager argv is invalid")
-            _validate_retained_manager_argv_for_raw(
-                root=root, manager_argv=manager_argv, manifest=manifest)
-            backend.validate_synthetic_main_config(
-                _read(root / "config/hotstuff.gen.conf", "materialized main config"), root=root,
-                manager_argv=manager_argv)
-            public_identity_fingerprint = _validate_materialized_identity_for_raw(
-                root=root, manager_argv=manager_argv, manifest=manifest)
-        except backend.OperatorCapacityV3BackendError as exc:
-            raise RawValidationError(str(exc)) from exc
-        if (_sha(_read(root / "config/stage-a-envelope.wire", "Stage-A envelope"))
-                != manifest.get("stage_a_envelope_sha256") or
-                _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt"))
-                != manifest.get("stage_a_verifier_receipt_sha256")):
-            raise RawValidationError("Stage-A materialization authority differs from manifest")
-        window = receipt["e1_measurement_window"]
-        if not isinstance(window, dict) or set(window) != {"activated_replica_ids", "all_replica_e1_activation_events", "all_replica_e1_activation_monotonic_ns", "post_e1_window_start_monotonic_ns", "post_e1_window_end_monotonic_ns", "post_e1_commit"}:
-            raise RawValidationError("runner receipt lacks the frozen complete E1 window schema")
-        start, end = window["post_e1_window_start_monotonic_ns"], window["post_e1_window_end_monotonic_ns"]
-        if (window["activated_replica_ids"] != list(range(N)) or type(start) is not int or type(end) is not int or end - start != WINDOW_NS or window["all_replica_e1_activation_monotonic_ns"] != start):
-            raise RawValidationError("E1 window is not exact all-31 activation plus fixed 30 seconds")
-        activation_events = window["all_replica_e1_activation_events"]
-        if not isinstance(activation_events, list) or len(activation_events) != N:
-            raise RawValidationError("runner receipt lacks all 31 E1 activation events")
-        activation_digests = {event.get("epoch_digest") for event in activation_events if isinstance(event, dict)}
-        if len(activation_digests) != 1:
-            raise RawValidationError("runner E1 activation events do not share one exact digest")
-        epoch1_digest = _hex(next(iter(activation_digests)), "E1 activation digest")
-        run_id = authority["pins"].get("run_id") if isinstance(authority["pins"], dict) else None
-        if not isinstance(run_id, str) or not run_id:
-            raise RawValidationError("raw-validation authority pins lack run ID")
-        manager_raw = _read(root / "raw/manager-events.jsonl", "manager event stream")
-        if _sha(manager_raw) != authority["event_stream_sha256"]["manager"]:
-            raise RawValidationError("manager stream differs from authority pin")
-        manager_events = _stream_events(root / "raw/manager-events.jsonl", kind="adaptation_manager",
-                       source_id="adaptive-manager", run_id=run_id)
-        streams: dict[int, list[dict[str, Any]]] = {}
-        for replica in range(N):
-            path = root / f"raw/replica-{replica}.jsonl"
-            raw = _read(path, f"replica-{replica} event stream")
-            if _sha(raw) != authority["event_stream_sha256"][f"replica-{replica}"]:
-                raise RawValidationError(f"replica-{replica} stream differs from authority pin")
-            streams[replica] = _stream_events(path, kind="replica", source_id=f"replica-{replica}", run_id=run_id)
-        pins = authority["pins"]
-        if not isinstance(pins, dict):
-            raise RawValidationError("raw-validation authority pins are invalid")
-        chain = consumption_audit.audit_consumption_chain(
-            stage_a_wire=root / "config/stage-a-envelope.wire", stage_b_wire=root / "raw/stage-b-authorization.wire",
-            successor_bundle=root / "transitions/e0-to-e1-operator-capacity/successor.bundle", consumption_record=root / "raw/consumption.json",
-            stage_a_verifier_receipt=root / str(authority["stage_a_verifier_receipt"]),
-            stage_b_verifier_receipt=root / str(authority["stage_b_verifier_receipt"]), pins=pins)
-        baseline = baseline_replay.replay_operator_capacity_baseline(
-            manager_events, consumption_record=_json(
-                _read(root / "raw/consumption.json", "consumption record"), "consumption record"),
-            manager_argv=manager_argv)
-        recomputed = independently_recompute_verifiers(root, authority)
-        if (not isinstance(recomputed, Mapping) or set(recomputed) != {"stage_a_receipt_sha256", "stage_b_receipt_sha256"} or
-                recomputed["stage_a_receipt_sha256"] != _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt")) or
-                recomputed["stage_b_receipt_sha256"] != _sha(_read(root / str(authority["stage_b_verifier_receipt"]), "Stage-B verifier receipt"))):
-            raise RawValidationError("independent native verifier recomputation differs from retained receipts")
-        commits = native_replay.replay_post_e1_common_commits(streams, run_id=run_id,
-            epoch1_digest=epoch1_digest, window_start_ns=start, window_end_ns=end)
-        if any(commit.transaction_count != 1 for commit in commits):
-            raise RawValidationError("counted E1 commits do not retain one synthetic command each")
-        _validate_cpu(root, authority, start=start, end=end)
-        cleanup = receipt["cleanup"]
-        if not isinstance(cleanup, dict) or cleanup.get("stop_quota_monitor") != "completed" or cleanup.get("terminate_manager_and_replicas") != "completed" or not isinstance(cleanup.get("terminate_owned_replica_scopes"), dict) or not isinstance(cleanup.get("verify_scope_cleanup"), dict) or cleanup["terminate_owned_replica_scopes"].get("complete") is not True or cleanup["verify_scope_cleanup"].get("complete") is not True or len(cleanup["terminate_owned_replica_scopes"].get("units", [])) != N or len(cleanup["verify_scope_cleanup"].get("units", [])) != N:
-            raise RawValidationError("runner cleanup receipt is incomplete")
-        return {"schema_version": 1, "kind": _RESULT, "verdict": "COMPLETE_NO_CLAIM",
-                "claim_eligible": False, "figure_eligible": False, "automatic_retries": 0,
-                "complete_common_commit_count": len(commits), "common_commits": [item.__dict__ for item in commits],
-                "measurement_window": {"start_monotonic_ns": start, "end_monotonic_ns": end},
-                "workload_boundary": "all-31 common committed-block cadence under a pinned replica-local synthetic drive; transaction_count is a nonempty-slot invariant, not TPS or unique transactions",
-                "synthetic_workload": workload,
-                "public_identity_fingerprint": public_identity_fingerprint,
-                "consumption_chain": chain, "baseline_replay": baseline}
+        return _validate_evidence(root, receipt=receipt, authority=authority,
+            independently_recompute_verifiers=independently_recompute_verifiers)
     except (RawValidationError, consumption_audit.ConsumptionAuditError, native_replay.NativeReplayError,
             baseline_replay.BaselineReplayError, KeyError, TypeError) as exc:
         return _failure("RAW_CONTRACT_INCOMPLETE", str(exc))
+
+
+def _validate_evidence(root, *, receipt, authority, independently_recompute_verifiers,
+                       cluster_physical_regime=None):
+    """Shared protocol/metric proof; callers must close their own launch authority."""
+    manifest_raw = _read(root / "materialization-manifest.json", "materialization manifest", 256 * 1024)
+    if _sha(manifest_raw) != authority["materialization_manifest_sha256"]:
+        raise RawValidationError("materialization manifest differs from authority pin")
+    manifest = _json(manifest_raw, "materialization manifest")
+    if manifest.get("verdict") != "MATERIALIZED_NO_EXECUTION" or manifest.get("protocol") != {"N": 31, "Q": 21, "tree_count": 21}:
+        raise RawValidationError("materialization manifest is not frozen W18 N31")
+    workload = _validate_materialized_workload_for_raw(manifest)
+    artifacts = manifest.get("artifact_sha256")
+    if not isinstance(artifacts, dict):
+        raise RawValidationError("materialization artifacts are absent")
+    required_config = {"config/hotstuff.gen.conf", *(f"config/replica-{replica}.conf" for replica in range(N))}
+    if not required_config.issubset(artifacts) or any(
+            _sha(_read(root / relative, f"materialized {relative}")) != artifacts[relative]
+            for relative in required_config):
+        raise RawValidationError("effective synthetic workload configuration differs from manifest")
+    try:
+        try:
+            manager_argv = json.loads(_read(root / "runtime/manager-argv.json", "retained manager argv").decode("ascii"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RawValidationError("retained manager argv is invalid") from exc
+        if not isinstance(manager_argv, list) or not all(isinstance(value, str) for value in manager_argv):
+            raise RawValidationError("retained manager argv is invalid")
+        _validate_retained_manager_argv_for_raw(
+            root=root, manager_argv=manager_argv, manifest=manifest)
+        backend.validate_synthetic_main_config(
+            _read(root / "config/hotstuff.gen.conf", "materialized main config"), root=root,
+            manager_argv=manager_argv)
+        public_identity_fingerprint = _validate_materialized_identity_for_raw(
+            root=root, manager_argv=manager_argv, manifest=manifest)
+    except backend.OperatorCapacityV3BackendError as exc:
+        raise RawValidationError(str(exc)) from exc
+    if (_sha(_read(root / "config/stage-a-envelope.wire", "Stage-A envelope"))
+            != manifest.get("stage_a_envelope_sha256") or
+            _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt"))
+            != manifest.get("stage_a_verifier_receipt_sha256")):
+        raise RawValidationError("Stage-A materialization authority differs from manifest")
+    window = receipt["e1_measurement_window"]
+    if not isinstance(window, dict) or set(window) != {"activated_replica_ids", "all_replica_e1_activation_events", "all_replica_e1_activation_monotonic_ns", "post_e1_window_start_monotonic_ns", "post_e1_window_end_monotonic_ns", "post_e1_commit"}:
+        raise RawValidationError("runner receipt lacks the frozen complete E1 window schema")
+    start, end = window["post_e1_window_start_monotonic_ns"], window["post_e1_window_end_monotonic_ns"]
+    if (window["activated_replica_ids"] != list(range(N)) or type(start) is not int or type(end) is not int or end - start != WINDOW_NS or window["all_replica_e1_activation_monotonic_ns"] != start):
+        raise RawValidationError("E1 window is not exact all-31 activation plus fixed 30 seconds")
+    activation_events = window["all_replica_e1_activation_events"]
+    if not isinstance(activation_events, list) or len(activation_events) != N:
+        raise RawValidationError("runner receipt lacks all 31 E1 activation events")
+    activation_digests = {event.get("epoch_digest") for event in activation_events if isinstance(event, dict)}
+    if len(activation_digests) != 1:
+        raise RawValidationError("runner E1 activation events do not share one exact digest")
+    epoch1_digest = _hex(next(iter(activation_digests)), "E1 activation digest")
+    run_id = authority["pins"].get("run_id") if isinstance(authority["pins"], dict) else None
+    if not isinstance(run_id, str) or not run_id:
+        raise RawValidationError("raw-validation authority pins lack run ID")
+    manager_raw = _read(root / "raw/manager-events.jsonl", "manager event stream")
+    if _sha(manager_raw) != authority["event_stream_sha256"]["manager"]:
+        raise RawValidationError("manager stream differs from authority pin")
+    manager_events = _stream_events(root / "raw/manager-events.jsonl", kind="adaptation_manager",
+                   source_id="adaptive-manager", run_id=run_id)
+    streams: dict[int, list[dict[str, Any]]] = {}
+    for replica in range(N):
+        path = root / f"raw/replica-{replica}.jsonl"
+        raw = _read(path, f"replica-{replica} event stream")
+        if _sha(raw) != authority["event_stream_sha256"][f"replica-{replica}"]:
+            raise RawValidationError(f"replica-{replica} stream differs from authority pin")
+        streams[replica] = _stream_events(path, kind="replica", source_id=f"replica-{replica}", run_id=run_id)
+    pins = authority["pins"]
+    if not isinstance(pins, dict):
+        raise RawValidationError("raw-validation authority pins are invalid")
+    chain = consumption_audit.audit_consumption_chain(
+        stage_a_wire=root / "config/stage-a-envelope.wire", stage_b_wire=root / "raw/stage-b-authorization.wire",
+        successor_bundle=root / "transitions/e0-to-e1-operator-capacity/successor.bundle", consumption_record=root / "raw/consumption.json",
+        stage_a_verifier_receipt=root / str(authority["stage_a_verifier_receipt"]),
+        stage_b_verifier_receipt=root / str(authority["stage_b_verifier_receipt"]), pins=pins)
+    baseline = baseline_replay.replay_operator_capacity_baseline(
+        manager_events, consumption_record=_json(
+            _read(root / "raw/consumption.json", "consumption record"), "consumption record"),
+        manager_argv=manager_argv)
+    recomputed = independently_recompute_verifiers(root, authority)
+    if (not isinstance(recomputed, Mapping) or set(recomputed) != {"stage_a_receipt_sha256", "stage_b_receipt_sha256"} or
+            recomputed["stage_a_receipt_sha256"] != _sha(_read(root / str(authority["stage_a_verifier_receipt"]), "Stage-A verifier receipt")) or
+            recomputed["stage_b_receipt_sha256"] != _sha(_read(root / str(authority["stage_b_verifier_receipt"]), "Stage-B verifier receipt"))):
+        raise RawValidationError("independent native verifier recomputation differs from retained receipts")
+    commits = native_replay.replay_post_e1_common_commits(streams, run_id=run_id,
+        epoch1_digest=epoch1_digest, window_start_ns=start, window_end_ns=end)
+    if any(commit.transaction_count != 1 for commit in commits):
+        raise RawValidationError("counted E1 commits do not retain one synthetic command each")
+    _validate_cpu(root, authority, start=start, end=end,
+                  cluster_physical_regime=cluster_physical_regime)
+    cleanup = receipt["cleanup"]
+    if not isinstance(cleanup, dict) or cleanup.get("stop_quota_monitor") != "completed" or cleanup.get("terminate_manager_and_replicas") != "completed" or not isinstance(cleanup.get("terminate_owned_replica_scopes"), dict) or not isinstance(cleanup.get("verify_scope_cleanup"), dict) or cleanup["terminate_owned_replica_scopes"].get("complete") is not True or cleanup["verify_scope_cleanup"].get("complete") is not True or len(cleanup["terminate_owned_replica_scopes"].get("units", [])) != N or len(cleanup["verify_scope_cleanup"].get("units", [])) != N:
+        raise RawValidationError("runner cleanup receipt is incomplete")
+    return {"schema_version": 1, "kind": _RESULT, "verdict": "COMPLETE_NO_CLAIM",
+            "claim_eligible": False, "figure_eligible": False, "automatic_retries": 0,
+            "complete_common_commit_count": len(commits), "common_commits": [item.__dict__ for item in commits],
+            "measurement_window": {"start_monotonic_ns": start, "end_monotonic_ns": end},
+            "workload_boundary": "all-31 common committed-block cadence under a pinned replica-local synthetic drive; transaction_count is a nonempty-slot invariant, not TPS or unique transactions",
+            "synthetic_workload": workload,
+            "public_identity_fingerprint": public_identity_fingerprint,
+            "consumption_chain": chain, "baseline_replay": baseline}
