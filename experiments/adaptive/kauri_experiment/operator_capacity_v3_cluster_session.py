@@ -52,7 +52,9 @@ def run_cell(session, *, ordinal, cell, shared, repo, build_receipt, booking_id,
     arguments = prepare.prepare(root, shared_path=shared, private=session / "inputs" / name,
         run_id=run_id, arm=arm, regime=regime, repo=repo, build_receipt=build_receipt,
         booking_id=booking_id, approval_reference=reference)
-    cluster.write(root / "runtime/session-booking-admission.json", admission)
+    # Keep runtime absent until the bounded child verifies fresh outputs.
+    # The root-level receipt is included in the sealed raw inventory.
+    cluster.write(root / "session-booking-admission.json", admission)
     cluster.execute(**arguments)
     terminal_sha = cluster.sha((root / validation.TERMINAL).read_bytes())
     result = validation.replay(root, expected_terminal_sha256=terminal_sha)
@@ -127,7 +129,7 @@ def evaluate(session):
 
 
 def verify_cell_booking(root, allowed_ids):
-    admission, _ = cluster.read(root / "runtime/session-booking-admission.json")
+    admission, _ = cluster.read(root / "session-booking-admission.json")
     request, _ = cluster.read(root / "runtime/cluster-request.json")
     if (admission["booking_id"] not in allowed_ids or
             admission["booking_id"] != request["booking_id"] or
