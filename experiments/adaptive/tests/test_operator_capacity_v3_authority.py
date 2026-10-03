@@ -72,6 +72,33 @@ def test_missing_native_stage_b_command_has_no_acceptance_path() -> None:
         subject._rerun((), "Stage-B", b'{"receipt":"b"}\n', runner=lambda *_args, **_kwargs: None)
 
 
+@pytest.mark.parametrize("mutation", [None, "time", "verdict", "signature"])
+def test_stage_a_replay_uses_only_the_exact_sealed_live_time(tmp_path, mutation):
+    old = {"kind": "kauri-operator-capacity-native-envelope-verification-receipt-v1",
+           "verdict": "NATIVE_ENVELOPE_VERIFIED_NO_EXECUTION",
+           "verification_monotonic_raw_ns": 123, "envelope_wire_sha256": "a" * 64}
+    def native(command, **_kwargs):
+        assert command[1:3] == ("--replay-at-monotonic-raw-ns", "123")
+        new = {**old, "kind": "kauri-operator-capacity-historical-envelope-verification-receipt-v1",
+               "verdict": "HISTORICAL_ENVELOPE_VERIFIED_NO_EXECUTION"}
+        if mutation == "time": new["verification_monotonic_raw_ns"] = 124
+        if mutation == "verdict": new["verdict"] = old["verdict"]
+        if mutation == "signature": return type("Done", (), {"returncode": 2})()
+        _write(Path(command[-1]), new)
+        return type("Done", (), {"returncode": 0})()
+    if mutation is None:
+        subject._rerun(("native",), "Stage-A", json.dumps(old).encode(), runner=native)
+    else:
+        with pytest.raises(subject.OperatorCapacityV3AuthorityError):
+            subject._rerun(("native",), "Stage-A", json.dumps(old).encode(), runner=native)
+
+
+def test_caller_cannot_supply_a_historical_time():
+    with pytest.raises(subject.OperatorCapacityV3AuthorityError, match="sealed live receipt"):
+        subject._rerun(("native", "--replay-at-monotonic-raw-ns", "1"), "Stage-A", b"{}",
+                       runner=lambda *_args, **_kwargs: None)
+
+
 def test_missing_stage_b_receipt_requires_a_complete_bound_native_command(tmp_path: Path) -> None:
     with pytest.raises(subject.OperatorCapacityV3AuthorityError, match="complete native Stage-B"):
         subject._stage_b_command_is_bound(

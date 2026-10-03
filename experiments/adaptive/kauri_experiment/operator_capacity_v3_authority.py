@@ -142,19 +142,35 @@ def _rerun(command: Sequence[str], label: str, retained: bytes,
         raise OperatorCapacityV3AuthorityError(f"explicit native {label} verifier command is required")
     if "--output" in command:
         raise OperatorCapacityV3AuthorityError(f"native {label} verifier command must not preselect output")
+    if "--replay-at-monotonic-raw-ns" in command:
+        raise OperatorCapacityV3AuthorityError("historical time must come from the sealed live receipt")
+    old = _json(retained, f"retained {label} verifier receipt")
+    historical = label == "Stage-A" and old.get("kind") == (
+        "kauri-operator-capacity-native-envelope-verification-receipt-v1")
+    replay_command = tuple(command)
+    if historical:
+        tick = old.get("verification_monotonic_raw_ns")
+        if (old.get("verdict") != "NATIVE_ENVELOPE_VERIFIED_NO_EXECUTION" or
+                type(tick) is not int or not 0 < tick <= 2**64 - 1):
+            raise OperatorCapacityV3AuthorityError("sealed live Stage-A verification time is invalid")
+        replay_command += ("--replay-at-monotonic-raw-ns", str(tick))
     with tempfile.TemporaryDirectory(prefix=f"kauri-w18-{label.lower()}-verify-") as directory:
         output = Path(directory) / "receipt.json"
         try:
-            invoked = runner((*command, "--output", str(output)), capture_output=True,
+            invoked = runner((*replay_command, "--output", str(output)), capture_output=True,
                              check=False, timeout=30)
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise OperatorCapacityV3AuthorityError(f"native {label} verifier could not complete") from exc
         if getattr(invoked, "returncode", None) != 0:
             raise OperatorCapacityV3AuthorityError(f"native {label} verifier rejected sealed raw inputs")
         fresh = _read(output, f"fresh native {label} verifier receipt", 128 * 1024)
-    old = _json(retained, f"retained {label} verifier receipt")
     new = _json(fresh, f"fresh native {label} verifier receipt")
-    ignored = {"verification_monotonic_raw_ns"} if label == "Stage-A" else set()
+    if historical:
+        if (new.get("kind") != "kauri-operator-capacity-historical-envelope-verification-receipt-v1" or
+                new.get("verdict") != "HISTORICAL_ENVELOPE_VERIFIED_NO_EXECUTION"):
+            raise OperatorCapacityV3AuthorityError("native Stage-A did not produce a historical replay receipt")
+        new = {**new, "kind": old["kind"], "verdict": old["verdict"]}
+    ignored = {"verification_monotonic_raw_ns"} if label == "Stage-A" and not historical else set()
     if set(old) != set(new) or any(new[key] != value for key, value in old.items() if key not in ignored):
         raise OperatorCapacityV3AuthorityError(f"fresh native {label} verifier receipt differs from retained receipt")
     if ignored and (type(new.get("verification_monotonic_raw_ns")) is not int or

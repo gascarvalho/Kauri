@@ -179,6 +179,19 @@ def test_rejects_stage_a_hash_drift_without_creating_root(tmp_path: Path, native
     assert not (tmp_path / "out").exists()
 
 
+def test_historical_verification_receipt_cannot_authorize_live_materialization(tmp_path, native_identities):
+    values = _inputs(tmp_path, native_identities)
+    path = values["stage_a_verifier_receipt"]["path"]
+    receipt = json.loads(path.read_bytes())
+    receipt.update(kind="kauri-operator-capacity-historical-envelope-verification-receipt-v1",
+                   verdict="HISTORICAL_ENVELOPE_VERIFIED_NO_EXECUTION")
+    path.write_bytes(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n")
+    values["stage_a_verifier_receipt"]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    with pytest.raises(subject.OperatorCapacityV3MaterializerError):
+        subject.materialize_operator_capacity_v3(tmp_path / "out", **values)
+    assert not (tmp_path / "out").exists()
+
+
 def test_rejects_unapproved_replica_executable_before_materialization(
     tmp_path: Path, native_identities: dict[str, object],
 ) -> None:

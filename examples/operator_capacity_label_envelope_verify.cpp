@@ -7,6 +7,8 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <iostream>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -33,6 +35,7 @@ struct Arguments {
     std::string issuer_id, issuer_reference, issuer_public_key_hex;
     std::string issuer_public_key_fingerprint, approved_capacity_digest;
     std::string arm, source_revision;
+    std::optional<std::uint64_t> replay_at_monotonic_raw_ns;
 };
 
 bool lowercase_hex(std::string_view value, std::size_t size)
@@ -138,10 +141,12 @@ void write_exclusive(const std::filesystem::path &path, const std::string &conte
 
 Arguments arguments(int argc, char **argv)
 {
-    if (argc != 21) throw std::invalid_argument("invalid argument count");
+    if (argc != 21 && argc != 23) throw std::invalid_argument("invalid argument count");
     Arguments result;
+    std::set<std::string> seen;
     for (int index = 1; index < argc; index += 2) {
         const std::string flag(argv[index]), value(argv[index + 1]);
+        if (!seen.insert(flag).second) throw std::invalid_argument("duplicate argument: " + flag);
         if (flag == "--epoch0-tree-file") result.tree_file = value;
         else if (flag == "--stage-a-envelope-wire") result.envelope_file = value;
         else if (flag == "--issuer-id") result.issuer_id = value;
@@ -152,6 +157,12 @@ Arguments arguments(int argc, char **argv)
         else if (flag == "--arm") result.arm = value;
         else if (flag == "--source-revision") result.source_revision = value;
         else if (flag == "--output") result.output = value;
+        else if (flag == "--replay-at-monotonic-raw-ns") {
+            const auto tick = decimal(value, "historical verification time");
+            if (tick == 0 || std::to_string(tick) != value)
+                throw std::invalid_argument("invalid historical verification time");
+            result.replay_at_monotonic_raw_ns = tick;
+        }
         else throw std::invalid_argument("unknown argument: " + flag);
     }
     if (result.tree_file.empty() || result.envelope_file.empty() || result.output.empty() ||
@@ -200,8 +211,12 @@ std::string receipt(const Arguments &args, const std::string &envelope_sha256,
                     const hotstuff::uint256_t &topology_digest,
                     std::uint64_t verification_monotonic_raw_ns)
 {
-    return "{\"schema_version\":1,\"kind\":" + json_string(kReceiptKind) +
-        ",\"verdict\":" + json_string(kReceiptVerdict) +
+    const auto kind = args.replay_at_monotonic_raw_ns
+        ? "kauri-operator-capacity-historical-envelope-verification-receipt-v1" : kReceiptKind;
+    const auto verdict = args.replay_at_monotonic_raw_ns
+        ? "HISTORICAL_ENVELOPE_VERIFIED_NO_EXECUTION" : kReceiptVerdict;
+    return "{\"schema_version\":1,\"kind\":" + json_string(kind) +
+        ",\"verdict\":" + json_string(verdict) +
         ",\"envelope_wire_sha256\":" + json_string(envelope_sha256) +
         ",\"envelope_canonical_digest\":" + json_string(envelope_digest.to_hex()) +
         ",\"approved_capacity_digest\":" + json_string(args.approved_capacity_digest) +
@@ -254,7 +269,10 @@ int main(int argc, char **argv)
         const hotstuff::OperatorCapacityLabelEnvelopeIssuer issuer{
             issuer_id, args.issuer_reference,
             hotstuff::uint256_t(hotstuff::from_hex(args.approved_capacity_digest)), public_key};
-        const auto verification_monotonic_raw_ns = monotonic_raw_now_ns();
+        const auto now_ns = monotonic_raw_now_ns();
+        if (args.replay_at_monotonic_raw_ns && *args.replay_at_monotonic_raw_ns > now_ns)
+            throw std::runtime_error("historical verification time is in the future");
+        const auto verification_monotonic_raw_ns = args.replay_at_monotonic_raw_ns.value_or(now_ns);
         if (!hotstuff::verify_operator_capacity_label_envelope(
                 *decoded.value, issuer, members, epoch0, topology_digest,
                 verification_monotonic_raw_ns))

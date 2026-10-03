@@ -194,6 +194,42 @@ TEST_CASE("operator-capacity CLI emits a receipt only for exact signed Stage-A i
     REQUIRE(sampled_time_offset != std::string::npos);
     CHECK(receipt.at(sampled_time_offset + sampled_time.size()) >= '1');
 
+    SECTION("historical replay preserves validity at the sealed time without live admission") {
+        auto expired_snapshot = snapshot;
+        expired_snapshot.valid_from_monotonic_ns = now_ns - 4'000'000'000ULL;
+        expired_snapshot.valid_until_monotonic_ns = now_ns - 3'000'000'000ULL;
+        expired_snapshot.canonical_digest = hotstuff::operator_capacity_snapshot_digest(expired_snapshot);
+        const auto expired = hotstuff::sign_operator_capacity_label_envelope(
+            membership, epoch0, topology, hotstuff::OperatorCapacityArm::fast_priority_treatment,
+            expired_snapshot, 73, private_key);
+        const auto expired_path = directory.path / "expired.wire";
+        write_bytes(expired_path, hotstuff::encode_operator_capacity_label_envelope(expired, limits));
+        const auto live_path = directory.path / "expired-live.json";
+        CHECK(invoke(command(tree_path, expired_path, live_path, public_key_hex(public_key),
+            sha256_hex(public_bytes), expired_snapshot.canonical_digest.to_hex())) == 2);
+        CHECK_FALSE(std::filesystem::exists(live_path));
+        const auto replay_path = directory.path / "historical.json";
+        auto historical = command(tree_path, expired_path, replay_path, public_key_hex(public_key),
+            sha256_hex(public_bytes), expired_snapshot.canonical_digest.to_hex());
+        const auto historical_tick = now_ns - 3'500'000'000ULL;
+        historical.insert(historical.end(), {"--replay-at-monotonic-raw-ns", std::to_string(historical_tick)});
+        REQUIRE(invoke(historical) == 0);
+        const auto replay = receipt_text(replay_path);
+        CHECK(replay.find("\"verdict\":\"HISTORICAL_ENVELOPE_VERIFIED_NO_EXECUTION\"") != std::string::npos);
+        CHECK(replay.find("\"verification_monotonic_raw_ns\":" + std::to_string(historical_tick)) != std::string::npos);
+        const auto rejected_path = directory.path / "invalid-historical.json";
+        historical[historical.size() - 3] = rejected_path.string();
+        historical.back() = std::to_string(now_ns);
+        CHECK(invoke(historical) == 2);
+        CHECK_FALSE(std::filesystem::exists(rejected_path));
+        historical.back() = std::to_string(UINT64_MAX);
+        CHECK(invoke(historical) == 2);
+        CHECK_FALSE(std::filesystem::exists(rejected_path));
+        historical.back() = "0";
+        CHECK(invoke(historical) == 2);
+        CHECK_FALSE(std::filesystem::exists(rejected_path));
+    }
+
     auto corrupted = wire; corrupted.back() ^= 1U;
     const auto corrupted_path = directory.path / "corrupted.wire";
     write_bytes(corrupted_path, corrupted);
