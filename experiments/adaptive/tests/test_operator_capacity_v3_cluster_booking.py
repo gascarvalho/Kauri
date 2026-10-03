@@ -46,4 +46,13 @@ def test_listing_dates_are_bound_to_current_authorized_table(monkeypatch):
     assert cluster.booking_listing() == ROW
     command = commands[0]
     assert command[command.index('-s') + 1] == '2026-10-03 10:30'
-    assert command[command.index('-e') + 1] == '2026-10-03 19:00'
+    assert command[command.index('-e') + 1] == '2026-10-04 00:00'
+
+
+def test_adjacent_evening_booking_preserves_exact_identity_and_bounds():
+    evening = '| ' + ' | '.join(['hmb00bqo2193l29neqa48v7lm0', 'proteina02', 'gascarvalho',
+        'EXCLUSIVE', '5 hours', '2026-10-03 19:00', '2026-10-04 00:00']) + ' |\n'
+    now = datetime(2026, 10, 3, 17, 0, tzinfo=timezone.utc)
+    coverage = cluster.booking_coverage(ROW + evening, now, reserve_s=11500)
+    assert [row[0] for row in coverage['booking_rows']] == [BOOKING, 'hmb00bqo2193l29neqa48v7lm0']
+    assert coverage['coverage_until_utc'] == '2026-10-03T23:00:00+00:00'

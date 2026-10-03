@@ -1,11 +1,12 @@
-"""Author-approved W18 cluster timing; the legacy local default stays separate."""
+"""Prospective W18 convergence amendment; launch requires author approval."""
 import json
 
 
 def expected_profile():
-    return {"kind": "kauri-w18-cluster-aggregation-2s-leader-20s-v3",
-            "schema_version": 3, "aggregation_per_remaining_level_ms": 2000,
-            "leader_progress_timeout_ms": 20000, "leader_activation_grace_ms": 1000}
+    return {"kind": "kauri-w18-cluster-aggregation-2s-leader-20s-convergence-90s-v4",
+            "schema_version": 4, "aggregation_per_remaining_level_ms": 2000,
+            "leader_progress_timeout_ms": 20000, "leader_activation_grace_ms": 1000,
+            "convergence_deadline_seconds": 90}
 
 
 def aggregation_seconds(profile=None):
@@ -21,3 +22,8 @@ def leader_progress_seconds(profile=None):
     # Validate the same exact profile before selecting either native timer.
     aggregation_seconds(profile)
     return 5.0 if profile is None else 20.0
+
+
+def convergence_seconds(profile=None):
+    aggregation_seconds(profile)
+    return 30 if profile is None else 90

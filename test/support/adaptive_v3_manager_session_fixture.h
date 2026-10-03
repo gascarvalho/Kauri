@@ -161,7 +161,8 @@ struct Fixture {
                 std::nullopt,
             std::optional<EpochDefinitionInput> initial_override = std::nullopt,
             std::function<std::uint64_t()> operator_capacity_raw_clock_now_ns =
-                {})
+                {},
+            std::optional<std::uint64_t> pre_certificate_window_override = std::nullopt)
         : tick_scale(tick_scale),
           exact_v13_fault_window_contract(exact_v13_fault_window_contract),
           replicas(members(count)),
@@ -181,6 +182,8 @@ struct Fixture {
                   std::move(operator_capacity_issuer);
               result.operator_capacity_raw_clock_now_ns =
                   std::move(operator_capacity_raw_clock_now_ns);
+              if (pre_certificate_window_override)
+                  result.pre_certificate_window_ticks = *pre_certificate_window_override;
               return result;
           }()),
           session(replicas, initial, config),

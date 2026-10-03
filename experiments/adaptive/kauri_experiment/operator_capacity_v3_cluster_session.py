@@ -29,7 +29,7 @@ def design():
         "replica_cfs_quota_period_usec": cluster.REPLICA_CFS_PERIOD_US,
         "cluster_timing_profile": timing.expected_profile(),
         "booking_policy": "each cell within one exact event; campaign across verified adjacent exclusive events",
-        "baseline_decision_deadline_seconds": 240, "convergence_seconds": 30,
+        "baseline_decision_deadline_seconds": 240, "convergence_seconds": timing.convergence_seconds(timing.expected_profile()),
         "readiness_required": 31, "readiness_delivery_attempts": 1, "activation_delay_blocks": 5,
         "metric": "all31 same-window one-command common committed blocks",
         "metric_start": "maximum of all31 signed E1 activation times", "metric_seconds": 30,

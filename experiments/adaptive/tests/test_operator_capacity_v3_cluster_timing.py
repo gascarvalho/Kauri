@@ -22,6 +22,8 @@ def _cluster_fixture(tmp_path, regime='heterogeneous', arm='treatment'):
     manifest_path = root / 'materialization-manifest.json'
     manifest = json.loads(manifest_path.read_bytes())
     manifest['cluster_timing_profile'] = timing.expected_profile()
+    manager[manager.index('--convergence-deadline-seconds') + 1] = '90'
+    manifest['manager_argv_sha256'] = backend._argv_digest(manager)
     manifest['artifact_sha256']['config/hotstuff.gen.conf'] = hashlib.sha256(path.read_bytes()).hexdigest()
     manifest['synthetic_workload']['main_config_sha256'] = manifest['artifact_sha256']['config/hotstuff.gen.conf']
     manifest['arm'] = arm
@@ -57,6 +59,19 @@ def test_cluster_timing_cannot_enter_legacy_local_plan(tmp_path):
     with pytest.raises(backend.OperatorCapacityV3BackendError, match='legacy local'):
         backend.prepare_no_launch_backend(materialization_root=root, manager_argv=manager,
                                           replica_argv=replicas, quota_profile=quota)
+
+
+@pytest.mark.parametrize('deadline', ['30', '60', '180'])
+def test_cluster_manager_deadline_drift_rejects_after_rehash(tmp_path, deadline):
+    root, manager, replicas, quota = _cluster_fixture(tmp_path)
+    manager[manager.index('--convergence-deadline-seconds') + 1] = deadline
+    path = root / 'materialization-manifest.json'
+    manifest = json.loads(path.read_bytes())
+    manifest['manager_argv_sha256'] = backend._argv_digest(manager)
+    path.write_bytes(_canonical(manifest))
+    with pytest.raises(backend.OperatorCapacityV3BackendError, match='frozen cadence'):
+        backend.prepare_no_launch_backend(materialization_root=root, manager_argv=manager,
+            replica_argv=replicas, quota_profile=quota, cluster_physical_regime='heterogeneous')
 
 
 @pytest.mark.parametrize('mode', ['missing-profile', 'null-profile', 'timer-drift', 'profile-drift', 'leader-drift', 'old-cluster-profile', 'previous-cluster-profile'])
@@ -103,6 +118,7 @@ def test_materializer_writes_identical_approved_timing_for_both_arms(tmp_path, n
     config = (root / 'config/hotstuff.gen.conf').read_text()
     assert 'aggregation-timeout = 2.0\n' in config
     assert 'leader-progress-timeout = 20.0\n' in config
+    assert result['manager_argv'][result['manager_argv'].index('--convergence-deadline-seconds') + 1] == '90'
     assert result['manifest']['protocol'] == {'N':31, 'Q':21, 'tree_count':21}
     physical._verify_synthetic_config_before_spawn(root, result['manager_argv'])
     assert not (root / 'runtime').exists() and not list((root / 'raw').iterdir())
@@ -110,6 +126,7 @@ def test_materializer_writes_identical_approved_timing_for_both_arms(tmp_path, n
 
 @pytest.mark.parametrize('field,value', [('schema_version', True), ('aggregation_per_remaining_level_ms', 500),
                                        ('leader_progress_timeout_ms', 5000), ('leader_activation_grace_ms', 0),
+                                       ('convergence_deadline_seconds', 30),
                                        ('extra', 'unpinned')])
 def test_timing_profile_is_exact_typed_and_closed(field, value):
     profile = timing.expected_profile();profile[field] = value
@@ -119,6 +136,8 @@ def test_timing_profile_is_exact_typed_and_closed(field, value):
 def test_legacy_default_remains_half_second():
     assert timing.aggregation_seconds() == 0.5
     assert timing.leader_progress_seconds() == 5.0
+    assert timing.convergence_seconds() == 30
+    assert timing.convergence_seconds(timing.expected_profile()) == 90
 
 
 def test_approved_leader_timer_allows_native_fallback_recovery_horizon():

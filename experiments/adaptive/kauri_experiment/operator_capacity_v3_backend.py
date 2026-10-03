@@ -492,7 +492,7 @@ _MANAGER_FIXED_VALUES = {
 }
 
 
-def _validate_manager_argv(argv: Sequence[str], *, root: Path) -> None:
+def _validate_manager_argv(argv: Sequence[str], *, root: Path, cluster_timing_profile=None) -> None:
     """Accept only the materializer's ordered manager command grammar.
 
     The manifest digest is an integrity binding, not an authorization for a
@@ -510,8 +510,10 @@ def _validate_manager_argv(argv: Sequence[str], *, root: Path) -> None:
     singleton = pairs[:len(_MANAGER_SINGLETON_FLAGS)]
     if tuple(flag for flag, _ in singleton) != _MANAGER_SINGLETON_FLAGS:
         _fail("manager argv differs from the materializer command grammar")
-    if any(value != _MANAGER_FIXED_VALUES.get(flag, value) for flag, value in singleton
-           if flag in _MANAGER_FIXED_VALUES):
+    fixed_values = {**_MANAGER_FIXED_VALUES,
+                    "--convergence-deadline-seconds": str(timing.convergence_seconds(cluster_timing_profile))}
+    if any(value != fixed_values.get(flag, value) for flag, value in singleton
+           if flag in fixed_values):
         _fail("manager argv changes a frozen cadence or protocol parameter")
     values = dict(singleton)
     if (not values["--listen"].startswith("127.0.0.1:") or
@@ -592,7 +594,9 @@ def validate_materialized_manager_argv(
     *, root: Path, manager_argv: Sequence[str], expected_sha256: object,
 ) -> None:
     """Validate the full frozen manager command retained for raw replay."""
-    _validate_manager_argv(manager_argv, root=root)
+    manifest = _json(_read_regular(root / "materialization-manifest.json", "materialization manifest"),
+                     "materialization manifest")
+    _validate_manager_argv(manager_argv, root=root, cluster_timing_profile=manifest.get("cluster_timing_profile"))
     if _argv_digest(manager_argv) != expected_sha256:
         _fail("retained manager argv differs from frozen materialization manifest")
     _transition_policy(manager_argv)

@@ -29,6 +29,7 @@ from . import operator_capacity_v3_local_runner as physical
 
 BOOKINGS = {
     "ah8geq2que22d95lkhr9ttm5bg": ("2026-10-03 10:30", "2026-10-03 19:00"),
+    "hmb00bqo2193l29neqa48v7lm0": ("2026-10-03 19:00", "2026-10-04 00:00"),
 }
 REQUEST_KIND = "kauri-w18-cluster-arm-request-v1"
 APPROVAL_KIND = "kauri-w18-cluster-arm-approval-v1"

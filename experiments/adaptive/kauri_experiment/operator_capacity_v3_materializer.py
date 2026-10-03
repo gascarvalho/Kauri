@@ -501,7 +501,7 @@ def materialize_operator_capacity_v3(
     ]
     manager_argv = [str(manager_binary), "--protocol-mode", "adaptive_v3", "--listen", f"127.0.0.1:{ports['manager']}",
                     "--tls-privkey", tls[N]["sec"], "--tls-cert", tls[N]["crt"], "--issuer-id", "1", "--issuer-private-key", issuer["sec"],
-                    "--activation-delay-blocks", "5", "--convergence-deadline-seconds", "30", "--tree-fanout", "5", "--pipeline-stretch", "2",
+                    "--activation-delay-blocks", "5", "--convergence-deadline-seconds", str(timing.convergence_seconds(cluster_timing_profile)), "--tree-fanout", "5", "--pipeline-stretch", "2",
                     "--shape-candidate-fanouts", "5", "--shape-deterministic-seed", "1", "--transition-request", transition,
                     "--bundle-output", str(bundle), "--epoch-zero-tree-file", str(tree), "--structured-event-run-id", run_id,
                     "--structured-event-source-instance", source_instance, "--structured-event-output", str(manager_events),

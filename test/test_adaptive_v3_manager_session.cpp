@@ -36,6 +36,31 @@ std::uint32_t survivor_reported_tree(const AdaptiveV3ManagerSession &session,
 
 } // namespace
 
+TEST_CASE("prospective certificate window remains finite after delayed predecessor progress",
+          "[adaptive-v3][manager-session][deadline]")
+{
+    for (const std::uint64_t window : {30'000ULL, 90'000ULL}) {
+        Fixture fixture(7, {2, 3, 4, 5, 6}, 1,
+            BlsMembershipConstruction::random, 1, false, std::nullopt, std::nullopt, {}, window);
+        fixture.select_containment({0, 1});
+        REQUIRE(fixture.session.begin_readiness(10));
+        fixture.session.advance(30'010);
+        if (window == 30'000) {
+            REQUIRE(fixture.session.status() == AdaptiveV3ManagerSessionStatus::terminal);
+            CHECK(fixture.session.terminal_audit()->reason ==
+                  AdaptiveV3ManagerSessionTerminalReason::pre_certificate_deadline);
+        } else {
+            REQUIRE(fixture.session.status() == AdaptiveV3ManagerSessionStatus::collecting);
+            fixture.session.advance(90'009);
+            REQUIRE(fixture.session.status() == AdaptiveV3ManagerSessionStatus::collecting);
+            fixture.session.advance(90'010);
+            REQUIRE(fixture.session.status() == AdaptiveV3ManagerSessionStatus::terminal);
+            CHECK(fixture.session.terminal_audit()->reason ==
+                  AdaptiveV3ManagerSessionTerminalReason::pre_certificate_deadline);
+        }
+    }
+}
+
 TEST_CASE("CERT13 manager session drives two certified N7 transitions without preseeded identities",
           "[cert13][adaptive-v3][manager-session][n7][q5][r5][integration]")
 {
