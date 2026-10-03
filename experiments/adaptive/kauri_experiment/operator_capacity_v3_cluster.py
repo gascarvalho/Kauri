@@ -28,9 +28,7 @@ from . import operator_capacity_v3_local_runner as physical
 
 
 BOOKINGS = {
-    "32usk1i80tieqq3e8jterd8as4": ("2026-10-02 09:30", "2026-10-02 17:00"),
-    "9ju0eqk272j7ofgtkvii0rag68": ("2026-10-02 17:00", "2026-10-02 22:00"),
-    "i1v82b83o8flllp1g9ctb7b084": ("2026-10-02 22:00", "2026-10-03 00:00"),
+    "ah8geq2que22d95lkhr9ttm5bg": ("2026-10-03 10:30", "2026-10-03 19:00"),
 }
 REQUEST_KIND = "kauri-w18-cluster-arm-request-v1"
 APPROVAL_KIND = "kauri-w18-cluster-arm-approval-v1"
@@ -84,9 +82,11 @@ def booking_row(stdout, booking_id, observed_utc, *, reserve_s=360):
 
 
 def booking_listing():
+    start = min(bounds[0] for bounds in BOOKINGS.values())
+    end = max(bounds[1] for bounds in BOOKINGS.values())
     return subprocess.check_output(["gsd_manager", "-N", "proteina02", "booking", "ls",
-        "-u", "gascarvalho", "-m", "exclusive", "-s", "2026-10-02 09:30",
-        "-e", "2026-10-03 00:00", "-n", "100"], text=True, timeout=25)
+        "-u", "gascarvalho", "-m", "exclusive", "-s", start,
+        "-e", end, "-n", "100"], text=True, timeout=25)
 
 
 def authorized_booking_rows(stdout):

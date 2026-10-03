@@ -44,7 +44,7 @@ def test_exact_timing_binds_plan_spawn_request_and_retained_replay(tmp_path, reg
     physical._verify_synthetic_config_before_spawn(root, manager)
     build = tmp_path / 'build.json';build.write_bytes(b'build')
     request = cluster.build_request(plan, root=root, run_id='test', build_receipt=build,
-                                    booking_id='9ju0eqk272j7ofgtkvii0rag68')
+                                    booking_id=next(iter(cluster.BOOKINGS)))
     assert request['cluster_timing_profile'] == timing.expected_profile()
     (root / 'raw/preserved.json').write_bytes(b'preserved')
     retained = backend.inspect_retained_cluster_backend(**args)
