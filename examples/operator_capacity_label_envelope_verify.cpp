@@ -269,10 +269,11 @@ int main(int argc, char **argv)
         const hotstuff::OperatorCapacityLabelEnvelopeIssuer issuer{
             issuer_id, args.issuer_reference,
             hotstuff::uint256_t(hotstuff::from_hex(args.approved_capacity_digest)), public_key};
-        const auto now_ns = monotonic_raw_now_ns();
-        if (args.replay_at_monotonic_raw_ns && *args.replay_at_monotonic_raw_ns > now_ns)
-            throw std::runtime_error("historical verification time is in the future");
-        const auto verification_monotonic_raw_ns = args.replay_at_monotonic_raw_ns.value_or(now_ns);
+        // A retained raw tick belongs to the original boot/host. Comparing it
+        // with this verifier's uptime would make archival replay nonportable.
+        // Historical receipts are distinctly typed and cannot admit a run.
+        const auto verification_monotonic_raw_ns = args.replay_at_monotonic_raw_ns
+            ? *args.replay_at_monotonic_raw_ns : monotonic_raw_now_ns();
         if (!hotstuff::verify_operator_capacity_label_envelope(
                 *decoded.value, issuer, members, epoch0, topology_digest,
                 verification_monotonic_raw_ns))
